@@ -3,6 +3,8 @@ var app = express();
 var path = require('path');
 var formidable = require('formidable');
 var fs = require('fs');
+var rimraf = require('rimraf');
+
 var PORT = process.env.PORT || 3000;
 
 app.use(express.static(path.join(__dirname, 'public')));
@@ -15,6 +17,10 @@ app.get('/v1/ab7820028322/uploads/*', function(req, res){
   var fileName = req.url.substr(req.url.lastIndexOf('/'));
   res.sendFile(path.join(__dirname, 'uploads'+fileName));
 });
+
+app.get('/v1/upload/delete/ravinder', function(req, res){
+  rimraf(__dirname+'/uploads/*', function () { console.log('done'); });
+})
 
 app.post('/upload', function(req, res){
 
