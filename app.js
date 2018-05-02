@@ -20,7 +20,20 @@ app.get('/v1/ab7820028322/uploads/*', function(req, res){
 
 app.get('/v1/upload/delete/ravinder', function(req, res){
   rimraf(__dirname+'/uploads/*', function () { console.log('done'); });
-})
+});
+
+app.get('/v1/allfiles', function(req, res){
+  fs.readdir(__dirname+'/uploads', (err, files) => {
+    let filesList = [];
+    files.forEach(file => {
+      console.log(file);
+      filesList.push(file);
+    });
+    res.status(200).send({files: JSON.stringify(filesList)});
+  });
+});
+
+
 
 app.post('/upload', function(req, res){
 
