@@ -1,5 +1,21 @@
 $(function() {
   $('#downloadBtn').hide();
+
+  Dropzone.autoDiscover = false;
+  $("#dropzone").dropzone({
+      url: "/upload",
+      addRemoveLinks: true,
+      success: function (file, response) {
+          var imgName = response;
+          file.previewElement.classList.add("dz-success");
+          console.log("Successfully uploaded :" + imgName);
+          $('#downloadBtn').show();
+      },
+      error: function (file, response) {
+          file.previewElement.classList.add("dz-error");
+      }
+  });
+
 });
 
 $('.upload-btn').on('click', function (){
@@ -43,6 +59,7 @@ $('#upload-input').on('change', function(){
       contentType: false,
       success: function(data){
           console.log('upload successful!\n' + data);
+          $('#downloadBtn').show();
       },
       xhr: function() {
         // create an XMLHttpRequest
@@ -63,7 +80,6 @@ $('#upload-input').on('change', function(){
             // once the upload reaches 100%, set the progress bar text to done
             if (percentComplete === 100) {
               $('.progress-bar').html('Done');
-              $('#downloadBtn').show();
             }
 
           }
