@@ -11,6 +11,11 @@ app.get('/', function(req, res){
   res.sendFile(path.join(__dirname, 'views/index.html'));
 });
 
+app.get('/v1/ab7820028322/uploads/*', function(req, res){
+  var fileName = req.url.substr(req.url.lastIndexOf('/'));
+  res.sendFile(path.join(__dirname, 'uploads'+fileName));
+});
+
 app.post('/upload', function(req, res){
 
   // create an incoming form object

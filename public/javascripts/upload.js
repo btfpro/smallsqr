@@ -1,8 +1,22 @@
+$(function() {
+  $('#downloadBtn').hide();
+});
+
 $('.upload-btn').on('click', function (){
     $('#upload-input').click();
+    $('#downloadBtn').hide();
     $('.progress-bar').text('0%');
     $('.progress-bar').width('0%');
 });
+
+$('#downloadBtn').on('click', function (){
+  var fileName = '1.sqr';
+  window.open(
+    '/v1/ab7820028322/uploads/'+fileName,
+    '_blank'
+  );
+});
+
 
 $('#upload-input').on('change', function(){
 
@@ -49,6 +63,7 @@ $('#upload-input').on('change', function(){
             // once the upload reaches 100%, set the progress bar text to done
             if (percentComplete === 100) {
               $('.progress-bar').html('Done');
+              $('#downloadBtn').show();
             }
 
           }
