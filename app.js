@@ -4,6 +4,7 @@ var path = require('path');
 var formidable = require('formidable');
 var fs = require('fs');
 var rimraf = require('rimraf');
+const sqrparser = require('./server/sqrparser');
 
 var PORT = process.env.PORT || 5000;
 
@@ -35,8 +36,8 @@ app.get('/v1/allfiles', function(req, res) {
     });
 });
 
-
-
+let uploadedFileName = "";
+ 
 app.post('/upload', function(req, res) {
 
     // create an incoming form object
@@ -51,6 +52,7 @@ app.post('/upload', function(req, res) {
     // every time a file has been uploaded successfully,
     // rename it to it's orignal name
     form.on('file', function(field, file) {
+        uploadedFileName = file.name;
         fs.rename(file.path, path.join(form.uploadDir, file.name));
     });
 
@@ -61,7 +63,14 @@ app.post('/upload', function(req, res) {
 
     // once all the files have been uploaded, send a response to the client
     form.on('end', function() {
-        res.end('success');
+        let promise = sqrparser(__dirname + '/uploads/' + uploadedFileName, __dirname + '/uploads/output.txt');
+        promise.then(() => {
+            // console.log('converted *****');
+            res.status(200).send('/v1/ab7820028322/uploads/output.txt');
+        }, (err) => {
+            // sendFile(path.join(__dirname, '/uploads/output.txt'));
+            // console.log(err);
+        });
     });
 
     // parse the incoming request containing the form data

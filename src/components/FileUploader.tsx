@@ -1,5 +1,7 @@
+import axios from 'axios';
 import * as React from 'react';
 import {DropzoneComponent} from 'react-dropzone-component';
+import FileDownload from 'react-file-download';
 
 class FileUploader extends React.Component {
     public success: any;
@@ -34,10 +36,12 @@ class FileUploader extends React.Component {
         this.callback = () => console.log('Hello!');
 
         
-        this.success = (file: any) => {
+        this.success = (file: any, data: any) => {
             // this.props.uploadSuccess();
             // tslint:disable-next-line:no-console
-            console.log('uploaded', file)
+            axios.get(data).then((response) => {
+                FileDownload(response.data, 'output.txt');
+            });
         };
 
         // tslint:disable-next-line:no-console

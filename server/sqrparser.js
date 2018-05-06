@@ -3,7 +3,7 @@
  */
 
 
-const Promise = require('bluebird');
+// const Promise = require('bluebird');
 const express = require('express');
 const readline = require('readline');
 const fs = require('fs');
@@ -11,13 +11,13 @@ const fs = require('fs');
 
 
 const sqrparser = (inputfile,opfile) => new Promise((resolve, reject) => {
-
+    //opfile = '../uploads/output.txt';
     const rl = readline.createInterface({
         input: fs.createReadStream(inputfile)
     });
 
     const outputfile = fs.createWriteStream(opfile, {
-        flags: 'a' // 'a' means appending (old data will be preserved)
+       // flags: 'a' // 'a' means appending (old data will be preserved)
     });
     var inSelect = false;
     var firstFrom = false;
@@ -64,15 +64,17 @@ const sqrparser = (inputfile,opfile) => new Promise((resolve, reject) => {
     console.log('Line from file:', line);
     }).on('close', () => {
         outputfile.end();
-    }).catch((error) => { reject(error); });
+        console.log('output file created');
+        resolve();
+    });
 
 });
 
-//sqrparser('/Users/voddes/Extras/UD/SQR_Project/1/gexpy644.sqr','/Users/voddes/Extras/UD/SQR_Project/1/output.txt');
+// sqrparser('/Users/voddes/Extras/UD/SQR_Project/1/gexpy644.sqr','/Users/voddes/Extras/UD/SQR_Project/1/output.txt');
 
-const router = express.Router({ mergeParams: true });
+// const router = express.Router({ mergeParams: true });
 
-router.post('/upload', sqrparser);
+// router.post('/upload', sqrparser);
 
 
-module.exports = router;
+module.exports = sqrparser;

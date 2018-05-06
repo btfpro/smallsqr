@@ -12,10 +12,14 @@ class App extends React.Component {
   //     return "";
   //   }
   // }
+
+// <div> <button className="btn btn-success btn-lg" id="downloadBtn"
+// onClick={this.downloadHandler}>Download</button>
+// < /div>
   public downloadHandler() {
     const fileName: string = '1.sqr';
     axios.get('/v1/ab7820028322/uploads/'+fileName).then((response) => {
-      FileDownload(response.data, 'output.sqr');
+      FileDownload(response.data, 'output.txt');
     });
   }
   public render() {
@@ -31,9 +35,7 @@ class App extends React.Component {
                   <FileUploader />
                   <br/>
                   <br/>
-                  <div>
-                  <button className="btn btn-success btn-lg" id="downloadBtn" onClick={this.downloadHandler}>Download</button>
-                  </div>
+                  
                 </div>
               </div>
             </div>
