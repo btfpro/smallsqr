@@ -5,6 +5,7 @@ var formidable = require('formidable');
 var fs = require('fs');
 var rimraf = require('rimraf');
 const sqrparser = require('./server/sqrparser');
+const uuidv1 = require('uuid/v1');
 
 var PORT = process.env.PORT || 5000;
 
@@ -15,8 +16,8 @@ app.get('/', function(req, res) {
 });
 
 app.get('/v1/ab7820028322/uploads/*', function(req, res) {
-    var fileName = req.url.substr(req.url.lastIndexOf('/'));
-    res.sendFile(path.join(__dirname, 'uploads' + fileName));
+    let uploadPath = req.url.replace('/v1/ab7820028322', '')
+    res.sendFile(path.join(__dirname, uploadPath));
 });
 
 app.get('/v1/upload/delete/ravinder', function(req, res) {
@@ -36,10 +37,8 @@ app.get('/v1/allfiles', function(req, res) {
     });
 });
 
-let uploadedFileName = "";
- 
 app.post('/upload', function(req, res) {
-
+    let uploadedFileName = "";
     // create an incoming form object
     var form = new formidable.IncomingForm();
 
@@ -47,8 +46,10 @@ app.post('/upload', function(req, res) {
     form.multiples = true;
 
     // store all uploads in the /uploads directory
-    form.uploadDir = path.join(__dirname, '/uploads');
-
+    form.uploadDir = path.join(__dirname, '/uploads/') + uuidv1();
+    if (!fs.existsSync(form.uploadDir)) {
+        fs.mkdirSync(form.uploadDir);
+    }
     // every time a file has been uploaded successfully,
     // rename it to it's orignal name
     form.on('file', function(field, file) {
@@ -63,10 +64,10 @@ app.post('/upload', function(req, res) {
 
     // once all the files have been uploaded, send a response to the client
     form.on('end', function() {
-        let promise = sqrparser(__dirname + '/uploads/' + uploadedFileName, __dirname + '/uploads/output.txt');
+        let promise = sqrparser(form.uploadDir+'/'+uploadedFileName , form.uploadDir  + '/output.txt');
         promise.then(() => {
             // console.log('converted *****');
-            res.status(200).send('/v1/ab7820028322/uploads/output.txt');
+            res.status(200).send('/v1/ab7820028322' + form.uploadDir.replace(__dirname, "") + '/output.txt');
         }, (err) => {
             // sendFile(path.join(__dirname, '/uploads/output.txt'));
             // console.log(err);

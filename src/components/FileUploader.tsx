@@ -1,9 +1,11 @@
-import axios from 'axios';
+// tslint:disable-next-line:no-reference
+/// <reference path="../interface.d.ts" />
+// import axios from 'axios';
 import * as React from 'react';
 import {DropzoneComponent} from 'react-dropzone-component';
-import FileDownload from 'react-file-download';
+// import FileDownload from 'react-file-download';
 
-class FileUploader extends React.Component {
+class FileUploader extends React.Component < IFileUploaderProps , any> {
     public success: any;
     public callback: any;
     public componentConfig: any;
@@ -11,7 +13,8 @@ class FileUploader extends React.Component {
     public dropzone: any;
     public removedfile: any;
     public djsConfig: any;
-    constructor(props: {}) {
+    public solution1Path: string;
+    constructor(props : IFileUploaderProps) {
         super(props);
 
         // For a full list of possible configurations,
@@ -37,11 +40,11 @@ class FileUploader extends React.Component {
 
         
         this.success = (file: any, data: any) => {
+            this.solution1Path = data;
+            this.props.onSol1Path(data);
             // this.props.uploadSuccess();
             // tslint:disable-next-line:no-console
-            axios.get(data).then((response) => {
-                FileDownload(response.data, 'output.txt');
-            });
+            
         };
 
         // tslint:disable-next-line:no-console

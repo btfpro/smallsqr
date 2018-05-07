@@ -6,22 +6,33 @@ import FileUploader from './components/FileUploader';
 
 // import logo from './logo.svg';
 
-class App extends React.Component {
+class App extends React.Component <{}, {sol1Path: string}>{
+  constructor(props: any){
+    super(props);
+    this.state = {
+      sol1Path : ''
+    }
+  }
+
+  public onSol1Path = (val: string) => {
+    this.setState({
+      sol1Path : val
+    });
+  }
+
+  public downloadHandler = () => {
+    axios.get(this.state.sol1Path).then((response) => {
+      FileDownload(response.data, 'output.txt');
+    });
+  }
   // public fileUploadSuccess(event: any) {
   //   if (event) {
   //     return "";
   //   }
   // }
 
-// <div> <button className="btn btn-success btn-lg" id="downloadBtn"
-// onClick={this.downloadHandler}>Download</button>
-// < /div>
-  public downloadHandler() {
-    const fileName: string = '1.sqr';
-    axios.get('/v1/ab7820028322/uploads/'+fileName).then((response) => {
-      FileDownload(response.data, 'output.txt');
-    });
-  }
+
+ 
   public render() {
     return (
         <div className="container">
@@ -32,10 +43,13 @@ class App extends React.Component {
                   <span className="glyphicon glyphicon-cloud-upload" />
                   <h2>File Uploader</h2>
                   <h4>SQR Files</h4>
-                  <FileUploader />
+                  <FileUploader onSol1Path={this.onSol1Path}/>
                   <br/>
                   <br/>
-                  
+                  <div> <button className="btn btn-success btn-lg" id="downloadBtn"
+                    onClick={this.downloadHandler}
+                  disabled={!this.state.sol1Path}>Sol1 Download</button>
+                  </div>
                 </div>
               </div>
             </div>

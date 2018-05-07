@@ -7,6 +7,8 @@
 const express = require('express');
 const readline = require('readline');
 const fs = require('fs');
+const uuidv1 = require('uuid/v1');
+
 
 
 
@@ -27,7 +29,7 @@ const sqrparser = (inputfile,opfile) => new Promise((resolve, reject) => {
         Promise.resolve(line.trim())
         .then((line) => {
         //console.log(line);
-            if(line.startsWith('!')){   //do northing with comment line.
+            if (line.startsWith('!')) {   //do northing with comment line.
             return '';
             } else if(line.toLowerCase().startsWith('begin-select')) {  //if line is a start of select stat
                 inSelect = true;
