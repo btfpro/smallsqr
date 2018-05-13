@@ -92,7 +92,7 @@ const slone = (fileName,dirPath) => {
                 console.log(matchText);
                 var procedures = matchText.match(/do\s(\w+)(-?(\w+)?)*/igm); //TODO: revisit to support multi -.
                 //console.log(procedures);
-                procedures.forEach(traverseProcedure.bind(null,null,fileName,false));
+                procedures.forEach(traverseProcedure.bind(null,fileName,false));
                 /*console.log(results);
                 console.log(result);
                 console.log(res);
