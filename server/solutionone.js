@@ -10,7 +10,7 @@ const fs = require('fs');
 var findInFiles = require('find-in-files');
 
 
-const traverseProcedure = (parentprocName,fileName,isInclude, procName) => {
+const traverseProcedure = (fileName,isInclude, procName) => {
     //console.log(procName);
     //console.log(isInclude);
     //console.log(fileName);
@@ -30,8 +30,8 @@ const traverseProcedure = (parentprocName,fileName,isInclude, procName) => {
                 console.log(procedures);
                 //procedures.forEach(traverseProcedure.bind(null,procName,fileName,false));
                 procedures.forEach(function(proc){
-                    if (proc != parentprocName)
-                        traverseProcedure.bind(null,procName,fileName,false,proc);
+                    //if (proc != parentprocName)
+                        traverseProcedure.bind(null,fileName,false,proc);
                 });
                 /*console.log(results);
                  console.log(result);
@@ -57,7 +57,7 @@ const traverseProcedure = (parentprocName,fileName,isInclude, procName) => {
                                 res.matches.forEach(function (sqrFileStr) {
                                     sqrFileStr = sqrFileStr.replace(/Include|\\s|\'/gi, "");
                                     console.log(procName + ' Searching in File: ' + sqrFileStr);
-                                    traverseProcedure(parentprocName,sqrFileStr.trim(), true, procName);
+                                    traverseProcedure(sqrFileStr.trim(), true, procName);
                                 });
                             //var matchText = res.matches[0];
                             //console.log(matchText);
