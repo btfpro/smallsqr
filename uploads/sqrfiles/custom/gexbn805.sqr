@@ -1,0 +1,1220 @@
+!***********************************************************************
+! GEXBN805:  When the pay period end date and the pay check issue date
+!	     cross months, there may be instances where deductions that
+!	     should be taken from the first pay period of the month are
+!	     missed due to the dating of the deduction begin date on the 
+!	     base benefit tables. This audit will look for deduction
+!	     begin dates that are incorrect and update the dates so that 
+!	     deductions are taken during the first pay period of the month.
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module is the confidential and proprietary information of       *
+! Giant Eagle, Inc.; it is not to be copied, reproduced, or transmitted*
+! in any form, by any means, in whole or in part, nor is it to be used *
+! for any purpose other than that for which it is expressly provided   *
+! without the written permission of Giant Eagle.                       *
+!                                                                      *
+!                                                                      *
+!***********************************************************************
+!***********************************************************************
+!                         MODIFICATION HISTORY                         *
+!***********************************************************************
+!  ID#     INITIALS    DATE           DESCRIPTION OF THE CHANGE	       *	
+!***********************************************************************
+!  GBNC059   SXK       08/07/1998     INITIAL CREATION                 *
+!  GBNC059   SXK       09/09/1998     All the selects need to look in 
+!				      range ending with pay_end_dt + 1
+!  GBNC059   SXK       10/15/1998     Put the exception in case of
+!				      Transfer from W06 to W05
+!  GBNC059   SXK       11/18/1998     Rolled back 10/15/98 Changes
+!  GBNC059   SXK       12/17/1998     No need to look for new effdt
+!				      pay end date, and make sure it is
+!				      not confirmed. This is done to 
+!				      facilitate adjustments
+!  GBNC059   CJH       01/11/1999    -Correct retrievals from ben_prog_partic
+!                                     to be specific by empl_rcd to handle
+!                                     multiple job EEs.
+!                                    -Only update base benefit rows if the
+!                                     effdt needs to be changed.  Do not 
+!                                     update over the same value.  
+!            SXK       05/19/1999    -Corrected main select to use
+!					coverage begin date also to join
+!					with bas partic tables
+!            SXK       06/24/19999   Modified to use coverage_elect_dt,
+!					benefit_plan while checking
+!					effective date before updating it
+!            CJH       01/02/2001    Correct get-pay-end-dt procedure to 
+!                                    ignore off-cycle pay calendar entries.
+!                                    (PAY_OFF_CYCLE_CAL = 'N')
+!            CJH       07/26/2001    Do not update the base benefit child tables
+!                                    if the parent records are not successfully
+!                                    updated first.
+!            CJH       12/12/2002    Do not select from ps_bas_partic events again
+!                                    set the conditions true and not run
+!                                    get-bp-and-event-class procedure
+! ISDVNPK  08/28/2007 Modified for 9.0 upgrade with JOB and JOB_JR changes
+!  GEX-MXT             02/14/2007     Date format changes reverted back
+!***********************************************************************
+
+#include 'setenv.sqc' !Set environment
+
+begin-setup
+
+#include 'setup32a.sqc'
+
+declare-report Report-log
+Printer-Type=HPLASERJET
+  layout=DEFAULT
+end-declare
+
+end-setup
+
+!*********************************************************************
+!Initial processing, retrieving current dates and calls the main 
+!procedure to do the processing.                                     
+!*********************************************************************
+begin-report
+
+  use-report Report-log
+
+! CJH - 01/11/1999 - begin
+!  do Alter-Session  ! GEX ISDVNPK  08/28/2007 
+! CJH - 01/11/1999 - end
+  do Init-DateTime
+  do Init-Number
+  do stdapi-init
+  
+  move 'GEXBN805' to $ReportID
+  move 'Adjusting Deduction Begin Date based on pay end date vs pay check date' to $ReportTitle
+  display $ReportTitle
+
+  do Get-Current-DateTime
+  let $reportdate_mm = substr($reportdate,1,2)
+  let $reportdate_dd = substr($reportdate,4,2)
+  let $reportdate_yy = substr($reportdate,7,2)		!GEX-MXT reverted the date format changes
+  do MakeYear4Digits ($reportdate_yy)
+  
+
+  let $reportdate_ccyyyy = $reportdate_mm||'/'||$reportdate_dd||'/'||$reportdate_yy
+
+  do format-datetime($reportdate_ccyyyy,$reportdate_ccyy,{DEFMDY},'','NATIVE') 
+
+! CJH 01/11/1999-begin
+  let #updTran = 0
+! CJH 01/11/1999-end
+
+  do Report
+  do Commit-Transaction
+  date-time () hh:mi:ss &timeEnded
+  display 'Report Ended: ' noline
+  display &timeEnded
+  do stdapi-term
+
+end-report
+
+!*********************************************************************
+!If this Program is being executed through process scheduler, 
+!the run control parameters and calls the main processing procedure.
+!Otherwise, interrogates the user for the run control parameters and 
+!validates them. If the run control parameters are invalid, stops the
+!execution.
+!*********************************************************************
+begin-procedure Report
+
+date-time () hh:mi:ss &timeBegan
+display 'Report Began: ' noline
+display &timeBegan
+
+move 'N' to $Errorfound
+
+move $reportdate_ccyyyy to $rnctl_date
+
+let $rnctl_mm = substr($rnctl_Date,1,2)
+let $rnctl_dd = substr($rnctl_Date,4,2)
+let $rnctl_yyyy = substr($rnctl_Date,7,4)       
+let $rnctl_yy  = substr($rnctl_date,9,2)
+move $rnctl_yyyy to #rnctl_yyyy
+move $rnctl_yy to #rnctl_yy
+
+do get-pay-end-dt   
+
+do process-employee-data
+
+
+Report-Exit:
+
+
+  date-time () hh:mi:ss &timeProcess
+  display #updTran 99999 noline
+  display ' Records Updated ' 
+  display #InputTran 99999 noline
+  display ' Transactions Processed ' 
+  display &timeProcess
+
+end-procedure
+
+!*********************************************************************
+!Prints the header information in the report log.
+!*********************************************************************
+
+begin-heading 8 for-reports=(report-log)
+
+ #Include 'stdhdg01.sqc'
+
+!  date-time () DD-MON-YYYY &curr_Date 
+!  print &curr_Date ()
+  position (-1)
+  print 'Report Log' () center bold
+
+  position (+3)
+  print 'Trans#' (,1) bold
+  print 'Emplid' (,18) bold
+  print 'Message' (,50) bold
+  print '-' (+1,1,127) fill
+ 
+
+end-heading
+
+!*********************************************************************
+!Prints the footer in the report log
+!*********************************************************************
+
+begin-footing 2 for-reports=(Report-log)
+page-number (1,108) 'Page '  
+last-page () ' of ' '.'
+
+end-footing
+
+!*********************************************************************
+!Gets the pay end date of the previous pay cycle.
+!*********************************************************************
+
+Begin-Procedure get-pay-end-dt
+
+move 'N' to $found
+
+begin-select on-error=sql-error-found('Get-Pay-End-Dt')
+PAY.PAY_BEGIN_DT
+PAY.PAY_END_DT
+
+  move &PAY.PAY_END_DT to $pay_end_Dt
+  move &PAY.PAY_BEGIN_DT to $pay_begin_dt
+  display 'Pay End Date:' noline
+  display $pay_end_Dt
+  move 'Y' to $found
+  exit-select
+
+FROM PS_PAY_CALENDAR PAY
+
+WHERE PAY.PAY_END_DT = (SELECT MAX(PAY_END_DT)
+   		      FROM PS_PAY_CALENDAR
+		     WHERE PAY_END_DT <= $reportdate_ccyy
+! 01/02/2001 - add criteria to ignore off-cycle calendar entries
+                       AND PAY_OFF_CYCLE_CAL = 'N')
+AND PAY.PAY_OFF_CYCLE_CAL = 'N'
+! 01/02/2001 - end
+end-select
+
+if $found = 'N'
+   do error-found
+   print 'No Previously confirmed Pay Cycle as of:' (,34)
+   print $reportdate_ccyy ()
+   stop
+else
+   ! CJH 09/09/1998 - Need to increment by 1 to get the sunday
+   do convert-to-dtu-date($pay_end_Dt,$range_end_dt_dtu)
+   do dtu-add-days($range_end_dt_dtu,1,$range_end_dt_dtu)
+   do convert-from-dtu-date($range_end_dt_dtu,$range_end_dt)
+   Display 'After adding one day to the pay end date'
+   display $range_end_Dt
+   !CJH 09/09/98 End
+end-if
+
+end-procedure
+
+!*********************************************************************
+!Retrieves each employee who participated in Benefit Program and
+!calls necessary procedures to process further. 
+!********************************************************************* 
+
+begin-procedure process-employee-data
+
+let $hlt_cobra_event_id = 1
+
+let $base_table = 'PS_DISABILITY_BEN HLT, PS_JOB JOB'
+let $table_name = 'D'
+display 'Processing Disability Tables'
+do process-base-tables
+
+new-page
+
+let $base_table = 'PS_FSA_BENEFIT HLT, PS_JOB JOB'
+let $table_name = 'F'
+display 'Processing FSA Tables'
+do process-base-tables
+
+new-page
+
+let $base_table = 'PS_HEALTH_BENEFIT HLT, PS_JOB JOB'
+let $table_name = 'H'
+display 'Processing Health Tables'
+let $hlt_cobra_event_id = 'HLT.COBRA_EVENT_ID'
+do process-base-tables
+
+new-page
+
+let $base_table = 'PS_LIFE_ADD_BEN HLT, PS_JOB JOB'
+let $table_name = 'L'
+let $hlt_cobra_event_id = 1
+display 'Processing Life Tables'
+do process-base-tables
+
+new-page
+
+let $base_table = 'PS_SAVINGS_PLAN HLT, PS_JOB JOB'
+let $table_name = 'S'
+display 'Processing Saving Tables'
+do process-base-tables
+
+end-procedure
+
+!*********************************************************************
+!Processes employees from Base table 
+!*********************************************************************
+Begin-Procedure Process-Base-Tables
+
+move 'N' to $errorfound
+move 'N' to $beninfo_found
+display $base_table
+
+begin-select on-error=sql-error-found('Process-Base-Tables')
+HLT.EMPLID
+HLT.EMPL_RCD
+HLT.COVERAGE_BEGIN_DT
+HLT.PLAN_TYPE
+HLT.BENEFIT_PLAN
+HLT.EFFDT
+HLT.COVERAGE_ELECT
+HLT.BENEFIT_NBR
+JOB.COMPANY
+JOB.PAYGROUP
+JOB.EFFDT
+X.EVENT_ID
+X.BENEFIT_PROGRAM
+X.EVENT_CLASS
+X.SCHED_ID 
+X.BENEFIT_RCD_NBR
+[$hlt_cobra_event_id] &HLT.COBRA_EVENT_ID = number
+!SXK 06/24/1999 Begin
+HLT.COVERAGE_ELECT_DT
+!SXK 06/24/1999 End
+
+
+   add 1 to #inputtran
+
+   move 'Y' to $beninfo_found
+   move 'N' to $skip_employee_processing
+
+   move &HLT.Emplid to $emplid
+   move &HLT.EMPL_RCD to #empl_rcd
+
+   move &JOB.COMPANY to $company
+   move &JOB.PAYGROUP to $paygroup
+   move &JOB.EFFDT to $effdt
+
+   move &HLT.PLAN_TYPE to $plan_type
+   move &HLT.BENEFIT_PLAN to $benefit_plan
+   move &HLT.COVERAGE_ELECT to $coverage_elect
+   move &HLT.COVERAGE_BEGIN_DT to $coverage_begin_dt
+   if $table_name = 'H'
+      move &HLT.COBRA_EVENT_ID to #cobra_event_id
+   end-if
+   move &HLT.BENEFIT_NBR to #benefit_nbr
+   move &HLT.EFFDT to $old_effdt
+
+!SXK 06/24/1999 Begin
+   move &HLT.COVERAGE_ELECT_DT to $coverage_elect_dt
+!SXK 06/24/1999 End
+
+! CJH - 01/11/1999 - begin
+   display '***** New EE/rcd#/Plan type ****: ' noline
+   display $emplid noline
+   display ' / ' noline
+   display #empl_rcd  999 noline
+   display ' / ' noline
+   display $plan_type
+! CJH - 01/11/1999 - end
+
+
+   display 'Benefit Plan:' noline
+   display $benefit_plan
+   display 'Coverage Begin Date:' noline
+   display $coverage_begin_dt
+   display 'Event ID:' noline
+   display &x.event_id
+
+!SXK 09/15/98 Begin   
+    do check-coverage-begin-pay
+
+   display 'Coverage Pay Begin Date:' noline
+   display $coverage_pay_begin_dt
+   
+   if $skip_employee_processing = 'N'
+
+      move &X.BENEFIT_PROGRAM to $benefit_program
+      move &X.EVENT_CLASS      to $event_class
+      move &X.SCHED_ID    to $sched_id
+      move &X.BENEFIT_RCD_NBR to #benefit_rcd#
+      move &X.EVENT_ID to #event_id
+
+      show 'BP: ' $benefit_program
+      show 'event class: ' $event_class
+      show 'bas_sched_id: ' $sched_id
+      show 'benefit_rcd#: ' #benefit_rcd#
+      show 'event_id: ' #event_id
+      let $found = 'Y'
+! 12/12/2002 - CJH - do not retrieve event info again     
+!      do get-bp-and-event-class
+      display 'Found after BP and Event Class:' noline
+      display $found      
+      if $found = 'Y'
+         do get-event-rules-id
+         display 'After Event Rules:' noline
+         display $found
+         if $found = 'Y'
+            do find-event-date-rule
+            display 'After Event Date Rule:' noline
+            display $found
+            if $found = 'Y'
+               move ' ' to $scenario
+               display 'Coverage Ends Cd:' noline
+               display $coverage_ends_cd
+               display 'Coverage Begins Cd:' noline
+               display $coverage_begins_cd
+               display 'Grace Period Month:' noline
+               display #grace_period_mm
+               display 'Ded Flxcr End Cd:' noline
+               display $ded_flxcr_end_cd
+
+	!SXK 09/14/98 Begin
+   
+		if $coverage_elect = 'T'
+		      do check-BP-transfer
+		      display 'BP change:' noline
+		      display $BP_change
+		      if $BP_change = 'Y'
+    !SXK 10/15/1998 For BP Transfer from W06 to W05, no need to check the 
+    !default method, keep on processing further. Even we go back to 
+    !the previous event rule of old benefit program, we cannot put
+    !the 8 months grace period on it.
+    !                    if $old_benefit_program = 'W06' and
+    !                       $benefit_program = 'W05'
+    !                    else                        
+		         if $default_method <> 'T'
+		            display 'Default Method of Event Class is <> Term'
+		            do error-found
+		            print 'Wrong Event Rule for plan type ' (,34)
+                            print $plan_type ()
+                            print ';Event ID - ' ()
+                            print &x.event_id ()
+		            move 'Y' to $skip_employee_processing
+		         end-if
+    !                    end-if
+    !SXK 10/15/1998 End
+		      end-if
+		end-if
+
+	!SXK 09/14/98 End
+               do check-rules
+
+               display 'Scenario:' noline
+               display $scenario
+               if $skip_employee_processing = 'N'
+!SXK 09/14/98 Begin
+                  do process-further
+               end-if
+            end-if         
+  !SXK 09/14/98 Begin
+        else       !If no event rules found
+     !SXK 10/22/1998 Begin
+           let $process_further = 'N'
+           if $coverage_elect = 'T'
+              do check-BP-transfer
+	      display 'BP change:' noline
+	      display $BP_change
+              if $BP_change = 'Y'
+                 if $old_benefit_program = 'W06' and
+                    $benefit_program = 'W05' and $plan_type = '10'
+                    let $coverage_ends_cd = 'M'
+                    do check-rules
+                    display 'Scenario:' noline
+                    display $scenario
+                    if $skip_employee_processing = 'N'
+                       do process-further
+                       let $process_further = 'Y'
+                    end-if
+                 end-if
+              end-if
+            end-if
+          !SXK 10/22/1998 End                                     
+           if $process_further = 'N'                    
+              do error-found
+              print 'Event Rule is not found for plan type ' (,34)
+              print $plan_type ()
+              print ' in ' ()
+              print $base_table ()
+              print ';Event ID - ' ()
+              print &x.event_id ()
+           end-if
+  !SXK 09/14/98 End
+
+         end-if
+      end-if
+   end-if
+
+FROM [$base_table], PS_BAS_PARTIC X,
+     PS_BAS_PARTIC_PLAN Y
+
+WHERE HLT.COVERAGE_ELECT_DT >= $pay_begin_dt
+  AND HLT.COVERAGE_ELECT_DT <= $range_end_dt
+  AND ((HLT.COVERAGE_ELECT in ('E','W') 
+       and substr(to_char(HLT.COVERAGE_BEGIN_DT,'YYYY/MM/DD'),9,2) = '01') 
+       or HLT.COVERAGE_ELECT IN ('T'))
+  AND HLT.EMPLID = JOB.EMPLID
+  AND HLT.EMPL_RCD = JOB.EMPL_RCD
+  AND X.EMPLID = JOB.EMPLID
+  AND X.EMPL_RCD = JOB.EMPL_RCD
+  AND X.JOB_EFFDT = JOB.EFFDT
+  AND X.JOB_EFFSEQ = JOB.EFFSEQ
+  AND HLT.PLAN_TYPE = Y.PLAN_TYPE
+  AND HLT.EMPLID = Y.EMPLID
+  AND Y.EVENT_ID = X.EVENT_ID
+  AND Y.EMPLID = X.EMPLID
+  AND Y.SCHED_ID = X.SCHED_ID
+  AND Y.BENEFIT_RCD_NBR = X.BENEFIT_RCD_NBR
+! CJH - 01/11/1999 - begin
+! CANNOT join Benefit# on Base benefit tables to Benefit_rcd# on bas_partic
+!  AND Y.BENEFIT_RCD_NBR = HLT.BENEFIT_NBR
+! CJH - 01/11/1999 - end
+  AND Y.DEDUCTION_BEGIN_DT = HLT.EFFDT
+!SXK 05/19/1999 Begin - This is added to avoid to pick invalid event id
+!		from bas partic tables, for same deduction begin dt
+!		and different coverage begin dates
+  AND Y.COVERAGE_BEGIN_DT = HLT.COVERAGE_BEGIN_DT
+!SXK 05/19/1999 End
+ORDER BY HLT.EMPLID, HLT.PLAN_TYPE
+end-SELECT
+
+end-procedure
+
+!********************************************************************
+begin-procedure check-rules
+
+               if ($coverage_ends_cd = 'E' and #grace_period_mm > 0
+                  and ($coverage_elect = 'T'))
+		! or $coverage_elect = 'W')) 
+                  or ($coverage_ends_cd = 'P' and 
+                     ($coverage_elect = 'T'))
+		!	 or $coverage_elect = 'W'))
+!SXK 09/14/98 Begin
+                  and $skip_employee_processing = 'N'
+!SXK 09/14/98 End
+                  move 'B' to $scenario
+                  if $ded_flxcr_end_cd = 'F'
+                     do convert-to-dtu-date($coverage_pay_end_dt,$coverage_pay_end_dt_dtu)
+                     do dtu-add-days($coverage_pay_end_dt_dtu,1,$new_effdt_dtu)
+                     do convert-from-dtu-date($new_effdt_dtu,$new_effdt)
+                     display 'After determining FLXCR code:' noline
+                     display $found
+                  else
+                     if $ded_flxcr_end_cd = 'P'
+                        move $coverage_pay_begin_dt to $new_effdt
+!                        move $pay_end_Dt to $new_effdt_pay_end_dt
+                     end-if
+                     display 'Ded FLXCR Code:' noline
+                     display $ded_flxcr_end_cd
+                  end-if
+               else
+!SXK 09/14/98 Begin
+!                  if $coverage_ends_cd = 'M and $coverage_elect = 'E'
+
+                  if (($coverage_begins_cd = 'M' and $coverage_elect = 'E') or
+                     ($coverage_ends_cd = 'M' and $coverage_elect = 'T') or
+                     ($coverage_begins_cd = 'M' and $coverage_elect = 'W')  or
+                     ($coverage_begins_cd = 'A' and $coverage_elect = 'E') or
+                     ($coverage_begins_cd = 'A' and $coverage_elect = 'W'))
+!SXK 09/14/98 End
+                      move 'A' to $scenario
+                      display 'Pay Period:' noline
+                      display #pay_period
+!SXK 09/14/98 Begin
+                      if #pay_period = 1
+                         move $coverage_pay_begin_dt to $new_effdt
+!                         move $coverage_pay_end_dt to $new_effdt_pay_end_dt
+                      else
+                         do get-first-pay-period-dates
+                         display 'First Period Pay Begin Date:' noline
+                         display $first_pay_begin_dt
+                         move $first_pay_begin_dt to $new_effdt
+!                         move $first_pay_end_dt to $new_effdt_pay_end_dt
+                      end-if
+!SXK 09/14/98 End
+                  else ! Invalid combination of Coverage ends code and coverage elect
+                     move 'Y' to $skip_employee_processing
+                     move 'C' to $scenario
+                  end-if
+
+               end-if
+
+end-procedure
+
+!*********************************************************************
+
+Begin-Procedure process-further
+
+                  display 'New Effdt:' noline
+                  display $new_effdt
+                  do check-pay-confirm
+                  display 'New Effdt Pay End Dt:' noline
+                  display $new_effdt_pay_end_dt
+ !SXK 12/17/1998 Begin
+ !                  if $found = 'Y'
+ !                    move 'Y' to $skip_employee_processing
+ !                    display '****Employee has missed the deduction pay period****'
+ !                    do error-found
+ !                    print 'EE missed the deduction; Pay Period suppose to have' (,34)
+ !                    print ' deduction taken: ' ()
+ !                    print $new_effdt ()
+ !                    print ' to ' ()
+ !                    print $new_effdt_pay_end_dt ()
+ !	             print ' for Plan Type: ' () 
+ !		     print $plan_type ()
+ !                    print ';Event ID - ' ()
+ !                    print &x.event_id ()
+ !                 end-if
+ !SXK 12/17/1998 End
+
+
+! CJH - 01/11/1999 - begin
+! Do not an error when EE not currently in BP
+! Still update base benefit tables
+!                  if $skip_employee_processing = 'N'
+!                     do check-ben-prog-partic
+!                     display 'Ben Prog Partic Found:' noline
+!                     display $found
+!                     if $found = 'Y'
+                        do update-base-tables
+!                     else
+!                        display 'Benefit Program assignment is not found'
+!                        do error-found
+!                        print 'Benefit Program ' (,34)
+!                        print $benefit_program ()
+!			print ' is not assigned <= the Pay Period End Date: ' ()
+!                        print $new_effdt_pay_end_dt ()
+!			print ' for Plan Type: ' ()
+!                        print $plan_type ()
+!                        print ';Event ID - ' ()
+!                        print &x.event_id ()
+!                     end-if
+!                  end-if 
+! CJH - 01/11/1999 - end                  
+
+end-procedure
+
+!*********************************************************************
+!Checks if coverage begin date pay period is confirmed or not
+!*********************************************************************
+
+Begin-Procedure check-coverage-begin-pay
+
+move 'N' to $found
+move ' ' to $coverage_pay_begin_dt
+move ' ' to $coverage_pay_end_Dt
+move ' ' to $coverage_check_dt
+
+begin-select on-error=sql-error-found('Check-Coverage-Begin-Pay')
+CON.PAY_PERIOD
+CON.PAY_CONFIRM_RUN 
+CON.PAY_BEGIN_DT
+!SXK 09/14/98 Begin
+CON.PAY_END_DT
+to_char(CON.CHECK_DT,'YYYY/MM/DD') &CON.CHECK_DT
+!SXK 09/14/98 End
+    if &CON.PAY_CONFIRM_RUN = 'Y'
+       move 'Y' to $found  
+    end-if
+    let #pay_period = to_number(&CON.PAY_PERIOD)
+    let $coverage_pay_begin_dt = &CON.PAY_BEGIN_DT
+!SXK 09/14/98 Begin
+    let $coverage_pay_end_dt = &CON.PAY_END_DT
+    let $coverage_check_dt = &CON.CHECK_DT
+!SXK 09/14/98 End
+    
+FROM PS_PAY_CALENDAR con
+
+WHERE CON.COMPANY = $company
+  AND CON.PAYGROUP = $paygroup
+  AND CON.PAY_BEGIN_DT <= $coverage_begin_dt
+  AND CON.PAY_END_DT >= $coverage_begin_Dt
+end-select
+
+end-procedure
+
+!*********************************************************************
+!Retrives Benefit Program and Event Class from PS_BAS_PARTIC
+!*********************************************************************
+
+Begin-Procedure get-bp-and-event-class
+
+move 'N' to $found
+
+begin-select on-error=sql-error-found('Get-BP-and-Event-Class')
+BAS.BENEFIT_PROGRAM
+BAS.EVENT_CLASS
+BAS.SCHED_ID 
+BAS.BENEFIT_RCD_NBR
+BAS.EVENT_ID
+    move &BAS.BENEFIT_PROGRAM to $benefit_program
+    move &BAS.EVENT_CLASS      to $event_class
+    move &BAS.SCHED_ID    to $sched_id
+    move &BAS.BENEFIT_RCD_NBR to #benefit_rcd_nbr
+    move &BAS.EVENT_ID to #event_id
+    show 'BP: ' $benefit_program
+    show 'event class: ' $event_class
+    show 'bas_sched_id: ' $sched_id
+    show 'benefit_rcd#: ' #benefit_rcd#
+    show 'event_id: ' #event_id
+
+    move 'Y' to $found
+
+FROM PS_BAS_PARTIC BAS
+
+WHERE BAS.EMPLID = $emplid
+  AND BAS.EMPL_RCD = #empl_rcd
+  AND JOB_EFFDT  = $effdt
+  AND JOB_EFFSEQ = (SELECT MAX(JOB_EFFSEQ)
+                      FROM PS_BAS_PARTIC
+                     WHERE EMPLID = BAS.EMPLID
+                       AND EMPL_RCD = BAS.EMPL_RCD
+                       AND JOB_EFFDT = $effdt)
+end-select
+
+end-procedure
+
+!*********************************************************************
+!Retrieves event rules id from PS_BEN_DEFN_PLAN
+!*********************************************************************
+
+Begin-Procedure get-event-rules-id
+
+move 'N' to $found
+
+begin-select on-error=sql-error-found('Get-Event-Rules-ID')
+EVT.EVENT_RULES_ID
+
+    move &EVT.EVENT_RULES_ID to $event_rules_id
+    move 'Y' to $found
+
+FROM PS_BEN_DEFN_PLAN EVT
+WHERE EVT.BENEFIT_PROGRAM = $benefit_program
+  AND EVT.PLAN_TYPE = $plan_type
+  AND EVT.EFFDT = (SELECT MAX(EFFDT)
+                      FROM PS_BEN_DEFN_PLAN
+                     WHERE BENEFIT_PROGRAM = $benefit_program
+                       AND PLAN_TYPE = $plan_type
+                       AND EFFDT <= $range_end_dt)
+end-select
+
+end-procedure
+
+!*********************************************************************
+!Determines whether the date that was inserted into the base
+!benefit tables by Ben Admin was inserted under and 'On Event Date' 
+!or 'First of Month following Event Date' rule
+!*********************************************************************
+
+Begin-Procedure find-event-date-rule
+
+move 'N' to $found
+
+!SXK 09/14/98 Begin
+move ' ' to $coverage_begins_cd
+move ' ' to $coverage_ends_cd
+move 0 to #grace_period_mm
+move ' ' to $ded_flxcr_end_cd
+move ' ' to $default_method
+!SXK 09/14/98 End
+
+begin-select on-error=sql-error-found('Find-Event-Date-Rule')
+!SXK 09/14/98 Begin
+EDT.COVERAGE_BEGINS_CD
+EDT.DFLT_METHOD
+!SXK 09/14/98 End
+EDT.COVERAGE_ENDS_CD
+EDT.GRACE_PERIOD_MM
+EDT.DED_FLXCR_END_CD
+
+    move &EDT.COVERAGE_BEGINS_CD to $coverage_begins_cd
+    move &EDT.COVERAGE_ENDS_CD to $coverage_ends_cd
+    move &EDT.GRACE_PERIOD_MM to #grace_period_mm
+    move &EDT.DED_FLXCR_END_CD to $ded_flxcr_end_cd
+    move &EDT.DFLT_METHOD to $default_method
+    move 'Y' to $found
+
+FROM PS_BAS_EVENT_CLASS EDT
+WHERE EDT.EVENT_RULES_ID  = $event_rules_id
+  AND EDT.EVENT_CLASS = $event_class
+  AND EDT.EFFDT = (SELECT MAX(EFFDT)
+                      FROM PS_BAS_EVENT_CLASS
+                     WHERE EVENT_RULES_ID = $event_rules_id
+                       AND EVENT_CLASS = $event_class
+                       AND EFFDT <= $range_end_dt)
+end-select
+
+end-procedure
+
+!SXK 09/14/98 Begin
+!*********************************************************************
+!Retrieves first pay period begin and end dates
+!*********************************************************************
+
+Begin-Procedure get-first-pay-period-dates
+
+move 'N' to $found
+move ' ' to $first_pay_begin_dt
+move ' ' to $first_pay_end_Dt
+
+begin-select on-error=sql-error-found('Get-first-pay-period-dates')
+CON1.PAY_BEGIN_DT
+CON1.PAY_END_DT
+
+    let $first_pay_begin_dt = &CON1.PAY_BEGIN_DT
+    let $first_pay_end_dt = &CON1.PAY_END_DT
+
+FROM PS_PAY_CALENDAR con1
+
+WHERE CON1.COMPANY = $company
+  AND CON1.PAYGROUP = $paygroup
+  AND CON1.PAY_PERIOD = 1
+  AND substr(to_char(CON1.CHECK_DT,'YYYY/MM/DD'),6,2) = 
+      substr($coverage_check_dt,6,2)
+  AND substr(to_char(CON1.CHECK_DT,'YYYY/MM/DD'),1,4) =
+      substr($coverage_check_dt,1,4)
+end-select
+
+end-procedure
+
+
+!*********************************************************************
+!Checks if new effdt pay period that will be used to update base benefit tables
+!is confirmed or not
+!*********************************************************************
+
+Begin-Procedure check-pay-confirm
+
+move 'N' to $found
+
+begin-select on-error=sql-error-found('Check-Pay-Confirm')
+EFF.PAY_CONFIRM_RUN
+EFF.PAY_BEGIN_DT
+EFF.PAY_END_DT
+ !SXK 12/17/1998 Begin No need to look for pay is confirmed
+ !    if &EFF.PAY_CONFIRM_RUN = 'Y'
+ !      move 'Y' to $found  
+ !   end-if
+ !SXK 12/17/1998 End
+    move &EFF.PAY_END_DT to $new_effdt_pay_end_dt
+
+FROM PS_PAY_CALENDAR EFF
+
+WHERE EFF.COMPANY = $company
+  AND EFF.PAYGROUP = $paygroup
+  AND EFF.PAY_BEGIN_DT = $new_effdt
+end-select
+
+end-procedure
+
+!*********************************************************************
+!Checks if there is a benefit program transfer 
+!*********************************************************************
+
+Begin-Procedure Check-BP-transfer
+
+move 'N' to $BP_change
+
+begin-select on-error=sql-error-found('Check-BP-Transfer')
+XRF.BENEFIT_PROGRAM 
+    if RTRIM(&XRF.BENEFIT_PROGRAM,' ') <> RTRIM($benefit_program,' ')
+       move 'Y' to $BP_change
+  !SXK 10/15/1998 Begin
+       move &XRF.BENEFIT_PROGRAM to $old_benefit_program
+  !SXK 10/15/1998 End
+    end-if
+FROM PS_BEN_PROG_PARTIC XRF
+WHERE XRF.EMPLID = $emplid
+! CJH - 01/11/1999 - begin
+  and XRF.empl_rcd = #empl_rcd
+! CJH - 01/11/1999 - end
+  AND XRF.EFFDT = (SELECT MAX(EFFDT)
+                      FROM PS_BEN_PROG_PARTIC
+                     WHERE EMPLID = $emplid
+! CJH - 01/11/1999 - begin
+                       and empl_rcd = #empl_rcd
+! CJH - 01/11/1999 - end
+                       AND EFFDT < $effdt)
+end-select
+
+end-procedure
+
+!*********************************************************************
+!Checks PS_BEN_PROG_PARTIC if employee is in benefit program before
+!the new_effdt_pay_end_dt
+!*********************************************************************
+
+Begin-Procedure Check-Ben-Prog-Partic
+
+move 'N' to $found
+
+begin-select on-error=sql-error-found('Check-Ben-Prog-Partic')
+'X'
+    move 'Y' to $found
+FROM PS_BEN_PROG_PARTIC PRG
+WHERE PRG.EMPLID = $emplid
+! CJH - 01/11/1999 - begin
+  AND PRG.empl_rcd = #empl_rcd
+! CJH - 01/11/1999 - end
+  AND PRG.BENEFIT_PROGRAM = $benefit_program
+  AND PRG.EFFDT = (SELECT MAX(EFFDT)
+                      FROM PS_BEN_PROG_PARTIC
+                     WHERE EMPLID = $emplid
+! CJH - 01/11/1999 - begin
+                       and empl_rcd = #empl_rcd
+! CJH - 01/11/1999 - end
+!                       AND BENEFIT_PROGRAM = $benefit_program
+                       AND EFFDT <= $new_effdt_pay_end_dt)
+end-select
+
+end-procedure
+
+!*********************************************************************
+!Updates benefits base table effdt and bas_partic_plan deduction
+!begin date. The table name will be supplied by the corresponding
+!procedure 
+!*********************************************************************
+
+Begin-Procedure Update-Base-Tables
+! CJH - 01/11/1999 - begin
+move ' ' to $covrg_elect_stmt
+move ' ' to $covrg_elect_dt_stmt
+move ' ' to $benefit_plan_stmt
+move ' ' to $cobra_event
+move 'N' to $errorfound
+Evaluate $table_name
+    when = 'H'
+         move 'PS_HEALTH_BENEFIT' to $ps_table_name
+         let $cobra_event = 'AND COBRA_EVENT_ID = '||to_char(#cobra_event_id)
+         let $covrg_elect_stmt = 'AND COVERAGE_ELECT = '
+         concat '''' with $covrg_elect_stmt 
+         concat $coverage_elect with $covrg_elect_stmt
+         concat '''' with $covrg_elect_stmt
+!SxK 06/24/1999 Begin
+         let $covrg_elect_dt_stmt = 'AND COVERAGE_ELECT_DT = '
+         concat '''' with $covrg_elect_dt_stmt 
+         concat $coverage_elect_dt with $covrg_elect_dt_stmt
+         concat '''' with $covrg_elect_dt_stmt
+
+         let $benefit_plan_stmt = 'AND BENEFIT_PLAN = '
+         concat '''' with $benefit_plan_stmt
+         concat $benefit_plan with $benefit_plan_stmt
+         concat '''' with $benefit_plan_stmt
+!SXK 06/24/1999 End
+
+         do update-effdt
+         move ' ' to $covrg_elect_stmt
+!SXK 06/24/1999 Begin
+         move ' ' to $covrg_elect_dt_stmt
+         move ' ' to $benefit_plan_stmt
+!SXK 06/24/1999 End
+! CJH - 07/26/2001 - begin
+         if $base-updated = 'Y'
+             move 'PS_HEALTH_DEPENDNT' to $ps_table_name
+             do update-effdt
+         end-if
+! CJH - 07/26/2001 - end
+    when = 'D'
+         move 'PS_DISABILITY_BEN' to $ps_table_name
+         let $covrg_elect_stmt = 'AND COVERAGE_ELECT = '
+         concat '''' with $covrg_elect_stmt 
+         concat $coverage_elect with $covrg_elect_stmt
+         concat '''' with $covrg_elect_stmt
+!SxK 06/24/1999 Begin
+         let $covrg_elect_dt_stmt = 'AND COVERAGE_ELECT_DT = '
+         concat '''' with $covrg_elect_dt_stmt 
+         concat $coverage_elect_dt with $covrg_elect_dt_stmt
+         concat '''' with $covrg_elect_dt_stmt
+
+         let $benefit_plan_stmt = 'AND BENEFIT_PLAN = '
+         concat '''' with $benefit_plan_stmt
+         concat $benefit_plan with $benefit_plan_stmt
+         concat '''' with $benefit_plan_stmt
+!SXK 06/24/1999 End
+
+         do update-effdt
+    when = 'F'
+         move 'PS_FSA_BENEFIT' to $ps_table_name
+         let $covrg_elect_stmt = 'AND COVERAGE_ELECT = '
+         concat '''' with $covrg_elect_stmt 
+         concat $coverage_elect with $covrg_elect_stmt
+         concat '''' with $covrg_elect_stmt
+!SxK 06/24/1999 Begin
+         let $covrg_elect_dt_stmt = 'AND COVERAGE_ELECT_DT = '
+         concat '''' with $covrg_elect_dt_stmt 
+         concat $coverage_elect_dt with $covrg_elect_dt_stmt
+         concat '''' with $covrg_elect_dt_stmt
+
+         let $benefit_plan_stmt = 'AND BENEFIT_PLAN = '
+         concat '''' with $benefit_plan_stmt
+         concat $benefit_plan with $benefit_plan_stmt
+         concat '''' with $benefit_plan_stmt
+!SXK 06/24/1999 End
+
+         do update-effdt
+    when = 'L'
+         move 'PS_LIFE_ADD_BEN' to $ps_table_name
+         let $covrg_elect_stmt = 'AND COVERAGE_ELECT = '
+         concat '''' with $covrg_elect_stmt 
+         concat $coverage_elect with $covrg_elect_stmt
+         concat '''' with $covrg_elect_stmt
+!SxK 06/24/1999 Begin
+         let $covrg_elect_dt_stmt = 'AND COVERAGE_ELECT_DT = '
+         concat '''' with $covrg_elect_dt_stmt 
+         concat $coverage_elect_dt with $covrg_elect_dt_stmt
+         concat '''' with $covrg_elect_dt_stmt
+
+         let $benefit_plan_stmt = 'AND BENEFIT_PLAN = '
+         concat '''' with $benefit_plan_stmt
+         concat $benefit_plan with $benefit_plan_stmt
+         concat '''' with $benefit_plan_stmt
+!SXK 06/24/1999 End
+
+         do update-effdt
+         move ' ' to $covrg_elect_stmt
+!SXK 06/24/1999 Begin
+         move ' ' to $covrg_elect_dt_stmt
+         move ' ' to $benefit_plan_stmt
+!SXK 06/24/1999 End
+! CJH - 07/26/2001 - begin
+         if $base-updated = 'Y'
+             move 'PS_LIFE_ADD_BENEFC' to $ps_table_name
+             do update-effdt
+         end-if
+! CJH - 07/26/2001 - end
+    when = 'S'
+         move 'PS_SAVINGS_PLAN' to $ps_table_name
+         let $covrg_elect_stmt = 'AND COVERAGE_ELECT = '
+         concat '''' with $covrg_elect_stmt 
+         concat $coverage_elect with $covrg_elect_stmt
+         concat '''' with $covrg_elect_stmt
+!SxK 06/24/1999 Begin
+         let $covrg_elect_dt_stmt = 'AND COVERAGE_ELECT_DT = '
+         concat '''' with $covrg_elect_dt_stmt 
+         concat $coverage_elect_dt with $covrg_elect_dt_stmt
+         concat '''' with $covrg_elect_dt_stmt
+
+         let $benefit_plan_stmt = 'AND BENEFIT_PLAN = '
+         concat '''' with $benefit_plan_stmt
+         concat $benefit_plan with $benefit_plan_stmt
+         concat '''' with $benefit_plan_stmt
+!SXK 06/24/1999 End
+
+         do update-effdt
+         move ' ' to $covrg_elect_stmt
+!SXK 06/24/1999 Begin
+         move ' ' to $covrg_elect_dt_stmt
+         move ' ' to $benefit_plan_stmt
+!SXK 06/24/1999 End
+
+! CJH - 07/26/2001 - begin
+         if $base-updated = 'Y'
+             move 'PS_SAVINGS_BENEFIC' to $ps_table_name
+             do update-effdt
+             move ' ' to $covrg_elect_stmt
+             move ' ' to $covrg_elect_dt_stmt
+             move ' ' to $benefit_plan_stmt
+
+             move 'PS_SAVINGS_INVEST' to $ps_table_name
+             do update-effdt
+         end-if
+! CJH - 07/26/2001 - end
+End-Evaluate   
+end-procedure
+
+!*********************************************************************
+!Updates EFFDT on Base Benefit Tables
+!*********************************************************************
+
+Begin-Procedure Update-Effdt
+
+! CJH - 01/11/1999 - begin
+! Check to see if update is actually changing the EFFDT or if
+! the EFFDT is already correct.  If the EFFDT is already correct,
+! do not bother with the base benefit table update
+
+  let $base-updated = 'N'
+  do check-effective-date  
+  if $date-found = 'Y'
+      display 'Not necessary to update ' noline
+      display $ps_table_name noline
+      display '.  Existing dt:' noline
+      display $existing_dt noline
+      display ' New Effdt:' noline
+      display $new_effdt
+  else
+    if $rows-found = 'Y' 
+        begin-sql on-error=sql-error-found('Update-Effdt')
+           UPDATE [$ps_table_name]
+              SET EFFDT = $new_effdt
+            WHERE EMPLID = $emplid
+              AND EMPL_RCD = #empl_rcd
+              [$cobra_event]
+              AND PLAN_TYPE = $plan_type
+              AND BENEFIT_NBR = #benefit_nbr
+              AND EFFDT = $old_effdt
+        end-sql
+      if #sql-count > 0
+         display 'Updating ' noline
+         display $ps_table_name
+         display 'Old Effdt:' noline
+         display $old_effdt
+         display 'New Effdt:' noline
+         display $new_effdt
+
+         add +1 to #updTran
+         move 'Y' to $base-updated
+      else
+         display 'No rows found to update in ' noline
+         display $ps_table_name noline
+      end-if
+
+
+    else
+      display 'No rows found in ' noline
+      display $ps_table_name noline
+      display ' to update'
+    end-if
+  end-if
+
+! CJH - 01/11/1999 - begin
+! only update bas_partic_plan if there will be a change in the date
+
+   if $base-updated = 'N'
+      display 'Not necessary to update PS_BAS_PARTIC_PLAN.  Existing dt: ' noline
+      display $existing_dt noline
+      display ' New Effdt:' noline
+      display $new_effdt
+   else
+      do update-ded-begin-date
+   end-if
+
+! CJH - 01/11/1999 - end
+
+end-procedure
+
+
+!**********************************************************************
+!  Check Effective date of Base Benefit tables
+!**********************************************************************
+begin-procedure check-effective-date
+ 
+  move 'N' to $date-found
+  move 'N' to $rows-found
+
+begin-SELECT
+EFFDT
+
+   move 'Y' to $rows-found
+   do format-datetime(&EFFDT, $EFFDT_str, {DEFCMP}, '', '')
+   do format-datetime($new_effdt, $new_effdt_str, {DEFCMP}, '', '')
+   if $EFFDT_str = $new_effdt_str
+       move &EFFDT to $existing_dt 
+       move 'Y' to $date-found
+   end-if
+
+   
+from [$ps_table_name] 
+ WHERE EMPLID = $emplid
+   AND EMPL_RCD = #empl_rcd
+ [$cobra_event]
+   AND PLAN_TYPE = $plan_type
+   AND BENEFIT_NBR = #benefit_nbr
+  [$covrg_elect_stmt]
+!SXK 06/24/1999 begin
+  [$covrg_elect_dt_stmt]
+  [$benefit_plan_stmt]
+!SXK 06/24/1999 End
+!  [$covrg_elect_value]
+!   AND COVERAGE_ELECT = $coverage_elect
+end-SELECT
+end-procedure
+
+
+
+!*********************************************************************
+!Updates DEDUCTION_BEGIN_DT on Bas Partic Plan Table
+!*********************************************************************
+
+Begin-Procedure Update-Ded-Begin-Date
+
+display 'Updating BAS_PARTIC_PLAN ' noline
+display 'New Deduction Begin Date:' noline
+display $new_effdt
+
+begin-sql on-error=sql-error-found('Update-Ded-Begin-Date')
+UPDATE PS_BAS_PARTIC_PLAN
+   SET DEDUCTION_BEGIN_DT = $new_effdt
+WHERE SCHED_ID = $sched_id
+  AND EMPLID = $emplid
+  AND BENEFIT_RCD_NBR = #benefit_rcd_nbr
+  AND EVENT_ID = #event_id
+  AND PLAN_TYPE = $plan_type
+  AND BENEFIT_PROGRAM = $benefit_program
+end-sql
+
+end-procedure
+
+!*********************************************************************
+! Remove RETRODED_RQST rows that Ben Admin inserted for the plan type
+!*********************************************************************
+begin-procedure remove-rqst-rows
+
+display 'Removing RETRODED_RQST rows for emplid/rcd#/plan_type: ' noline
+display $emplid noline
+display '/' noline
+display #empl_rcd 999 noline
+display '/' noline
+display $plan_type
+
+begin-SQL
+DELETE from ps_retroded_rqst RRR
+ where RRR.emplid = $emplid
+   and RRR.empl_rcd = #empl_rcd
+   and RRR.plan_type = $plan_type
+   and RRR.retroded_effdt = $old_effdt   ! remove the rqst rows for the
+                                         ! old effdt
+end-SQL
+end-procedure
+
+!*******************************************************************
+#Include 'tranctrl.sqc'  !Common Transaction Control Procedures
+!*#Include 'reset.sqc'     !Reset printer procedure
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'payrnctl.sqc'  !Select-Parameters
+#Include 'stdapi.sqc'    !Get_Run_Control Procedure
+#Include 'datemath.sqc'  !Does the date-math functions
+#Include 'readxlat.sqc'  !Read xlattable
+#Include 'gexbncf1.sqc'  !
+!#include 'gexaltse.sqc'  ! ORACLE Alter Session   ! GEX ISDVNPK  08/28/2007 

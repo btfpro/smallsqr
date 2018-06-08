@@ -1,0 +1,1332 @@
+!***********************************************************************
+! GEXPY607:  WAGES AND HOURS INTERFACE TO DATA WAREHOUSE               *
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module is the confidential and proprietary information of       *
+! Giant Eagle, Inc.; it is not to be copied, reproduced,or transmitted *
+! in any form, by any means, in whole or in part, nor is it to be used *
+! for any purpose other than that for which it is expressly provided   *
+! without the written permission of Giant Eagle.                       *
+!                                                                      *
+! Copyright (c) 1997-1998 Giant Eagle,Inc. All Rights Reserved         *
+!                                                                      *
+!***********************************************************************
+!                                                                      *        
+! GEXPY607 :            Wages and Hours Interface to Data Warehouse    *
+!                                                                      *        
+! Narrative:            This program creates a weekly subtotal report  *
+!                       by DeptID, Account Code, Jobcode, and Earnings *
+!                       Code for wages and hours from the current      *
+!                       Retail Payroll for the Data Warehouse.         *
+!                                                                      *
+! #Debugx Used:         #debug9 paragraph trace                        *
+!                       #debug8 key variable values                    *
+!                       #debug7 data returned from sql calls           * 
+!                                                                      *  
+! SQL Tables:           gex_dept_tbl                                   *
+!                       job                                            *
+!                       pay_cal_bal_id                                 *
+!                       pay_earnings                                   *
+!                       pay_oth_earns                                  *
+!                                                                      *
+! Written by:           Jim Hutchison                                  *       
+!                                                                      *
+! Normally Run:         Weekly                                         *
+!                                                                      *
+! Control Parms:        FOR WHERE CLAUSE:                              *
+!                         Company Division Code                        *
+!                         Company                                      *
+!                         Paygroup                                     *
+!                         Deptid                                       *
+!                         Employee Status                              *
+!                         Account Code                                 *
+!                         As Of Date                                   *
+!                                                                      *
+!***********************************************************************
+!                         MODIFICATION HISTORY                         *
+!***********************************************************************
+! INITIALS     DATE         DESCRIPTION OF THE CHANGE                  *
+!***********************************************************************
+! JDH          06/22/98     Initial Creation                           *
+! SXK          09/08/98     Added OUTFILE variable                     *
+! JNB          11/23/98     Added 'W' in position 1 and added full     *
+!                             part time to the file                    *
+! JNB          01/07/99     Eliminating 'I' the 4th position in deptid *
+! JNB          01/29/99     Removed the reference to oth_pay while     *
+!                              calculating earnings_wages              *
+! JDH          04/07/99     Fixed problem with main logic.             *
+! CWB          09/09/99     Added logic to not process EEs who are on  *
+!                            light duty.                               * 
+! JNB          09/15/99     Removed comment from #include 'gexxx922.sqc'
+!                           and commented #include 'gexxx9xx.sqc'      *
+! JNB          01/06/2000   Excluded Earnings code DDP from interface  *
+!                                                                      *
+! AXL          07/24/2000   Substitute DEPT_OVERRIDE for DEPTID        *
+!                                                                      *
+! CWB          07/22/2003   Add logic to handle the BMC pharmacies.    *
+!                           This code may need to be removed           *
+!                           after 09/01/2003.                          * 
+!                                                                      *
+! MXR          03/07/2007   ITG # 40408 - modify for training hours    *
+!GEX-AXG      08/16/2007   Upgrade 9.0				       *
+! GEXPY_848_E133689_01 2012-08-15 Vahini Katta                         *
+! Added Jobcode 98019 to the evaluate in Write-Record Procedure        *
+! GEXPY_848_P146265_01 2013-10-01 Richard Chen
+! Load Data to Staging tables for Logile Project 
+!***********************************************************************
+
+
+#include 'setenv.sqc' !Set environment
+#include 'setup02.sqc'
+!#define OUTFILE /apps/hr/hrms90/hrdev90/outgoing/	!For Testing
+
+Begin-Report
+#debug9 Show 'Begin-Report'
+  Do P100-Initialization
+  Do Create-Temp-Table
+  Do P200-Main-Process
+  Do PL-File-UP
+  Do PL-Earning-Tbl       !GEXPY_848_P146265_01 2013-10-01
+  Do PL-Populate-Logile   !GEXPY_848_P146265_01 2013-10-01
+  Do P300-Finalization
+  Do Drop-Temp-Table
+End-Report
+
+
+Begin-Procedure P100-Initialization
+#debug9 Show 'P100-Initialization'
+  !Do Set-Optimizer-Goal	!Commented for Upgrade 9.0 GEX-AXG
+
+  Do Init-DateTime           !datetime.sqc
+  Do Init-Number             !number.sqc
+  Do Get-Current-DateTime    !curdttim.sqc
+  Do Stdapi-Init             !stdapi.sqc
+
+  Let $ReportID      =   'GEXPY607'
+  Let $ReportTitle   =   'WAGES AND HOURS INTERFACE TO DATA WAREHOUSE'
+
+  Show '$ReportID    = ' $ReportID
+  Show '$ReportTitle = ' $ReportTitle
+  Show '$ReportDate  = ' $ReportDate
+  Show '$ReportTime  = ' $ReportTime
+
+  Let $GEXXX900_Company_Alias  = 'pe.company'
+  Let $GEXXX901_Company_Alias  = 'pe.company'
+  Let $GEXXX901_Paygroup_Alias = 'pe.paygroup'
+  Let $GEXXX902_Deptid_Alias   = 'pe.deptid'
+  Let $GEXXX903_Emp_Stat_Alias = 'j.empl_status'
+  Let $GEXXX907_Div_CD_Alias   = 'gdt.gex_company_div_cd'
+  Let $GEXXX909_Acct_CD_Alias  = 'pe.acct_cd'
+
+  If $prcs_process_instance = ''
+  
+    Do GEXXX950-Input-Parameters
+  Else
+    Do P120-Process-Scheduler-Run-Controls
+  End-If
+
+  Do Format-DateTime($X000_Where_Select_AsOfDate, $X000_Report_Heading_AsOfDate, {DEFDATE}, '', '')
+  Let $X000_Order_By = 'Deptid, Acct_cd, Jobcode, F/P, Erncd'
+
+  Show '$GEXXX907_Include_Div_Cd_Display_Criteria           = ' $GEXXX907_Include_Div_Cd_Display_Criteria
+  Show '$GEXXX900_Include_Company_Display_Criteria          = ' $GEXXX900_Include_Company_Display_Criteria
+  Show '$GEXXX901_Include_Company_Paygroup_Display_Criteria = ' $GEXXX901_Include_Company_Paygroup_Display_Criteria
+  Show '$GEXXX902_Include_Deptid_Display_Criteria           = ' $GEXXX902_Include_Deptid_Display_Criteria
+  Show '$GEXXX903_Include_Emp_Stat_Display_Criteria         = ' $GEXXX903_Include_Emp_Stat_Display_Criteria
+  Show '$GEXXX909_Include_Acct_Cd_Display_Criteria          = ' $GEXXX909_Include_Acct_Cd_Display_Criteria
+  Show '$X000_Where_Select_AsOfDate = '                         $X000_Where_Select_AsOfDate
+
+  Do P130-Print-Cover-Page
+  Do P140-Open-File
+  Do P150-Get-Last-Confirmed-Pay
+
+  Create-Array Name=Earnings-Array Size=2500
+    Field=erncd:Char:3
+    Field=hours:Number
+    Field=amount:Number
+    !Vendaxg Added For Owner Flag Issue - Begin 
+    !Field=jobcode:Char:5			!isdvmxd added for ITG 43297 on 01/16/09
+    !Field=acct_cd:Char:3			!isdvmxd added for ITG 43297 on 01/16/09
+    !Field=full_part_time_flag:Char:1		!isdvmxd added for ITG 43297 on 01/16/09
+    Field=Department:Char
+    Field=DeptID:Char
+    Field=DeptID_OverRide:Char
+    !Vendaxg Added For Owner Flag Issue - Begin 
+    !isdvmxd commented
+  !Vendaxg Added For Owner Flag Issue - Begin 
+  !Create-Array Name=Final-Array Size=1500
+  !  Field=Gex_EarnCd:Char:3
+  !  Field=Sum_Hours:Number
+  !  Field=Sum_Earns:Number
+  !  Field=Owner_Flag:Char
+  !  Field=Department_OverRide:Char
+  !Vendaxg Added For Owner Flag Issue - End
+    !isdvmxd commented
+  Clear-Array Name=Earnings-Array
+  
+  Do PL-Clean-Tbl               !GEXPY_848_P146265_01 2013-10-01 Richard Chen  
+
+  !Do P160-Earnings-Lookup	!Vendaxg Commented For Owner Flag Issue 
+End-Procedure
+
+!Commented for Upgrade 9.0 GEX-AXG -  Begin
+!Begin-Procedure Set-Optimizer-Goal
+!#debug9 Show 'Set-Optimizer-Goal'
+!  Begin-SQL
+!    Alter Session Set OPTIMIZER_GOAL=RULE;
+!  End-SQL
+!End-Procedure
+!Commented for Upgrade 9.0 GEX-AXG - End
+
+!----------------------------------------------------!  
+! GEXPY_848_P146265_01 2013-10-01 Richard Chen       !
+! Clean up the staging tables                        !
+!----------------------------------------------------!
+Begin-Procedure PL-Clean-Tbl
+
+  Begin-sql
+    Delete from PS_GEX_PY607_FILE
+  End-sql 
+  
+  Begin-sql
+    Delete from PS_GEX_HRS_WAGES
+  End-sql
+  
+  Begin-sql
+    Delete from PS_GEX_LOGILE_HRWA
+  End-sql
+  
+End-procedure
+!----------------------------------------------------!
+
+Begin-Procedure P120-Process-Scheduler-Run-Controls
+#debug9 Show 'P120-Process-Scheduler-Run-Controls'
+  Do GEXXX922-Select-Parameters
+
+  Let $X000_Where_Select_AsOfDate = $GEX_RC_PAY.AsOfDate
+  If Rtrim ($GEX_RC_PAY.AsOfDate, ' ') = ''
+    Let $X000_Where_Select_AsOfDate = $AsOfToday
+  End-If
+
+  Do GEXXX900-Select-Company-Parameters
+  Do GEXXX901-Select-Company-Paygroup-Parameters
+  Do GEXXX902-Select-Deptid-Parameters
+  Do GEXXX903-Select-Emp-Stat-Parameters
+  Do GEXXX907-Select-Div-CD-Parameters 
+  Do GEXXX909-Select-Acct-CD-Parameters
+End-Procedure
+
+
+Begin-Procedure P130-Print-Cover-Page
+#debug9 Show 'P130-Print-Cover-Page'
+  Print 'RUN CONTROL INFORMATION FOR THIS REPORT RUN:'            (+5,1)
+  Print '$Prcs_OprID          ='                                  (+2,5)
+  Print $Prcs_OprID                                               (0,+2)
+  Print '$Prcs_Run_Cntl_ID    ='                                  (+1,5)
+  Print $Prcs_Run_Cntl_ID                                         (0,+2)
+
+  Print 'SELECTION CRITERIA FOR THIS REPORT RUN:'                 (+5,2)
+  Print '$GEXXX907_Include_Div_Cd_Display_Criteria           ='   (+2,5)
+  Print $GEXXX907_Include_Div_Cd_Display_Criteria                 (0,+2)
+  Print '$GEXXX900_Include_Company_Display_Criteria          ='   (+1,5)
+  Print $GEXXX900_Include_Company_Display_Criteria                (0,+2)
+  Print '$GEXXX901_Include_Company_paygroup_Display_Criteria ='   (+1,5)
+  Print $GEXXX901_Include_Company_paygroup_Display_Criteria       (0,+2)
+  Print '$GEXXX902_Include_Deptid_Display_Criteria           ='   (+1,5)
+  Print $GEXXX902_Include_Deptid_Display_Criteria                 (0,+2)
+  Print '$GEXXX903_Include_Emp_Stat_Display_Criteria         ='   (+1,5)
+  Print $GEXXX903_Include_Emp_Stat_Display_Criteria               (0,+2)
+  Print '$GEXXX909_Include_Acct_Cd_Display_Criteria          ='   (+1,5)
+  Print $GEXXX909_Include_Acct_Cd_Display_Criteria                (0,+2)
+
+  Print 'As Of Date :'                      (+2,5)
+  Print $X000_Report_Heading_AsOfDate       (0,+2)
+
+  Print 'SORT ORDER FOR THIS REPORT RUN:'   (+5,2)
+  Print $X000_Order_By                      (+2,5)
+
+  Let #PAGE-COUNT = 0
+  NEW-PAGE
+End-Procedure
+
+
+begin-procedure P140-Open-File
+#debug9 Show 'P140-Open-File'
+   Let $file1 = '{OUTFILE}' || Lower($ReportID) || '.dat'  !isdvmxr uncommentf or prod
+ Show 'File oped for writing : '$File1
+ !  Let $file1 =  'c:\temp\gexpy607.dat'  !testing
+   
+   
+  Open $file1
+       As 1
+       For-Writing
+       Record=65:Fixed
+       Status=#filestat
+
+  If #filestat != 0
+     Show 'Error opening output file.  Program terminating.'
+     Stop
+  End-If
+End-Procedure
+
+
+Begin-Procedure P150-Get-Last-Confirmed-Pay
+#debug9 Show 'P150-Get-Last-Confirmed-Pay'
+Begin-Select
+Max(pay_end_dt) &pay_end_dt
+  Let $pay_end_dt = &pay_end_dt
+  show '$pay_end_dt: ' $pay_end_dt
+
+  let $Year4 = '1'
+  do Format-DateTime($pay_end_dt, $date_out, {DEFYMD}, '', '')
+  let $payenddt = substr($date_out,1,4)||substr($date_out,6,2)||substr($date_out,9,2)
+  
+  ! GEXPY_848_P146265_01 2013-10-01 Richard Chen Begin
+  let $pay_dt =  &pay_end_dt
+  ! GEXPY_848_P146265_01 2013-10-01 Richard Chen End
+  
+  Show 'Last confirmed pay end date:  ' $pay_end_dt
+
+From   ps_pay_calendar
+
+Where  pay_end_dt <= $X000_Where_Select_AsOfDate
+And    pay_confirm_run = 'Y'
+End-Select
+End-Procedure
+
+
+Begin-Procedure P160-Earnings-Lookup
+#debug9 Show 'P160-Earnings-Lookup'
+Begin-Select
+et.erncd
+
+  Add 1 To #Array-Size
+  Put &et.erncd Into Earnings-Array(#Array-Size)
+
+  If &et.erncd = 'REG'
+    Let #reg-erncd-pointer = #Array-Size
+  Else
+    If &et.erncd = 'OTP'
+      Let #otp-erncd-pointer = #Array-Size
+    End-If
+  End-If
+
+From   ps_earnings_tbl et
+
+Where  effdt =
+      (Select Max(effdt)
+       From   ps_earnings_tbl
+       Where  erncd  = et.erncd
+       And    effdt <= $pay_end_dt)
+ And   erncd <> 'DDP'    !JNB 01/06/2000
+Order By et.erncd
+End-Select
+End-Procedure
+
+
+Begin-Procedure P200-Main-Process
+#debug9 Show 'P200-Main-Process'
+
+Let #Array-Pointer = 0
+Begin-Select
+! CWB 07/22/2003 BEGIN
+
+!Decode(Substr(pe.deptid,4,1),'I',gdt.department,gdt.deptid) &department
+Decode(Substr(j.deptid,1,2),'47',gdt.department,(Decode(Substr(j.deptid,4,1),'I',gdt.department,gdt.deptid)) ) &department
+! CWB 07/22/2003 END
+		      ()  On-Break  Level=1  Print=Never
+
+gdt.deptid            ()  On-Break  Level=2
+				    Print=Never
+
+pe.acct_cd            ()  On-Break  Level=3
+				    Print=Never
+
+pe.jobcode            ()  On-Break  Level=4
+				    Print=Never
+
+j.full_part_time      ()  On-Break  Level=5
+				    Print=Never
+				    After=P220-Print-Array
+pe.company
+pe.paygroup
+pe.pay_end_dt
+pe.off_cycle
+pe.page_num
+pe.line_num
+pe.addl_nbr
+
+pe.reg_hrly_earns+pe.reg_earns &reg_earns
+pe.reg_earn_hrs+pe.reg_hrs     &reg_hours
+pe.ot_hrly_earns               &ot_earns
+pe.ot_hrs                      &ot_hours
+
+! CWB 09/09/99 Begin
+j.gex_deptid_ovr
+j.gex_acct_cd_ovr
+j.gex_gl_exp_ovr
+! CWB 09/09/99 End
+gxp.gex_block_dw       !isdvsxp ITG 59128 04/07/2009  
+gdt.department         !isdvsxp ITG 59128 04/07/2009  
+  
+  if &gxp.gex_block_dw <> 'Y'   !isdvsxp ITG 59128 04/07/2009 
+  let $Data-Found-Flag = 'Y'
+
+  let $department     = &department
+  let $deptid         = &gdt.deptid
+  let $acct_cd        = &pe.acct_cd
+  let $jobcode        = &pe.jobcode
+  let $full_part_time = &j.full_part_time
+  let $gdtdepartment  = &gdt.department        !isdvsxp ITG 59128 04/07/2009    
+
+! CWB 09/09/99 Begin
+  let $deptid_ovr     = substr(&j.gex_deptid_ovr,1,4)
+  let $acct_cd_ovr    = substr(&j.gex_acct_cd_ovr,1,3)
+  let $gl_exp_ovr     = substr(&j.gex_gl_exp_ovr,1,6)
+
+  If (($deptid_ovr  = 'CGL5')  or  !MXR          03/07/2007   ITG # 40408  Commented out 
+      ($deptid_ovr  = 'CGL6')) and
+      $acct_cd_ovr = '101'   and
+      $gl_exp_ovr  = '700052'
+  else                             !MXR          03/07/2007   ITG # 40408  Commented out 
+! CWB 09/09/99 End
+
+! AXL 07/24/2000 - Begin
+  If isblank($deptid_ovr) = 0 
+     let $department     = $deptid_ovr
+  End-If
+! AXL 07/24/2000 - End
+
+  If &reg_hours <> 0 Or
+     &reg_earns <> 0
+    !Vendaxg Modified for Owner Flag Issue - Begin
+    !Array-Add &reg_hours &reg_earns To Earnings-Array(#reg-erncd-pointer) Hours Amount
+    Put 'REG' &reg_hours &reg_earns $department $deptid $deptid_ovr into Earnings-Array(#Array-Pointer)
+    !Put 'REG' &reg_hours &reg_earns $jobcode $acct_cd $full_part_time $department $deptid $deptid_ovr into Earnings-Array(#Array-Pointer)   !isdvmxd modified for iTG 43297 on 01/16/09
+    Add 1 to #Array-Pointer
+    !Vendaxg Modified for Owner Flag Issue - End
+  End-If
+
+  If &ot_hours <> 0 Or
+     &ot_earns <> 0
+    
+    !Vendaxg Modified for Owner Flag Issue - Begin
+    !Array-Add &ot_hours &ot_earns To Earnings-Array(#otp-erncd-pointer) Hours Amount
+    Put 'OTP' &reg_hours &reg_earns $department $deptid $deptid_ovr into Earnings-Array(#Array-Pointer)
+    !Put 'OTP' &reg_hours &reg_earns $jobcode $acct_cd $full_part_time $department $deptid $deptid_ovr into Earnings-Array(#Array-Pointer)   !isdvmxd modified for iTG 43297 on 01/16/09
+    Add 1 to #Array-Pointer
+    !Vendaxg Modified for Owner Flag Issue - End
+  End-If
+
+  Do P210-Pay-Oth-Earns
+
+! CWB 09/09/99 Begin
+  End-if                  !MXR          03/07/2007   ITG # 40408  Commented out 
+! CWB 09/09/99 End
+ 
+ 
+ END-IF  !isdvsxp ITG 59128 04/07/2009 
+
+From   ps_gex_dept_tbl   gdt,
+       ps_job            j,
+       ps_pay_earnings   pe,
+       ps_gex_person     gxp   !isdvsxp ITG 59128 04/07/2009
+
+Where  pe.pay_end_dt       = $pay_end_dt
+
+And    pe.emplid           = j.emplid 
+and    pe.emplid           = gxp.emplid !isdvsxp ITG 59128 04/07/2009  
+And    pe.empl_rcd        = j.empl_rcd
+
+And    j.effdt             =
+      (Select Max(effdt)
+       From   ps_job
+       Where  emplid       = j.emplid
+       And    empl_rcd    = j.empl_rcd
+       And    effdt       <= $pay_end_dt)
+
+And    j.effseq            =
+      (Select Max(effseq)
+       From   ps_job
+       Where  emplid       = j.emplid
+       And    empl_rcd    = j.empl_rcd
+       And    effdt        = j.effdt)
+
+And    pe.deptid           = gdt.deptid
+!And   pe.deptid in ('1297','0070')!,'3528','0231','3203','4028','4703')		!Vendaxg added for testing
+!And    pe.deptid = '0002'
+!AND    J.JOBCODE in ('10026','30005')!,'80010','88005')		!isdvmxd added for testing on 01/16/09
+!AND    pe.acct_cd = '001'
+And    gdt.effdt           =
+      (Select Max(effdt)
+       From   ps_gex_dept_tbl
+       Where  deptid       = gdt.deptid
+       And    effdt       <= $pay_end_dt)
+
+And    gdt.sequence_number =
+      (Select Max(sequence_number)
+       From   ps_gex_dept_tbl
+       Where  deptid       = gdt.deptid
+       And    effdt        = gdt.effdt)
+
+And   [$GEXXX900_Include_Company_Criteria]
+And   [$GEXXX901_Include_Company_Paygroup_Criteria] 
+And   [$GEXXX902_Include_Deptid_Criteria]
+And   [$GEXXX907_Include_Div_Cd_Criteria]
+And   [$GEXXX903_Include_Emp_Stat_Criteria]
+And   [$GEXXX909_Include_Acct_Cd_Criteria]
+
+! CWB 07/22/2003 BEGIN
+!Order By Decode(Substr(pe.deptid,4,1),'I',gdt.department,gdt.deptid),gdt.deptid,pe.acct_cd,pe.jobcode,j.full_part_time
+Order by Decode(Substr(j.deptid,1,2),'47',gdt.department,(Decode(Substr(j.deptid,4,1),'I',gdt.department,gdt.deptid))),
+gdt.deptid,pe.acct_cd,pe.jobcode,j.full_part_time 
+! CWB 07/22/2003 END
+
+End-Select
+End-Procedure
+
+
+Begin-Procedure P210-Pay-Oth-Earns
+#debug9 Show 'P210-Pay-Oth-Earns'
+!Show 'Entering Procedure P210-Pay-Oth-Earns '
+Begin-Select
+poe.erncd
+poe.oth_earns
+poe.oth_hrs
+  !Vendaxg Modified for Owner Flag Issue - Begin
+  !Let $found = 'N'
+  !Let #k = 0
+
+  !While $found = 'N'
+  !  Add 1 to #k
+  !  Get $erncd #hours #amount From Earnings-Array(#k)
+  !  If &poe.erncd = $erncd 
+  !    Array-Add &poe.oth_hrs &poe.oth_earns To Earnings-Array(#k) Hours Amount
+  !    Let $found = 'Y'
+  !  End-If
+  !End-While
+  If &poe.oth_earns <> 0 Or 
+  	&poe.oth_hrs <> 0
+  	Put &poe.erncd &poe.oth_hrs &poe.oth_earns $department $deptid $deptid_ovr into Earnings-Array(#Array-Pointer) 
+  	!Put &poe.erncd &poe.oth_hrs &poe.oth_earns $jobcode $acct_cd $full_part_time $department $deptid $deptid_ovr into Earnings-Array(#Array-Pointer) 			!isdvmxd modified for ITG# 43297 on 01/16/09
+  	Show 'Put in Other Earns :' &poe.erncd '  '  &poe.oth_hrs '  ' &poe.oth_earns  '  '  $department '  '  $deptid '  '  $deptid_ovr
+  	Add 1 to #Array-Pointer
+  End-If
+  !Vendaxg Modified for Owner Flag Issue - End
+From   ps_pay_oth_earns  poe
+
+Where  poe.company    = &pe.company
+And    poe.paygroup   = &pe.paygroup
+And    poe.pay_end_dt = &pe.pay_end_dt
+And    poe.off_cycle  = &pe.off_cycle
+And    poe.page_num      = &pe.page_num
+And    poe.line_num      = &pe.line_num
+And    poe.addl_nbr      = &pe.addl_nbr
+And    poe.erncd      <> 'DDP'   ! JNB 01/06/2000
+
+Order By poe.erncd
+End-Select
+
+!Show 'Exiting Procedure P210-Pay-Oth-Earns '
+End-Procedure
+
+
+Begin-Procedure P220-Print-Array
+#debug9 Show 'P220-Print-Array'
+ 
+Do Process-Array	!Vendaxg Added for Owner Flag Issue 
+
+Do Process-Temp-Table
+
+Do Delete-Temp-Table
+
+!Final-Array(#Final_Array_Pointer)
+!Show 'Final Arrat Pointer : '#Final_Array_Pointer
+!Let #j = 0
+!While #j < #Final_Array_Pointer
+
+!Get $Gex_Earncd #Sum_of_Hours #Sum_of_earns $Owner_Flag $Department_Override from Final-Array(#j)
+!Get $erncd #earnings_hours #earnings_wages $Owner_Flag $Department_Override from Final-Array(#j)
+!Show 'Final Get : ' $erncd ' ' #earnings_hours ' ' #earnings_wages ' ' $Owner_Flag ' ' $Department_Override
+!Let $Owner_Flag = Ltrim(RTrim($Owner_Flag,' '),' ')
+!If $Owner_Flag = '' 
+!	Let $Owner_Flag = 'N'
+!End-if
+
+!Let $Department_Override = Ltrim(RTrim($Department_Override,' '),' ')
+!If $Department_Override = '' 
+!	!Let $Department_Override = $department
+!	Let $Department_Override =  $deptid
+!End-if
+
+!Do P230-Build-Record
+
+!Add 1 to #j
+
+!End-While
+!  While #j <= #Array-Size
+!    Get $erncd #earnings_hours #earnings_wages From Earnings-Array(#j)
+!     If #earnings_hours <> 0 Or
+!       #earnings_wages <> 0 
+!      Do P230-Build-Record
+!      Put 0 0 Into Earnings-Array(#j) Hours Amount
+!    End-If
+!    Add 1 To #j
+!  End-While
+!Vendaxg Added for Owner Flag Issue - Begin
+Clear-Array Name=Earnings-Array
+!Clear-Array Name=Final-Array		!isdvmxd commented
+!Vendaxg Added for Owner Flag Issue - End
+
+
+End-Procedure
+
+
+Begin-Procedure P230-Build-Record
+#debug9 Show 'P230-Build-Record'
+  If #earnings_hours < 0
+    Let #earnings_hours = #earnings_hours * -100
+    Let $earnings_hours_sign = '-'
+  Else
+    Let #earnings_hours = #earnings_hours * 100
+    Let $earnings_hours_sign = '+'
+  End-If
+
+  If #earnings_wages < 0
+    Let #earnings_wages = #earnings_wages * -100
+    Let $earnings_wages_sign = '-'
+  Else
+    Let #earnings_wages = #earnings_wages * 100
+    Let $earnings_wages_sign = '+'
+  End-If
+
+  Move #earnings_hours To $earnings_hours 0000000
+  Move #earnings_wages To $earnings_wages 000000000
+
+  !Vendaxg Commented for Owner Flag Issue - Begin
+  !If $deptid = $department
+  !  Let $owner_flag = 'N'
+! CWB 07/22/2003 BEGIN
+  !else
+  !Vendaxg Commented for Owner Flag Issue - End
+  if $deptid = '4701' 
+  or $deptid = '4702' 
+  or $deptid = '4703' 
+  or $deptid = '4704' 
+  or $deptid = '4705'   
+    Let $owner_flag = 'N'
+! CWB 07/22/2003 END
+!Vendaxg Commented for Owner Flag Issue - Begin
+!Else
+ !   Let $owner_flag = 'Y'
+!Vendaxg Commented for Owner Flag Issue - End
+  End-If
+! CWB 07/22/2003 BEGIN
+  !end-if !Vendaxg Commented for Owner Flag Issue 
+! CWB 07/22/2003 END
+
+  Do P240-Write-Record
+End-Procedure
+
+
+Begin-Procedure P240-Write-Record
+#debug9 Show 'P240-Write-Record'
+
+             evaluate $jobcode        ! MXR          03/07/2007   ITG # 40408 - modify for training hours 
+           when = '98008'
+             let $erncd = '140'
+           when = '98010'
+             let $erncd = '142'
+           when = '98002'
+             let $erncd = '143'
+           when = '98006'
+             let $erncd = '150'
+           when = '98009'
+             let $erncd = '151'
+           when = '98013'
+             let $erncd = '153'
+           when = '98007'
+             let $erncd = '156'
+           when = '98003'
+             let $erncd = '147'
+           when = '98004'
+             let $erncd = '148'
+           when = '98005'
+             let $erncd = '149'
+           when = '98014'
+             let $erncd = '14A'
+           when = '98019'         !GEXPY_848_E133689_01 2012-08-15 Vahini Katta
+	     let $erncd = '141'
+           when-other     
+          end-evaluate  ! MXR          03/07/2007   ITG # 40408 - modify for training hours 
+  Add 1 To #recs-written
+
+  Write 1 From 'W':1
+	       $payenddt:8
+	       !Vendaxg Modified for Owner Flag Issue - Begin
+	       !$department:10
+	       $Department_Override:10
+	       !Vendaxg Modified for Owner Flag Issue - Begin
+	       !$owner_flag:1  		!commented by isdvmxd for ITG 43297 on 01/21/2009
+	       $Gex_Owner_Flag:1	!added by isdvmxd for ITG 43297 on 01/21/2009
+	       $acct_cd:10
+	       $jobcode:6
+	       $full_part_time:1
+	       $erncd:3
+	       $earnings_hours_sign:1
+	       $earnings_hours:7
+	       $earnings_wages_sign:1
+	       $earnings_wages:9
+    Status=#filestat
+
+  If #filestat != 0
+     Show 'Error writing output file.  Program terminating.'
+     Stop
+  End-If
+  
+ Let $owner_flag = 'N'
+ !-------------------------------------------------------!
+ ! GEXPY_848_P146265_01 2013-10-01 Richard Chen  Begin   !
+ !-------------------------------------------------------!
+ Let $Insert_Flag ='YYYYY'
+ 
+ Let $Insert_Flag_File = 'Y'
+ Let $Insert_Flag_File2 = 'Y'
+ Let $Insert_Flag_File3 = 'Y'
+ Let $Insert_Flag_File4 = 'Y'
+ Let $Insert_Flag_File5 = 'Y'
+ Let $Insert_Flag_File6 = 'Y'
+ 
+ Let #Flag_Insert = 0
+ 
+ Let $Dept_Test = Ltrim(Rtrim($Department_Override, ' '), ' ')
+ 
+ Let $Earn_cd_Test = Ltrim(Rtrim($erncd, ' '), ' ')
+ 
+ Evaluate $Dept_Test
+  When = '0000'
+  When = '0013'
+  When = '2496'
+  When = 'CGL7'
+  When = 'CGL8'
+  When = 'CGLL'
+    Let $Insert_Flag_File = 'N'
+    Break
+  When-Other
+    Break
+ End-Evaluate 
+ 
+ Evaluate $jobcode
+   When = '98015'
+   When = '98017'
+   When = '98099'
+     Let $Insert_Flag_File6 = 'N'
+     Break
+   When-Other
+     Break
+ End-Evaluate 
+ 
+ Let #Flag1 = Range(substr($Dept_Test,1,1), 'A', 'Z')
+ Let #Flag2 = Range(substr($Dept_Test,2,1), 'A', 'Z')
+ Let #Flag3 = Range(substr($Dept_Test,3,1), 'A', 'Z')
+ Let #Flag4 = Range(substr($Dept_Test,4,1), 'A', 'Z')
+ 
+ Let #Flag_Insert = #Flag1 + #Flag2 + #Flag3 + #Flag4
+ 
+ If #Flag_Insert >= 1
+    Let $Insert_Flag_File4 = 'N'
+ End-If   
+  
+ If Ltrim(Rtrim($acct_cd, ' '), ' ')='101' and Ltrim(Rtrim($jobcode, ' '), ' ')='90000'
+    Let $Insert_Flag_File2 = 'N'
+ End-if
+ 
+ Evaluate $Earn_cd_Test
+   When = '140'
+   When = '141'
+   When = '142'
+   When = '143'
+   When = '144'
+   When = '145'
+   When = '146'
+   When = '147'
+   When = '148'
+   When = '149'
+   When = '517'
+   When = '518'
+   When = '604'
+   When = 'OTB'
+   When = 'STK'
+   When = 'STP'
+   When = 'TAX'
+   When = 'UCL'
+     Let $Insert_Flag_File3 = 'N'
+     Break
+   When-Other
+     Break
+ End-Evaluate 
+ 
+ If Ltrim(Rtrim($acct_cd, ' '), ' ')='102'
+    Let $Insert_Flag_File5 = 'N'
+ End-If
+ 
+ If Ltrim(Rtrim($jobcode, ' '), ' ')='00004' or Ltrim(Rtrim($jobcode, ' '), ' ')='00006'
+    Let $Insert_Flag_File5 = 'N'
+ End-If
+ 
+ If $Gex_Owner_Flag = 'Y'
+    Let $Insert_Flag_File5 = 'N'
+ End-If   
+ 
+ Let $Insert_Flag = $Insert_Flag_File||$Insert_Flag_File2||$Insert_Flag_File3||$Insert_Flag_File4||$Insert_Flag_File5||$Insert_Flag_File6
+ 
+ If $Insert_Flag = 'YYYYYY'
+   Do PL-Insert-File
+ End-if
+
+! GEXPY_848_P146265_01 2013-10-01 Richard Chen End 
+ 
+End-Procedure
+
+!-----------------------------------------------------!
+! GEXPY_848_P146265_01 2013-10-01 Richard Chen        !
+! Based on Earning code, get the hours and wages for  !
+! Productive, Vacation, Training and Other            !
+!-----------------------------------------------------!
+Begin-Procedure PL-Earning-Tbl
+
+Let $r_erncd = ' '
+Let $r_deptid = ' '
+Let $r_acct_cd = ' '
+Let $r_optv = 'N'
+let #r_earnings_hours = 0
+Let #r_earnings_wages = 0
+
+Begin-Select
+EARN.PAY_DT                &EARN.PAY_DT                 
+EARN.DEPTID                &EARN.DEPTID
+EARN.ACCT_CD               &EARN.ACCT_CD
+EARN.ERNCD                 &EARN.ERNCD 
+SUM(EARN.EARNINGS_HOURS)   &EARN.HOURS   
+SUM(EARN.EARNINGS_WAGES)   &EARN.WAGES 
+
+   Let $r_erncd          =  Ltrim(Rtrim(&EARN.ERNCD ,' '),' ')
+   Let $r_deptid         =  Ltrim(Rtrim(&EARN.DEPTID ,' '),' ')
+   Let $r_acct_cd        =  Ltrim(Rtrim(&EARN.ACCT_CD ,' '),' ')
+   Let #r_earnings_hours =  &EARN.HOURS 
+   Let #r_earnings_wages =  &EARN.WAGES
+   Let $r_paydt          =  &EARN.PAY_DT
+   
+   !---check if it is prod, train, vacation or other hours
+   
+   Do PL-Check-Optv-Insert
+      
+FROM PS_GEX_PY607_FILE EARN
+GROUP BY EARN.PAY_DT, EARN.DEPTID, EARN.ACCT_CD, EARN.ERNCD
+ORDER BY EARN.PAY_DT, EARN.DEPTID, EARN.ACCT_CD, EARN.ERNCD
+End-select
+
+End-Procedure
+
+!-----------------------------------------------------!
+! GEXPY_848_P146265_01 2013-10-01 Richard Chen        !
+! Populate logile staging table                       !
+!-----------------------------------------------------!
+Begin-Procedure PL-Populate-Logile
+
+Begin-select
+HRWA.PAY_DT                  &HRWA.PAY_DT                 
+HRWA.DEPTID                  &HRWA.DEPTID
+HRWA.ACCT_CD                 &HRWA.ACCT_CD
+SUM(HRWA.PRODUCTIVE_HOURS)   &HRWA.PRODUCTIVE_HOURS   
+SUM(HRWA.PRODUCTIVE_WAGES)   &HRWA.PRODUCTIVE_WAGES
+SUM(HRWA.TRAINING_HOURS)     &HRWA.TRAINING_HOURS
+SUM(HRWA.TRAINING_WAGES)     &HRWA.TRAINING_WAGES
+SUM(HRWA.VACATION_HOURS)     &HRWA.VACATION_HOURS
+SUM(HRWA.VACATION_WAGES)     &HRWA.VACATION_WAGES
+SUM(HRWA.OTHER_HOURS)        &HRWA.OTHER_HOURS
+SUM(HRWA.OTHER_WAGES)        &HRWA.OTHER_WAGES
+
+   Let $L_paydt          =  &HRWA.PAY_DT
+   Let $L_deptid         =  Ltrim(Rtrim(&HRWA.DEPTID ,' '),' ')
+   Let $L_acct_cd        =  Ltrim(Rtrim(&HRWA.ACCT_CD ,' '),' ')
+   Let #L_prod_hours     =  &HRWA.PRODUCTIVE_HOURS 
+   Let #L_prod_wages     =  &HRWA.PRODUCTIVE_WAGES
+   Let #L_train_hours    =  &HRWA.TRAINING_HOURS
+   Let #L_train_wages    =  &HRWA.TRAINING_WAGES
+   Let #L_vacaiton_hours =  &HRWA.VACATION_HOURS
+   Let #L_vacation_wages =  &HRWA.VACATION_WAGES
+   Let #L_other_hours    =  &HRWA.OTHER_HOURS
+   Let #L_other_wages    =  &HRWA.OTHER_WAGES
+   
+   Do PL-Logile-Descr
+   
+   Do PL-Insert-Logile
+      
+FROM PS_GEX_HRS_WAGES HRWA
+GROUP BY HRWA.PAY_DT, HRWA.DEPTID, HRWA.ACCT_CD
+ORDER BY HRWA.PAY_DT, HRWA.DEPTID, HRWA.ACCT_CD
+End-select
+
+End-Procedure
+
+!----------------------------------------------------------------!
+!GEXPY_848_P146265_01 2013-10-01 Richard Chen                    !
+!Procedure to get the descr for  acct cd                         !
+!----------------------------------------------------------------!
+Begin-procedure PL-Logile-Descr
+
+Let $LDC.DESCR = '  '
+
+Begin-Select
+LDC.ACCT_CD
+LDC.DESCR       &LDC.DESCR
+
+  Let $LDC.DESCR = &LDC.DESCR
+
+FROM PS_ACCT_CD_TBL LDC
+WHERE LDC.ACCT_CD = $L_acct_cd 
+
+End-Select
+
+End-Procedure
+!----------------------------------------------------------------!
+!GEXPY_848_P146265_01 2013-10-01 Richard Chen                    !
+!Procedure to insert data to logile final table                  !
+!----------------------------------------------------------------!
+Begin-procedure PL-Insert-Logile
+Begin-sql
+INSERT INTO PS_GEX_LOGILE_HRWA
+  VALUES($L_paydt,
+ 	$L_deptid, 
+  	$L_acct_cd,
+  	$LDC.DESCR,
+  	#L_prod_hours/100,
+  	#L_prod_wages/100,
+  	#L_train_hours/100,
+  	#L_train_wages/100,
+  	#L_vacaiton_hours/100,
+  	#L_vacation_wages/100,
+  	#L_other_hours/100,
+  	#L_other_wages/100 )  
+End-sql
+End-procedure
+!----------------------------------------------------------------!
+!GEXPY_848_P146265_01 2013-10-01 Richard Chen                    !
+!Procedure to check if it is Prod, Training, Vacation, or others !
+!----------------------------------------------------------------!
+Begin-Procedure PL-Check-Optv-Insert
+
+Let $r_optv = 'N'
+
+begin-Select 
+ck.erncd
+ck.text1     &ck.text1
+
+   Let $r_text1 = Ltrim(Rtrim(&ck.text1 ,' '),' ')
+   
+   If $r_text1 = 'OTHER'
+      Let $r_optv = 'O'
+      Do PL-Insert-Hours-Wages-Other    
+   End-if
+       
+   If $r_text1 = 'VACATION'
+      Let $r_optv = 'V'
+      Do PL-Insert-Hours-Wages-Vacation 
+   End-if
+       
+   If $r_text1 = 'TRAINING'
+      Let $r_optv = 'T'
+      Do PL-Insert-Hours-Wages-Training
+   End-if
+       
+   If $r_text1 = 'PRODUCTIVE'
+      Let $r_optv = 'P'
+      Do PL-Insert-Hours-Wages-Productive 
+   End-if
+
+from ps_gex_rc_earn_cd ck
+where substr(ck.erncd,1,3)= $r_erncd and ck.oprid='HRBATCH' and ck.run_cntl_id = 'gexpy607' 
+end-select
+
+End-Procedure
+
+!*****************************************************!
+!Procedure to set negative value                      !
+!*****************************************************!
+Begin-Procedure PL-File-UP
+
+Begin-Sql
+Update PS_GEX_PY607_FILE
+set earnings_hours = earnings_hours*-1
+where earnings_hour_sign = '-'
+End-sql
+
+Begin-sql
+Update  PS_GEX_PY607_FILE
+set earnings_wages = earnings_wages * -1
+where earnings_wage_sign = '-'
+End-sql
+
+End-Procedure
+!-----------------------------------------------------!
+! GEXPY_848_P146265_01 2013-10-01 Richard Chen Begin  !
+! Procedure to insert the hours and wages initially   !
+!-----------------------------------------------------!
+Begin-Procedure PL-Insert-Hours-Wages-Other
+
+  Begin-Sql
+  INSERT INTO PS_GEX_HRS_WAGES
+  VALUES($r_paydt,
+ 	$r_deptid, 
+  	$r_acct_cd,
+  	$r_erncd,
+  	0,
+  	0,
+  	0,
+  	0,
+  	0,
+  	0,
+  	#r_earnings_hours,
+  	#r_earnings_wages )  
+  End-Sql
+
+End-Procedure
+!-----------------------------------------------------!
+! GEXPY_848_P146265_01 2013-10-01 Richard Chen Begin  !
+! Procedure to insert the hours and wages initially   !
+!-----------------------------------------------------!
+Begin-Procedure PL-Insert-Hours-Wages-Productive
+
+  Begin-Sql
+  INSERT INTO PS_GEX_HRS_WAGES
+  VALUES($r_paydt,
+ 	$r_deptid, 
+  	$r_acct_cd,
+  	$r_erncd,
+  	#r_earnings_hours,
+  	#r_earnings_wages,
+  	0,
+  	0,
+  	0,
+  	0,
+  	0,
+  	0 )  
+  End-Sql
+
+End-Procedure
+
+!-----------------------------------------------------!
+! GEXPY_848_P146265_01 2013-10-01 Richard Chen Begin  !
+! Procedure to insert the hours and wages initially   !
+!-----------------------------------------------------!
+Begin-Procedure PL-Insert-Hours-Wages-Training
+
+  Begin-Sql
+  INSERT INTO PS_GEX_HRS_WAGES
+  VALUES($r_paydt,
+ 	$r_deptid, 
+  	$r_acct_cd,
+  	$r_erncd,
+  	0,
+  	0,
+  	#r_earnings_hours,
+  	#r_earnings_wages,
+  	0,
+  	0,
+  	0,
+  	0 )  
+  End-Sql
+
+End-Procedure
+
+
+!-----------------------------------------------------!
+! GEXPY_848_P146265_01 2013-10-01 Richard Chen Begin  !
+! Procedure to insert the hours and wages initially   !
+!-----------------------------------------------------!
+Begin-Procedure PL-Insert-Hours-Wages-Vacation
+
+  Begin-Sql
+  INSERT INTO PS_GEX_HRS_WAGES
+  VALUES($r_paydt,
+ 	$r_deptid, 
+  	$r_acct_cd,
+  	$r_erncd,
+  	0,
+  	0,
+  	0,
+  	0,
+  	#r_earnings_hours,
+  	#r_earnings_wages,
+  	0,
+  	0 )  
+  End-Sql
+
+End-Procedure
+!-----------------------------------------------------!
+! GEXPY_848_P146265_01 2013-10-01 Richard Chen Begin  !
+! Procedure to insert the staging table for file      !
+!-----------------------------------------------------!
+Begin-Procedure PL-Insert-File
+
+  Begin-Sql
+  INSERT INTO PS_GEX_PY607_FILE
+  VALUES($pay_dt,
+ 	$Department_Override, 
+  	$Gex_Owner_Flag,
+  	$acct_cd,
+  	$jobcode,
+  	$full_part_time,
+  	$erncd,
+  	$earnings_hours_sign,
+  	#earnings_hours,
+  	$earnings_wages_sign,
+  	#earnings_wages)
+  
+  End-Sql
+
+End-Procedure
+!GEXPY_848_P146265_01 2013-10-01 Richard Chen End
+
+
+Begin-Procedure P300-Finalization
+#debug9 Show 'P300-Finalization'
+  If $Data-Found-Flag <> 'Y'
+    Print 'NO DATA SELECTED FOR THIS REPORT RUN'        (25,) Center
+  End-If
+
+  Do Format-Number(#recs-written,$recs-written,'888,888,888')
+  Show ''
+  Show $recs-written ' records written to ' $file1
+  Show ''
+  Do P310-Close-File
+
+  Do Reset                   !reset.sqc
+  Do Stdapi-Term             !stdapi.sqc
+  Show 'Successful end of report'
+End-Procedure
+
+
+Begin-Procedure P310-Close-File
+#debug9 Show 'P310-Close-File'
+  Close 1
+
+  If #filestat != 0
+     Show 'Error closing output file.  Program terminating.'
+     Stop
+  End-If
+End-Procedure
+
+
+
+Begin-Procedure Process-Array
+Show 'Entering Procedur Process-Array Array-Pointer : '#Array-Pointer
+
+Let #j = 0
+Let #Final_Array_Pointer =0 
+Let $Earncd_ALready_Calculated = 'N'
+While #j < #Array-Pointer
+
+    !Get $Gex_Earncd #Gex_Hours #Gex_Earns $Department $Deptid $Deptid_override from Earnings-Array(#j)
+    Get $Gex_Earncd #Gex_Hours #Gex_Earns  $Department $Deptid $Deptid_override from Earnings-Array(#j)		!isdvmxd modified for iTG 43297 on 01/16/09
+    Show $Gex_Earncd ' ' #Gex_Hours ' '  #Gex_Earns ' department'  $Department  ' deptid'  $Deptid  ' override'  $Deptid_override
+    
+    	!isdvmxd added for ITG 43297 on 01/16/09 -- Begin
+    	
+    	If $Deptid <> $Department
+		Let $Owner_Flag = 'Y'
+	Else
+		Let $Owner_Flag = 'N'
+	End-if
+    	
+    	Let #blank = isblank($Deptid_Override)
+    	If #blank = 0
+    		
+		Let $Deptid_override = $Deptid_override
+		Show '$Deptid_override = $Deptid_override ::' $Deptid_override
+	Else
+		If #blank = 1
+			Let $Deptid_override = $Deptid
+			Show '$Deptid_override = $Deptid :: ' $Deptid_override 
+		End-If
+				
+	End-if
+    	!isdvmxd added for ITG 43297 on 01/16/09 -- End
+    	!isdvsxp ITG 59128 04/07/2009  -- start
+    	 if substr($Deptid_override,4,1) ='I'
+    	 
+    	 Let $Deptid_override = $gdtdepartment
+    	 Let $Owner_Flag = 'N'
+    	 end-if
+        !isdvsxp ITG 59128 04/07/2009 -- end
+    	
+    	Do Insert-Into-Temp
+        Add 1 to #j
+    
+End-while
+
+
+Let #Array-Pointer = 0	
+    
+
+Show 'Exiting Procedur Process-Array'
+End-Procedure Process-Array
+
+Begin-Procedure Insert-Into-Temp
+!Show ' Inserting : '$Gex_Earncd ' ' #Gex_Hours ' '  #Gex_Earns ' '  $Department  ' '  $Deptid  ' '  $Deptid_override	!commented by isdvmxd for ITG 43297 on 01/16/09
+
+If Ltrim(Rtrim($Deptid_override, ' '),' ') = '' 
+	Let $Deptid_override = ' '
+End-if
+Begin-Sql
+INSERT INTO PS_GEX_T_GEXPY607
+VALUES($Gex_Earncd,
+	#Gex_Hours,
+	#Gex_Earns,
+	!$Gex_Jobcode,			!added by isdvmxd for ITG 43297 on 01/16/09
+	!$Gex_Acct_Cd,			!added by isdvmxd for ITG 43297 on 01/16/09
+	!$Gex_Full_Part_Time,		!added by isdvmxd for ITG 43297 on 01/16/09
+	$Owner_Flag,			!added by isdvmxd for ITG 43297 on 01/21/09
+	$Department,			
+	$Deptid,			
+	$Deptid_override)
+
+End-Sql
+
+	
+
+End-Procedure Insert-Into-Temp
+
+
+Begin-Procedure Create-Temp-Table 
+Show 'Entering Procedure Create-temp-TABle'
+
+Let $tablename = 'PS_GEX_T_GEXPY607'
+Begin-sql 
+CREATE TABLE [$tablename] 
+ 	(EARNCD		VARCHAR2(4)		NOT NULL,			
+ 	GEX_HOURS       NUMBER(38,3)		NOT NULL,		
+	GEX_EARNS	NUMBER(38,3)		NOT NULL,
+	!GEX_JOBCODE	VARCHAR(5)		NOT NULL,	!added by isdvmxd for ITG 43297 on 01/16/09
+	!GEX_ACCT_CD	VARCHAR(3)		NOT NULL,	!added by isdvmxd for ITG 43297 on 01/16/09
+	!GEX_FULL_PART_TIME	VARCHAR(1)	NOT NULL,	!added by isdvmxd for ITG 43297 on 01/16/09
+	OWNER_FLAG	VARCHAR(1)		NOT NULL,	!added by isdvmxd for ITG 43297 on 01/21/09
+	DEPARTMENT	VARCHAR2(4)		NOT NULL,	
+	DEPTID		VARCHAR2(4)		NOT NULL,	
+	DEPTID_OVERRIDE VARCHAR2(4)		NOT NULL)
+	
+        TABLESPACE TE7TOOLS001
+
+End-Sql
+
+
+End-Procedure Create-Temp-Table
+
+Begin-Procedure Drop-Temp-Table 
+Begin-Sql
+Drop table [$tablename]
+End-Sql
+
+End-Procedure Drop-Temp-Table 
+
+Begin-Procedure Process-Temp-Table
+
+Let $Prev_Erncd = ' '
+Let $Prev_deptid_ovr = ' '
+let #earnings_hours = 0
+Let #earnings_wages = 0
+let $first ='y'
+
+Begin-Select 
+TEMP.EARNCD
+SUM(TEMP.GEX_HOURS)     &TEMP.GEX_HOURS   
+SUM(TEMP.GEX_EARNS)  	&TEMP.GEX_EARNS  
+!TEMP.GEX_JOBCODE			!added by isdvmxd for ITG 43297 on 01/16/09
+!TEMP.GEX_ACCT_CD			!added by isdvmxd for ITG 43297 on 01/16/09
+!TEMP.GEX_FULL_PART_TIME		!added by isdvmxd for ITG 43297 on 01/16/09
+TEMP.OWNER_FLAG				!added by isdvmxd for ITG 43297 on 01/21/09
+TEMP.DEPTID	
+!TEMP.DEPARTMENT			!commented by isdvmxd for ITG 43297 on 01/16/09
+TEMP.DEPTID_OVERRIDE 
+	
+	show &temp.earncd 'earnd code ' &TEMP.GEX_HOURS ' hours and ' &TEMP.GEX_EARNS ' earns ' &TEMP.DEPTID ' DEptid ' &TEMP.DEPTID_OVERRIDE ' Dept_override ' 
+	Let $erncd =  Ltrim(Rtrim(&TEMP.EARNCD,' '),' ')
+	Let #earnings_hours =  &TEMP.GEX_HOURS
+	Let #earnings_wages =  &TEMP.GEX_EARNS
+	!Let $jobcode = LTrim(RTrim(&TEMP.GEX_JOBCODE,' '),' ')			!added by isdvmxd for ITG 43297 on 01/16/09
+	!Let $acct_cd = LTrim(RTrim(&TEMP.GEX_ACCT_CD,' '),' ')			!added by isdvmxd for ITG 43297 on 01/16/09
+	!Let $full_part_time_flag = LTrim(RTrim(&TEMP.GEX_FULL_PART_TIME,' '), ' ') 	!added by isdvmxd for ITG 43297 on 01/16/09
+	Let $Gex_Owner_Flag = Ltrim(Rtrim(&TEMP.OWNER_FLAG,' '),' ')			!added by isdvmxd for ITG 43297 on 01/21/09
+	Let $Deptid  = Ltrim(Rtrim(&TEMP.DEPTID,' '),' ')
+	!Let $Department = Ltrim(Rtrim(&TEMP.DEPARTMENT,' '),' ')	
+	Let $Department_Override = Ltrim(Rtrim(&TEMP.DEPTID_OVERRIDE,' '),' ')
+	!Show $erncd '  ' #earnings_hours '  ' &Gex_Hours '  ' #earnings_wages  '  '  $Deptid
+	
+	!Show '#earnings_hrs = ' #earnings_hrs
+	!Show '#earnings_earns = ' #earnings_earns
+	
+	!isdvmxd commented for ITG 43297 on 01/16/2009  --- Begin
+	!If $Deptid <> $Department
+	!	Let $Owner_Flag = 'Y'
+	!Else
+	!	Let $Owner_Flag = 'N'
+	!End-if
+	
+	
+	!If $Department_Override <> ''
+	!	Let $Department_Override = $Department_Override
+	!Else
+	!	Let $Department_Override = $Deptid
+	!End-if
+	!isdvmxd commented for ITG 43297 on 01/16/2009  --- End
+	
+	!Show '$erncd ::::: $Prev_Erncd' $erncd  $Prev_Erncd
+	 If #earnings_hours <> 0 Or #earnings_wages <> 0 	!isdvmxd added for ITG 43297 on 01/16/09
+	 	Do P230-Build-Record
+	 End-If			!isdvmxd added for ITG 43297 on 01/16/09
+	 
+FROM  [$tablename] TEMP
+!GROUP BY TEMP.EARNCD,TEMP.DEPTID,TEMP.DEPARTMENT,TEMP.DEPTID_OVERRIDE
+GROUP BY TEMP.EARNCD,TEMP.DEPTID,TEMP.DEPTID_OVERRIDE,TEMP.OWNER_FLAG			!modified by isdvmxd for ITG 43297 on 01/16/09	
+
+End-Select
+
+End-Procedure Process-Temp-Table
+
+
+Begin-Procedure Delete-Temp-Table
+
+Begin-Sql
+DELETE FROM [$tablename];
+End-Sql
+
+Begin-Sql
+COMMIT;
+End-Sql
+
+End-Procedure Delete-Temp-Table
+
+
+
+
+#include 'gexxx950.sqc'  !Get SQRW run controls
+#include 'gexxx900.sqc'  !Get company multiple row table
+#include 'gexxx901.sqc'  !Get company/paygroup multiple row table
+#include 'gexxx902.sqc'  !Get deptid multiple row table
+#include 'gexxx903.sqc'  !Get employee status multiple row table
+#include 'gexxx907.sqc'  !Get company/division code multiple row table
+#include 'gexxx909.sqc'  !Get acct_cd code multiple row table
+#include 'gexxx922.sqc'  !Get pay single row run control
+!#include 'gexxx9xx.sqc'  !Get pay single row run control        jnb 09/15/99
+
+#Include 'reset.sqc'     !Reset printer procedure
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'stdapi.sqc'    !Update Process API
+#Include 'datemath.sqc'  !Does the date-math functions
+#Include 'getbalid.sqc'  !Get-Calendar-Year-Id
+#Include 'askaod.sqc'    !Ask-As-Of-Date procedure

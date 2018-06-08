@@ -1,0 +1,1477 @@
+! ***************************************************************!
+!  This software and related documentation are provided under a!
+!  license agreement containing restrictions on use and!
+!  disclosure and are protected by intellectual property!
+!  laws. Except as expressly permitted in your license agreement!
+!  or allowed by law, you may not use, copy, reproduce,!
+!  translate, broadcast, modify, license, transmit, distribute,!
+!  exhibit, perform, publish or display any part, in any form or!
+!  by any means. Reverse engineering, disassembly, or!
+!  decompilation of this software, unless required by law for!
+!  interoperability, is prohibited.!
+!  The information contained herein is subject to change without!
+!  notice and is not warranted to be error-free. If you find any!
+!  errors, please report them to us in writing.!
+!  !
+!  Copyright (C) 1988, 2011, Oracle and/or its affiliates.!
+!  All Rights Reserved.!
+! ***************************************************************!
+ 
+ 
+!                                                                    !
+!***********************************************************************
+!                                                                      *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+!                                                                      *
+!                                                                      *
+!                                                                      *
+!                                                                      *
+!***********************************************************************
+!
+! CHANGE HISTORY
+! 07/03/96 - Converted Work List processing to support V6 Business Process
+! definitions. This required a changed to call 'Log-WL-Entry' and call
+! to 'Worklist-gen'.
+! 07/09/96 - Added support to for data conversion profiles. Added
+! "Cvt_Profile_ID" global variable.
+! 07/12/96 - Updated the Format-Value routine to receive the "decimal
+! position" input parameter. This is used to handle implied decimals.
+! 07/24/96 - Changed the select in the proc Get-ECPROFILEIDS to handle
+! parent level trading partner profiles. It now selects either the profile
+! info from the current TPID or the related TPID.
+! 08/20/96 - Added call to "Update-Prcs-Run-Status" to update the run
+! control status in process scheduler.
+! 08/22/96 - Changed date logic in 'Format-Value' so that global
+! define 'DYN-DateTimeIn-Prefix' is used.
+! 09/23/96 - Changed correlation table names so that they don't match
+! actual table names. This fix is for DB2 support. In most cases dropped
+! correlation usage.
+! 09/30/96 - Changed the select in 'Get-ECPROFILEIDS' routine so that
+! it complies with new standard of EC_RELATED_TP_ID. New rule says that
+! if RELATED = EC_EXT_TP_ID then it is a partner, otherwise it is a child.
+! This simplifies the join condition.
+! 10/17/96 - Due to DB2 returning trailing blanks, needed to use 'rtrim'
+! function for all selected character columns.
+! 10/28/96 - Dropped usage of local $Current_datetime variable and
+! referenced the standard $SysDateTime variable.
+! 11/13/96 - Changed Get-Action_Code routine to handle NULL secondary
+! event codes. Only primary are required for selection.
+! 01/15/97 - Changed the insert into ECBUSDOCERR to use DESCR254 column.
+! This data type is compatible across platforms (old column was long).
+!
+!***********************************************************************
+
+
+!----------------------------------------------------------------------!
+!  Get-BUSDOC
+!  This proc is used when trying to reprocess an inbound data file that
+!  was in error. It retrieves the business document file name from
+!  the original load information header table.
+!----------------------------------------------------------------------!
+begin-procedure Get-BUSDOC(#busdocid, :$file_name)
+   #debugh do debug-msg('Get-BUSDOC')
+
+begin-select on-error=SQLError
+
+ECBUSDOCID
+ECBUSDOCFILENAME
+
+   let $file_name = rtrim(&ECBUSDOCFILENAME,' ')
+
+FROM PS_ECBUSDOCHDR
+WHERE ECBUSDOCID = #busdocid
+
+end-select
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+!  Get-ECBUSDOCID 
+!  Modified by Hexaware - Incident: 728555003, 23/07/2004
+!  The Doc ID is a single row table that contains a sequence number
+!  for the last document ID processed. This proc selects that number,
+!  sets the start and end IDs for batch, and updates the ID in the table
+!----------------------------------------------------------------------!
+begin-procedure Get-ECBUSDOCID
+#debugh do debug-msg('Get-ECBUSDOCID')
+
+   let #ECBUSDOCID = -1
+begin-sql on-error=SQLError
+   UPDATE PS_ECBUSDOCID
+   SET ECBUSDOCID = ECBUSDOCID + 1
+end-sql
+   
+begin-select on-error=SQLError
+ECBUSDOCID
+
+   let #ECBUSDOCID = &ECBUSDOCID
+   if #ECBUSDOCID_START = 0             ! First document in batch
+      let #ECBUSDOCID_START = #ECBUSDOCID
+      let #ECBUSDOCID_END   = #ECBUSDOCID
+   else
+      let #ECBUSDOCID_END = #ECBUSDOCID
+   end-if
+
+FROM PS_ECBUSDOCID
+end-select
+
+   if #ECBUSDOCID = -1          ! First time the Agent has been run
+
+      begin-sql on-error=SQLError
+         INSERT INTO PS_ECBUSDOCID VALUES (1)
+      end-sql
+
+begin-select on-error=SQLError
+ECBUSDOCID &FIRST_ECBUSDOCID
+
+   let #ECBUSDOCID = &FIRST_ECBUSDOCID
+   if #ECBUSDOCID_START = 0             ! First document in batch
+      let #ECBUSDOCID_START = #ECBUSDOCID
+      let #ECBUSDOCID_END   = #ECBUSDOCID
+   else
+      let #ECBUSDOCID_END = #ECBUSDOCID
+   end-if
+
+FROM PS_ECBUSDOCID
+end-select
+ 
+   end-if
+   #debugv display '#ECBUSDOCID=' noline
+   #debugv display #ECBUSDOCID
+
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+!  Process-ECBUSDOCHDR
+!  This proc adds a new row into the business document table to start
+!  tracking this unit of work.
+!  It also sets the global variable for maximum size of detail message.
+!----------------------------------------------------------------------!
+begin-procedure Process-ECBUSDOCHDR(#ecbusdocid, $file_name, $direction_sw, $log_status)
+   #debugh do debug-msg('Process-ECBUSDOCHDR')
+
+ let #_Detail_Max = 50
+
+begin-sql on-error=SQLError
+
+INSERT INTO PS_ECBUSDOCHDR
+(
+ECBUSDOCID,
+ECBUSDOCFILENAME,
+ECTRANSINOUTSW,
+ECBUSDOCSTATUS,
+ECERRORTOTAL,
+ECLOADTOTAL
+)
+VALUES
+(
+#ecbusdocid,
+$file_name,
+$direction_sw,
+$log_status,
+0,
+0
+)
+
+end-sql
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+!  Process-ECBUSDOCLN
+!  This proc creates a header record for the current LUW
+!----------------------------------------------------------------------!
+begin-procedure Process-ECBUSDOCLN(#ecbusdocid, $ectransid, #qinstance_nbr, $direction_sw)
+   #debugh do debug-msg('Process-ECBUSDOCLN')
+   #debugv display 'docid=' noline
+   #debugv display #ecbusdocid
+   #debugv display 'trans id=' noline
+   #debugv display $ectransid
+   #debugv display 'q instance=' noline
+   #debugv display #qinstance_nbr
+   #debugv display 'direction switch=' noline
+   #debugv display $direction_sw
+
+begin-sql on-error=SQLError
+
+INSERT INTO PS_ECBUSDOCLN
+(
+ECBUSDOCID,
+ECTRANSID,
+ECQUEUEINSTANCE,
+ECTRANSINOUTSW
+)
+VALUES
+(
+#ecbusdocid,
+$ectransid,
+#qinstance_nbr,
+$direction_sw
+)
+
+end-sql
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+!  Process-ECBUSDOCDTL
+!----------------------------------------------------------------------!
+begin-procedure Process-ECBUSDOCDTL
+   #debugh do debug-msg('Process-ECBUSDOCDTL')
+
+   let #infile_length = {PS-length}($ECDATAVALUE)
+   let #total_detail = trunc((#infile_length / #Detail_Max),0)
+   let #total_mod    = mod(#infile_length,#Detail_Max)
+
+   #debugv display '#LUWlinenum=' noline
+   #debugv display #LUWlinenum
+   #debugv display '#ecqueueinstance_err=' noline
+   #debugv display #ecqueueinstance_err
+
+   #debugv display '#Infile_Length= ' noline
+   #debugv display #infile_length
+   #debugv display '#total_detail=' noline
+   #debugv display #total_detail
+   #debugv display '#Total_Mod=' noline
+   #debugv display #total_mod
+
+   if mod(#infile_length,#Detail_Max) > 0
+      let #ECBUSDOCDATAROWS = trunc((#infile_length / #Detail_Max),0) + 1
+   else
+      let #ECBUSDOCDATAROWS = trunc((#infile_length / #Detail_Max),0)
+   end-if
+
+begin-sql on-error=SQLError
+
+INSERT INTO PS_ECBUSDOCDTL
+(
+ECBUSDOCID,
+ECTRANSID,
+ECQUEUEINSTANCE,
+ECTRANSINOUTSW,
+ECLUW_SEQNO,
+ECFILEROWID,
+ECBUSDOCSTATUS,
+ECBUSDOCDATAROWS
+)
+VALUES
+(
+#ECBUSDOCID,
+$ECTRANSID,
+#ecqueueinstance_err,
+$Bus_Doc_In_Out_Sw,
+#LUWlinenum,
+$ecfilerowid_filedata0,
+$ECBUSDOCDTL_Status,
+#ECBUSDOCDATAROWS
+)
+
+end-sql
+
+   let #SEQNO = 1
+   let #StartPos = 1
+
+   while #SEQNO <= #ECBUSDOCDATAROWS
+
+      let $ERRDATAVALUE = {PS-substr}($ECDATAVALUE,#StartPos,#Detail_Max)
+      let #ERRDATALENGTH = {PS-length}($ERRDATAVALUE)
+
+      #debugv display '$ERRDATAVALUE=' noline
+      #debugv display $ERRDATAVALUE
+      #debugv display '#ERRDATALENGTH=' noline
+      #debugv display #ERRDATALENGTH
+      #debugv display '#SEQNO=' noline
+      #debugv display #SEQNO
+
+      do Process-ECBUSDOCDATA
+      let #StartPos = #StartPos + #Detail_Max
+      let #SEQNO = #SEQNO + 1
+
+   end-while
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+!  Process-ECBUSDOCDATA
+!----------------------------------------------------------------------!
+begin-procedure Process-ECBUSDOCDATA
+   #debugh do debug-msg('Process-ECBUSDOCDATA')
+
+
+begin-sql on-error=SQLError
+
+INSERT INTO PS_ECBUSDOCDATA
+(
+ECBUSDOCID,
+ECTRANSID,
+ECQUEUEINSTANCE,
+ECTRANSINOUTSW,
+ECLUW_SEQNO,
+SEQNO,
+ECDATALENGTH,
+ECDATAVALUE
+)
+VALUES
+(
+#ECBUSDOCID,
+$ECTRANSID,
+#ecqueueinstance_err,
+$Bus_Doc_In_Out_Sw,
+#LUWlinenum,
+#SEQNO,
+#ERRDATALENGTH,
+$ERRDATAVALUE
+)
+
+end-sql
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+!  Process-ECBUSDOCERR
+!----------------------------------------------------------------------!
+begin-procedure Process-ECBUSDOCERR
+   #debugh do debug-msg('Process-ECBUSDOCERR')
+
+   let #Err_Seq = 0
+
+begin-select on-error=SQLError
+
+MAX(SEQNO)  &MAX_SEQ
+
+  let #Err_Seq = &MAX_SEQ + 1
+
+FROM PS_ECBUSDOCERR
+WHERE ECBUSDOCID = #ECBUSDOCID
+AND   ECTRANSID  = $ECTRANSID
+AND   ECQUEUEINSTANCE = #ecqueueinstance_err
+AND   ECTRANSINOUTSW = $Bus_Doc_In_Out_Sw
+AND   ECLUW_SEQNO = #LUWlinenum
+
+end-select
+
+   #debugv display '#ecqueueinstance_err=' noline
+   #debugv display #ecqueueinstance_err
+   #debugv display '#LUWlinenum=' noline
+   #debugv display #LUWlinenum
+   #debugv display '#Err_Seq=' noline
+   #debugv display #Err_Seq
+   let $Error_Misc = {PS-substr}($Error_Misc, 1, 254)
+
+begin-sql on-error=SQLError
+
+INSERT INTO PS_ECBUSDOCERR
+(
+ECBUSDOCID,
+ECTRANSID,
+ECQUEUEINSTANCE,
+ECTRANSINOUTSW,
+ECLUW_SEQNO,
+SEQNO,
+MESSAGE_SET_NBR,
+DESCR254,
+MESSAGE_NBR
+)
+VALUES
+(
+#ECBUSDOCID,
+$ECTRANSID,
+#ecqueueinstance_err,
+$Bus_Doc_In_Out_Sw,
+#LUWlinenum,
+#Err_Seq,
+#MESSAGE_SET_NBR,
+$Error_Misc,
+#MESSAGE_NBR)
+
+end-sql
+
+end-procedure
+
+!----------------------------------------------------------------------!
+!  Update-ECBUSDOCHDR
+!  This proc will set the business document status based on the global
+!  variable luw_error_total. The logical unit of work total is either
+!  calculated during program run or selected from a previous run (based
+!  on reload flag). It also updates totals for the document.
+!----------------------------------------------------------------------!
+begin-procedure Update-ECBUSDOCHDR(#id, $reload_flag, #load_count, #error_count)
+   #debugh do debug-msg('Update-ECBUSDOCHDR')
+   #debugv display 'id=' noline
+   #debugv display #id
+   #debugv display 'flag=' noline
+   #debugv display #reload_flag
+   #debugv display 'load=' noline
+   #debugv display #load_count
+   #debugv display 'error count=' noline
+   #debugv display #error_count
+
+   if $reload_flag = 'Y'
+      do Get-Preload-Total
+   end-if
+
+   evaluate #error_count
+      when = -1
+         let $temp_status = $_Not_Found_Status
+      when = 0
+         let $temp_status = $_Loaded_Status
+      when-other
+         let $temp_status = $_Load_Error_Status
+   end-evaluate
+   #debugv display 'status=' noline
+   #debugv display $temp_status
+
+begin-sql on-error=SQLError
+   UPDATE PS_ECBUSDOCHDR
+   SET ECBUSDOCSTATUS  = $temp_status,
+       ECLOADTOTAL     = #load_count,
+       ECERRORTOTAL    = #error_count
+   WHERE ECBUSDOCID    = #id
+end-sql
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+!  Update-ECBUSDOCDTL
+!----------------------------------------------------------------------!
+begin-procedure Update-ECBUSDOCDTL
+   #debugh do debug-msg('Update-ECBUSDOCDTL')
+
+   #debugv display 'Update-ECBUSDOCDTL'
+   #debugv display '$Temp_Status'
+   #debugv display $Temp_Status
+   #debugv display '#ECBUSDOCID'
+   #debugv display #ECBUSDOCID
+   #debugv display '$ECTRANSID'
+   #debugv display $ECTRANSID
+   #debugv display '#ecqueueinstance'
+   #debugv display #ecqueueinstance
+
+begin-sql on-error=SQLError
+   UPDATE PS_ECBUSDOCDTL
+   SET ECBUSDOCSTATUS    = $Temp_Status
+   WHERE ECBUSDOCID      = #ECBUSDOCID
+   AND   ECTRANSID       = $ectransid
+   AND   ECQUEUEINSTANCE = #ecqueueinstance
+   AND   ECTRANSINOUTSW  = $Bus_Doc_In_Out_Sw
+end-sql
+
+end-procedure
+
+!----------------------------------------------------------------------!
+!  Get-Preload-Total
+!  This proc resets the logical unit of work load and error totals in the
+!  case where a restart has happened. It sets global variables luw_error_total
+!  and luw_load_total based on document header info.
+!----------------------------------------------------------------------!
+begin-procedure Get-Preload-Total
+   #debugh do debug-msg('Get-Preload-Total')
+
+begin-select on-error=SQLError
+
+ECERRORTOTAL
+ECLOADTOTAL
+
+   if &ECERRORTOTAL > 0
+      let #luw_error_total = &ECERRORTOTAL - 1
+   else
+      let #luw_error_total = 0
+   end-if
+   let #luw_load_total  = #luw_load_total + &ECLOADTOTAL
+
+FROM PS_ECBUSDOCHDR
+WHERE ECBUSDOCID = #ECBUSDOCID
+
+end-select
+
+end-procedure
+
+!----------------------------------------------------------------------!
+!  Get-ECPROFILEIDS
+!  This proc retrieves the trading partner's profile keys based on the
+!  external TPID. It returns the map, data, and trading partner profile IDs.
+!----------------------------------------------------------------------!
+begin-procedure Get-ECPROFILEIDS($tp_id, :$map_pro_id, :$tp_pro_id, :$cvt_pro_id)
+   #debugh do debug-msg('Get-ECPROFILEIDS')
+
+begin-select on-error=SQLError
+
+PARTNER.TP_PROFILE_ID
+PARTNER.ECMAPPROFILEID
+PARTNER.CVT_PROFILE_ID
+
+   let $map_pro_id   = rtrim(&PARTNER.ECMAPPROFILEID, ' ')
+   let $tp_pro_id    = rtrim(&PARTNER.TP_PROFILE_ID, ' ')
+   let $cvt_pro_id   = rtrim(&PARTNER.CVT_PROFILE_ID, ' ')
+
+FROM PS_ECEXTPARTNER PARTNER, PS_ECEXTPARTNER ENTITY
+WHERE ENTITY.EC_RELATED_TP_ID = PARTNER.EC_EXT_TP_ID
+AND   ENTITY.EC_EXT_TP_ID = $tp_id
+
+end-select
+
+   #debugv display 'map_pro_id=' noline
+   #debugv display $map_pro_id
+   #debugv display 'tp_profile_ID='  noline
+   #debugv display $tp_pro_id
+   #debugv display 'cvt_profile_ID='  noline
+   #debugv display $cvt_pro_id
+
+end-procedure
+
+!----------------------------------------------------------------------!
+!  Convert-EC_ALIAS_TP_ID
+!  This proc converts an inbound internal TPID from an alias value to
+!  a business unit.
+!----------------------------------------------------------------------!
+begin-procedure Convert-EC_ALIAS_TP_ID($int_tp_id, $entitycd, :$bu)
+   #debugh do debug-msg('Convert-EC_ALIAS_TP_ID')
+
+   let $bu = ''
+
+begin-select on-error=SQLError
+
+PS_ECINTLINK1.BUSINESS_UNIT
+
+   let $bu = rtrim(&PS_ECINTLINK1.BUSINESS_UNIT, ' ')
+
+FROM  PS_ECINTLINK PS_ECINTLINK1
+WHERE PS_ECINTLINK1.EC_INT_TP_ID = $int_tp_id
+AND   PS_ECINTLINK1.ECENTITYCD   = $entitycd
+
+end-select
+
+   #debugv display '$bu=' noline
+   #debugv display $bu
+
+end-procedure
+
+!----------------------------------------------------------------------!
+!  Convert-External_TP_ID
+!  This proc converts an inbound external trading partner ID to a customer
+!  or vendor number. First, it determines what the setid is for the
+!  business unit in question. The business unit can be either at the
+!  file control level or at the individual transaction level (which
+!  overrides). Next, it will look up the customer or vendor value based
+!  upon the TPID link table. Assumption -- ecentitycd has been provided
+!  in flat file.
+!----------------------------------------------------------------------!
+begin-procedure Convert-External_TP_ID($bus_unit, $tp_id, $entitycd, $recname, :$cust_vndr)
+   #debugh do debug-msg('Convert-External_TP_ID')
+   #debugv display 'bus unit=' noline
+   #debugv display $bus_unit
+   #debugv display 'input $tp_id=' noline
+   #debugv display $tp_id
+   #debugv display '$entitycd=' noline
+   #debugv display $entitycd
+   #debugv display '$recname=' noline
+   #debugv display $recname
+
+   let $cust_vndr = ''
+   let $treename = ''
+   let $_SetCntrlValue = $bus_unit
+   do GetSetID($recname,$treename,$setid)
+   #debugv display 'CE TPID $setid=' noline
+   #debugv display $setid
+
+   if isblank($setid) or isnull($setid)
+      let $setid = $bus_unit
+   end-if
+
+
+begin-select on-error=SQLError
+
+PS_ECEXTTPLINK1.ECCUSTVNDRVAL
+
+   let $cust_vndr = rtrim(&PS_ECEXTTPLINK1.ECCUSTVNDRVAL, ' ')
+
+FROM  PS_ECEXTTPLINK PS_ECEXTTPLINK1
+WHERE PS_ECEXTTPLINK1.EC_EXT_TP_ID = $tp_id
+AND   PS_ECEXTTPLINK1.ECENTITYCD   = $entitycd
+AND   PS_ECEXTTPLINK1.SETID        = $setid
+
+end-select
+
+   #debugv display 'Output $cust_vndr=' noline
+   #debugv display $cust_vndr
+
+end-procedure
+
+!----------------------------------------------------------------------!
+!  Convert-Internal_Cust_Vndr
+!  This proc will convert an outbound customer or vendor value to an
+!  external TPID. It needs the ecentitycd, and value (all from
+!  the staging area).
+!----------------------------------------------------------------------!
+begin-procedure Convert-Internal_Cust_Vndr($bus_unit, $value, $entitycd, $recname, :$tp_id)
+   #debugh do debug-msg('Convert-Internal_Cust_Vndr')
+   #debugv display 'bus unit=' noline
+   #debugv display $bus_unit
+   #debugv display 'input $value= ' noline
+   #debugv display $value
+   #debugv display '$entitycd= ' noline
+   #debugv display $entitycd
+   #debugv display '$recname= ' noline
+   #debugv display $recname
+
+   let $ec_ext_tp_id = ''
+   let $TreeName = ''
+   let $_SetCntrlValue = $bus_unit
+   do GetSetID($recname,$TreeName,$setid) ! common function
+   #debugv display 'CICV $setid=' noline
+   #debugv display $setid
+   do Get-EC_EXT_TP_ID($value, $entitycd, $setid, $tp_id)
+
+   #debugv display '$tp_id= ' noline
+   #debugv display $tp_id
+
+end-procedure
+
+!----------------------------------------------------------------------!
+!  Convert-BUSINESS_UNIT
+!  This proc converts an outbound business unit ID to a trading partner
+!  ID. This is based upon an alias tied to the current external ID.
+!  It returns both the internal trading partner ID plus the corresponding
+!  alias ID.
+!----------------------------------------------------------------------!
+begin-procedure Convert-BUSINESS_UNIT($bu, $entitycd, $ext_tp_id, :$int_tp_id, :$alias_tp_id)
+   #debugh do debug-msg('Convert-BUSINESS_UNIT')
+   #debugv display 'Input Business UNIT ' noline
+   #debugv display $bu
+   #debugv display 'Input entity code ' noline
+   #debugv display $entitycd
+
+   let $alias_tp_id = ''
+   let $int_tp_id = ''
+
+begin-select on-error=SQLError
+
+PS_ECINTLINK2.EC_INT_TP_ID,
+PS_ECTPALIAS1.EC_ALIAS_TP_ID
+
+   let $int_tp_id   = rtrim(&PS_ECINTLINK2.EC_INT_TP_ID, ' ')
+   let $alias_tp_id = rtrim(&PS_ECTPALIAS1.EC_ALIAS_TP_ID, ' ')
+
+FROM  PS_ECINTLINK PS_ECINTLINK2,
+      PS_ECTPALIAS PS_ECTPALIAS1
+WHERE PS_ECINTLINK2.BUSINESS_UNIT = $bu
+AND   PS_ECINTLINK2.ECENTITYCD    = $entitycd
+AND   PS_ECTPALIAS1.EC_EXT_TP_ID  = $ext_tp_id
+AND   PS_ECINTLINK2.EC_INT_TP_ID  = PS_ECTPALIAS1.EC_INT_TP_ID
+
+end-select
+
+   #debugv display '$alias_tp_id ' noline
+   #debugv display $alias_tp_id
+   #debugv display '$int_tp_id ' noline
+   #debugv display $int_tp_id
+
+end-procedure
+
+!----------------------------------------------------------------------!
+!  Get-EC_EXT_TP_ID
+!  Retrieve the TP_ID for an external trading partner based on internal
+!  number, entity type, and setid.
+!----------------------------------------------------------------------!
+begin-procedure Get-EC_EXT_TP_ID($value, $entitycd, $setid, :$tp_id)
+   #debugh do debug-msg('Get-EC_EXT_TP_ID')
+   #debugv display 'input $value ' noline
+   #debugv display $value
+   #debugv display '$entitycd ' noline
+   #debugv display $entitycd
+   #debugv display '$setid ' noline
+   #debugv display $setid
+
+begin-select on-error=SQLError
+
+PS_ECEXTTPLINK2.EC_EXT_TP_ID
+
+   let $tp_id = rtrim(&PS_ECEXTTPLINK2.EC_EXT_TP_ID,' ')
+
+FROM  PS_ECEXTTPLINK PS_ECEXTTPLINK2
+WHERE PS_ECEXTTPLINK2.ECCUSTVNDRVAL = $value
+AND   PS_ECEXTTPLINK2.ECENTITYCD    = $entitycd
+AND   (PS_ECEXTTPLINK2.SETID         = $setid OR
+       PS_ECEXTTPLINK2.SETID = ' ')
+
+end-select
+   #debugv display '$tpid ' noline
+   #debugv display $tp_id
+   #debugh do debug-msg('End Get-EC_EXT_TP_ID')
+
+end-procedure
+
+!----------------------------------------------------------------------!
+!  Get-ENTITYCD_Type
+!  This proc retrieves the entity code type defined in the ECENTITYCDS
+!  record. This is used to determine if an entity is either a business
+!  unit or a customer/vendor.
+!----------------------------------------------------------------------!
+begin-procedure Get-ECENTITYCD_Type($entity_code, :$ec_ext_id_sw, :$recname)
+   #debugh do debug-msg('Get-ENTITYCD_Type')
+
+   #debugv display '$entity_code=' noline
+   #debugv display $entity_code
+   let $ec_ext_id_sw  = ''
+
+begin-select on-error=SQLError
+
+PS_ECENTITYCDS1.ECEXTIDSW
+PS_ECENTITYCDS1.RECNAME
+
+   let $ec_ext_id_sw  = rtrim(&PS_ECENTITYCDS1.ECEXTIDSW, ' ')
+   let $recname  = rtrim(&PS_ECENTITYCDS1.RECNAME, ' ')
+
+FROM PS_ECENTITYCDS PS_ECENTITYCDS1
+WHERE PS_ECENTITYCDS1.ECENTITYCD = $entity_code
+
+end-select
+
+   #debugv display '$ec_ext_id_sw=' noline
+   #debugv display $ec_ext_id_sw
+   #debugv display '$Entity Recname=' noline
+   #debugv display $recname
+
+end-procedure
+
+!----------------------------------------------------------------------!
+!  Get-ECMAPID
+!  Retrieve the data map ID based on input transaction and map profile ID
+!----------------------------------------------------------------------!
+begin-procedure Get-ECMAPID($map_pro_id, $ectransid, $in_out_sw, :$map_id)
+   #debugh do debug-msg('Get-ECMAPID')
+
+   let $map_id = ''
+
+begin-select on-error=SQLError
+
+PS_ECPROMAP1.ECMAPID
+
+   let $map_id = rtrim(&PS_ECPROMAP1.ECMAPID, ' ')
+
+FROM PS_ECPROMAP PS_ECPROMAP1
+WHERE PS_ECPROMAP1.ECMAPPROFILEID = $map_pro_id
+AND   PS_ECPROMAP1.ECMAPID IN
+      (SELECT PS_ECMAPDEFN1.ECMAPID
+       FROM   PS_ECMAPDEFN PS_ECMAPDEFN1
+       WHERE  PS_ECMAPDEFN1.ECTRANSID = $ectransid
+       AND    PS_ECMAPDEFN1.ECTRANSINOUTSW = $in_out_sw)
+
+end-select
+
+   #debugv display '$map_id=' noline
+   #debugv display $map_id
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+!  Get-Action-Code
+!----------------------------------------------------------------------!
+begin-procedure Get-Action-Code( $tp_profile_id, $ectransid,
+                $pri_evt_cd, $sec_evt_cd, :$action_code)
+   #debugh do debug-msg('Get-Action-Code')
+   #debugv display '$tp_profile_ID=' noline
+   #debugv display $tp_profile_ID
+   #debugv display '$ectransid='     noline
+   #debugv display $ectransid
+   #debugv display '$pri_evt_cd='    noline
+   #debugv display $pri_evt_cd
+   #debugv display '$sec_evt_cd='    noline
+   #debugv display $sec_evt_cd
+
+   if isnull($sec_evt_cd)
+      let $sec_evt_cd = ' '               ! reset for PS null value
+   end-if
+   let $action_code = ' '
+
+begin-select on-error=SQLError
+
+PS_ECACTIONS.ECACTIONCD
+
+   let $action_code = rtrim(&PS_ECACTIONS.ECACTIONCD,' ')
+
+FROM PS_ECACTIONS
+WHERE PS_ECACTIONS.TP_PROFILE_ID = $tp_profile_id
+AND   PS_ECACTIONS.ECTRANSID  = $ectransid
+AND   PS_ECACTIONS.ECPRIEVTCD = $pri_evt_cd
+AND   PS_ECACTIONS.ECSECEVTCD = $sec_evt_cd
+
+end-select
+
+   #debugv display 'Output Action Code=' noline
+   #debugv display $action_code
+
+end-procedure
+
+!----------------------------------------------------------------------!
+!  Get-Event_Code
+!  This proc will retrieve the primary and secondary event codes based
+!  on the input TPID and action code. These event codes will be used
+!  on the outbound data stream.
+!----------------------------------------------------------------------!
+begin-procedure Get-Event_Code($tp_profile_id, $ectransid, $action_code,
+                :$pri_evt_cd, :$sec_evt_cd)
+   #debugh do debug-msg('Get-Event-Code')
+
+   #debugv display '$tp_profile_ID=' noline
+   #debugv display $tp_profile_ID
+   #debugv display '$ectransid=' noline
+   #debugv display $ectransid
+   #debugv display '$action_code=' noline
+   #debugv display $action_code
+   let $pri_evt_cd = ''
+   let $sec_evt_cd = ''
+   let $action_code = rtrim($action_code,' ')
+
+begin-select on-error=SQLError
+
+PS_ECACTIONS.ECPRIEVTCD
+PS_ECACTIONS.ECSECEVTCD
+
+   let $pri_evt_cd = rtrim(&PS_ECACTIONS.ECPRIEVTCD, ' ')
+   let $sec_evt_cd = rtrim(&PS_ECACTIONS.ECSECEVTCD, ' ')
+
+FROM PS_ECACTIONS
+WHERE PS_ECACTIONS.TP_PROFILE_ID = $tp_profile_ID
+AND   PS_ECACTIONS.ECTRANSID  = $ectransid
+AND   PS_ECACTIONS.ECACTIONCD = $action_code
+
+end-select
+
+   #debugv display '$pri_evt_cd=' noline
+   #debugv display $pri_evt_cd
+   #debugv display '$sec_evt_cd=' noline
+   #debugv display $sec_evt_cd
+
+end-procedure
+
+!----------------------------------------------------------------------!
+!  Get-ECQUEUEINSTANCE
+!----------------------------------------------------------------------!
+begin-procedure Get-ECQUEUEINSTANCE($ectransid, $inout_sw, :#qinstance)
+   #debugh do debug-msg('Get-ECQUEUEINSTANCE')
+
+   let #qinstance = -1
+
+begin-select on-error=SQLError
+
+ECQUEUEINSTANCE
+
+   let #qinstance = &ECQUEUEINSTANCE
+
+FROM  PS_ECQUEUEINST
+WHERE ECTRANSID = $ECTRANSID
+AND   ECTRANSINOUTSW = $inout_sw
+
+end-select
+
+! Check for previous entries in PC_ECQUEUE for the same ECTRANSID
+begin-select on-error=SQLError
+MAX(PS_ECQUEUE1.ECQUEUEINSTANCE) &maxqinstance
+FROM  PS_ECQUEUE  PS_ECQUEUE1
+WHERE ECTRANSID = $ECTRANSID
+AND   ECTRANSINOUTSW = $inout_sw
+end-select
+
+      begin-SQL  On-Error=SQL-Error
+        DELETE FROM PS_ECQUEUEINST
+        WHERE ECQUEUEINSTANCE = -1 AND ECTRANSID=$ECTRANSID
+      end-SQL
+
+   if #qinstance  = -1
+      if &maxqinstance > 0
+         let #qinstance = &maxqinstance + 1
+      else
+         let #qinstance = 1
+      end-if
+
+      begin-sql on-error=SQLError
+         INSERT INTO PS_ECQUEUEINST
+         (ECTRANSID,ECQUEUEINSTANCE, ECTRANSINOUTSW) VALUES ($ECTRANSID,#qinstance, $inout_sw)
+      end-sql
+   else                  ! Prime Q instance to next available slot
+      add 1 to #qinstance
+   end-if
+   #debugv display 'New #qinstance=' noline
+   #debugv display #qinstance
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+!  Update-ECQUEUEINSTANCE
+!  This proc updates the Q instance counter and then returns the
+!  incremented counter for future processing.
+!----------------------------------------------------------------------!
+begin-procedure Update-ECQUEUEINSTANCE($ectransid, $inout_sw, :#qinstance)
+   #debugh do debug-msg('Update-ECQUEUEINSTANCE')
+   #debugv display 'Input transid=' noline
+   #debugv display $ectransid
+   #debugv display 'Input Q Instance=' noline
+   #debugv display #qinstance
+
+begin-sql on-error=SQLError
+   DELETE FROM PS_ECQUEUEINST
+   WHERE ECTRANSID = $ectransid
+   AND ECQUEUEINSTANCE = -1
+end-sql
+
+begin-sql on-error=SQLError
+   UPDATE PS_ECQUEUEINST
+   SET ECQUEUEINSTANCE = #qinstance
+   WHERE ECTRANSID = $ectransid
+   AND   ECTRANSINOUTSW = $inout_sw
+end-sql
+
+   add 1 to #qinstance
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+!  Update-ECQUEUE
+!  This proc is used by outbound processing to update the status of the EC queue
+!  entry. It updates the bus doc ID since the outbound process creates
+!  a new one each time it is run.
+!----------------------------------------------------------------------!
+begin-procedure Update-ECQUEUE($ectransid, $direction_sw, #qinstance, #docid, $new_status)
+   #debugh do debug-msg('Update-ECQUEUE')
+
+begin-sql on-error=SQLError
+   UPDATE PS_ECQUEUE
+   SET ECQUEUESTATUS = $new_status,
+       ECBUSDOCID    = #docid,
+       ECDRIVERDTTM = {DateTimeIn-Prefix}$_SysDateTime{DateTimeIn-Suffix}
+   WHERE ECTRANSID = $ectransid
+   AND   ECQUEUEINSTANCE = #qinstance
+   AND   ECTRANSINOUTSW = $direction_sw
+end-sql
+
+end-procedure
+
+!----------------------------------------------------------------------!
+!  Process-Tp_Conversion_Type
+!  Given the input parms, it will select either the internal or external data
+!  value from the conversion table (setup in EDI manager). This type of data
+!  conversion is based upon a conversion type (defined in EDI Manager).
+!----------------------------------------------------------------------!
+begin-procedure Process-TP_Conversion_Type($cvt_id, $convert_type, $direction_sw, $in_value, :$result_value)
+   #debugh do debug-msg('Process-TP_Conversion_Type')
+
+   #debugv display '$cvt_id=' noline
+   #debugv display $cvt_id
+   #debugv display 'Convert type=' noline
+   #debugv display $convert_type
+   #debugv display 'Direction Sw=' noline
+   #debugv display $direction_sw
+   #debugv display 'input value=' noline
+   #debugv display $in_value
+
+
+   if isblank($in_value) or isnull($in_value)
+        let $in_value = ' '
+   end-if
+
+   let $result_value = ''
+   if $direction_sw = 'O'
+      let $where_clause = 'WHERE PS_ECTPCVT_LN1.CVT_PROFILE_ID = '
+          || $_sql_char || $cvt_id || $_sql_char
+          || 'AND   PS_ECTPCVT_LN1.ECTPCVTID    = '
+          || $_sql_char || $convert_type || $_sql_char
+          || 'AND   PS_ECTPCVT_LN1.ECINTVALUE   = '
+          || $_sql_char || $in_value || $_sql_char
+          || ' AND PS_ECTPCVT_LN1.ECINTDEF = '
+          || $_sql_char || 'Y' || $_sql_char
+
+   else
+      let $where_clause = 'WHERE PS_ECTPCVT_LN1.CVT_PROFILE_ID = '
+          || $_sql_char || $cvt_id || $_sql_char
+          || ' AND   PS_ECTPCVT_LN1.ECTPCVTID    = '
+          || $_sql_char || $convert_type || $_sql_char
+          || ' AND PS_ECTPCVT_LN1.ECEXTVALUE   = '
+          || $_sql_char || $in_value || $_sql_char
+          || ' AND PS_ECTPCVT_LN1.ECEXTDEF = '
+          || $_sql_char || 'Y' || $_sql_char
+   end-if
+
+begin-select on-error=SQLError
+
+PS_ECTPCVT_LN1.ECINTVALUE
+PS_ECTPCVT_LN1.ECEXTVALUE
+
+   if $direction_sw = 'O'
+      let $result_value   = rtrim(&PS_ECTPCVT_LN1.ECEXTVALUE, ' ')
+   else
+      let $result_value   = rtrim(&PS_ECTPCVT_LN1.ECINTVALUE, ' ')
+   end-if
+
+FROM  PS_ECTPCVT_LN PS_ECTPCVT_LN1
+[$where_clause]
+
+end-select
+
+! if the value is blank, check to see if there is a default specified at the
+! tp conversion header level, if so... use it... if not.. check if PASSTHRU
+! is specified... if so... make the result value the  in value
+
+
+let $where_clause = 'WHERE PS_ECTPCVT_HDR1.CVT_PROFILE_ID = '
+          || $_sql_char || $cvt_id || $_sql_char
+          || ' AND   PS_ECTPCVT_HDR1.ECTPCVTID    = '
+          || $_sql_char || $convert_type || $_sql_char
+
+
+
+begin-select on-error=SQLError
+
+PS_ECTPCVT_HDR1.ECCVTPASSTHRU
+PS_ECTPCVT_HDR1.ECTPCVTDEFAULT
+
+   let $pass_thru   = rtrim(&PS_ECTPCVT_HDR1.ECCVTPASSTHRU, ' ')
+   let $default_val = rtrim(&PS_ECTPCVT_HDR1.ECTPCVTDEFAULT, ' ')
+
+FROM PS_ECTPCVT_HDR PS_ECTPCVT_HDR1
+[$where_clause]
+
+end-select
+
+if isblank($result_value) or isnull($result_value)
+
+ if isblank($default_val) or isnull($default_val)
+    if $pass_thru = 'Y'
+      let $result_value = $in_value
+    end-if
+ else
+    let $result_value = $default_val
+ end-if
+
+end-if
+
+   #debugv display '$result value=' noline
+   #debugv display $result_value
+
+end-procedure
+
+!----------------------------------------------------------------------!
+!  Format-Value
+!----------------------------------------------------------------------!
+begin-procedure Format-Value($data_type, :$value, #decimal_pos)
+
+   #debugv display 'Format-Value type=' noline
+   #debugv display $data_type
+   #debugv display 'Format-Value in value=' noline
+   #debugv display $value
+   #debugv display 'decimal pos=' noline
+   #debugv display #decimal_pos
+
+   let $value = rtrim($value, ' ')
+
+   ! 0=char,1=long,2=number,3=sign,4=date,5=time,6=dttm,8=image
+
+   evaluate $data_type
+      when = '0'
+         if isblank($value)     ! set field = blank for DB insert
+            let $value = ' '
+         else
+            do translate-char($value, $_sql_char, $value)
+         end-if
+         let $value = $_sql_char || $value || $_sql_char ! bracket data value with quotes
+      when = '2'
+      when = '3'
+         if isblank($value)
+            let $value = '0'
+         else
+            if  #decimal_pos > 0 and instr($value,'.', 1) = 0
+               let #insert_point = {PS-length}($value) - #decimal_pos
+               let #insert_point = cond(#insert_point < 0, 0, #insert_point)
+               let $temp = {PS-substr}($value, #insert_point + 1, #decimal_pos)
+               let $value = {PS-substr}($value, 1, #insert_point) || '.' || $temp
+            end-if
+         end-if
+      when = '4'
+
+         do Format-Datetime($value, $value, {DEFYMD}, '', 'native')
+         let $value = '{DYN-DateIn-Prefix}' || $_sql_char || $value
+                      || $_sql_char || '{DYN-DateIn-Suffix}'
+
+         #debugv display 'Format-Value as Loaded' noline
+         #debugv display $value
+
+      when = '5'    ! Need special work around since time only is not handled by Format-DateTime
+         do Convert_Time_Output($value, $value)
+         let $value = '{DYN-TimeIn-Prefix}' || $value || '{DYN-TimeIn-Suffix}'
+
+      when = '6'
+         do Format-Datetime($value, $value, {DEFYMD}, 'time', 'native')
+         let $value = '{DYN-DateTimeIn-Prefix}' || $_sql_char || $value ||
+                      $_sql_char || '{DYN-DateTimeIn-Suffix}'
+      when-other
+         break
+   end-evaluate
+
+end-procedure
+
+
+
+!----------------------------------------------------------------------!
+! Process-Flex-Date
+!
+! our goal here is to convert whatever is in the flatfile
+! (specified by date positions) to a format
+! of YYYY/MM/DD which is what SQR seems to process correctly.
+! or (of course) vise versa... This will be called by both inbound and outbound
+! agents.
+! In order to limit the amount of parsing done by the agent, the
+! actual formatting of the date has been moved to the client (online) so
+! all we need is the year,month and date starting positions and length as
+! well as the delimiter.
+!----------------------------------------------------------------------!
+begin-procedure Process-Flex-Date($indate,:$outdate, #y_start,#y_len,#m_start,#m_len,#d_start,#d_len,$delim,
+      $inout_sw)
+
+
+let $long_months = 'JANFEBMARAPRMAYJUNJULAUGSEPOCTNOVDEC'
+
+
+if $inout_sw = 'I'   ! inbound date  so we want to convert to YYYY/MM/DD before loading
+    let $y_val = {PS-substr}($indate,#y_start,#y_len)
+    let $m_val = {PS-substr}($indate,#m_start,#m_len)
+    let $d_val = {PS-substr}($indate,#d_start,#d_len)
+
+    if #m_len = 3 ! we have to convert from MMM (JAN)
+        let #mnth_loc = trunc(((instr($long_months,$m_val,1) + 2)/3),0)
+        let $m_val = to_char(#mnth_loc)
+        if #mnth_loc <= 9
+          let $m_val = '0'||$m_val
+        end-if
+       #debugv display 'Month Converted to Number: ' noline
+       #debugv display $m_val
+    end-if
+
+    if #y_len = 2   ! we have to determine what century to add
+                    ! this is always a tricky thing to do...as we don't if it's a birthdate or
+                    ! the half life of some chemical substance.  Since delimiter is not really used
+                    ! for inbound... we'll force 21st century if delim is 2, 20th if 1.
+                    ! if neither, than 21st if year is < 50, 20 if >= 50.  No panacea on this.
+        let $assume_cent = '19'
+
+        if $delim = '2'
+            let $assume_cent = '20'
+        else
+           if $delim = '1'
+           else
+             if to_number($y_val) < 50
+               let $assume_cent = '20'
+             end-if
+           end-if
+        end-if
+        let $y_val = $assume_cent || $y_val
+
+    end-if
+
+! we will force in a '/' for the delimiter since that is what sqr likes.
+
+    let $outdate = $y_val||'/'||$m_val||'/'||$d_val
+
+    #debugv display 'converted date=' noline
+    #debugv display $outdate
+
+
+       !  OUTBOUND
+else   ! outbound date so we want to convert FROM YYYY/MM/DD to their template
+
+   let $y_val = {PS-substr}($indate,1,4)
+   let $m_val = {PS-substr}($indate,6,2)
+   let $d_val = {PS-substr}($indate,9,2)
+
+                ! fill the array with the delimiter
+   let #cnt = 1
+   while #cnt <= 20
+     put $delim into flex_date(#cnt)
+     let #cnt = #cnt + 1
+   end-while
+
+   if #m_len = 3  ! we have to convert TO MMM (JAN)
+     let #num_month = (to_number($m_val) * 3) - 2   ! get location in string above.
+     let $m_val = {PS-substr}($long_months,#num_month,3)
+     #debugv display $m_val
+   end-if
+
+   if #y_len =2    ! strip off the century for 2 character years.
+     let $y_val = {PS-substr}($y_val,3,2)
+   end-if
+
+   ! since there is no SQR function to put values INTO a dynamic loc in a str we have
+   ! to use an array  FLEX_DATE which is global.  Kludge !
+
+   if #y_len > #m_len        ! the largest field - this changes if we allow julian dates
+     let #big_len = #y_len
+   else
+     let #big_len = #m_len
+   end-if
+
+   let #y_pos = #y_start     ! counters to hold the location of Y,M and D
+   let #m_pos = #m_start
+   let #d_pos = #d_start
+
+   let #cnt = 1
+
+   while #cnt <= #big_len          ! populate the array
+
+       if #cnt <= #y_len
+           let $temp_char = {PS-substr}($y_val,#cnt,1)
+           put $temp_char into flex_date(#y_pos)
+       end-if
+
+       if #cnt <= #m_len
+           let $temp_char = {PS-substr}($m_val,#cnt,1)
+           put $temp_char into flex_date(#m_pos)
+       end-if
+
+       if #cnt <= #d_len
+           let $temp_char = {PS-substr}($d_val,#cnt,1)
+           put $temp_char into flex_date(#d_pos)
+       end-if
+
+
+       let #cnt = #cnt + 1
+       let #y_pos = #y_pos + 1
+       let #m_pos = #m_pos + 1
+       let #d_pos = #d_pos + 1
+
+   end-while
+
+   get $outdate from flex_date(1)
+             ! extract the string from the array
+   let #cnt = 1
+   let $outdate = ' '
+   while #cnt <= 20
+     get $temp_char from flex_date(#cnt)
+     let $outdate = $outdate || $temp_char
+     let #cnt = #cnt + 1
+   end-while
+
+   let $outdate = ltrim(rtrim($outdate,$delim),' ')
+
+
+   #debugv display 'converted out date=' noline
+   #debugv display $outdate
+
+end-if
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+! Translate char ' for value string. Every time it detects the xlate
+! character in the string, it will insert this char. Used for correctly
+! supporting quotes.
+!----------------------------------------------------------------------!
+begin-procedure translate-char($data_val, $xlate, :$char_result)
+   #debugh do debug-msg('translate-char ')
+
+   if instr($data_val,$xlate,1) > 0
+
+      let #m = 1
+      let #length_of = {PS-length}($data_val)
+      let $char_result = ''
+
+      while #m <= #length_of
+         let $char = {PS-substr}($data_val, #m, 1)
+         evaluate $char
+            When = $xlate
+               let $char_result = $char_result || $xlate || $char
+            When-Other
+               let $char_result = $char_result || $char
+         end-evaluate
+         add 1 to #m
+      end-while
+
+   else
+      let $char_result = $data_val
+   end-if
+   #debugv display 'translate char $char_result=' noline
+   #debugv display $char_result
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+! Strip Char will loop through all characters in the value string
+! provided and remove all occurrences of ANY CHARACTER in $strip.
+! This is used to remove characters like dashes, periods etc.
+!----------------------------------------------------------------------!
+
+begin-procedure Process-Strip-Char($invalue,:$outvalue,$strip)
+
+  let #val_len = {PS-length}($invalue)
+  let #i = 1
+  let $cur_char = ''
+  let $outvalue = ''
+
+  while #i <= #val_len
+
+     let $cur_char = {PS-substr}($invalue,#i,1)
+
+     if instr($strip, $cur_char, 1) = 0
+
+        let $outvalue = $outvalue || $cur_char
+
+     end-if
+
+     add 1 to #i
+  end-while
+
+end-procedure
+
+
+
+
+!----------------------------------------------------------------------!
+!  Log-WL-Entry
+!  This proc takes care of priming the Worklist business document table
+!  with data needed for worklist entries. It then calls the WL generator
+!  to actually create the PS-compliant worklist data.
+!----------------------------------------------------------------------!
+begin-procedure Log-WL-Entry($bpname, $activity_name, $event_name,
+                             $wlname, $recname, $appname,
+                             #bus_doc_id, $ectransid, #qinstance, $direction_sw)
+   #debugh do debug-msg('Log-WL-Entry')
+   #debugv display '$bpname=' noline
+   #debugv display $bpname
+   #debugv display 'Activity=' noline
+   #debugv display $activity_name
+   #debugv display 'Event=' noline
+   #debugv display $event_name
+   #debugv display '$wlname=' noline
+   #debugv display $wlname
+   #debugv display 'Log-WL recname=' noline
+   #debugv display $recname
+   #debugv display 'bus doc id=' noline
+   #debugv display #bus_doc_id
+   #debugv display '$ectransid=' noline
+   #debugv display $ectransid
+   #debugv display '#qinstance=' noline
+   #debugv display #qinstance
+   #debugv display '$direction_sw=' noline
+   #debugv display $direction_sw
+
+
+begin-sql on-error=SQLError
+
+INSERT INTO PS_ECBUSDOCTMP_WL
+(
+PROCESS_INSTANCE,
+BUSPROCNAME,
+ACTIVITYNAME,
+EVENTNAME,
+WORKLISTNAME,
+INSTANCEID,
+TRANSACTIONID,
+ECBUSDOCID,
+ECTRANSID,
+ECQUEUEINSTANCE,
+ECTRANSINOUTSW
+)
+VALUES
+(
+#_prcs_process_instance,
+$bpname,
+$activity_name,
+$event_name,
+$wlname,
+0,
+0,
+#bus_doc_id,
+$ectransid,
+#qinstance,
+$direction_sw
+)
+
+end-sql
+
+
+
+   do Worklist-Generator($bpname, $activity_name, $event_name, 'ECBUSDOCTMP_WL', $appname)
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+! Procedure: SQLError                                                  !
+! Descr:     Procedure to be executed if an error occurs due to        !
+!            incorrect SQL.  Suppresses the DB2 error status returned  !
+!            when a SELECT embedded in an INSERT or similar statement  !
+!            returns an empty set.                                     !
+!----------------------------------------------------------------------!
+
+begin-procedure SQLError
+#ifdef DB2
+    if #Sql-Status != 6100
+#endif
+
+    display 'SQLError Has Occurred...'
+    display '#Sql-Status'
+    display #Sql-Status
+    display '$SQL-Error'
+    display $SQL-Error
+    display '$SQL-Msg'
+    display $SQL-Msg
+
+    print ' ' (+1,1)
+    print #Sql-Status (+1,1) edit 9999999
+    print $Sql-Error (+1,1)
+    print $Sql-Msg (+1,1)
+
+    let #prcs_run_status = #prcs_run_status_error
+    do Update-Prcs-Run-Status
+    STOP
+
+#ifdef DB2
+    end-if
+#endif
+end-procedure
+
+
+!----------------------------------------------------------------------!
+!  Debug-Msg
+!----------------------------------------------------------------------!
+begin-procedure Debug-Msg($procedure_name)
+   display ' '
+   display '----------------------------------'
+   display $procedure_name
+   display ' '
+end-procedure
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,607 @@
+!***********************************************************************
+! GEXPYAP2:  This program populates GEX VOUCHER and DISTRIB table for  *
+!            AP Interface for Garnishments                             *
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module is the confidential and proprietary information of       *
+! Giant Eagle, Inc.; it is not to be copied, reproduced, or transmitted*
+! in any form, by any means, in whole or in part, nor is it to be used *
+! for any purpose other than that for which it is expressly provided   *
+! without the written permission of Giant Eagle.                       *
+!                                                                      *
+!***********************************************************************
+!                         MODIFICATION HISTORY                         *
+!***********************************************************************
+!  ID#     INITIALS    DATE           DESCRIPTION OF THE CHANGE        *        
+!***********************************************************************
+!  9.0 Upgrade    ISDVNPK   11/12/2007     INITIAL CREATION            *
+!  9.0 GEX ISDVNPK 01/15/2008 Changed to fetch the overide DEPTID & Pay check COMPANY
+!  9.0 GEX ISDVNPK 06/23/2008 Added to slect the MIN SEQ NO for GARNISH to calculate for the GARN COMPANY fee correctly 	
+!
+!  Ujwal Dyasani 10-Feb-2017	Change the process so that it includes *
+!								Child Support garnishments with Payee  *
+!								Name not starting with X               *
+!***********************************************************************
+
+#include 'setenv.sqc' !Set environment
+
+begin-setup
+
+!#include 'setupdb.sqc'
+#include 'setup32a.sqc'
+
+declare-report Report-log
+Printer-Type=HPLASERJET
+  layout=DEFAULT
+end-declare
+
+end-setup
+
+!*********************************************************************
+!Initial processing, retrieving current dates and calls the main 
+!procedure to do the processing.                                     
+!*********************************************************************
+begin-report
+
+  do Init-DateTime
+  do Init-Number
+  do stdapi-init
+  
+  move 'GEXPYAP2' to $ReportID
+  move 'Report Log' to $ReportTitle
+  display $ReportTitle
+  let $orig_source = 'GRN'
+  let #error_count  = 0
+  do Get-Current-DateTime
+
+
+  do Report
+  do Commit-Transaction
+
+  date-time () hh:mi:ss &timeEnded
+  display 'Report Ended: ' noline
+  display &timeEnded
+  if #error_count = 0
+     use-report report-log
+     print 'NO ERRORS FOUND' (+1,1)
+  end-if
+  do stdapi-term
+  do reset
+
+end-report
+
+!*********************************************************************
+
+
+!***************************************************************************
+begin-procedure Report
+
+date-time () hh:mi:ss &timeBegan
+display 'Report Began: ' noline
+display &timeBegan
+
+ move 'N' to $Errorfound
+
+  if $prcs_process_instance = ''
+     		let $reportdate_ccyy = $AsOfToday
+  else
+      Do GEXXX922-Select-Parameters
+      let $reportdate_ccyy = $GEX_RC_PAY.ASOFDATE
+      if rtrim($GEX_RC_PAY.ASOFDATE,' ') = ''
+				let $reportdate_ccyy = $asoftoday
+      end-if
+   end-if   
+
+let $rnctl_Date = $reportdate_ccyy
+
+
+ do process-employee-data
+ do Process-GARN-COMPFEE-Data
+
+ if $sev-error = 'Y'
+    goto report-exit
+ end-if
+  
+Report-Exit:
+
+
+  date-time () hh:mi:ss &timeProcess
+  display #InputTran 99999 noline
+  display ' Transactions Processed: ' noline
+  display &timeProcess
+
+end-procedure
+
+!*********************************************************************
+!Prints the header information in the report log.
+!*********************************************************************
+
+begin-heading 6 for-reports=(report-log)
+
+ move 'Report Log' to $ReportTitle
+LET $REPORTID = 'GEXPYAP2'
+ #Include 'stdhdg01.sqc'
+
+  position (+2)
+ 
+end-heading
+
+
+!*********************************************************************
+!Prints the footer in the report log
+!*********************************************************************
+
+begin-footing 2 for-reports=(Report-log)
+page-number (1,160) 'Page '  
+last-page () ' of ' '.'
+
+end-footing
+
+
+!*********************************************************************
+!Retrieves the employees with latest paychecks and with garnishment 
+!deductions.
+!*********************************************************************
+
+Begin-Procedure Process-Employee-Data
+
+move 'N' to $errorfound
+move 'N' to $found
+move 'N' to $new_page
+let #inputtran = 0
+let #deptid_fee = 0
+
+
+position (1)
+
+begin-SELECT 
+B.COMPANY 
+B.PAYGROUP
+DECODE((LTRIM(OVJ.GEX_DEPTID_OVR, ' ')),'',PAYERN3.DEPTID ,OVJ.GEX_DEPTID_OVR) &PB.DEPTID
+C.AP_VENDOR_ID 
+B.PAY_END_DT 
+D.DEDCD
+SUM(D.DED_CUR) &ded_amt
+
+  add 1 to #inputtran
+  move 'Y' to $found
+
+    !move &ded_Amt to #ded_amt
+    !add #ded_amt to #vend_ded_amt
+     move &ded_Amt to #vend_ded_amt
+  move 'N' to $new_page
+
+ let $ap_dedcd       = &d.dedcd 	
+ 
+ do vendor-before
+
+FROM  PS_PAY_CALENDAR A, 
+      PS_PAY_CAL_BAL_ID A1,
+      PS_PAY_CHECK    B,
+      PS_GARN_SPEC    C,
+      PS_PAY_NA_DED_LIAB D,
+      PS_PAY_EARNINGS     PAYERN3, !  9.0 GEX ISDVNPK 01/15/2008
+      PS_JOB             OVJ       !  9.0 GEX ISDVNPK 01/15/2008
+WHERE A.COMPANY 				= A1.COMPANY 
+  AND A.PAYGROUP 				= A1.PAYGROUP
+  AND A.PAY_END_DT 			= A1.PAY_END_DT 
+  AND A1.BALANCE_ID 		= 'CY'
+  AND B.COMPANY         = A.COMPANY
+  AND B.PAYGROUP        = A.PAYGROUP
+  AND B.PAY_END_DT      = A.PAY_END_DT
+  AND B.PAY_END_DT = (SELECT MAX(PAY_END_DT)
+			FROM PS_PAY_CHECK 
+		       WHERE COMPANY = B.COMPANY
+			 AND PAYGROUP = B.PAYGROUP
+			 AND PAY_END_DT <= $rnctl_date)
+  AND B.PAYCHECK_NBR     <> 0
+  AND B.PAYCHECK_STATUS in ('F','A') 
+  AND C.COMPANY         = B.COMPANY
+  AND C.EMPLID          = B.EMPLID
+  AND D.COMPANY         = B.COMPANY
+  AND D.PAYGROUP        = B.PAYGROUP
+  AND D.OFF_CYCLE       = B.OFF_CYCLE
+  AND D.PAGE_NUM        = B.PAGE_NUM
+  AND D.LINE_NUM        = B.LINE_NUM
+  AND D.SEPCHK          = B.SEPCHK
+  AND D.GARNID          = C.GARNID
+  AND D.PAY_END_DT      = B.PAY_END_DT
+  !AND C.GARN_STATUS IN ('A','R')	! GEX ISDVNPK removed as per mail from Cynthia/Patricia on 12/19/2007
+  !Commnted by Ujwal Dyasani 10-Feb-2017 - Begin
+  !AND C.GARN_TYPE != 'C'	! Exclude Child Support Payments
+  !Commnted by Ujwal Dyasani 10-Feb-2017 - End
+  !  9.0 GEX ISDVNPK 01/15/2008
+  !Added by Ujwal Dyasani 10-Feb-2017 - Begin
+  AND ((C.GARN_TYPE != 'C')
+  or (C.GARN_TYPE = 'C' and upper(c.GARN_PAYEE_NAME) not like 'X%'))
+  !Added by Ujwal Dyasani 10-Feb-2017 - End
+  AND PAYERN3.COMPANY    = D.COMPANY
+  AND PAYERN3.PAYGROUP   = D.PAYGROUP
+  AND PAYERN3.PAY_END_DT = D.PAY_END_DT
+  AND PAYERN3.OFF_CYCLE  = D.OFF_CYCLE
+  AND PAYERN3.PAGE_NUM   = D.PAGE_NUM
+  AND PAYERN3.LINE_NUM   = D.LINE_NUM
+  AND PAYERN3.ADDL_NBR   = D.ADDL_NBR
+  AND PAYERN3.SEPCHK     = D.SEPCHK
+  AND OVJ.EMPLID   = B.Emplid
+  AND OVJ.EMPL_RCD = B.Empl_Rcd
+  AND OVJ.EFFDT = (SELECT MAX(OVJ1.EFFDT) FROM PS_JOB OVJ1
+      								WHERE OVJ1.EMPLID    = OVJ.EMPLID
+												AND OVJ1.EMPL_RCD  = OVJ.EMPL_RCD
+												AND OVJ1.EFFDT    <= $rnctl_date)
+  AND OVJ.EFFSEQ = (SELECT MAX(OVJ2.EFFSEQ) FROM PS_JOB OVJ2
+                      WHERE OVJ2.EMPLID    = OVJ.EMPLID
+                        AND OVJ2.EMPL_RCD  = OVJ.EMPL_RCD
+                        AND OVJ2.EFFDT     = OVJ.EFFDT)
+  !  9.0 GEX ISDVNPK 01/15/2008                        
+  GROUP BY B.COMPANY, B.PAYGROUP, DECODE((LTRIM(OVJ.GEX_DEPTID_OVR, ' ')),'',PAYERN3.DEPTID ,OVJ.GEX_DEPTID_OVR), C.AP_VENDOR_ID, B.PAY_END_DT, D.DEDCD
+  ORDER BY B.COMPANY, B.PAYGROUP, DECODE((LTRIM(OVJ.GEX_DEPTID_OVR, ' ')),'',PAYERN3.DEPTID ,OVJ.GEX_DEPTID_OVR), C.AP_VENDOR_ID, B.PAY_END_DT, D.DEDCD
+end-SELECT
+
+if $found = 'N'
+   print 'No Garnishments found for the latest payroll run'(,34)
+end-if
+
+end-procedure
+
+
+!*********************************************************************
+!Retrieves the employees with latest paychecks and with garnishment 
+!deductions.
+!*********************************************************************
+
+Begin-Procedure Process-GARN-COMPFEE-Data
+
+move 'N' to $errorfound
+move 'N' to $found
+move 'N' to $new_page
+
+begin-SELECT
+BCOM.COMPANY 
+BCOM.PAYGROUP
+DECODE((LTRIM(OVJC.GEX_DEPTID_OVR, ' ')),'',PAYERN3C.DEPTID,OVJC.GEX_DEPTID_OVR) &PBCOM.DEPTID
+CCOM.AP_VENDOR_ID 
+BCOM.PAY_END_DT 
+DCOM.DEDCD
+SUM(DCOM.DEDUCT_CMPNY_FEE) &ded_cmpny_fee
+
+ add 1 to #inputtran
+  move 'Y' to $found
+
+    !move &ded_cmpny_fee to #ded_cmpny_fee
+    !add #ded_cmpny_fee to #vend_fee
+    move &ded_cmpny_fee to #vend_fee
+  
+  
+ let $ap_dedcd       = &dCOM.dedcd 		
+ 
+  do vendor-before1
+
+FROM  PS_PAY_CALENDAR ACOM, 
+      PS_PAY_CAL_BAL_ID ACOM1,
+      PS_PAY_CHECK    BCOM,
+      PS_GARN_SPEC    CCOM,
+      PS_PAY_GARNISH DCOM,
+      PS_PAY_NA_DED_LIAB DL,  !  9.0 GEX ISDVNPK 01/15/2008
+      PS_PAY_EARNINGS     PAYERN3C, !  9.0 GEX ISDVNPK 01/15/2008
+      PS_JOB         OVJC   !  9.0 GEX ISDVNPK 01/15/2008
+WHERE ACOM.COMPANY 				 = ACOM1.COMPANY 
+  AND ACOM.PAYGROUP 			 = ACOM1.PAYGROUP
+  AND ACOM.PAY_END_DT 		 = ACOM1.PAY_END_DT 
+  AND ACOM1.BALANCE_ID 		 = 'CY'
+  AND BCOM.COMPANY         = ACOM.COMPANY
+  AND BCOM.PAYGROUP        = ACOM.PAYGROUP
+  AND BCOM.PAY_END_DT      = ACOM.PAY_END_DT
+  AND BCOM.PAY_END_DT = (SELECT MAX(PAY_END_DT)
+			FROM PS_PAY_CHECK 
+		       WHERE COMPANY = BCOM.COMPANY
+			 AND PAYGROUP = BCOM.PAYGROUP
+			 AND PAY_END_DT <= $rnctl_date)
+  AND BCOM.PAYCHECK_NBR     <> 0
+  AND BCOM.PAYCHECK_STATUS in ('F','A') 
+  AND CCOM.COMPANY         = BCOM.COMPANY
+  AND CCOM.EMPLID          = BCOM.EMPLID
+  AND DCOM.COMPANY         = BCOM.COMPANY
+  AND DCOM.PAYGROUP        = BCOM.PAYGROUP
+  AND DCOM.OFF_CYCLE       = BCOM.OFF_CYCLE
+  AND DCOM.PAGE_NUM        = BCOM.PAGE_NUM
+  AND DCOM.LINE_NUM        = BCOM.LINE_NUM
+  AND DCOM.SEPCHK          = BCOM.SEPCHK
+  AND DCOM.GARNID          = CCOM.GARNID
+  AND DCOM.PAY_END_DT      = BCOM.PAY_END_DT
+  !AND CCOM.GARN_STATUS IN ('A','R')	! GEX ISDVNPK removed as per mail from Cynthia/Patricia on 12/19/2007
+  !Commnted by Ujwal Dyasani 10-Feb-2017 - Begin
+  !AND CCOM.GARN_TYPE != 'C'	! Exclude Child Support Payments
+  !Commnted by Ujwal Dyasani 10-Feb-2017 - End
+  !  9.0 GEX ISDVNPK 01/15/2008
+  !Added by Ujwal Dyasani 10-Feb-2017 - Begin
+  AND ((CCOM.GARN_TYPE != 'C') 
+  or (CCOM.GARN_TYPE = 'C' and upper(CCOM.GARN_PAYEE_NAME) not like 'X%'))
+  !Added by Ujwal Dyasani 10-Feb-2017 - End
+  AND DCOM.COMPANY        = DL.COMPANY
+  AND DCOM.PAYGROUP       = DL.PAYGROUP
+  AND DCOM.OFF_CYCLE      = DL.OFF_CYCLE
+  AND DCOM.PAGE_NUM       = DL.PAGE_NUM
+  AND DCOM.LINE_NUM       = DL.LINE_NUM
+  AND DCOM.SEPCHK         = DL.SEPCHK
+  AND DCOM.GARNID         = DL.GARNID
+  AND DCOM.PAY_END_DT     = DL.PAY_END_DT
+  AND PAYERN3C.COMPANY    = DL.COMPANY
+  AND PAYERN3C.PAYGROUP   = DL.PAYGROUP
+  AND PAYERN3C.PAY_END_DT = DL.PAY_END_DT
+  AND PAYERN3C.OFF_CYCLE  = DL.OFF_CYCLE
+  AND PAYERN3C.PAGE_NUM   = DL.PAGE_NUM
+  AND PAYERN3C.LINE_NUM   = DL.LINE_NUM
+  AND PAYERN3C.ADDL_NBR   = DL.ADDL_NBR
+  AND PAYERN3C.SEPCHK     = DL.SEPCHK
+  ! GEX ISDVNPK 06/23/2008 Added to slect the MIN SEQ NO for GARNISH to calculate for the GARN COMPANY fee correctly 
+  AND DL.seqno = 	 (SELECT MIN(dla1.seqno) FROM PS_PAY_NA_DED_LIAB dla1
+  					WHERE dla1.COMPANY    = DL.COMPANY
+  						AND dla1.PAYGROUP   = DL.PAYGROUP
+  						AND dla1.PAY_END_DT = DL.PAY_END_DT
+  						AND dla1.OFF_CYCLE  = DL.OFF_CYCLE
+  						AND dla1.PAGE_NUM   = DL.PAGE_NUM
+  						AND dla1.LINE_NUM   = DL.LINE_NUM
+  						!AND dla1.ADDL_NBR   = DL.ADDL_NBR
+  						AND dla1.SEPCHK     = DL.SEPCHK
+  						AND dla1.GARNID     = DL.GARNID)	
+  ! GEX ISDVNPK 06/23/2008 Added to slect the MIN SEQ NO for GARNISH to calculate for the GARN COMPANY fee correctly 	
+  AND OVJC.EMPLID   = BCOM.Emplid
+  AND OVJC.EMPL_RCD = BCOM.Empl_Rcd
+  AND OVJC.EFFDT = (SELECT MAX(OVJC1.EFFDT) FROM PS_JOB OVJC1
+      								WHERE OVJC1.EMPLID    = OVJC.EMPLID
+												AND OVJC1.EMPL_RCD  = OVJC.EMPL_RCD
+												AND OVJC1.EFFDT    <= $rnctl_date)
+  AND OVJC.EFFSEQ = (SELECT MAX(OVJC2.EFFSEQ) FROM PS_JOB OVJC2
+                      WHERE OVJC2.EMPLID    = OVJC.EMPLID
+                        AND OVJC2.EMPL_RCD  = OVJC.EMPL_RCD
+                        AND OVJC2.EFFDT     = OVJC.EFFDT)
+  !  9.0 GEX ISDVNPK 01/15/2008                        
+  GROUP BY BCOM.COMPANY, BCOM.PAYGROUP, DECODE((LTRIM(OVJC.GEX_DEPTID_OVR, ' ')),'',PAYERN3C.DEPTID,OVJC.GEX_DEPTID_OVR), CCOM.AP_VENDOR_ID, BCOM.PAY_END_DT, DCOM.DEDCD
+  ORDER BY BCOM.COMPANY, BCOM.PAYGROUP, DECODE((LTRIM(OVJC.GEX_DEPTID_OVR, ' ')),'',PAYERN3C.DEPTID,OVJC.GEX_DEPTID_OVR), CCOM.AP_VENDOR_ID, BCOM.PAY_END_DT, DCOM.DEDCD
+end-SELECT
+
+if $found = 'N'
+   print 'No Garnishments found for the latest payroll run'(,34)
+end-if
+
+end-procedure
+
+
+!*********************************************************************
+begin-procedure vendor-before
+#debug7 show 'Vendor-Before'	
+
+if rtrim(&c.ap_vendor_id,' ') <> ''
+   unstring &c.ap_vendor_id by '-' into $ap_vendor_id_10 $ap_location
+else
+   print 'AP Vendor Id is blank for Deptid :'(,34)
+   print &pb.deptid ()
+   print '; No Voucher is created, please create it manually' ()
+end-if
+
+  Do Deduction-Class
+let $ap_vendor_id_1 = $ap_vendor_id_10||$ap_location
+let $V_AP_VENDOR_ID = $AP_VENDOR_ID_1
+let $V_COMPANY      = &B.COMPANY   ! GEX ISDVNPK 01/15/2008
+let $v_deptid = &pb.deptid
+let $V_ACCOUNT = &GL_LIABILITY
+let $V_INVOICE_DT = &B.PAY_END_DT
+
+
+   #debug7 show '&c.ap_vendor_id ' &c.ap_vendor_id 
+   #debug7 show '&B.PAY_END_DT ' &B.PAY_END_DT
+   #debug7 show '&pb.deptid ' &pb.deptid
+   
+
+do convert-to-dtu-date(&b.pay_end_Dt,$friday_dtu)
+do dtu-add-days($friday_dtu,6,$friday_dtu_dt)
+do convert-from-dtu-date($friday_dtu_dt,$v_due_dt)
+
+
+let $ap_frequency = 'W'
+
+let #V_GROSS_AMT = #vend_ded_amt
+let $V_ENTERED_DT = $rnctl_date
+
+do create-AP-Voucher
+!Begin - use for testing
+!  show '1. vendor-change'
+!  show '&b.pay_end_dt: ' &b.pay_end_dt
+!  show 'Company/Paygroup: ' $prev_company
+!  show '$V_AP_VENDOR_ID ' $V_AP_VENDOR_ID
+!  show '$V_DEPTID ' $V_DEPTID
+!  show '$V_ACCOUNT ' $V_ACCOUNT
+!  show '$V_ENTERED_DT ' $V_ENTERED_DT
+!  show '$V_INVOICE_DT ' $V_INVOICE_DT
+!  show '$V_DUE_DT ' $V_DUE_DT
+! End
+if $bu_found = 'N' and #V_GROSS_AMT <> 0
+   display 'AP Voucher Creation failed:'
+   show '$V_AP_VENDOR_ID ' $V_AP_VENDOR_ID
+   show '$V_DEPTID ' $V_DEPTID
+   show '$V_ACCOUNT ' $V_ACCOUNT
+   show '#V_GROSS_AMT ' #V_GROSS_AMT
+   show '$V_ENTERED_DT ' $V_ENTERED_DT
+   show '$V_INVOICE_DT ' $V_INVOICE_DT
+   show '$V_DUE_DT ' $V_DUE_DT
+   print 'AP Voucher Creation failed:' (,34)
+   print '$V_AP_VENDOR_ID ' ()
+   print $V_AP_VENDOR_ID ()
+   print '$V_DEPTID ' ()
+   print $V_DEPTID ()
+   print '$V_ACCOUNT ' ()
+   print $V_ACCOUNT ()
+   print '#V_GROSS_AMT ' ()
+   print #V_GROSS_AMT ()
+   print '$V_ENTERED_DT ' ()
+   print  $V_ENTERED_DT ()
+   print '$V_INVOICE_DT '  ()
+   print $V_INVOICE_DT ()
+   print  '$V_DUE_DT ' ()
+   print  $V_DUE_DT ()
+end-if
+
+   let $V_AP_VENDOR_ID = ' '
+   Let $V_COMPANY = ' '   ! GEX ISDVNPK 01/15/2008
+   let $V_DEPTID = ' '
+   let $V_INVOICE_DT = ' '
+   let #GROSS_AMT = 0
+   let $V_ENTERED_DT = ' '
+   let $V_ACCOUNT = ' '
+   let $V_DUE_DT = ' '
+
+let #vend_fee = 0
+
+move 0 to #vend_fee
+move 0 to #vend_ded_amt
+
+end-procedure
+
+
+
+!*********************************************************************
+begin-procedure vendor-before1
+#debug7 show 'Vendor-Before1'	
+
+if rtrim(&ccom.ap_vendor_id,' ') <> ''
+   unstring &ccom.ap_vendor_id by '-' into $ap_vendor_id_10 $ap_location
+else
+   print 'AP Vendor Id is blank for Deptid :'(,34)
+   print &pbcom.deptid ()
+   print '; No Voucher is created, please create it manually' ()
+end-if
+let $ap_vendor_id_1 = $ap_vendor_id_10||$ap_location
+let $V_AP_VENDOR_ID = $AP_VENDOR_ID_1
+let $V_COMPANY = &BCOM.COMPANY   ! GEX ISDVNPK 01/15/2008
+let $v_deptid = &pbcom.deptid
+let $V_ACCOUNT = '509155'
+let $V_INVOICE_DT = &Bcom.PAY_END_DT
+
+  
+   #debug7 show '&ccom.ap_vendor_id ' &ccom.ap_vendor_id 
+   #debug7 show '&BCOM.PAY_END_DT ' &BCOM.PAY_END_DT
+   #debug7 show '&pbcom.deptid ' &pbcom.deptid
+   
+
+do convert-to-dtu-date(&bcom.pay_end_Dt,$friday_dtu)
+do dtu-add-days($friday_dtu,6,$friday_dtu_dt)
+do convert-from-dtu-date($friday_dtu_dt,$v_due_dt)
+
+
+let $ap_frequency = 'W'
+
+let #V_GROSS_AMT = 0 - #vend_fee
+let $V_ENTERED_DT = $rnctl_date
+
+   
+   #debug7 show '$V_AP_VENDOR_ID ' $V_AP_VENDOR_ID
+   #debug7 show '&B.PAY_END_DT ' &B.PAY_END_DT
+   #debug7 show '$V_INVOICE_DT set in Vendor before ' $V_INVOICE_DT
+   
+
+do create-AP-Voucher
+! Begin - use for testing
+!  show '2. vendor-change'
+!  show '$friday_dtu:    ' $friday_dtu
+!  show '$friday_dtu_dt: ' $friday_dtu_dt
+!  show '----------------'
+!  show '&b.pay_end_dt:  ' &b.pay_end_dt
+!  show 'Company/Paygroup: ' $prev_company
+!  show '$V_AP_VENDOR_ID ' $V_AP_VENDOR_ID
+!  show '$V_DEPTID ' $V_DEPTID
+!  show '$V_ACCOUNT ' $V_ACCOUNT
+!  show '$V_ENTERED_DT ' $V_ENTERED_DT
+!  show '$V_INVOICE_DT ' $V_INVOICE_DT
+!  show '$V_DUE_DT ' $V_DUE_DT
+! End
+
+if $bu_found = 'N' AND #V_GROSS_AMT <> 0
+   display 'AP Voucher Creation failed:'
+   show '$V_AP_VENDOR_ID ' $V_AP_VENDOR_ID
+   show '$V_DEPTID ' $V_DEPTID
+   show '$V_ACCOUNT ' $V_ACCOUNT
+   show '#V_GROSS_AMT ' #V_GROSS_AMT
+   show '$V_ENTERED_DT ' $V_ENTERED_DT
+   show '$V_INVOICE_DT ' $V_INVOICE_DT
+   show '$V_DUE_DT ' $V_DUE_DT
+   print 'AP Voucher Creation failed:' (,34)
+   print '$V_AP_VENDOR_ID ' ()
+   print $V_AP_VENDOR_ID ()
+   print '$V_DEPTID ' ()
+   print $V_DEPTID ()
+   print '$V_ACCOUNT ' ()
+   print $V_ACCOUNT ()
+   print '#V_GROSS_AMT ' ()
+   print #V_GROSS_AMT ()
+   print '$V_ENTERED_DT ' ()
+   print  $V_ENTERED_DT ()
+   print '$V_INVOICE_DT '  ()
+   print $V_INVOICE_DT ()
+   print  '$V_DUE_DT ' ()
+   print  $V_DUE_DT ()
+
+end-if
+
+   let $V_AP_VENDOR_ID = ' '
+   let $V_COMPANY = ' '   ! GEX ISDVNPK 01/15/2008
+   let $V_DEPTID = ' '
+   let $V_INVOICE_DT = ' '
+   let #GROSS_AMT = 0
+   let $V_ENTERED_DT = ' '
+   let $V_ACCOUNT = ' '
+   let $V_DUE_DT = ' '
+
+let #vend_fee = 0
+
+move 0 to #vend_fee
+
+end-procedure
+
+
+!***************************************************************************
+Begin-Procedure Deduction-Class
+#debug9 Show 'Deduction-Class'
+Begin-Select
+GL_liability
+
+From   ps_deduction_class 
+Where  dedcd            = &D.DEDCD
+And    effdt            =
+      (Select Max(effdt)
+       From   ps_deduction_class 
+       Where  dedcd     = &D.DEDCD
+       And    effdt    <= $rnctl_date)
+End-Select
+End-Procedure
+!***************************************************************************
+
+!********************************************************************
+!This procedure displays in the error report if there are any sql erros
+!happened in the program
+!********************************************************************
+
+begin-procedure SQL-Error-Found($Proc_Name) 
+  print 'SQL Error in ' (,34)
+  print $Proc_Name ()  
+  print $_sql-error () 
+  print 'sql-status:' ()
+  print #_sql-status () edit 99999 
+end-procedure
+
+
+#Include 'tranctrl.sqc'  !Common Transaction Control Procedures
+#Include 'reset.sqc'     !Reset printer procedure
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'payrnctl.sqc'  !Select-Parameters
+#Include 'stdapi.sqc'    !Get_Run_Control Procedure
+#Include 'datemath.sqc'  !Does the date-math functions
+
+#include 'gexxx901.sqc'  !Get company/paygroup multiple row table
+#include 'gexxx902.sqc'  !Get deptid multiple row table
+#include 'gexxx922.sqc'  !Get pay single row run control
+#include 'gexpyvhu.sqc'  !Creates AP Voucher entries

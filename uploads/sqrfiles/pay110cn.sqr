@@ -1,0 +1,748 @@
+!**********************************************
+!  PAY110CN:  Survey of Employment: Education *
+!**********************************************
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+!   This module contains confidential and proprietary information      *
+!   of Oracle; it is not to be copied, reproduced, or transmitted      *
+!   in any form, by any means, in whole or in part, nor is it to       *
+!   be used for any purpose other than that for which it is            *
+!   expressly provided under the applicable license agreement.         *
+!                                                                      *
+!   Copyright (C) 2006 Oracle. All Rights Reserved.                    *
+!***********************************************************************
+!                                                                      *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+!          $Date:  2006/07/20:04:43:13                                 
+!       $Release:  HR9                                                 
+!      $Revision:  101                                                 
+!                                                                      *
+!***********************************************************************
+
+#include 'setenv.sqc' !Set environment
+#Include 'setup02.sqc'  !Printer and page-size initialization
+
+begin-report
+  do Init-Report
+  do Process-Main
+  do Stdapi-Term
+end-report
+
+begin-procedure Init-Report
+  move 'PAY110CN' to $ReportID
+  move 'Survey of Employment: Education ' to $ReportTitle
+  display $ReportTitle
+
+  do Init-DateTime
+  do Init-Number
+  do Stdapi-Init
+  do Get-Calendar-Year-Id
+  if $Prcs_Process_Instance = ''
+    input $Calendar_Year 'Enter Year, e.g. 1990'
+    input $MonthCd 'Enter Month e.g. 1, 2'
+  else
+    do Select-Parameters
+    move #RC_PAY.Balance_Year to $Calendar_Year 9999
+    move #RC_PAY.Balance_Period       to $MonthCd
+  end-if
+
+  move  $Calendar_Year to #Calendar_Year
+  move  $MonthCd to $MonthCd 09
+  move  $MonthCd to #MonthCd
+  do Get-Month-Name ($MonthCd, $MonthName)
+  do Get-Current-DateTime
+  move $AsOfToday to $AsOfDate
+  do Array-Initialization
+end-procedure
+
+
+begin-setup
+
+  page-size 58 177
+
+end-setup
+
+
+begin-procedure Array-Initialization
+  create-array name=LastPeriodTotals size=6 -
+               field=TotalName:char         -
+               field=PrintCol:number        -
+               field=Pay_Begin_Dt:char:3    -
+               field=Pay_End_Dt:char:3      -
+               field=EmplCount:number:3     -
+               field=RegGross:number:3      -
+               field=OT_Earns:number:3      -
+               field=RegHrs:number:3        -
+               field=OT_Hrs:number:3
+
+  put 'Weekly'          into LastPeriodTotals(1) TotalName
+  put 'Every 2 Weeks'   into LastPeriodTotals(2) TotalName
+  put 'Semi-Monthly'    into LastPeriodTotals(3) TotalName
+  put 'Monthly'         into LastPeriodTotals(4) TotalName
+  put 'Other'           into LastPeriodTotals(5) TotalName
+
+  create-array name=IrregularPayments size=5 -
+               field=ErnCd:char              -
+               field=Pay_Begin_Dt:char       -
+               field=Pay_End_Dt:char         -
+               field=NonTeachers:number      -
+               field=Teachers:number         -
+               field=Supply:number
+
+  create-array name=AbsenceCounts     size=6 -
+               field=MinEffDt:char           -
+               field=MaxEffDt:char           -
+               field=NonTeachers:number      -
+               field=Teachers:number         -
+               field=Supply:number
+end-procedure
+
+begin-heading 4
+  #Include 'stdhdg02.sqc'
+
+  move $MonthName to $MonthYear
+  concat ', ' with $MonthYear
+  concat $Calendar_Year with $MonthYear
+  print $MonthYear               (3,1)   center
+
+end-heading
+
+!*************************************************************************
+begin-procedure Process-Main
+begin-SELECT
+A.COMPANY    () on-break print=never  level=1 procedure=Company-Change
+A.PAYGROUP
+A.PAY_BEGIN_DT
+A.PAY_END_DT
+P.EMPL_TYPE
+FT.FREQUENCY_TYPE
+
+  move &A.Company    to $Company
+  move &A.PayGroup   to $PayGroup
+  move &A.Pay_End_Dt to $Pay_End_Dt
+  move &A.Pay_End_Dt to $AsOfDate
+
+  if $Company <> $priorCompany
+    do Get-Company-Data
+    move $Company to $priorCompany
+  end-if
+
+  evaluate &FT.FREQUENCY_TYPE  !set element # for pay frequency
+    when = 'W'                !Weekly
+      move 1 to #Freq#
+    when = 'B'                !BiWeekly
+      move 2 to #Freq#
+    when = 'S'                !SemiMonthly
+      move 3 to #Freq#
+    when = 'M'                !Monthly
+      move 4 to #Freq#
+    when-other                !Other
+      move 5 to #Freq#
+  end-evaluate
+
+  do Get-Employees
+
+  PUT                             &A.Pay_Begin_Dt       -
+                                  &A.Pay_End_Dt         -
+    INTO LASTPERIODTOTALS(#FREQ#)  PAY_BEGIN_DT(0)      -
+                                   PAY_END_DT(0)
+  move 'Y' to $DataFound
+
+FROM  PS_PAY_CALENDAR A,
+      PS_PAYGROUP_TBL P,
+      PS_FREQUENCY_TBL FT
+WHERE A.PAY_CONFIRM_RUN = 'Y'
+  AND A.PAY_END_DT      =
+      (SELECT MAX(A1.PAY_END_DT)
+         FROM PS_PAY_CALENDAR A1, PS_PAY_CAL_BAL_ID A2
+         WHERE A1.COMPANY       = A.COMPANY
+          AND A1.PAYGROUP      = A.PAYGROUP
+          AND A1.COMPANY = A2.COMPANY AND A1.PAYGROUP = A2.PAYGROUP
+          AND A1.PAY_END_DT = A2.PAY_END_DT
+          AND A2.BALANCE_ID = $Calendar_Year_Id
+          AND A2.BALANCE_YEAR  = #Calendar_Year
+          AND A2.BALANCE_PERIOD  = #MonthCd)
+  AND P.COMPANY       = A.COMPANY
+  AND P.PAYGROUP      = A.PAYGROUP
+  AND P.COUNTRY       = 'CAN'
+  AND P.EFFDT            =
+      (SELECT MAX(EFFDT)
+         FROM PS_PAYGROUP_TBL
+        WHERE COMPANY    = A.COMPANY
+          AND PAYGROUP   = A.PAYGROUP
+          AND EFF_STATUS = 'A'
+          AND EFFDT     <= A.PAY_END_DT)
+  AND P.PAY_FREQUENCY    = FT.FREQUENCY_ID
+  AND FT.EFF_STATUS      = 'A'
+  AND FT.EFFDT           =
+      (SELECT MAX(FT1.EFFDT)
+         FROM PS_FREQUENCY_TBL FT1
+         WHERE FT1.FREQUENCY_ID   = FT.FREQUENCY_ID
+           AND FT1.EFF_STATUS     = FT.EFF_STATUS
+           AND FT1.EFFDT         <= P.EFFDT)
+end-SELECT
+
+  move 1 to #changeLevel
+  move 'Y' to $End
+
+  if $DataFound = 'Y'
+    do Get-Irregular-Payments
+    do Get-Month-Year-Totals
+    do Get-Absent-Without-Pay
+    do Print-Report
+  else
+    display 'No Data Selected'
+  end-if
+
+end-procedure
+
+
+begin-procedure Get-Employees
+
+begin-SELECT
+B.EMPLID
+B.EMPL_TYPE
+B.OFF_CYCLE
+B.PAGE_NUM
+B.LINE_NUM
+B.SEPCHK
+B.TOTAL_GROSS
+B.BUSINESS_UNIT
+
+  move &B.Business_unit to $Busunit
+  let $Recname = 'JOBCODE_TBL'
+  do Get-Setid($Busunit,$Recname,$Setid)
+  do Get-Pay-Earnings
+
+  if $Pay_Status_OK = 'Y' !and emplid <> prev emplid
+    ARRAY-ADD 1 to LASTPERIODTOTALS(#FREQ#) EMPLCOUNT(#TYPE#)
+  end-if
+
+FROM  PS_PAY_CHECK B
+WHERE B.COMPANY    = $Company
+  AND B.PAYGROUP   = $PayGroup
+  AND B.PAY_END_DT = $Pay_End_Dt
+ORDER BY B.EMPLID
+end-SELECT
+
+end-procedure
+
+
+begin-procedure Get-Pay-Earnings
+
+  move 'N' to $Pay_Status_OK
+
+begin-SELECT
+C.ADDL_NBR
+C.REG_EARNS+C.REG_HRLY_EARNS &Earnings
+C.REG_HRS+C.REG_EARN_HRS     &Hours
+C.OT_HRLY_EARNS
+C.OT_HRS
+JC.JOBCODE
+JC.JOB_FUNCTION
+
+  evaluate &JC.Job_Function   !set element # for employee type
+    when = 'NTC'              !Non Teaching Staff
+      move 0 to #Type#
+    when = 'TCH'              !Teaching Staff
+      move 1 to #Type#
+    when = 'SUP'              !Supply or Substitute Teaching Staff
+      move 2 to #Type#
+    when-other                !Non Teaching Staff
+      move 0 to #Type#
+  end-evaluate
+
+  ARRAY-ADD                    &Earnings                 -
+                               &Hours                    -
+                               &C.OT_Hrly_Earns          -
+                               &C.OT_Hrs                 -
+    to LastPeriodTotals(#Freq#) RegGross(#Type#)         -
+                                REGHRS(#TYPE#)           -
+                                OT_EARNS(#TYPE#)         -
+                                OT_HRS(#TYPE#)
+
+  do Get-Other-Hours-Earnings
+  move 'Y' to $Pay_Status_OK
+
+FROM  PS_PAY_EARNINGS C,
+      PS_JOBCODE_TBL  JC
+WHERE C.COMPANY         = $Company
+  AND C.PAYGROUP        = $PayGroup
+  AND C.PAY_END_DT      = $Pay_End_Dt
+  AND C.OFF_CYCLE       = &B.Off_Cycle
+  AND C.PAGE_NUM           = &B.PAGE_NUM
+  AND C.LINE_NUM           = &B.LINE_NUM
+  AND C.SEPCHK          = &B.SepChk
+  AND C.OK_TO_PAY       = 'Y'
+  AND C.PAY_LINE_STATUS IN ('C','F','V')
+  AND JC.SETID          = $Setid
+  AND JC.JOBCODE        = C.JOBCODE
+  AND JC.EFFDT          =
+      (SELECT MAX(EFFDT)
+         FROM PS_JOBCODE_TBL
+        WHERE SETID      = JC.SETID
+          AND JOBCODE    = JC.JOBCODE
+          AND EFFDT     <= &A.Pay_End_Dt)
+ORDER BY C.ADDL_NBR
+end-SELECT
+
+end-procedure
+
+
+begin-procedure Get-Other-Hours-Earnings
+
+begin-SELECT
+OTH_HRS,OTH_EARNS
+
+  ARRAY-ADD &Oth_Earns     to LASTPERIODTOTALS(#FREQ#) REGGROSS(#TYPE#)
+  ARRAY-ADD &Oth_Hrs       to LASTPERIODTOTALS(#FREQ#) REGHRS(#TYPE#)
+
+FROM  PS_PAY_OTH_EARNS
+WHERE COMPANY    = $Company
+  AND PAYGROUP   = $PayGroup
+  AND PAY_END_DT = $Pay_End_Dt
+  AND OFF_CYCLE  = &B.Off_Cycle
+  AND PAGE_NUM      = &B.PAGE_NUM
+  AND LINE_NUM      = &B.LINE_NUM
+  AND SEPCHK     = &B.SepChk
+  AND ADDL_NBR      = &C.ADDL_NBR
+end-SELECT
+
+end-procedure
+
+
+begin-procedure Company-Change
+
+  move 2 to #changeLevel
+  do Get-Irregular-Payments
+  do Get-Month-Year-Totals
+  do Print-Report
+
+end-procedure
+
+
+begin-procedure Get-Irregular-Payments
+
+  move 0 to #ErnCdCount
+
+begin-SELECT
+
+GR.SETID
+JT.JOB_FUNCTION
+
+MIN(PC.PAY_BEGIN_DT) &Min_Pay_Begin_Dt
+MAX(PC.PAY_END_DT)   &Max_Pay_End_Dt
+
+OE.ERNCD
+
+#ifdef DB2ALL
+DECIMAL(SUM(OE.OTH_EARNS), 15, 3) &Oth_Earns_MTD
+#else
+SUM(OE.OTH_EARNS)    &Oth_Earns_MTD
+#end-if
+
+  evaluate &JT.Job_Function
+    when = 'NTC'              !NonTeaching Staff
+      ARRAY-ADD &Oth_Earns_MTD to IRREGULARPAYMENTS(#ERNCDCOUNT) NONTEACHERS
+    when = 'TCH'              !Teaching Staff
+      ARRAY-ADD &Oth_Earns_MTD to IRREGULARPAYMENTS(#ERNCDCOUNT) TEACHERS
+    when = 'SUP'              !Supply or Substitue Teachers
+      ARRAY-ADD &Oth_Earns_MTD to IRREGULARPAYMENTS(#ERNCDCOUNT) SUPPLY
+    when-other                !Non Teaching Staff
+      ARRAY-ADD &Oth_Earns_MTD to IRREGULARPAYMENTS(#ERNCDCOUNT) NONTEACHERS
+  end-evaluate
+
+  if #ErnCdCount < 4
+    PUT &OE.ErnCd INTO IRREGULARPAYMENTS(#ERNCDCOUNT) ERNCD
+    add 1 to #ErnCdCount
+  else
+    PUT 'Oth'   INTO IRREGULARPAYMENTS(#ERNCDCOUNT) ERNCD
+  end-if
+
+  GET $Min_Pay_Begin_Dt from IRREGULARPAYMENTS(#ERNCDCOUNT) PAY_BEGIN_DT
+  do Format-DateTime(&Min_Pay_Begin_Dt, $out, {DEFCMP}, '', '')
+  do Format-DateTime($Min_Pay_Begin_Dt, $out1, {DEFCMP}, '', '')
+
+  if $out < $out1 or RTRIM($Min_Pay_Begin_Dt, ' ') = ''
+    PUT &Min_Pay_Begin_Dt INTO IRREGULARPAYMENTS(#ERNCDCOUNT) PAY_BEGIN_DT
+  end-if
+
+  GET $Max_Pay_End_Dt from IRREGULARPAYMENTS(#ERNCDCOUNT) PAY_END_DT
+
+  do Format-DateTime(&Max_Pay_End_Dt, $out, {DEFCMP}, '', '')
+  do Format-DateTime($Max_Pay_End_Dt, $out1, {DEFCMP}, '', '')
+
+  if $out > $out1
+    PUT &Max_Pay_End_Dt INTO IRREGULARPAYMENTS(#ERNCDCOUNT) PAY_END_DT
+  end-if
+
+FROM  PS_PAY_EARNINGS  PE,
+      PS_PAY_OTH_EARNS OE,
+      PS_PAYGROUP_TBL  PG,
+      PS_PAY_CALENDAR  PC, PS_PAY_CAL_BAL_ID PCB,
+      PS_JOBCODE_TBL   JT,
+      PS_REC_GROUP_REC RC, PS_SET_CNTRL_GROUP GR
+WHERE PE.COMPANY            = $Company
+  AND PE.PAYGROUP           = $PayGroup
+  AND OE.PAYGROUP           = $PayGroup
+  AND OE.COMPANY            = PE.COMPANY
+  AND OE.PAYGROUP           = PE.PAYGROUP
+  AND OE.PAY_END_DT         = PE.PAY_END_DT
+  AND OE.OFF_CYCLE          = PE.OFF_CYCLE
+  AND OE.PAGE_NUM              = PE.PAGE_NUM
+  AND OE.LINE_NUM              = PE.LINE_NUM
+  AND OE.SEPCHK             = PE.SEPCHK
+  AND OE.ADDL_NBR              = PE.ADDL_NBR
+  AND JT.SETID              = GR.SETID
+  AND JT.JOBCODE            = PE.JOBCODE
+  AND JT.EFFDT              =
+      (SELECT MAX(EFFDT)
+         FROM PS_JOBCODE_TBL
+         WHERE SETID     = JT.SETID
+          AND JOBCODE    = JT.JOBCODE
+          AND EFFDT     <= &A.Pay_End_Dt)
+  AND PG.PAYGROUP           = $PayGroup
+  AND PC.COMPANY            = $Company
+  AND PC.PAYGROUP           = $PayGroup
+  AND PC.COMPANY            = PCB.COMPANY AND PC.PAYGROUP = PCB.PAYGROUP
+  AND PC.PAY_END_DT         = PCB.PAY_END_DT AND PCB.BALANCE_ID = $Calendar_Year_Id
+  AND PCB.BALANCE_PERIOD    = #MonthCd
+  AND PC.PAY_END_DT         = OE.PAY_END_DT
+  AND RC.RECNAME            = 'JOBCODE_TBL'
+  AND RC.REC_GROUP_ID       = GR.REC_GROUP_ID
+  AND GR.SETCNTRLVALUE      = PE.BUSINESS_UNIT
+GROUP BY GR.SETID, JT.JOB_FUNCTION, OE.ERNCD
+ORDER BY GR.SETID, JT.JOB_FUNCTION, OE.ERNCD
+end-SELECT
+
+end-procedure
+
+
+begin-procedure Get-Month-Year-Totals
+
+begin-SELECT
+
+#ifdef DB2ALL
+DECIMAL(SUM(B1.TOTAL_GROSS), 15, 3) &Total_Gross_Month
+#else
+SUM(B1.TOTAL_GROSS)         &Total_Gross_Month
+#end-if
+
+FROM  PS_PAY_CHECK    B1,
+      PS_PAY_CALENDAR C1, PS_PAY_CAL_BAL_ID C2
+WHERE B1.COMPANY            = $Company
+  AND B1.COMPANY            = C1.COMPANY
+  AND B1.PAYGROUP           = C1.PAYGROUP
+  AND B1.PAY_END_DT         = C1.PAY_END_DT
+  AND C1.COMPANY = C2.COMPANY AND C1.PAYGROUP = C2.PAYGROUP
+  AND C1.PAY_END_DT = C2.PAY_END_DT
+  AND C2.BALANCE_PERIOD            = #MonthCd
+end-SELECT
+
+begin-SELECT
+
+#ifdef DB2ALL
+DECIMAL(SUM(Y.TOTAL_GROSS_YTD), 15, 3) &Total_Gross_YTD
+#else
+SUM(Y.TOTAL_GROSS_YTD)         &Total_Gross_YTD
+#end-if
+
+FROM  PS_CAN_CHECK_YTD Y
+WHERE Y.COMPANY       = $Company
+  AND Y.BALANCE_YEAR = #Calendar_Year
+  AND Y.BALANCE_ID = $Calendar_Year_Id
+  AND Y.BALANCE_PERIOD       =
+      (SELECT MAX(Y1.BALANCE_PERIOD)
+         FROM PS_CAN_CHECK_YTD Y1
+        WHERE Y1.COMPANY       = $Company
+          AND Y1.BALANCE_YEAR = #Calendar_Year
+          AND Y1.BALANCE_ID = Y.BALANCE_ID
+          AND Y1.BALANCE_PERIOD      <= #MonthCd)
+end-SELECT
+end-procedure
+
+!*************************************************************************
+begin-procedure Get-Absent-Without-Pay
+begin-SELECT
+
+CG.SETID
+JJ.JOB_FUNCTION
+E.ACTION_REASON
+
+MIN(E.EFFDT) &MinEffDt
+MAX(E.EFFDT) &MaxEffDt
+
+COUNT(*) &Reason_Count
+
+  evaluate &E.Action_Reason
+    when = 'USH'
+      move 0 to #i
+    when = 'SLO'
+      move 1 to #i
+    when = 'RED'
+      move 2 to #i
+    when = 'TMP'
+      move 3 to #i
+    when = 'SEA'
+      move 4 to #i
+    when-other
+      move 5 to #i
+  end-evaluate
+
+  evaluate &JJ.Job_Function   !set element # for employee type
+    when = 'NTC'              !Non Teaching Staff
+      PUT &Reason_Count INTO ABSENCECOUNTS(#I) TEACHERS
+    when = 'TCH'              !Teaching Staff
+      PUT &Reason_Count INTO ABSENCECOUNTS(#I) SUPPLY
+    when = 'SUP'              !Supply or Substitute Teachers
+      PUT &Reason_Count INTO ABSENCECOUNTS(#I) SUPPLY
+    when-other                !Non Teaching Staff
+      PUT &Reason_Count INTO ABSENCECOUNTS(#I) TEACHERS
+  end-evaluate
+
+  GET $MinEffDt from ABSENCECOUNTS(#I) MINEFFDT
+  do Format-DateTime(&MinEffDt, $out, {DEFCMP}, '', '')
+  do Format-DateTime($MinEffDt, $out1, {DEFCMP}, '', '')
+
+  if $out1 < $out2 or RTRIM($MinEffDt, ' ') = ''
+    PUT &MinEffDt INTO ABSENCECOUNTS(#I) MINEFFDT
+  end-if
+
+  GET $MaxEffDt from ABSENCECOUNTS(#I) MAXEFFDT
+
+  if &MaxEffDt > $MaxEffDt
+    PUT &MaxEffDt INTO ABSENCECOUNTS(#I) MAXEFFDT
+  end-if
+
+FROM PS_EMPLOYEES    E,
+     PS_JOBCODE_TBL JJ,
+     PS_REC_GROUP_REC RG, PS_SET_CNTRL_GROUP CG
+WHERE E.ACTION_REASON IN ('USH','SEA','SLO','TMP','RED')
+  AND JJ.SETID   = CG.SETID
+  AND JJ.JOBCODE = E.JOBCODE
+  AND JJ.EFFDT          =
+      (SELECT MAX(EFFDT)
+         FROM PS_JOBCODE_TBL
+        WHERE SETID      = JJ.SETID
+          AND JOBCODE    = JJ.JOBCODE
+          AND EFFDT     <= &A.Pay_End_Dt)
+  AND RG.RECNAME            = 'JOBCODE_TBL'
+  AND RG.REC_GROUP_ID       = CG.REC_GROUP_ID
+  AND CG.SETCNTRLVALUE      = E.BUSINESS_UNIT
+GROUP BY CG.SETID,
+         JJ.JOB_FUNCTION,
+         E.ACTION_REASON
+end-SELECT
+end-procedure
+
+!*************************************************************************
+begin-procedure Print-Report
+  print 'I.'                               (2,1)
+  print 'INFORMATION FOR THE LAST PAY PERIOD(S) OF THE MONTH' (0,1) center
+  print 'PAY PERIODS'            (+2,1)   center
+  print 'Weekly          '       (+1,43)
+  print 'Every Two Weeks '       (0,65)
+  print 'Semi-Monthly    '       (0,92)
+  print 'Monthly         '       (0,120)
+  print 'Every 4 Weeks or Other' (0,138)
+
+  print 'A. NON TEACHING STAFF             '   (+2,1)
+  print '   1. Period Begin/End Date       '   (+1,1)
+  print '   2. Number of Hourly Employees  '   (+1,1)
+  print '   3. (a) Regular Gross Pay       '   (+1,1)
+  print '      (b) Overtime Pay            '   (+1,1)
+  print '   4. (a) Total Hours Paid        '   (+1,1)
+  print '      (b) Overtime Hours Paid     '   (+1,1)
+  print 'B. TEACHING STAFF                 '   (+2,1)
+  print '   5. Period Begin/End Date       '   (+1,1)
+  print '   6. Number of Salaried Employees'   (+1,1)
+  print '   7. (a) Regular Gross Pay       '   (+1,1)
+  print '      (b) Overtime Pay            '   (+1,1)
+  print '   8. Hours in Standard Work Week '   (+1,1)
+  print 'C. SUPPLY OR SUBSTITUTE TEACHERS  '   (+2,1)
+  print '   9. Period Begin/End Date       '   (+1,1)
+  print '  10. Number of Other Employees   '   (+1,1)
+  print '  11. Regular Gross Pay           '   (+1,1)
+
+  move 0  to #Type#           !Non Teachers
+  move 1  to #Freq#
+  move 7  to #Pos
+  do Print-Detail
+
+  move 1  to #Type#           !Teachers
+  move 1  to #Freq#
+  move 15 to #Pos
+  do Print-Detail
+
+  move 2  to #Type#           !Supply or Substitue Teachers
+  move 1  to #Freq#
+  move 22 to #Pos
+  do Print-Detail
+
+  print 'II.'                                  (+3,1)
+  print 'INFORMATION FOR THE ENTIRE MONTH'     (0,1)   center
+  print '  12. Irregular Payments          '   (+3,1)
+  print 'Payment Type'                         (0,+5)
+  print '  Period Covered  '                   (0,+5)
+  print ' Amount to NonTeachers '              (0,+5)
+  print 'Amount to Teachers'                   (0,+5)
+  print ' Amount to Supply '                   (0,+5)
+  position (+1)
+
+  while #count <= #ErnCdCount
+
+    get                             $ErnCd       -
+                                    #NonTeachers -
+                                    #Teachers    -
+                                    #Supply      -
+      from IrregularPayments(#count) ErnCd       -
+                                     NonTeachers -
+                                     Teachers    -
+                                     Supply
+
+    if RTRIM($ErnCd, ' ') <> ''
+      do Get-Earnings-Name
+    end-if
+
+    if #count <> 4
+      print $EarningsAbbrv                     (+1,40)
+    else
+      print 'Other'                            (+1,40)
+    end-if
+
+    if RTRIM($Min_Pay_Begin_Dt, ' ') <> '' and RTRIM($Max_Pay_End_Dt, ' ') <> ''
+      do Format-DateTime($Min_Pay_Begin_Dt, $PayDates, {DEFDATE}, '', '')
+      concat ' - ' with $PayDates
+      do Format-DateTime($Max_Pay_End_Dt, $Temp, {DEFDATE}, '', '')
+      concat $Temp with $PayDates
+    else
+      move ' ' to $PayDates
+    end-if
+
+    print $PayDates                    (0,59)
+    do Format-Number(#NonTeachers, $out, 'b9,999,999')
+    print $out                         (0,84)
+    do Format-Number(#Teachers, $out, 'b9,999,999')
+    print $out                         (0,106)
+    do Format-Number(#Supply, $out, 'b9,999,999')
+    print $out                         (0,129)
+    add 1 to #count
+  end-while
+
+  print '  13. Total Payroll               '   (+3,1)
+  print 'Survey Month: '                       (0,60)
+  print &Total_Gross_Month                     (0,+2)  edit 999,999,999
+  print 'Year-to-date: '                       (0,100)
+  print &Total_Gross_YTD                       (0,+2)  edit 999,999,999
+
+  print '  14. Employees Absent Without Pay  ' (+3,1)
+  print 'Period Covered'                       (0,+5)
+  print ' Count NoNTeachers'                   (0,+5)
+  print 'Count Teachers'                       (0,+5)
+  print ' Count Supply '                       (0,+5)
+  print '         Unpaid statutory holiday   ' (+2,1)
+  print '         Strike/Lock-out            ' (+1,1)
+  print '         Layoff                     ' (+1,1)
+  print '         Temporary Closure          ' (+1,1)
+  print '         Seasonal Closure           ' (+1,1)
+  print '         Other                      ' (+1,1)
+  position (-6)
+  move 0 to #count
+
+  while #count <= 5
+    position (+1)
+
+    get                         $MinEffDt    -
+                                $MaxEffDt    -
+                                #NonTeachers -
+                                #Teachers    -
+                                #Supply      -
+      from AbsenceCounts(#count) MinEffDt    -
+                                 MaxEffDt    -
+                                 NonTeachers -
+                                 Teachers    -
+                                 Supply
+
+    if RTRIM($MinEffDt, ' ') <> ''
+      do Format-DateTime($MinEffDt, $EffDates, {DEFDATE}, '', '')
+      concat ' - ' with $EffDates
+      do Format-DateTime($MaxEffDt, $Temp, {DEFDATE}, '', '')
+      concat $Temp with $EffDates
+      print $EffDates                          (0,42)
+      do Format-Number(#NonTeachers, $out, 'b99,999')
+      print $out                               (0,65)
+      do Format-Number(#Teachers, $out, 'b99,999')
+      print $out                               (0,86)
+      do Format-Number(#Supply, $out, 'b99,999')
+      print $out                               (0,104)
+    end-if
+
+    add 1 to #count
+  end-while
+
+end-procedure
+
+
+begin-procedure Print-Detail
+  columns 40 65 90 115 140
+
+  while #Freq# <= 5
+    position (#Pos)
+
+    get                             $Pay_Begin_Dt         -
+                                    $Pay_End_Dt           -
+      from LastPeriodTotals(#Freq#)  Pay_Begin_Dt(0)      -
+                                     Pay_End_Dt(0)
+
+    if RTRIM($Pay_Begin_Dt, ' ') <> ''
+      do Format-DateTime($Pay_Begin_Dt, $PayDates, {DEFDATE}, '', '')
+      concat ' - ' with $PayDates
+      do Format-DateTime($Pay_End_Dt, $Temp, {DEFDATE}, '', '')
+      concat $Temp with $PayDates
+      print $PayDates           (+1,1)
+    end-if
+
+    get #EmplCount from LastPeriodTotals(#Freq#) EmplCount(#Type#)
+    do Format-Number(#EmplCount, $out, 'b99,999')
+    print $out        (+1,5)
+
+    get #RegGross  from LastPeriodTotals(#Freq#) RegGross(#Type#)
+    do Format-Number(#RegGross, $out, 'b99,999,999')
+    print $out        (+1,1)
+
+    get #OT_Earns  from LastPeriodTotals(#Freq#) OT_Earns(#Type#)
+    do Format-Number(#OT_Earns, $out, 'b99,999,999')
+    print $out        (+1,1)
+
+    get #RegHrs    from LastPeriodTotals(#Freq#) RegHrs(#Type#)
+    do Format-Number(#RegHrs, $out, 'b99,999,999')
+    print $out        (+1,1)
+
+    get #OT_Hrs    from LastPeriodTotals(#Freq#) OT_Hrs(#Type#)
+    do Format-Number(#OT_Hrs, $out, 'b99,999,999')
+    print $out        (+1,1)
+
+    add 1 to #Freq#
+    next-column
+  end-while
+
+  columns 1
+end-procedure
+
+
+#Include 'getcodta.sqc'  !Get-Company-Data procedure
+#Include 'reset.sqc'     !Reset printer procedure
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'getmonnm.sqc'  !Get-Month-Name procedure
+#Include 'geternnm.sqc'  !Get-Earnings-Name procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'stdapi.sqc'    !Update Process API
+#Include 'payrctl2.sqc'  !Get-Run-Control procedure
+#Include 'getbalid.sqc'  !Get-Calendar-Year-Id
+#Include 'getsetid.sqc'  !Get-Calendar-Year-Id
+#Include 'sqrtrans.sqc'  !Translate SQR strings to given language

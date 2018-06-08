@@ -1,0 +1,585 @@
+!***********************************************************************
+! GEXBNYPA: Youngstown Anniversary Yr Evaluation - Pension Contribution*
+!***********************************************************************
+!           This program prints out a report showing each ee that had  *
+!           a new job row inserted and also a log that shows each ee   *
+!           that came through for processing and how they were         *
+!           evaluated.   It calculates the benefit changes on the      *
+!           actual hours worked and inserts config7 field on PS_JOB    *
+!           for Youngstown Clerks:(BProgram=R19,R20,R21,R22,R23,R24,R25)  
+!           It will run weekly.  Ee's must have service date >= 9/12/02*
+!           (from SQR PRocess Tbl) and must have >= 12 months of srvc; *
+!           and their anniversary date (the month and day) must fall   *
+!           between the pay begin date and pay end date.               * 
+!           Config7 will be updated to 'A000000' if avg hours worked   * 
+!           in the past year is >= 32.  Config7 updated to 'B000000'   *                                
+!           if avg hours worked < 32. Job rows inserted with ATO/BLC   *
+!           and effdt is Sunday before job run date.                   *
+!***********************************************************************
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module is the confidential and proprietary information of       *
+! Giant Eagle, Inc.; it is not to be copied, reproduced, or transmitted*
+! in any form, by any means, in whole or in part, nor is it to be used *
+! for any purpose other than that for which it is expressly provided   *
+! without the written permission of Giant Eagle.                       *
+!***********************************************************************
+!                         MODIFICATION HISTORY                         *
+!***********************************************************************
+!  CSR   INITIALS   DATE     DESCRIPTION OF THE CHANGE	               *	
+!***********************************************************************
+! HR10312  SCM   11/11/2003  INITIAL CREATION                          *
+!***********************************************************************
+#include 'setenv.sqc' !Set environment
+#include 'setup32.sqc'
+ 
+begin-setup
+
+
+declare-report JobInsert-Detail-Report
+ Printer-Type=HPLASERJET            !If you run in SQRW, comment this out or the carriage cntls will show
+ layout=Default
+end-declare
+
+declare-report Report-log
+  Printer-Type=HPLASERJET           !If you run in SQRW, comment this out 
+  layout=Default
+end-declare
+
+end-setup
+
+!*********************************************************************
+!Initial processing, retrieving current dates and calls the main 
+!procedure to do the processing.                                     
+!*********************************************************************
+begin-report
+
+  use-report JobInsert-Detail-Report
+
+  do Init-DateTime
+  do Init-Number
+  do stdapi-init 
+
+  do Get-Current-DateTime
+  let $reportdate_mm = substr($reportdate,1,2)
+  let $reportdate_dd = substr($reportdate,4,2)
+  let $reportdate_yy = substr($reportdate,7,2)
+
+  Let #Current_Year = Substr($AsOfToday,8,4)            !AsOfToday looks like: 01-JAN-2002
+  move #Current_year to $Current_year
+
+  Let $GEXXX911_Benefit_Program_Alias = 'B.BENEFIT_PROGRAM'       
+
+  do P100-Get-Max-Confirmed-Pay-End
+  do P105-Get-Date-Ranges-and-Calc-Weeks                   
+
+  let $reportdate_ccyyyy = $reportdate_mm||'/'||$reportdate_dd||'/'||$current_year  
+  do format-datetime($reportdate_ccyyyy,$reportdate_ccyy,{DEFMDY},'','NATIVE')
+   
+  show '$reportdate_ccyy   used as job row insert action date:  ' $reportdate_ccyy
+
+  do Report
+  do Commit-Transaction
+  date-time () hh:mi:ss &timeEnded
+  date-time () MM/DD/YYYY &dateEnded
+  show ' '
+  show 'Report Ended at ' &timeEnded ' on ' &dateEnded
+  show ' '
+
+  do stdapi-term
+
+end-report
+
+begin-heading 8 for-reports=(Report-log)
+  LET $REPORTID = 'BNYPALOG'
+  move 'Youngstown Pension Eligibility- ALL Activity - Report Log' to $ReportTitle
+
+ #Include 'stdhdg01.sqc'
+ 
+  print 'BP'                              (7,1)
+  print 'Emplid'                          (0,7)
+  print 'Name'                            (0,17)
+  print 'Service Dt'                      (0,47)
+  print 'Total Hours'                     (0,63)  
+  print 'Average Weekly'                  (0,83)  
+  print 'Leave Weeks'                     (0,105)       
+  print 'For the Year'                    (+1,63) 
+  print '     Hours'                      (0,83)
+  print 'Message'                         (0,120)        
+  print '-'                               (+1,1,174) fill
+
+end-heading
+
+
+begin-heading 8 for-reports=(JobInsert-Detail-Report)
+  move 'GEXBNYPA' to $ReportID
+  move 'Youngstown/Canfield Pension Anniversary Year Evaluation ' to $ReportTitle
+  display $ReportTitle
+
+ #Include 'stdhdg01.sqc'
+  Let $Heading_Line2 = 'Job Inserts for 32 Average Hour Evaluation'
+  
+  Print $Heading_Line2                    (3,)  center
+  Print 'Evaluation Date Range between '  (5,1) 
+  Print $pay_begin_dt                     (0,32)
+  print 'and '                            (0,44)
+  print $pay_end_dt                       (0,48)  
+  print 'BP'                              (7,1)
+  print 'Emplid'                          (0,6)
+  print 'Name'                            (0,17)
+  print 'Service Dt'                      (0,47)
+  print 'Total Hours'                     (0,63)  
+  print 'Average Weekly'                  (0,83)  
+  print 'Leave Weeks'                     (0,105)
+  print 'JobEffdt'                        (0,123) 
+           
+  print 'For The Year'                    (+1,63) 
+  print '     Hours'                      (0,83)
+  print 'NotWorked'                       (0,105)
+  print 'Prior Config7'                   (0,140)
+  print 'New Config7'                     (0,156)         
+  print '-'                               (+1,1,174) fill
+end-heading
+ 
+!*********************************************************************
+!Prints the footer in the report log
+!*********************************************************************
+
+begin-footing 2 for-reports=(Report-log)
+page-number (1,108) 'Page '  
+last-page () ' of ' '.'
+
+end-footing
+
+!*********************************************************************
+!If this Program is being executed through process scheduler, 
+!the run control parameters and calls the main processing procedure.
+!Otherwise, interrogates the user for the run control parameters and 
+!validates them. If the run control parameters are invalid, stops the
+!execution.
+!*********************************************************************
+begin-procedure Report
+
+date-time () hh:mi:ss &timeBegan
+show '------------------------------------'
+display 'Time Report Began: ' noline
+display &timeBegan
+show '------------------------------------'
+
+ move 'N' to $Errorfound
+
+move $reportdate_ccyyyy to $rnctl_date
+
+let $rnctl_mm = substr($rnctl_Date,1,2)
+let $rnctl_dd = substr($rnctl_Date,4,2)
+let $rnctl_yyyy = substr($rnctl_Date,7,4)       
+let $rnctl_yy  = substr($rnctl_date,9,2)
+move $rnctl_yyyy to #rnctl_yyyy
+move $rnctl_yy to #rnctl_yy
+
+ Let #inputtran = 0
+ Let #inserts   = 0
+ Let #recs_onlog = 0
+ do P200-Process-Employee-Data
+
+ if $sev-error = 'Y'
+    goto report-exit
+ end-if
+ 
+use-report JobInsert-Detail-Report
+  print '# of Job Inserts:   '        (+2,2)
+  print #inserts                      (,25)  edit 9,999
+
+use-report Report-Log
+  print '# Employees on Log: '        (+2,2)
+  print #recs_onlog                   (,25)  edit 999,999
+  print '# of Job Inserts:   '        (+1,2)
+  print #inserts                      (,25)  edit 9,999
+ 
+Report-Exit:
+  
+  display ' Transactions Processed:  ' noline
+  display #InputTran 999999
+  display ' # Job Inserts:           ' noline
+  display #inserts 99999
+ 
+  date-time () hh:mi:ss &timeEnded  
+  show '------------------------------------'
+  display 'Time Report Ended: ' noline
+  display &timeEnded
+  show '------------------------------------'  
+
+end-procedure
+
+
+!*********************************************************************
+Begin-Procedure P100-Get-Max-Confirmed-Pay-End
+!*********************************************************************
+#debug9 Show 'P100-Get-Max-Confirmed-Pay-End'
+ 
+Begin-Select Loops=1
+PC.CHECK_DT
+PC.PAY_END_DT
+PC.PAY_BEGIN_DT  
+
+  Let $pay_end_dt     = &PC.PAY_END_DT
+  Let $pay_begin_dt   = &PC.PAY_BEGIN_DT
+  Let $check_issue_dt = &PC.CHECK_DT
+  show 'Pay Begin Date:              ' $pay_begin_dt
+  Show 'Max Confirmed Pay End Date:  ' $pay_end_dt
+
+FROM   PS_PAY_CALENDAR PC
+Where  pc.company = 'GEI'
+  and  pc.paygroup = 'RET'  
+  and  pc.pay_end_dt         =
+       (Select Max(pay_end_dt)
+       From   ps_pay_calendar pc2
+       Where  pc2.pay_end_dt <= SYSDATE
+        and   pc2.company = 'GEI'
+        and   pc2.paygroup = 'RET'
+        And   pc2.PAY_CONFIRM_RUN = 'Y')
+  
+End-Select
+End-Procedure
+
+!*********************************************************************
+Begin-Procedure P105-Get-Date-Ranges-and-Calc-Weeks
+!*********************************************************************
+#debug9 Show 'P105-Get-Date-Ranges-and-Calc-Weeks'
+
+!***  calculate the prior Sunday date for the new job insert row. This will be payenddt + 1 day.
+   do Convert-To-DTU-Date($Pay_end_dt,$Pay_end_dt_DTU)
+   do dtu-add-days($Pay_end_dt_DTU,+1,$Pay_end_dt_DTU)             !add 1 day to pay end dt
+   do convert-from-dtu-date($Pay_end_dt_DTU,$Pay_end_dt_dbf)
+   let $effdt_newrow_dbf  = $Pay_end_dt_dbf                   !Should=the sunday before sysdate,
+                                                              !use for inserting new job rows.
+   show '$effdt_newrow_dbf is Sunday prior to sysdate =  ' $effdt_newrow_dbf
+
+   let $end_range = $pay_end_dt
+   do Convert-To-DTU-Date($Pay_end_dt,$Pay_end_dt_DTU)
+   do dtu-add-years($Pay_end_dt_DTU,-1,$Pay_end_dt_DTU)       !confirm pay_end_dt minus 1 year
+   do convert-from-dtu-date($Pay_end_dt_DTU,$Pay_end_dt_dbf)
+   let $begin_range = $Pay_end_dt_dbf
+   show '***********************************'
+   show '*** $begin_range = ' $begin_range
+   show '*** $end_range   = ' $end_range
+   show '***********************************' 
+    
+   do Convert-begin-end-range-to-weeks             ! calculate #weeks_peryr
+ 
+!************* Reformat pay_begin_dt and pay_end_dt to YYYYMMDD ******************
+
+    Do Convert-to-dtu-date($pay_begin_dt,$paybegin)
+    let $paybegin_yyyy     = substr($paybegin,1,4)
+    let $paybegin_mm       = substr($paybegin,6,2)
+    let $paybegin_dd       = substr($paybegin,9,2)
+    let $paybegin_mmdd     = $paybegin_mm||$paybegin_dd
+    show 'pay_begin_dt reformatted to $paybegin_mmdd:  ' $paybegin_mmdd
+
+    Do Convert-to-dtu-date($pay_end_dt,$payend)
+    let $payend_yyyy     = substr($payend,1,4)
+    let $payend_mm       = substr($payend,6,2)
+    let $payend_dd       = substr($payend,9,2)
+    let $payend_mmdd     = $payend_mm||$payend_dd
+    show 'pay_end_dt reformatted to $payend_mmdd:  ' $payend_mmdd
+
+
+end-Procedure
+
+!*********************************************************************
+!Calculates the avg number of hours worked per week during the last year.
+!Calls the main benefits participation logic and leave of absence logic
+!
+!*********************************************************************
+
+Begin-Procedure P200-Process-Employee-Data
+
+move 'N' to $errorfound
+move 'N' to $found
+
+!************************************************************
+!Logic to go to GEX_SQR_PROCESS table and retrieves all the 
+!benefit programs that need to be run through this SQR
+!************************************************************
+
+  move 'GEXBNYPA' to $ReportID_srch
+  show '$ReportID_srch to retrieve-benefit-pgms: ' $ReportID_srch
+!  need  $reportID_srch for ps_gex_sqr_process lookup in retrieve-benefit-pgms para  
+  do Retrieve-benefit-pgms                         !gexbnypy.sqc
+
+  display $BP_name
+ 
+  if $ben_pgm_found = 'N'
+     display 'No Benefit Programs found for Process:GEXBNYPA'
+  end-if
+  
+   show '$service_dt_crit = ' $service_dt_crit 
+
+end-procedure
+ 
+!*********************************************************************
+!Retrieves each employee who participated in Benefit Program and
+!calls necessary procedures to determine their average weekly hours. 
+!********************************************************************* 
+
+begin-procedure Process-benefit-partic               !Called from gexbnypa.sqc
+display 'Process-Benefit-Partic'
+
+ move 'N' to $errorfound
+
+!if $log_printed = 'Y'                  !New page for each Benefit program
+!   use-report report-log
+!   new-page
+!end-if
+
+   move $bp_name to $prev_bp_name
+ 
+use-report report-log
+
+move 'N' to $beninfo_found
+
+begin-select on-error=sql-error-found('P210-process-benefit-partic')
+B.EMPLID  &emplid
+B.EMPL_RCD  &empl_rcd#
+B.BENEFIT_PROGRAM
+C.ERNCD_SPCL
+C1.FIELDNAME_L1
+C1.FIELDNAME_L2
+C1.GEX_SPCL_ACCUM_CD2
+D.EMPL_RCD   
+D.EFFDT
+D.EFFSEQ
+D.EMPL_STATUS
+D.ACTION_REASON
+D.ELIG_CONFIG1
+D.ELIG_CONFIG7
+D.COMPANY
+D.DEPTID
+D.ACCT_CD
+D.JOBCODE
+D.REG_TEMP
+E.NAME
+SQRE.SERVICE_DT
+
+   move '                                ' to $Log_Message            !reset log message
+   add +1 to #InputTran
+   move 'Y' to $beninfo_found
+   move 'N' to $job_insert             !used to display insert message on report log
+   move &emplid                to $emplid
+   move &empl_rcd#             to $empl_rcd#
+   move &C1.GEX_SPCL_ACCUM_CD2 to $GEX_SPCL_ACCUM_CD2
+   move &SQRE.SERVICE_DT       to $Service_dt
+   
+   display ' '
+   show 'EMPLID =    ' $emplid
+
+   Do Convert-to-dtu-date($Service_dt,$service_DTU)
+   
+   let $service_yyyy     = substr($service_DTU,1,4)
+   let $service_mm       = substr($service_DTU,6,2)
+   let $service_dd       = substr($service_DTU,9,2)
+   let $service_mmdd     = $service_mm||$service_dd     
+   show '$Service_dt mmdd :  ' $service_mmdd                              
+   
+   do P300-Calculate-Months-of-Service 
+
+!******  Already calculated the number of weeks betw begin range and end range 
+!******  dates(for prev year) in the P105-Get-Date-Ranges-and-Calc-Weeks para.   
+!******  This field is:  #weeks_peryr.    Figure out the number of weeks 
+!******  ee was out during that period (begin range and end range) for FMLA
+!******  or personal leave and convert that into weeks. Subtract those leave
+!******  weeks from total weeks.  Sum up the hours the ee worked, then convert 
+!******  to avg hours per wk by dividing the wkly-spcl-hrs by # weeks worked.
+!******  These paragraphs are in gexbnypa.sqc
+
+   if #diff_months >= 12                             !must have 12 months of service and
+!   hire date must fall between the pay begin mmdd and pay end mmdd if its their anniversary date
+      if ($service_mmdd >= $paybegin_mmdd and $service_mmdd <= $payend_mmdd)
+         show '#### service date anniversary fell betw pay begin and pay end date ####'
+    
+         do Calc-total-absence-period    	             !calcs #total_absence(in days)
+         let #total_absence_wks = #total_absence/7
+         show '*** #total_absence_wks = ' #total_absence_wks
+         let #weeks_peryr_minus_loa_wks = #weeks_peryr - #total_absence_wks
+         show '*** #weeks_peryr_minus_loa_wks = ' #weeks_peryr_minus_loa_wks
+ 
+         do Calculate-sum-yrly-spcl-hrs
+         show '*** #yrly_spcl_hrs = ' #yrly_spcl_hrs
+ 
+         if #weeks_peryr_minus_loa_wks = 0          !means ee was out on loa entire range
+            let #week_hrs = 0
+         else
+            let #week_hrs = #yrly_spcl_hrs/#weeks_peryr_minus_loa_wks   !#weeks_hrs=avg hrs worked/week
+         end-if 
+ 
+         show '*** Avg hours per week,  #week_hrs = ' #week_hrs
+ 
+         Do P320-Evaluate-Hours-and-Insert-Job           !also prints job insert log
+      else
+         let $Log_Message = 'No Insert, 1 yr srvc but Anniv NOT betw pay beg/end'
+      end-if 
+   else
+     let $Log_Message = 'No Insert, < 1 year srvc'
+   end-if
+ 
+   
+!**-------- Print all employees on report log   --------**
+   use-report Report-log
+   do P420-Print-log                               
+   add 1 to #recs_onlog
+   move 'N' to $errorfound                      !reset in case there was an error on log
+   
+FROM PS_BEN_PROG_PARTIC B,
+     PS_SPCL_EARNS_TBL C,
+     PS_BEN_DEFN_PGM C1,
+     PS_JOB D,
+     PS_PERSONAL_DATA E,
+     PS_EMPLOYMENT SQRE
+     
+WHERE B.BENEFIT_PROGRAM = $BP_name
+  AND B.EMPLID = D.EMPLID
+  AND B.EMPL_RCD = D.EMPL_RCD
+  AND D.REG_TEMP in ('E','M','O','R','S')
+  AND D.EMPL_STATUS IN ('A', 'L', 'P')
+  AND B.EMPLID = E.EMPLID
+  AND D.EMPLID = SQRE.EMPLID
+  AND D.EMPL_RCD = SQRE.EMPL_RCD
+!  AND [$GEXXX911_INCLUDE_BENEFIT_PROGRAM_CRITERIA]                
+ [$service_dt_crit]                       !hire dt contract range determined in gexbnypa.sqc 
+  AND C1.BENEFIT_PROGRAM = B.BENEFIT_PROGRAM
+  AND C1.GEX_SPCL_ACCUM_CD2 = C.ERNCD_SPCL
+  AND B.EFFDT = (SELECT MAX(EFFDT)
+                   FROM PS_BEN_PROG_PARTIC
+                  WHERE EMPLID = B.EMPLID
+                    AND EMPL_RCD = B.EMPL_RCD
+                    AND EFFDT <= $effdt_newrow_dbf)     
+  AND C1.EFFDT = (SELECT MAX(EFFDT)
+                   FROM PS_BEN_DEFN_PGM
+                  WHERE BENEFIT_PROGRAM = $BP_name
+                    AND EFF_STATUS = 'A'
+                    AND EFFDT <= SYSDATE)              !setup tables check current effdt
+  AND C.EFFDT = (SELECT MAX(C3.EFFDT)
+                   FROM PS_SPCL_EARNS_TBL C3
+                  WHERE C3.ERNCD_SPCL = C.ERNCD_SPCL
+                    AND C3.EFF_STATUS = 'A'
+                    AND C3.EFFDT <= SYSDATE)           !setup tables check current effdt
+  AND D.EFFDT = (SELECT MAX(EFFDT)
+                   FROM PS_JOB
+                  WHERE EMPLID = D.EMPLID
+                    AND EMPL_RCD = D.EMPL_RCD
+                    AND EFFDT <= $effdt_newrow_dbf)    
+  AND D.EFFSEQ = (SELECT MAX(EFFSEQ)
+                   FROM PS_JOB
+                  WHERE EMPLID = D.EMPLID
+                    AND EMPL_RCD = D.EMPL_RCD
+                    AND EFFDT = D.EFFDT)
+  AND (D.ELIG_CONFIG7 = '000B000000'       !select ees who are at the low pension rate or 
+       OR D.ELIG_CONFIG7 = '0000000000')   !who are NOT having contributions
+  
+
+ORDER BY B.BENEFIT_PROGRAM, B.EMPLID
+end-SELECT
+
+ if $beninfo_found = 'N'
+   Let $beninfo_found = ' ' 
+   do error-found
+   print 'No Benefit Participation information found' (,34)
+ end-if
+
+end-procedure
+
+!**************************************************
+begin-procedure P300-Calculate-Months-of-Service
+!**************************************************
+
+  do Convert-To-DTU-Date($Pay_end_dt,$Pay_end_dt_DTU)
+  show 'pay_end_dt:       ' $pay_end_dt
+  do convert-to-dtu-date($Service_dt,$Service_dt_dtu)
+  show 'service_dt:       ' $service_dt
+  do dtu-diff-months($Service_dt_dtu,$Pay_end_dt_DTU,#diff_months)
+  show '#diff_months:     ' #diff_months                        
+
+end-procedure
+
+!*************************************************
+begin-procedure P320-Evaluate-Hours-and-Insert-Job
+!*************************************************
+
+   move &D.ELIG_CONFIG7 to $ee_config7_job
+
+   If #week_hrs >= 32
+      move '000A000000' to $elig_config7           !for job insert
+      move 'Job Insert as an "A", >= 32 hours  ' to $Log_Message
+!      show 'Insert A config7 jobrow eval at >= 32 hours'           
+      do insert-procedure               
+   else
+      if $ee_config7_job = '000B000000'
+!         show 'No Insert, already a B'                             
+         move 'No Insert, < 32 hrs, already a B' to $Log_Message
+         goto bypass-insert            
+      else
+         move '000B000000' to $elig_config7           !for job insert
+         move 'Job Insert as a "B", < 32 hours ' to $Log_Message
+!         show 'Insert B config7 jobrow eval at < 32 hours'         
+         do insert-procedure             
+          
+      end-if
+   end-if
+   
+   use-report JobInsert-Detail-Report
+   do P400-Print-JobInsert-Report
+   add +1 to #inserts
+   let $job_insert = 'Y'
+         
+bypass-insert:
+ 
+end-procedure
+  
+!*********************************************************************
+!      Print the Rows Inserted into Job
+!*********************************************************************    
+ 
+begin-procedure P400-Print-JobInsert-Report
+ 
+  print $BP_name                          (+1,1)
+  print $Emplid                           (0,6)
+  print &E.Name                           (0,17)
+  print $Service_Dt                       (0,47)
+  print #yrly_spcl_hrs                    (0,63)   edit 99,999.99   
+  print #week_hrs                         (0,86)   edit 999.99   
+  print #total_absence_wks                (0,109)  edit 99
+  print $effdt_newrow_dbf                 (0,123)                   
+  print &D.ELIG_CONFIG7                   (0,140)
+  print $elig_config7                     (0,156)
+           
+end-procedure
+
+!*********************************************************************
+!      Print the Log 
+!*********************************************************************    
+ 
+begin-procedure P420-Print-Log
+ 
+  print $BP_name                          (+1,1)
+  print $Emplid                           (0,6)
+  print &E.Name                           (0,17)
+  print $Service_Dt                       (0,47)
+  print #yrly_spcl_hrs                    (0,63)   edit 99,999.99   
+  print #week_hrs                         (0,86)   edit 999.99   
+  print #total_absence_wks                (0,109)  edit 99
+  print $Log_Message                      (0,120)
+           
+end-procedure
+
+
+#include 'getcodta.sqc'  !Get-Company-Data Procedure     
+#Include 'tranctrl.sqc'  !Common Transaction Control Procedures
+!*#Include 'reset.sqc'     !Reset printer procedure
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'payrnctl.sqc'  !Select-Parameters
+#Include 'stdapi.sqc'    !Get_Run_Control Procedure
+#Include 'datemath.sqc'  !Does the date-math functions
+#Include 'readxlat.sqc'  !Read xlattable
+#Include 'gexbnypa.sqc'  !Elig rules for config7 - clone of gexbnypy.sqc  

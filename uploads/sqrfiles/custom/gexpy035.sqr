@@ -1,0 +1,545 @@
+!***********************************************************************
+!  GEXPY035:  DEPARTMENT OT HOURS - MTD                                *
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module is the confidential and proprietary information of       *
+! Giant Eagle, Inc.; it is not to be copied, reproduced,or transmitted *
+! in any form, by any means, in whole or in part, nor is it to be used *
+! for any purpose other than that for which it is expressly provided   *
+! without the written permission of Giant Eagle.                       *
+!                                                                      *
+! Copyright (c) 1997-1998 Giant Eagle,Inc. All Rights Reserved         *
+!                                                                      *
+!***********************************************************************
+!                                                                      *        
+! GEXPY035:             Department OT Hours - MTD                      *
+!                                                                      *        
+! Narrative:		This program will generate a report            *
+!                       containing detailed information about the      *
+!                       overtime hours of employees.  Only active      *
+!                       employees who worked overtime for the company, *
+!                       paygroup, and pay period specified at runtime  *
+!                       will be selected for processing.               *
+!                                                                      *
+! #Debugx Used:		#debug9 paragraph trace                        *
+!			      #debug8 key variable values                    *
+!			      #debug7 data returned from sql calls           * 
+!                                                                      *  
+! SQL Tables:		GEX_DEPT_TBL                                   *
+!                       EARNINGS_BAL                                   *
+!                       PAY_OTH_EARNS                                  *
+!                       PAY_CAL_BAL_ID                                 *
+!                       ACCT_CD_TBL                                    *
+!                       PERSONAL_DATA                                  *
+!                       EMPLOYMENT                                     *
+!                       JOB                                            *
+!                                                                      *
+! Written by:		Jim Hutchison  02/18/98                        *       
+!                                                                      *
+! Normally Run:		Weekly                                         *
+!                                                                      *
+! Control Parms:		FOR WHERE CLAUSE:                              *
+!				  Company Division Code                        *
+!				  Company  	                                   *
+!				  Paygroup  	                             *
+!				  Deptid	                                   *
+!				  Employee Status	                             *
+!				  Account Code                                 *
+!				  As Of Date                                   *
+!                                                                      *
+!***********************************************************************
+!                         MODIFICATION HISTORY                         *
+!***********************************************************************
+!	INITIALS	DATE		DESCRIPTION OF THE CHANGE                *
+!***********************************************************************
+!	JDH		02/18/98	Initial Creation                         *
+!	JDH		10/20/98	Modified heading                         *
+!     JDH         01/08/99    Added logic to obtain balances for the   *
+!                              month of the last confirmed pay end dt. *
+!     JDH         01/23/99    Added logic to get the maximum           *
+!                              balance period per earnings code        *
+!                              from the earnings balance table.        *
+!     JNB         04/10/2000  Changed the join ps_pay_oth_earns with   *
+!                             ps_pay_check to ps_pay_earnings in       *  
+!                             procedure p200-Get-OT-Hours              *     
+!     CWB         02/19/2003  Added EMPL_RCD to join to EARNINGS_BAL   *
+!                             for version 8.3                          *
+!GEX_PY238 SXD    08/20/2007  Reference of EFFDT is removed from the  *  
+!                              PS_ACCT_CD_TBL.                         *  
+!    GEX-MXT      09/26/2007  Replaced PS_ACCT_CD_TBL with             *
+!                             PS_GEX_ACCT_CD_TBL                       *
+!     MXR         07/22/2008  ITG-51359 Add erncd 173          
+!***********************************************************************
+
+
+#include 'setenv.sqc'    !Set environment
+#Include 'setup32.sqc'   !Printer and page-size initialization
+
+
+begin-report
+#debug9 Show 'begin-report'
+
+  do Init-DateTime           !datetime.sqc
+  do Init-Number             !number.sqc
+  do Get-Current-DateTime    !curdttim.sqc
+  do P000-Init-Report
+  do P100-Process-Main
+  do Reset                   !reset.sqc
+  do Stdapi-Term             !stdapi.sqc
+  date-time () HH:MI:SS   &timeEnded
+  date-time () MM/DD/YYYY &dateEnded
+  show 'Report Ended at ' &timeEnded ' on ' &dateEnded
+  Show 'Successful end of report'
+end-report
+
+
+begin-heading 7
+#debug9 Show 'begin-heading'
+
+  #Include 'stdhdg02.sqc'
+
+  Let $X000_temp_out = 'Sorted by ' || $X000_ORDER_BY
+  Print $X000_temp_out         (3,)  center
+!  Let $X000_temp_out = 'Report as of ' || $X000_REPORT_HEADING_ASOFDATE
+!  Print $X000_temp_out         (4,)  center
+  print $Reporting_Period      (4,)  center 
+
+  if $PayGroup <> $priorPayGroup
+    do Get-PayGroup-Data
+    move $PayGroup to $priorPayGroup
+  end-if
+
+  print 'Pay Group'            (4,1)
+  print $PayGroup              (0,13)
+  print $PayGroupName          (0,17)
+
+  print 'Pay End Dt:'          (5,1)
+  print $pay_end_heading       (5,+1)
+
+  PRINT 'EMPLOYEE NAME'        (+2,1)
+  PRINT 'DEPARTMENT'           (,39)
+  PRINT 'ACCT_CD'              (,57)
+  !PRINT 'SSN#'                 (,75) !GEX_SEC_REENG 2015-06-24 Vahini Katta
+  PRINT 'EMPLID'               (,75)  !GEX_SEC_REENG 2015-06-24 Vahini Katta
+  PRINT 'JOB CODE'             (,94)
+  PRINT 'HIRE DATE'            (,110)
+  PRINT 'CURR. OT HRS'         (,127)
+  PRINT 'MTD OT HRS'           (,147)
+  PRINT 'YTD OT HRS'           (,165)
+end-heading
+
+
+begin-procedure P000-Init-Report
+#debug9 Show 'P000-Init-Report'
+
+  move 'GEXPY035'            to $ReportID
+  move 'WEEKLY DEPARTMENT MTD OT HOURS' to $ReportTitle
+
+  do Stdapi-Init
+
+  Show '$ReportID=' $ReportID
+  Show '$ReportTitle=' $ReportTitle
+
+  Let $GEXXX900_Company_Alias  = 'J.COMPANY'
+  Let $GEXXX901_Company_Alias  = 'J.COMPANY'
+  Let $GEXXX901_Paygroup_Alias = 'J.PAYGROUP'
+  Let $GEXXX902_Deptid_Alias   = 'J.DEPTID'
+  Let $GEXXX903_Emp_Stat_Alias = 'J.EMPL_STATUS'
+  Let $GEXXX907_Div_CD_Alias   = 'GDT.GEX_COMPANY_DIV_CD'
+  Let $GEXXX909_Acct_CD_Alias  = 'J.ACCT_CD'
+
+  if $prcs_process_instance = ''
+    Do GEXXX950-Input-Parameters
+  else
+    Do GEXXX922-Select-Parameters
+
+    Do GEXXX900-Select-Company-Parameters
+    Do GEXXX901-Select-Company-Paygroup-Parameters
+    Do GEXXX902-Select-Deptid-Parameters
+    Do GEXXX903-Select-Emp-Stat-Parameters
+    Do GEXXX907-Select-Div-CD-Parameters 
+    Do GEXXX909-Select-Acct-CD-Parameters
+
+    Let $X000_WHERE_SELECT_ASOFDATE = $GEX_RC_PAY.AsOfDate
+    If Rtrim ($GEX_RC_PAY.AsOfDate, ' ') = ''
+      Let $X000_WHERE_SELECT_ASOFDATE = $AsOfToday
+    End-If
+  end-if
+
+  date-time () HH:MI:SS &timeBegan
+  date-time () MM/DD/YYYY &dateBegan
+  show 'Report Began at ' &timeBegan ' on ' &dateBegan
+
+  Do Format-DateTime($X000_WHERE_SELECT_ASOFDATE, $X000_REPORT_HEADING_ASOFDATE, {DEFDATE}, '', '')
+  Let $X000_ORDER_BY = 'Company, Paygroup, Department, Account Code, Name'
+
+  Show '$GEXXX907_INCLUDE_DIV_CD_DISPLAY_CRITERIA           ='   $GEXXX907_INCLUDE_DIV_CD_DISPLAY_CRITERIA
+  Show '$GEXXX900_INCLUDE_COMPANY_DISPLAY_CRITERIA          ='   $GEXXX900_INCLUDE_COMPANY_DISPLAY_CRITERIA
+  Show '$GEXXX901_INCLUDE_COMPANY_PAYGROUP_DISPLAY_CRITERIA ='   $GEXXX901_INCLUDE_COMPANY_PAYGROUP_DISPLAY_CRITERIA
+  Show '$GEXXX902_INCLUDE_DEPTID_DISPLAY_CRITERIA           ='   $GEXXX902_INCLUDE_DEPTID_DISPLAY_CRITERIA
+  Show '$GEXXX903_INCLUDE_EMP_STAT_DISPLAY_CRITERIA         ='   $GEXXX903_INCLUDE_EMP_STAT_DISPLAY_CRITERIA
+  Show '$GEXXX909_INCLUDE_ACCT_CD_DISPLAY_CRITERIA          ='   $GEXXX909_INCLUDE_ACCT_CD_DISPLAY_CRITERIA
+  Show '$X000_WHERE_SELECT_ASOFDATE ='   $X000_WHERE_SELECT_ASOFDATE
+
+  do P020-Get-Last-Confirmed-Pay
+  do P050-Print-Cover-Page
+
+  Do Get-Calendar-Year-Id    !getbalid.sqc
+end-procedure
+
+
+Begin-Procedure P020-Get-Last-Confirmed-Pay
+#debug9 Show 'P020-Get-Last-Confirmed-Pay'
+Begin-Select Loops=1
+pay_end_dt
+To_Char(pay_end_dt,'MM')           &balance_period
+To_Char(pay_end_dt,'YYYY')         &balance_year
+To_Char(pay_end_dt,'fmMonth YYYY') &period
+
+  Do Format-DateTime(&pay_end_dt, $pay_end_heading, {DEFDATE}, '', '')
+  Let $AsOfDate         = &pay_end_dt
+  Let $pay_end_dt       = &pay_end_dt
+  Let $balance_year     = &balance_year
+  Let $balance_period   = &balance_period
+  Let #balance_year     = &balance_year
+  Let #balance_period   = &balance_period
+  Let $Reporting_Period = &period
+
+  let #balance_qtr = #balance_period
+  let #balance_qtr = ((#balance_qtr - 1)/ 3) + 1
+  do Format-Number(#balance_qtr, $balance_qtr, '9.99') !avoid rounding the integer portion
+  move $balance_qtr to $balance_qtr x     !save the integer portion
+  let #balance_qtr = $balance_qtr
+
+  Show 'Report will contain balances for the month of ' $Reporting_Period
+  Show 'Last confirmed pay end date:  ' $pay_end_dt
+
+From   ps_pay_cal_bal_id
+
+Where  pay_end_dt         =
+      (Select Max(pay_end_dt)
+       From   ps_pay_cal_bal_id
+       Where  pay_end_dt <= $X000_WHERE_SELECT_ASOFDATE
+       And    balance_id  = 'CY')
+End-Select
+End-Procedure
+
+
+begin-procedure P050-Print-Cover-Page
+#debug9 Show 'P050-Print-Cover-Page'
+
+  If $prcs_process_instance <> ''
+    Print 'RUN CONTROL INFORMATION FOR THIS REPORT RUN:'      (+5,1)
+    Print '$Prcs_OPRID          ='                            (+2,5)
+    Print $Prcs_OPRID                                         (0,+2)
+    Print '$PRCS_RUN_CNTL_ID    ='                            (+1,5)
+    Print $PRCS_RUN_CNTL_ID                                   (0,+2)
+  End-If
+
+  Print 'SELECTION CRITERIA FOR THIS REPORT RUN:'                 (+5,2)
+  Print '$GEXXX907_INCLUDE_DIV_CD_DISPLAY_CRITERIA           ='   (+2,5)
+  Print $GEXXX907_INCLUDE_DIV_CD_DISPLAY_CRITERIA                 (0,+2)
+  Print '$GEXXX900_INCLUDE_COMPANY_DISPLAY_CRITERIA          ='   (+1,5)
+  Print $GEXXX900_INCLUDE_COMPANY_DISPLAY_CRITERIA                (0,+2)
+  Print '$GEXXX901_INCLUDE_COMPANY_PAYGROUP_DISPLAY_CRITERIA ='   (+1,5)
+  Print $GEXXX901_INCLUDE_COMPANY_PAYGROUP_DISPLAY_CRITERIA       (0,+2)
+  Print '$GEXXX902_INCLUDE_DEPTID_DISPLAY_CRITERIA           ='   (+1,5)
+  Print $GEXXX902_INCLUDE_DEPTID_DISPLAY_CRITERIA	            (0,+2)
+  Print '$GEXXX903_INCLUDE_EMP_STAT_DISPLAY_CRITERIA         ='   (+1,5)
+  Print $GEXXX903_INCLUDE_EMP_STAT_DISPLAY_CRITERIA               (0,+2)
+  Print '$GEXXX909_INCLUDE_ACCT_CD_DISPLAY_CRITERIA          ='   (+1,5)
+  Print $GEXXX909_INCLUDE_ACCT_CD_DISPLAY_CRITERIA                (0,+2)
+
+  Print 'As Of Date :'                                        (+2,5)
+  Print $X000_REPORT_HEADING_ASOFDATE                         (0,+2)
+
+  Print 'SORT ORDER FOR THIS REPORT RUN:'                     (+5,2)
+  Print $X000_ORDER_BY                                        (+2,5)
+
+  Let #PAGE-COUNT = 0
+  NEW-PAGE
+  Let #PAGE-COUNT = 1
+End-Procedure
+
+
+begin-procedure P100-Process-Main
+#debug9 Show 'P100-Process-Main'
+
+  Let $Data-Found-Flag = 'N'
+
+begin-SELECT
+J.COMPANY               ()         ON-BREAK    LEVEL=1
+                                               PRINT=NEVER
+
+J.PAYGROUP              ()         ON-BREAK    LEVEL=2
+                                               PRINT=NEVER
+
+J.DEPTID                ()         ON-BREAK    LEVEL=3
+                                               PRINT=NEVER
+                                               SAVE=$previous_deptid
+                                               AFTER=P600-Deptid-Change
+
+ACT.DESCRSHORT          ()         ON-BREAK    LEVEL=4
+                                               PRINT=NEVER
+                                               SAVE=$previous_acct
+                                               AFTER=P500-Acct-Change
+PD.NAME
+J.EMPLID
+J.EMPL_RCD
+J.JOBCODE
+E.HIRE_DT
+EB.BALANCE_PERIOD
+EB.HRS_MTD
+EB.HRS_YTD
+
+  Let $Data-Found-Flag = 'Y'
+
+  let $paygroup = &J.PAYGROUP
+  Let $Company  = &j.company
+
+  If &EB.BALANCE_PERIOD = #balance_period
+    let #hrs_mtd  = &eb.hrs_mtd
+  Else
+    let #hrs_mtd  = 0
+  End-If
+
+  let #hrs_ytd  = &eb.hrs_ytd
+
+  do P200-Get-Current-OT-Hours
+  do P400-Create-Detail
+
+!From   PS_ACCT_CD_TBL     ACT,		!GEX-MXT  COMMENTED ON 09/26/2007
+From   PS_GEX_ACCT_CD_TBL     ACT,	!GEX-MXT  ADDED ON 09/26/2007
+       ps_gex_dept_tbl    gdt,
+       PS_PERSONAL_DATA   PD,
+       PS_EMPLOYMENT      E,
+       PS_JOB             J,
+       PS_EARNINGS_BAL    EB
+
+WHERE  EB.EMPLID              = J.EMPLID
+AND    EB.EMPL_RCD            = J.EMPL_RCD      ! CWB 02/19/2003	
+AND    EB.COMPANY             = J.COMPANY
+AND    EB.BALANCE_ID          = 'CY'
+AND    EB.BALANCE_YEAR        = #balance_year
+
+AND    EB.BALANCE_PERIOD      =
+      (SELECT MAX(BALANCE_PERIOD)
+       FROM   PS_EARNINGS_BAL
+       WHERE  EMPLID          = EB.EMPLID
+       AND    EMPL_RCD        = EB.EMPL_RCD     ! CWB 02/19/2003
+       AND    COMPANY         = EB.COMPANY
+       AND    BALANCE_ID      = EB.BALANCE_ID
+       AND    BALANCE_YEAR    = EB.BALANCE_YEAR
+       AND    BALANCE_PERIOD <= #balance_period
+       AND    SPCL_BALANCE    = EB.SPCL_BALANCE
+       AND    ERNCD           = EB.ERNCD)
+
+AND    EB.SPCL_BALANCE        = 'N'
+!AND    EB.ERNCD               = 'OTP'         MXR         07/22/2008  ITG-51359 Add erncd 173 
+ AND    EB.ERNCD               in ( 'OTP','173')
+AND    ACT.ACCT_CD         = J.ACCT_CD
+!GEX-MXT  UNCOMMENTED ON 09/26/2007-BEGIN
+AND    ACT.EFFDT           =
+      (SELECT MAX(EFFDT)
+       !FROM   PS_ACCT_CD_TBL
+       FROM   PS_GEX_ACCT_CD_TBL
+       WHERE  ACT.ACCT_CD  = ACCT_CD)
+!GEX-MXT  UNCOMMENTED ON 09/26/2007-END
+
+AND    PD.EMPLID           = J.EMPLID
+
+AND    E.EMPLID            = J.EMPLID
+AND    E.EMPL_RCD         = J.EMPL_RCD
+
+AND    J.EFFDT             =
+      (SELECT MAX(EFFDT)
+       FROM   PS_JOB
+       WHERE  EMPLID       = J.EMPLID
+       AND    EMPL_RCD    = J.EMPL_RCD
+       AND    EFFDT       <= $pay_end_dt)
+
+AND    J.EFFSEQ            =
+      (SELECT MAX(EFFSEQ)
+       FROM   PS_JOB
+       WHERE  EMPLID       = J.EMPLID
+       AND    EMPL_RCD    = J.EMPL_RCD
+       AND    EFFDT        = J.EFFDT)
+
+And    j.deptid            = gdt.deptid
+
+And    gdt.effdt           =
+      (Select Max(effdt)
+       From   ps_gex_dept_tbl
+       Where  deptid       = gdt.deptid
+       And    effdt       <= $pay_end_dt)
+
+And    gdt.sequence_number =
+      (Select Max(sequence_number)
+       From   ps_gex_dept_tbl
+       Where  deptid       = gdt.deptid
+       And    effdt        = gdt.effdt)
+
+AND    EB.HRS_MTD > 0
+
+AND   [$GEXXX900_INCLUDE_COMPANY_CRITERIA]
+AND   [$GEXXX901_INCLUDE_COMPANY_PAYGROUP_CRITERIA] 
+AND   [$GEXXX902_INCLUDE_DEPTID_CRITERIA]
+AND   [$GEXXX907_INCLUDE_DIV_CD_CRITERIA]
+AND   [$GEXXX903_INCLUDE_EMP_STAT_CRITERIA]
+AND   [$GEXXX909_INCLUDE_ACCT_CD_CRITERIA]
+
+ORDER BY J.COMPANY,
+       J.PAYGROUP,
+       J.DEPTID,
+       ACT.DESCRSHORT,
+       PD.NAME
+end-SELECT
+
+  If $Data-Found-Flag = 'N'
+    Print 'NO DATA SELECTED FOR THIS REPORT RUN'	(25,) Center
+  Else
+    Do P700-Print-Report-Totals
+  End-If
+end-procedure
+
+! JNB 04/10/2000 Removed ps_pay_check and joined ps_pay_oth_earns with ps_pay_earnings
+
+begin-procedure P200-Get-Current-OT-Hours
+#debug9 Show 'P200-Get-Current-OT-Hours'
+begin-SELECT
+SUM(POE.OTH_HRS) &hrs_current
+
+  let #hrs_current = &hrs_current
+
+FROM   PS_PAY_EARNINGS    PE,
+       PS_PAY_OTH_EARNS   POE
+
+WHERE  PE.COMPANY         = &J.COMPANY
+AND    PE.PAYGROUP        = &J.PAYGROUP
+AND    PE.PAY_END_DT      = $pay_end_dt
+AND    PE.EMPLID          = &J.EMPLID
+AND    PE.EMPL_RCD       = &J.EMPL_RCD
+
+AND    POE.COMPANY        = PE.COMPANY
+AND    POE.PAYGROUP       = PE.PAYGROUP
+AND    POE.PAY_END_DT     = PE.PAY_END_DT
+AND    POE.OFF_CYCLE      = PE.OFF_CYCLE
+AND    POE.PAGE_NUM          = PE.PAGE_NUM
+AND    POE.LINE_NUM          = PE.LINE_NUM
+AND    POE.ADDL_NBR          = PE.ADDL_NBR
+!AND    POE.ERNCD          = 'OTP' MXR         07/22/2008  ITG-51359 Add erncd 173 
+AND    POE.ERNCD          in ( 'OTP','173')
+end-SELECT
+end-procedure
+
+
+begin-procedure P400-Create-Detail
+#debug9 Show 'P400-Create-Detail'
+
+  add 1 to #acct_count
+  add 1 to #deptid_count
+
+  add #hrs_current to #total_hrs_current
+  add #hrs_current to #deptid_hrs_current
+  add #hrs_current to #acct_hrs_current
+
+  add #hrs_mtd     to #total_hrs_mtd
+  add #hrs_mtd     to #deptid_hrs_mtd
+  add #hrs_mtd     to #acct_hrs_mtd
+
+  add #hrs_ytd     to #total_hrs_ytd
+  add #hrs_ytd     to #deptid_hrs_ytd
+  add #hrs_ytd     to #acct_hrs_ytd
+
+  print &PD.NAME                    (+1,1)
+  print &J.DEPTID                   (,39)
+  print &ACT.DESCRSHORT             (,57)
+  print &J.EMPLID                   (,75)   !edit xxx-xx-xxxx !GEX_SEC_REENG 2015-06-24 Vahini Katta
+  print &J.JOBCODE                  (,94)
+  do Format-DateTime(&E.HIRE_DT,$HireDate,{DEFMDY},'','')
+  print $HireDate                   (,110)
+  print #hrs_current                (,129)  edit 999,999.99
+  print #hrs_mtd                    (,147)  edit 999,999.99
+  print #hrs_ytd                    (,165)  edit 999,999.99
+end-procedure
+
+
+begin-procedure P500-Acct-Change
+#debug9 Show 'P500-Acct-Change'
+
+  if #acct_count > 0
+    print '------------'            (+1,127)
+    print '----------'              (,147)
+    print '----------'              (,165)
+    print 'TOTALS FOR'              (+1,94)
+    print $previous_acct            (,+1)
+    print #acct_hrs_current         (,127)    edit 9,999,999.99
+    print #acct_hrs_mtd             (,145)    edit 9,999,999.99
+    print #acct_hrs_ytd             (,163)    edit 9,999,999.99
+    print ''                        (+1)
+    move 0 to #acct_hrs_current
+    move 0 to #acct_hrs_mtd
+    move 0 to #acct_hrs_ytd
+    move 0 to #acct_count
+  end-if
+end-procedure
+
+
+begin-procedure P600-Deptid-Change
+#debug9 Show 'P600-Deptid-Change'
+
+  if #deptid_count > 0
+    print '------------'            (+1,127)
+    print '----------'              (,147)
+    print '----------'              (,165)
+    print 'TOTALS FOR DEPARTMENT'   (+1,94)
+    print $previous_deptid          (,+1)
+    print #deptid_hrs_current       (,127)    edit 9,999,999.99
+    print #deptid_hrs_mtd           (,145)    edit 9,999,999.99
+    print #deptid_hrs_ytd           (,163)    edit 9,999,999.99
+    move 0 to #deptid_hrs_current
+    move 0 to #deptid_hrs_mtd
+    move 0 to #deptid_hrs_ytd
+    move 0 to #deptid_count
+    new-page
+  end-if
+end-procedure
+
+
+begin-procedure P700-Print-Report-Totals
+#debug9 Show 'P700-Print-Report-Totals'
+
+  print '------------'              (+1,127)
+  print '----------'                (,147)
+  print '----------'                (,165)
+  print 'TOTALS FOR REPORT'         (+1,94)
+  print #total_hrs_current          (,127)    edit 9,999,999.99
+  print #total_hrs_mtd              (,145)    edit 9,999,999.99
+  print #total_hrs_ytd              (,163)    edit 9,999,999.99
+end-procedure
+
+
+#include 'gexxx900.sqc'  !Get company multiple row table
+#include 'gexxx901.sqc'  !Get company/paygroup multiple row table
+#include 'gexxx902.sqc'  !Get deptid multiple row table
+#include 'gexxx903.sqc'  !Get employee status multiple row table
+#include 'gexxx904.sqc'  !Get grade multiple row table
+#include 'gexxx907.sqc'  !Get company/division code multiple row table
+#include 'gexxx908.sqc'  !Get sal_admin_plan multiple row table
+#include 'gexxx909.sqc'  !Get acct_cd code multiple row table
+#include 'gexxx922.sqc'  !Get pay single row run control
+#include 'gexxx950.sqc'  !Get SQRW run controls
+
+#include 'askaod.sqc'    !Ask As Of Date input
+#include 'getcodta.sqc'  !Get company data
+#include 'getpgdta.sqc'  !Get paygroup data
+#Include 'readxlat.sqc'  !Read-Translate-Table procedure
+#Include 'reset.sqc'     !Reset printer procedure
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'datemath.sqc'  !Routines for date math
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'stdapi.sqc'    !Routines to Update Run Status
+#Include 'getbalid.sqc'  !Get-Calendar-Year-Id

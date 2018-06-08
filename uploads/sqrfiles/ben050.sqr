@@ -1,0 +1,683 @@
+!**************************************************
+! BEN050:   PeopleSoft Benefits                   *
+!           PS_PRIMARY_JOBS Audit Report          *
+!**************************************************
+
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+!                                                                      
+! This module contains confidential and proprietary information        *
+! of Oracle; it is not to be copied, reproduced, or transmitted        *
+! in any form, by any means, in whole or in part, nor is it to         *
+! be used for any purpose other than that for which it is              *
+! expressly provided under the applicable license agreement.           *
+!                                                                      *
+! Copyright (C) 2006 Oracle. All Rights Reserved.                      *
+!                                                                      *
+!----------------------------------------------------------------------
+!                                                                      
+!                $Date:  2006/05/22:02:31:39                           
+!             $Release:  HR9                                           
+!            $Revision:  101                                           
+!                                                                      *
+!***********************************************************************
+
+!***********************************************************************
+! This SQR is used to audit the PS_PRIMARY_JOBS table, looking
+! for instances in which the business rules below are violated.
+!
+! This report can be run for a single employee, or the entire population
+! of the PERSON table.
+!
+!
+! Basic Referential Integrity Rules for PRIMARY_JOBS Table:
+! ---------------------------------------------------------
+! (1) On any given effective date, one and only one job within a Benefit Record
+!     may designated as the primary job for Benefits (BN).
+! (2) Every Empl_Rcd on the Employment table for an employee must have at
+!     a minimum, one corresponding row in the Primary_Jobs table.
+! (3) Although the effective dates on Job and Primary_Jobs do not have to match
+!     for a particular Emplid/Empl_Rcd, a Primary_Jobs row must be in effect
+!     for every row. That is, there must exist a row in Primary_Jobs effective
+!     as of earliest effective date of the Job row with the corresponding
+!     Emplid/Empl_Rcd key.
+! (4) For a particular employee, each Empl Record in the Primary Jobs table
+!     must exist in the Employment table. That is, the Empl_Rcd must be valid
+!     for the employee.
+!
+!
+! RunTime Parameters:
+!          Emplid (Optional)
+!
+! Processing Description
+!     - An employee is selected from the PERSON table.
+!        - All rows for this employee are selected from Primary_Jobs
+!          and loaded to an internal array.
+!        - The minimum effective date in the Job table is selected for
+!          each job (Empl_Rcd) that the employee holds.
+!           - Each Benefit_Record/Empl_Rcd pair for the employee is
+!             loaded into a "job array".
+!           - Verify that an entry exists in Primary_Jobs for this job,
+!             with an effective date <= the earliest Job effective date.
+!        - Cross-Validate the data in the Primary Jobs array. For each
+!          entry, ensure that there is one (and only one) job designated
+!          as the primary job for this entry's Benefit Record.
+!        - Validate each Empl_Rcd in the Primary Jobs array, against the
+!          valid Empl_Rcds in the "Job Array'
+!
+!**********************************************************************
+!
+! Modification History:
+!       Initial Development: 10/15/99   PeopleSoft, Inc.  (DCD)
+!
+!**********************************************************************
+
+
+#Include 'setenv.sqc'  !Set Database Environment
+
+!------------------------------
+Begin-Setup
+!------------------------------
+
+ #Include 'ptpsp125.sqc'
+
+End-Setup
+
+
+!-----------------------------
+Begin-Program
+!-----------------------------
+  do Init-DateTime
+  do Init-Number
+  do Get-Current-DateTime
+  do Init-Report
+  do Process-Main
+
+  display 'Report Ended at: ' noline
+  do Display-Time
+  do Display-Summary
+
+  do Reset
+  do Stdapi-Term
+
+End-Program
+
+
+!*************************************
+begin-procedure Init-Report
+!*************************************
+
+
+ #Define MAX_PRI_JOBS    5000
+ #Define MAX_JOBS        500
+
+ #Define col_sep         3
+ #Define col_emplid      12
+ #Define col_BRN         3
+ #Define col_ERN         3
+ #Define col_effdt       12
+ #Define col_error_descr 76
+
+ ! Error Message Text
+ ! Let $PJ-No-Entry    = 'No entry in the Primary_Jobs table for this job'
+ ! Let $PJ-No-PJ-Emp   = 'No entries in Primary_Jobs table for this employee'
+ ! Let $PJ-No-Job      = 'No Job/Employment rows for this employee'
+ ! Let $PJ-No-PJ       = 'No Primary Job for this Benefit Record'
+ ! Let $PJ-Too-Many    = 'More than one Primary Job for this Benefit Record'
+ ! Let $PJ-Invalid-ERN = 'This Empl_Rcd in Primary_Jobs is not valid for this employee.'
+
+ Let $Quote = ''''
+
+ Move 'BEN050'  to  $ReportID
+ Do Get-Report-Language
+ Let $ReportTitle = $BEN050-REPORT-TITLE
+
+ ! Array of Primary_Jobs table entries
+ Create-Array Name = PJ-BN  Size = {MAX_PRI_JOBS}
+   Field=Benefit-Rcd-Nbr:number
+   Field=Empl-Rcd-Nbr:number
+   Field=Effdt-YMD:char
+   Field=Primary-Job-Ind:char
+
+ Create-Array Name = JOB-BN Size = {MAX_JOBS}
+   Field=Empl-Rcd-Nbr:number
+
+
+  Display $ReportTitle
+  Display 'Report Begin at: ' noline
+  Do Display-Time
+
+  do Stdapi-Init
+  if $prcs_process_instance = ''
+    do Ask-Parameters                   ! Invoked interactively
+  else
+    do Get-Values                       ! Invoked by Process Scheduler
+  end-if
+
+  If IsBlank($Emplid)
+    Let $Where_Clause = ''
+    Let $All_Employees = 'Y'
+  Else
+    Let $Where_Clause = 'WHERE A.EMPLID = ' || $Quote || $Emplid || $Quote
+    Let $All_Employees = 'N'
+  End-If
+
+end-procedure
+
+
+!**********************************
+Begin-Procedure Report-Translation
+!**********************************
+! Read from BEN050 program ids
+  do Init_Report_Translation($ReportID, $Language_Cd)
+
+  do Get_Field_Information ('BEN050', 'REPORT_TITLE',    $BEN050-REPORT-TITLE,   #CW)
+
+  do Get_Field_Information ('BEN050', 'PJ_NO_ENTRY',     $BEN050-PJ-NO-ENTRY,    #CW)
+  do Get_Field_Information ('BEN050', 'PJ_NO_PJ_EMP',    $BEN050-PJ-NO-PJ-EMP,   #CW)
+  do Get_Field_Information ('BEN050', 'PJ_NO_JOB',       $BEN050-PJ-NO-JOB,      #CW)
+  do Get_Field_Information ('BEN050', 'PJ_NO_PJ',        $BEN050-PJ-NO-PJ,      #CW)
+  do Get_Field_Information ('BEN050', 'PJ_TOO_MANY',     $BEN050-PJ-TOO-MANY,    #CW)
+  do Get_Field_Information ('BEN050', 'PJ_INVALID_ERN',  $BEN050-PJ-INVALID-ERN, #CW)
+
+  do Get_Field_Information ('BEN050', 'REPORT_ENDED',    $BEN050-REPORT-ENDED,   #CW)
+  do Get_Field_Information ('BEN050', 'EXCEPTIONS',      $BEN050-EXCEPTIONS,     #CW)
+  do Get_Field_Information ('BEN050', 'ALL_EMPLOYEES',   $BEN050-ALL-EMPLOYEES,  #CW)
+  do Get_Field_Information ('BEN050', 'ERROR_DESCR',     $BEN050-ERROR-DESCR,    #CW)
+  do Get_Field_Information ('BEN050', 'MAX_PJ_ERROR',    $BEN050-MAX-PJ-ERROR,   #CW)
+  do Get_Field_Information ('BEN050', 'MAX_JOB_ERROR',   $BEN050-MAX-JOB-ERROR,  #CW)
+  do Get_Field_Information ('BEN050', 'REPORT_REQ',      $BEN050-REPORT-REQ,     #CW)
+  do Get_Field_Information ('BEN050', 'NO_ERRORS',       $BEN050-NO-ERRORS,      #CW)
+  do Get_Field_Information ('BEN050', 'CHECK_REPORT',    $BEN050-CHECK-REPORT,   #CW)
+  do Get_Field_Information ('BEN050', 'END_REPORT',      $BEN050-END-REPORT,     #CW)
+
+  do Get_Field_Information ('BEN050', 'BEN',             $BEN050-BEN,            #CW)
+  do Get_Field_Information ('BEN050', 'EMP',             $BEN050-EMP,            #CW)
+  do Get_Field_Information ('BEN050', 'RCD',             $BEN050-RCD,            #CW)
+  do Get_Field_Information ('BEN050', 'EFFDT',           $BEN050-EFFDT,          #CW)
+
+
+End-Procedure
+
+
+!*************************************
+begin-procedure Get-Values
+!*************************************
+! Used for RunControl
+
+ do Select-Parameters
+ do Get-Emplid
+
+
+end-procedure
+
+
+!**********************************
+begin-procedure Ask-Parameters
+!**********************************
+! Used if run interactively
+
+ Input $InputEmplID 'Enter Emplid (or press <Return> for all Employees) '
+ Let $EmplID = RTRIM($InputEmplID, ' ')
+
+End-Procedure
+
+!**************
+Begin-Heading 8
+!**************
+
+ #Include 'stdhdg01.sqc'
+
+ Let $SubTitle = $BEN050-EXCEPTIONS
+ Concat ' ' with $SubTitle
+ If $All_Employees = 'Y'
+    Concat $BEN050-ALL-EMPLOYEES With $SubTitle
+ Else
+    Concat 'Emplid: ' With $SubTitle
+    Concat $Emplid    With $SubTitle
+ End-If
+
+ Print $SubTitle                    (+1,1)  CENTER
+
+ Print   ' '                        (+2,1,{col_emplid})
+ Print   $BEN050-BEN                (+0,+{col_sep},{col_BRN})
+ Print   $BEN050-EMP                (+0,+{col_sep},{col_ERN})
+ Print   ' '                        (+0,+{col_sep},{col_effdt})
+ Print   ' '                        (+0,+{col_sep},{col_error_descr})
+
+ Print   'Emplid'                   (+1,1,{col_emplid})
+ Print   $BEN050-RCD                (+0,+{col_sep},{col_BRN})
+ Print   $BEN050-RCD                (+0,+{col_sep},{col_ERN})
+ Print   $BEN050-EFFDT              (+0,+{col_sep},{col_effdt})
+ Print   $BEN050-ERROR-DESCR        (+0,+{col_sep},{col_error_descr})
+
+ Print   '='                        (+1,1,{col_emplid})                 Fill
+ Print   '='                        (+0,+{col_sep},{col_BRN})           Fill
+ Print   '='                        (+0,+{col_sep},{col_ERN})           Fill
+ Print   '='                        (+0,+{col_sep},{col_effdt})         Fill
+ Print   '='                        (+0,+{col_sep},{col_error_descr})   Fill
+
+End-Heading
+
+
+!*************************************
+Begin-Procedure Process-Main
+!*************************************
+!
+ Print ' ' (+1,1,1)
+
+ Let $Exceptions = 'N'
+
+ Do 100-Process-Employees
+
+End-Procedure
+
+
+!*************************************
+Begin-Procedure 100-Process-Employees
+!*************************************
+!
+! Driving loop - select specified Emplid,
+!                or every row from PERSON
+!
+
+ Let #PJ-Emp-Count = 0
+
+Begin-Select
+A.EMPLID
+
+            Add 1            to  #PJ-Emp-Count
+            Move &A.EMPLID   to  $Emplid
+
+            Add 1  to  #Count-Emp
+
+            Do 200-Load-Primary-Jobs-BN
+          If $No-PJ-Entries = 'N'
+            If #PJ-Entries-BN = 0
+               Move 'Y'              to     $Exceptions
+               Print $Emplid                (+1,1,{col_emplid})
+               Print ' '                    (+0,+{col_sep},{col_BRN})
+               Print ' '                    (+0,+{col_sep},{col_ERN})
+               Print ' '                    (+0,+{col_sep},{col_effdt})
+               Print $BEN050-PJ-NO-PJ-EMP   (+0,+{col_sep},{col_error_descr})
+            Else
+
+               Do 300-Process-Jobs
+
+               If #PJ-Job-Count = 0
+                  Move 'Y'                    to  $Exceptions
+                  Print $Emplid               (+1,1,{col_emplid})
+                  Print '---'                 (+0,+{col_sep},{col_BRN})
+                  Print '---'                 (+0,+{col_sep},{col_ERN})
+                  Print '    -'               (+0,+{col_sep},{col_effdt})
+                  Print $BEN050-PJ-NO-JOB     (+0,+{col_sep},{col_error_descr})
+               End-If
+
+               ! Find errors within the Primary_Jobs table/array
+               ! for this employee. (For each row in the Primary_Jobs
+               ! table/array, validate that there is one and only one
+               ! Primary Job designated for that Benefit Record, as of
+               ! that effective date).
+               Let #z = 1
+               While #z <= #PJ-Entries-BN
+
+                  Get #BRN-Target        from PJ-BN(#z) Benefit-Rcd-Nbr
+                  Get #ERN-Target        from PJ-BN(#z) Empl-Rcd-Nbr
+                  Get $Effdt-Target-YMD  from PJ-BN(#z) Effdt-YMD
+
+                  Do 410-Find-PJ-BN
+
+                  If #Primary-Jobs-Found <> 1
+                     Move 'Y'          to  $Exceptions
+                     Do Format-DateTime($Effdt-Target-YMD,$Date1,{DEFCMP},'','native')
+                     Do Format-DateTime($Date1,$DateOut,{DEFMDY},'','')
+                     Print $Emplid            (+1,1,{col_emplid})
+                     Print #BRN-Target        (+0,+{col_sep},{col_BRN})  Edit 099
+                     Print #ERN-Target        (+0,+{col_sep},{col_ERN})  Edit 099
+                     Print $DateOut           (+0,+{col_sep},{col_effdt})
+                     If #Primary-Jobs-Found = 0
+                        Print $BEN050-PJ-NO-PJ       (+0,+{col_sep},{col_error_descr})
+                     Else
+                        Move #Primary-Jobs-Found  to  $PJ-Found 888
+                        Print $BEN050-PJ-TOO-MANY    (+0,+{col_sep},{col_error_descr})
+                        Print ' ('                   (+0,+0)
+                        Print $PJ-Found              (+0,+0)
+                        Print ')'                    (+0,+0)
+                     End-If
+                  End-If
+                  Add 1  to  #z
+               End-While
+
+               ! Validate Empl_Rcd in Primary_Jobs against Empl_Rcd in Employment
+               Do 250-Report-Invalid-Jobs
+
+            End-If
+           End-If
+
+ FROM PS_PERSON A
+[$Where_Clause]
+ORDER BY EMPLID
+
+End-Select
+
+ If #PJ-Emp-Count = 0
+    If $Emplid = ''
+       Display 'Error: No Employees Found'
+       Print   'No Employees Found'                     (+2,0) CENTER
+    Else
+       Display 'Error: Requested Employee Not Found'
+       Print   'Requested Employee Not Found'           (+2,0) CENTER
+    End-If
+ End-If
+
+End-procedure
+
+
+!***************************************
+Begin-Procedure 200-Load-Primary-Jobs-BN
+!***************************************
+!
+
+ Move 0  to  #PJ-Entries-BN
+ Move 'Y' to $No-PJ-Entries
+
+Begin-Select
+D.BENEFIT_RCD_NBR
+E.EMPL_RCD
+E.EFFDT
+E.PRIMARY_JOB_IND
+E.PRIMARY_JOB_APP
+
+                  Move 'N' to $No-PJ-Entries
+                  Move &D.BENEFIT_RCD_NBR  to #BRN
+                  Move &E.EMPL_RCD         to #ERN
+                  Move &E.EFFDT            to  $Effdt
+                  Move &E.PRIMARY_JOB_IND  to $PJI
+                  Move &E.PRIMARY_JOB_APP  to $App
+
+                  Move ''        to  $DateOut
+                  Move $Effdt    to  $DateIn
+                  Do Format-Datetime($DateIn, $DateOut, {DEFCMP}, '', '')
+
+                  Add 1  to  #PJ-Entries-BN
+
+                  If #PJ-Entries-BN > {MAX_PRI_JOBS}
+                     Display $BEN050-MAX-PJ-ERROR                 noline
+                     Display ' for Emplid: '                      noline
+                     Display $Emplid
+                     STOP
+                  End-If
+
+                  Put #BRN      into  PJ-BN(#PJ-Entries-BN) Benefit-Rcd-Nbr
+                  Put #ERN      into  PJ-BN(#PJ-Entries-BN) Empl-Rcd-Nbr
+                  Put $DateOut  into  PJ-BN(#PJ-Entries-BN) Effdt-YMD
+                  Put $PJI      into  PJ-BN(#PJ-Entries-BN) Primary-Job-Ind
+
+  FROM PS_PER_ORG_ASGN D,
+       PS_PRIMARY_JOBS E
+WHERE E.EMPLID = D.EMPLID
+  AND E.EMPL_RCD = D.EMPL_RCD
+  AND E.PRIMARY_JOB_APP = 'BN'
+  AND E.EMPLID = $Emplid
+ORDER BY D.BENEFIT_RCD_NBR ASC,
+         E.EMPL_RCD ASC,
+         E.EFFDT ASC
+
+End-Select
+
+End-Procedure
+
+
+!**************************************
+Begin-Procedure 250-Report-Invalid-Jobs
+!**************************************
+!
+
+Begin-Select
+F.EMPL_RCD
+F.EFFDT
+
+                  Move &F.EFFDT            to  $Effdt
+
+                  Move ''        to  $DateOut
+                  Move $Effdt    to  $DateIn
+                  Do Format-Datetime($DateIn, $DateOut, {DEFMDY}, '', '')
+
+                  Print $Emplid                   (+1,1,{col_emplid})
+                  Print '---'                     (+0,+{col_sep},{col_BRN})
+                  Print &F.EMPL_RCD               (+0,+{col_sep},{col_ERN})  Edit 099
+                  Print $DateOut                  (+0,+{col_sep},{col_effdt})
+                  Print $BEN050-PJ-INVALID-ERN    (+0,+{col_sep},{col_error_descr})
+
+ FROM PS_PRIMARY_JOBS F
+WHERE F.PRIMARY_JOB_APP = 'BN'
+  AND F.EMPLID = $Emplid
+  AND NOT EXISTS (SELECT G.EMPL_RCD
+                    FROM PS_PER_ORG_ASGN G
+                   WHERE G.EMPLID = F.EMPLID
+                     AND G.EMPL_RCD = F.EMPL_RCD)
+ORDER BY F.EMPL_RCD ASC,
+         F.EFFDT ASC
+
+End-Select
+
+End-Procedure
+
+
+
+!*************************************
+Begin-Procedure 300-Process-Jobs
+!*************************************
+! Ensure that a row exists in Primary_Jobs for the earliest
+! job row in each Empl_Rcd that the employee holds.
+
+ Let #PJ-Job-Count = 0
+ Let #JOB-Entries-BN = 0
+
+Begin-Select
+C.BENEFIT_RCD_NBR
+B.EMPL_RCD
+MIN(B.EFFDT)     &MIN_EFFDT
+
+                     Add 1  to  #PJ-Job-Count
+
+                     Move &C.BENEFIT_RCD_NBR   to  #BRN-job
+                     Move &B.EMPL_RCD          to  #ERN-job
+                     Move &MIN_EFFDT           to  $Effdt-job
+
+                     ! Add each Empl_Rcd to the "Job Array"
+                     Add 1  to  #JOB-Entries-BN
+                     If #JOB-Entries-BN > {MAX_PRI_JOBS}
+                        Display $BEN050-MAX-JOB-ERROR       noline
+                        Display ' for Emplid:  '            noline
+                        Display $Emplid
+                        STOP
+                     End-If
+                     Put #ERN-job  into  JOB-BN(#JOB-Entries-BN) Empl-Rcd-Nbr
+
+                     Move ''          to  $DateOut
+                     Move $Effdt-job  to  $DateIn
+                     Do Format-Datetime($DateIn, $DateOut, {DEFCMP}, '', '')
+                     Move $DateOut    to  $Effdt-job-YMD
+
+                     ! Check to see if an entry exists in Primary_Jobs
+                     Do 400-Verify-PJ-Entry-BN
+
+                     If $PJ-Entry-BN = 'N'
+                        Move 'Y'             to  $Exceptions
+                        Do Format-DateTime($Effdt-job,$DateOut,{DEFMDY},'','')
+                        Print $Emplid               (+1,1,{col_emplid})
+                        Print #BRN-job              (+0,+{col_sep},{col_BRN})  Edit 099
+                        Print #ERN-job              (+0,+{col_sep},{col_ERN})  Edit 099
+                        Print $DateOut              (+0,+{col_sep},{col_effdt})
+                        Print $BEN050-PJ-NO-ENTRY   (+0,+{col_sep},{col_error_descr})
+                     End-If
+
+
+  FROM PS_PER_ORG_ASGN C,
+       PS_JOB B
+ WHERE B.EMPLID = C.EMPLID
+   AND B.EMPL_RCD = C.EMPL_RCD
+   AND B.EMPLID = $Emplid
+ GROUP BY C.BENEFIT_RCD_NBR,
+          B.EMPL_RCD
+ ORDER BY C.BENEFIT_RCD_NBR ASC,
+          B.EMPL_RCD ASC
+End-Select
+
+End-Procedure
+
+
+!*************************************
+Begin-Procedure 400-Verify-PJ-Entry-BN
+!*************************************
+!
+! Returns 'Y' in $PJ-Entry if there exists a row in Primary_Jobs
+! for the indicated BRN/ERN, in effect as of the Effdt of the indicated
+! Job row.
+!
+! We assume that the Primary-Job() array is in sequence by BRN/ERN/Effdt
+!
+
+ Move 'N'  to  $PJ-Entry-BN
+ Move 1  to  #i
+
+ While #i <= #PJ-Entries-BN
+
+   Get #BRN-i        from PJ-BN(#i) Benefit-Rcd-Nbr
+   Get #ERN-i        from PJ-BN(#i) Empl-Rcd-Nbr
+   Get $Effdt-YMD-i  from PJ-BN(#i) Effdt-YMD
+
+   If ( (#BRN-i > #BRN-job)
+        Or  ((#BRN-i = #BRN-job)
+             And (#ERN-i > #ERN-job)) )
+      Break
+   End-If
+
+   If ((#BRN-i = #BRN-job)
+      And (#ERN-i = #ERN-job))
+      If $Effdt-YMD-i <= $Effdt-job-YMD
+         Move 'Y'  to  $PJ-Entry-BN
+         Break
+      End-If
+   End-If
+
+   Add 1  to  #i
+ End-While
+
+End-Procedure
+
+
+!*************************************
+Begin-Procedure 410-Find-PJ-BN
+!*************************************
+!
+! Finds the Primary Job in effect for the indicated BRN/Effdt.
+! Also checks for more than one Primary Job in effect on the same date.
+!
+! We assume that the Primary-Job() array is in sequence by BRN/ERN/Effdt,
+! and we search in REVERSE order, so we see Effdts in Descending sequence.
+!
+! We return a count of the number of primary jobs in effect for the indicated
+! BRN as of Effdt in the #Primary-Jobs-Found variable.  If this is anything
+! other than "1", we have an error!
+!
+
+ Move 0  to  #Primary-Jobs-Found
+ Move 9999  to  #Last-ERN
+ Move #PJ-Entries-BN  to  #i
+
+ While #i > 0
+
+   Get #BRN-i        from PJ-BN(#i) Benefit-Rcd-Nbr
+   Get #ERN-i        from PJ-BN(#i) Empl-Rcd-Nbr
+   Get $PJI-i        from PJ-BN(#i) Primary-Job-Ind
+   Get $Effdt-i-YMD  from PJ-BN(#i) Effdt-YMD
+
+   If #BRN-i < #BRN-Target
+      Break
+   End-If
+
+   If #ERN-i <> #Last-ERN                    ! Skip to next ERN when appropriate
+     If #BRN-i = #BRN-Target                 ! look for primary job in this BRN
+       If $Effdt-i-YMD <= $Effdt-Target-YMD  ! This is Max(Effdt)<= for this ERN
+            Move #ERN-i  to  #Last-ERN       ! After this, skip to next ERN
+            If $PJI-i = 'Y'                  ! This is primary for this BRN
+               Add 1  to  #Primary-Jobs-Found
+            End-If
+       End-If
+     End-If
+   End-If
+
+   Subtract 1  from  #i
+ End-While
+
+End-Procedure
+
+
+!------------------------------
+Begin-Procedure Display-Summary
+!------------------------------
+ Display ' '
+ Display $BEN050-REPORT-REQ             noline
+ Display ' '                            noline
+ If $All_Employees = 'Y'
+    Display $BEN050-ALL-EMPLOYEES
+ Else
+    Display 'Emplid: '                  noline
+    Display $Emplid
+ End-If
+ Display ' '
+ Display '*------ Run Statistics------*'
+ Display 'Employee Info -'
+ Display '   TOTAL EMPLOYEES: '         noline
+ Display #Count-Emp 9,999,999
+ Display ' '
+ Display '(Total Employee count above represents individuals'
+ Display ' in the PERSON table with corresponding rows'
+ Display ' in the Employment and Job tables).'
+ Display ' '
+ Display 'Process Completed Sucessfully - '   noline
+ If $Exceptions = 'N'
+   Display $BEN050-NO-ERRORS
+   Print $BEN050-NO-ERRORS (+2,1) CENTER
+ Else
+   Display $BEN050-CHECK-REPORT
+ End-If
+ Move  '*----- '  to $EndMsg
+ Concat $BEN050-END-REPORT with $EndMsg
+ Concat ' -----*' with $EndMsg
+ Print $EndMsg (+3,1) CENTER
+
+End-Procedure
+
+
+!*************************************
+Begin-Procedure Display-Time
+!*************************************
+
+  do Get-Current-DateTime
+  display $AsOfToday NoLine
+  display ', '       NoLine
+  display $AsOfNow
+  display ''
+
+End-Procedure
+
+!*************************************
+!begin-procedure sql-error
+!*************************************
+!End-Procedure
+
+
+#include 'stdapi.sqc'    !Routines to update run status
+#Include 'reset.sqc'     !Reset printer procedure
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'bnrunctl.sqc'  !Get application run control parameters
+#Include 'bngetval.sqc'  !Get BEN values mask routines
+#Include 'sqrtrans.sqc'  !Translate SQR strings to given language
+#Include 'getrplng.sqc'  !Get the report language

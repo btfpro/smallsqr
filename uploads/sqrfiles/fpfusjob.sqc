@@ -1,0 +1,4223 @@
+
+!************************************
+!*  FUSI_JOB.SQC                    *
+!************************************
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module contains confidential and proprietary information        *
+! of Oracle; it is not to be copied, reproduced, or transmitted        *
+! in any form, by any means, in whole or in part, nor is it to         *
+! be used for any purpose other than that for which it is              *
+! expressly provided under the applicable license agreement.           *
+!                                                                      *
+! Copyright (C) 2006 Oracle. All Rights Reserved.                      *
+!
+!----------------------------------------------------------------------
+!
+!                $Date:  2006/03/28:01:30:14                           
+!             $Release:  HR9                                           
+!            $Revision:  102                                           
+!                                                                      *
+!***********************************************************************
+
+#include 'fpsys.sqc'
+#include 'fpjob.sqc'
+#include 'fpsalary.sqc'
+#Include 'fpparam.sqc'
+#define action_array_size 100
+#define fusi_action_stack_size 10
+#DEFINE FUSI_DT_NT_COMPARABLE
+#DEFINE NATIVE_DATE_LEN 10
+
+#DEFINE USER-PRE-CHG
+
+begin-procedure fusi-init ($emplid, #empl_rcd, $dt_nt_start_date) !*
+  !* initializing data for a new emplid JOB fusion
+
+#debug print 'fusi-init (' (+1,1)
+#debug print $emplid ()
+#debug print ',' ()
+#debug print #empl_rcd ()
+#debug print ',' ()
+#debug print $dt_nt_start_date ()
+#debug print ')' ()
+
+
+!global variable initialization
+let $_fusi_emplid   = $emplid
+let #_fusi_empl_rcd = #empl_rcd
+let $_fusi_dt_nt_start_date = $dt_nt_start_date
+
+
+let #_fusi_first = 1
+
+!initialising JOB default values from PSRECFIELD, first time only
+if (#_fusi_first_pass = 0)
+
+  #debug print 'fusi-init.first_pass' (+1,1)
+
+  !creating action array, has to be in a no-parameter procedure
+  do fusi-init-array
+
+  let #_fusi_first_pass = 1
+
+!activation trace file
+#ifdef debug
+let  #_fic_debug   = 1
+!PS970611
+!let  $_fic_debug   = '{FILEPREFIX}' || 'TRACEDAT2.TXT' || '{FILESUFFIX}'
+let  $_fic_debug   = '{tempdir}IF.TRC'
+!PS970611
+open $_fic_debug  as #_fic_debug
+FOR-WRITING
+RECORD=1000:FIXED
+#end-if
+
+end-if
+
+!***take EMPL_RCD into account
+
+!deleting JOB rows newer than start_date
+print '***take EMPL_RCD into account to delete JOB rows newer than start_date' (+3,1)
+print '' (+3,)
+
+let $_sql-statement = $_ReportID || ',init-fusion-job,Delete,JOB'
+!- 8.3 begin-SQL On-Error=SQL-Error
+!- 8.3 delete from PS_JOB
+!- 8.3 where  EMPLID    =  $emplid
+!- 8.3 and    EFFDT     >= {DATEIN-PREFIX}$dt_nt_start_date{DATEIN-SUFFIX}
+!- 8.3 and    EMPL_RCD  =  #empl_rcd
+!- 8.3 end-SQL
+
+!SH 10/10/2000
+!deleting FPA_CI_JOB
+let $_sql-statement = $_ReportID || ',init-fusion-job,Delete,FPA_CI_JOB'
+begin-SQL On-Error=SQL-Error
+delete from PS_FPA_CI_JOB
+where  EMPLID    =  $emplid
+and    EMPL_RCD  =  #empl_rcd
+end-SQL
+
+
+!SH 10/10/2000
+!deleting FPA_CI_COMP
+let $_sql-statement = $_ReportID || ',init-fusion-job,Delete,FPA_CI_COMP'
+begin-SQL On-Error=SQL-Error
+delete from PS_FPA_CI_COMP
+where  EMPLID    =  $emplid
+and    EMPL_RCD  =  #empl_rcd
+end-SQL
+
+
+
+
+#IFNDEF FUSI_WORK_TABLE
+!initializing array index upper limit
+let #_action_array_upper = 0
+
+
+!selecting significant actions on component tables
+do fusi-select-action($_fusi_emplid, #_fusi_empl_rcd, $_fusi_dt_nt_start_date)
+
+!sorting the action_array
+do fusi-sort-action
+#END-IF
+
+end-procedure
+
+#IFDEF FUSI_WORK_TABLE
+begin-procedure fusi-clear-work-table !*
+  !* deletes all data from FPMWORKTABLE
+
+let $sql-statement = $ReportID || ',init-fusion-job,Delete,FPMWORKTABLE'
+
+begin-SQL On-Error=SQL-Error
+delete from PS_FPMWORKTABLE
+end-SQL
+
+end-procedure
+#END-IF
+
+
+
+begin-procedure fusi-init-array !*
+  !* creating action_array
+
+create-array name=fusi_action_stack size={fusi_action_stack_size}
+field=action:char:4
+
+!SH - 10/16 include action_reason
+create-array name=fusi_action_reason size={fusi_action_stack_size}
+field=action_reason:char:4
+
+
+#IFNDEF FUSI_WORK_TABLE
+
+!array where fusi-select-action puts its selects
+create-array name=nosort_action_array size={action_array_size}
+field=effdt:char:{NATIVE_DATE_LEN}
+field=effseq:number
+field=action:char:4
+field=recname:char:18
+field=sorted:number
+
+!array where fusi-loop-action gets its values, sorted by fusi-sort-action
+create-array name=action_array size={action_array_size}
+field=effdt:char:{NATIVE_DATE_LEN}
+field=effseq:number
+field=action:char:4
+field=recname:char:18
+
+#END-IF
+
+end-procedure
+
+
+begin-procedure fusion-job($emplid, #empl_rcd, $dt_nt_start_date, $sysdatetime, $oprid) !*
+  !* main procedure for job fusioning
+
+#debug print 'fusion-job (' (+1,1)
+#debug print $emplid ()
+#debug print ',' ()
+#debug print #empl_rcd ()
+#debug print ',' ()
+#debug print $dt_nt_start_date ()
+#debug print ')' ()
+
+!initializing variables, including first-time variables and selecting relevant
+!action
+do fusi-init($emplid, #empl_rcd, $dt_nt_start_date)
+
+#debug print '#_action_array_upper :' (+1,1)
+#debug print  #_action_array_upper ()
+
+#debug print 'calling fusi-loop-action' (+1,1)
+
+
+!main processing loop on relevant actions, modifies job
+do fusi-loop-action
+
+#debug print 'end fusi-loop-action' (+1,1)
+
+end-procedure
+
+#IFDEF FUSI_WORK_TABLE
+begin-procedure fusi-insert-action-worktable ($emplid, #empl_rcd, $dt_nt_EFFDT, #EFFSEQ, $ACTION, $ACTION_REASON, $RECNAME) !*
+  !* AREA:  inserts actions into the FUSI_WORK_TABLE
+
+#debug print 'fusi-insert-action-worktable (' (+1,1)
+#debug print $emplid ()
+#debug print ',' ()
+#debug print #empl_rcd ()
+#debug print ',' ()
+#debug print $dt_nt_EFFDT ()
+#debug print ',' ()
+#debug print #EFFSEQ ()
+#debug print ',' ()
+#debug print $ACTION ()
+#debug print ',' ()
+#debug print $ACTION_REASON ()
+#debug print ',' ()
+#debug print $RECNAME ()
+#debug print ')' ()
+
+let $_sql-statement = $_ReportID || ',fusi-insert-action-worktable,Insert,'
+begin-SQL On-Error=SQL-Error
+insert into PS_FPMWORKTABLE
+(EMPLID,
+EMPL_RCD,
+EFFDT,
+EFFSEQ,
+ACTION,
+ACTION_REASON,
+RECNAME)
+VALUES
+($EMPLID,
+#EMPL_RCD,
+{DATEIN-PREFIX}$dt_nt_EFFDT{DATEIN-SUFFIX},
+#EFFSEQ,
+$ACTION,
+$ACTION_REASON,
+$RECNAME)
+end-SQL
+
+end-procedure
+#END-IF
+
+#IFNDEF FUSI_WORK_TABLE
+
+begin-procedure fusi-insert-action ($EFFDT, #EFFSEQ, $ACTION, $RECNAME)!*
+  !* memorizing a fetched action
+  !* the calling program does not "know" the actual implementation, so
+  !* the sorted array processing is hidden and can be modified
+
+let #_action_array_upper = #_action_array_upper + 1
+#debug print 'fusi-insert-action (' (+1,1)
+#debug print $EFFDT   ()
+#debug print ',' ()
+#debug print #EFFSEQ  (,,3) edit 99
+#debug print ',' ()
+#debug print $ACTION  (,,3)
+#debug print ',' ()
+#debug print $RECNAME (,,20)
+#debug print ' at '   ()
+#debug print #_action_array_upper (,,3) edit 99
+#debug print ')' ()
+
+
+let $_fusi_insert_EFFDT    = $EFFDT
+let #_fusi_insert_EFFSEQ   = #EFFSEQ
+let $_fusi_insert_ACTION   = $ACTION
+let $_fusi_insert_RECNAME  = $RECNAME
+
+do fusi-insert-action-internal
+
+end-procedure
+
+
+begin-procedure fusi-insert-action-internal !*
+  !* inserting into the actual array
+  !* specific to this sorted array processing
+
+put $fusi_insert_effdt #fusi_insert_effseq $fusi_insert_action $fusi_insert_recname into nosort_action_array (#action_array_upper) effdt effseq action recname
+
+
+end-procedure
+
+
+begin-procedure fusi-sort-action !*
+  !* sorting the fusi-arrays
+!#action_array_upper
+
+!*** obviously, a more efficient sort would be beneficient
+!***This one leads to N x N/2 average shuffles where N is the amount of entries
+!***in the fusi_array table
+!***Could we dispense with a sorted array, but use a sorted fetch?  Gain?
+
+#ifdef debug
+print 'fusi-sort-action.non sorted array' (+1,1)
+let #fusi_sort_sort_pos = 1
+while (#fusi_sort_sort_pos <= #action_array_upper)
+  get $fusi_sort_effdt #fusi_sort_effseq $fusi_sort_action $fusi_sort_recname #fusi_sort_sorted from nosort_action_array (#fusi_sort_sort_pos) effdt effseq action recname sorted
+  print #fusi_sort_sort_pos (+1,1,4) edit 99
+  print $fusi_sort_effdt   (,,11)
+  print #fusi_sort_effseq  (,,4)     edit 99
+  print $fusi_sort_action  (,,4)
+  print $fusi_sort_recname (,,20)
+  let #fusi_sort_sort_pos = #fusi_sort_sort_pos + 1
+end-while
+print 'fusi-sort-action.end of non sorted array' (+1,1)
+#end-if
+
+#debugt print 'fusi-sort-action.outer loop' (+1,1)
+let #fusi_sort_sorted_index = 1
+while (#fusi_sort_sorted_index <= #action_array_upper)
+
+  let #fusi_sort_min_pos  = 0
+  let #fusi_sort_sort_pos = 1
+
+    #debugt print 'spos'  (+1,1,4)
+    #debugt print 'effdt' (,,11)
+    #debugt print 'effs'  (,,5)
+    #debugt print 'acti'  (,,5)
+    #debugt print 'rec '  (,,20)
+    #debugt print 'sort'  (,,5)
+    #debugt print 'mini'  (,,5)
+
+  while (#fusi_sort_sort_pos <= #action_array_upper)
+    get $fusi_sort_effdt #fusi_sort_effseq $fusi_sort_action $fusi_sort_recname #fusi_sort_sorted from nosort_action_array (#fusi_sort_sort_pos) effdt effseq action recname sorted
+    #debugt print #fusi_sort_sort_pos (+1,1,4) edit 99
+    #debugt print $fusi_sort_effdt   (,,11)
+    #debugt print #fusi_sort_effseq  (,,5)     edit 99
+    #debugt print $fusi_sort_action  (,,5)
+    #debugt print $fusi_sort_recname (,,20)
+    #debugt print #fusi_sort_sorted  (,,5)     edit 99
+    #debugt print #fusi_sort_min_pos (,,5)     edit 99
+    if (#fusi_sort_sorted = 0) !is it sorted yet?
+      if (#fusi_sort_min_pos = 0) !no question, this is our first possible minimum
+        #debugt print 'assign because no minima yet' (+1,5)
+        let $fusi_sort_effdt_min    =   $fusi_sort_effdt
+        let #fusi_sort_effseq_min   =   #fusi_sort_effseq
+        let $fusi_sort_action_min   =   $fusi_sort_action
+        let $fusi_sort_recname_min  =   $fusi_sort_recname
+        let #fusi_sort_min_pos      =   #fusi_sort_sort_pos
+      else
+        #IFDEF FUSI_DT_NT_COMPARABLE !can we directly compare nt_dt dates?  OK for SQLBase
+        if ($fusi_sort_effdt < $fusi_sort_effdt_min)
+          #debugt print 'assign because effdt smaller' (+1,5)
+
+        #ELSE
+        !*** add do Format-DateTime($dt_nt_,$dt_cmp,'CMP','',''), compare CMP dates
+        #END-IF
+          !next possible minimum
+          let $fusi_sort_effdt_min    =   $fusi_sort_effdt
+          let #fusi_sort_effseq_min   =   #fusi_sort_effseq
+          let $fusi_sort_action_min   =   $fusi_sort_action
+          let $fusi_sort_recname_min  =   $fusi_sort_recname
+          let #fusi_sort_min_pos      =   #fusi_sort_sort_pos
+        else
+          if ($fusi_sort_effdt = $fusi_sort_effdt_min)
+            if (#fusi_sort_effseq < #fusi_sort_effseq_min)
+              #debugt print 'assign because effseq smaller' (+1,5)
+              let $fusi_sort_effdt_min    =   $fusi_sort_effdt
+              let #fusi_sort_effseq_min   =   #fusi_sort_effseq
+              let $fusi_sort_action_min   =   $fusi_sort_action
+              let $fusi_sort_recname_min  =   $fusi_sort_recname
+              let #fusi_sort_min_pos      =   #fusi_sort_sort_pos
+            else
+              if (#fusi_sort_effseq = #fusi_sort_effseq_min)
+              else
+                if ($fusi_sort_action < $fusi_sort_action_min)
+                  #debugt print 'assign because action smaller' (+1,5)
+                  let $fusi_sort_effdt_min    =   $fusi_sort_effdt
+                  let #fusi_sort_effseq_min   =   #fusi_sort_effseq
+                  let $fusi_sort_action_min   =   $fusi_sort_action
+                  let $fusi_sort_recname_min  =   $fusi_sort_recname
+                  let #fusi_sort_min_pos      =   #fusi_sort_sort_pos
+                else
+                  if ($fusi_sort_action = $fusi_sort_action_min)
+                    if ($fusi_sort_recname < $fusi_sort_recname_min)
+                      #debugt print 'assign because recname smaller' (+1,5)
+                      let $fusi_sort_effdt_min    =   $fusi_sort_effdt
+                      let #fusi_sort_effseq_min   =   #fusi_sort_effseq
+                      let $fusi_sort_action_min   =   $fusi_sort_action
+                      let $fusi_sort_recname_min  =   $fusi_sort_recname
+                      let #fusi_sort_min_pos      =   #fusi_sort_sort_pos
+                    end-if !recname compare
+                  end-if   !action compare =
+                end-if   !action compare <
+              end-if     !effseq compare =
+            end-if     !effseq compare  <
+          end-if       !effdt  compare  =
+        end-if       !effdt  compare  <
+      end-if         !#fusi_sort_min_pos = 0?
+    end-if           !#fusi_sort_sorted  = 0?
+    let #fusi_sort_sort_pos = #fusi_sort_sort_pos + 1
+  end-while
+  !OK, we now take the minimum found and put it at the first free position of the
+  !sorted array
+  get $fusi_sort_effdt #fusi_sort_effseq $fusi_sort_action $fusi_sort_recname #fusi_sort_sorted from nosort_action_array (#fusi_sort_min_pos) effdt effseq action recname sorted
+  put $fusi_sort_effdt #fusi_sort_effseq $fusi_sort_action $fusi_sort_recname into action_array (#fusi_sort_sorted_index) effdt effseq action recname
+
+  #debugt print 'fusi-sort-action.tranfer from #fusi_sort_min_pos : ' (+1,1)
+  #debugt print #fusi_sort_min_pos (,,4)
+  #debugt print ' to #fusi_sort_sorted_index : ' ()
+  #debugt print #fusi_sort_sorted_index ()
+
+
+  !flag the minimum tranferred as sorted
+  put 1 into nosort_action_array (#fusi_sort_min_pos) sorted
+  let #fusi_sort_sorted_index = #fusi_sort_sorted_index + 1
+end-while
+
+#ifdef debug
+print 'fusi-sort-action.resulting sorted array' (+1,1)
+let #fusi_sort_sorted_index = 1
+while (#fusi_sort_sorted_index <= #action_array_upper)
+  get $fusi_sort_effdt #fusi_sort_effseq $fusi_sort_action $fusi_sort_recname from action_array (#fusi_sort_sorted_index) effdt effseq action recname
+  let #fusi_sort_sorted_index = #fusi_sort_sorted_index + 1
+
+  print #fusi_sort_sorted_index (+1,1,4) edit 99
+  print $fusi_sort_effdt   (,,11)
+  print #fusi_sort_effseq  (,,4) edit 99
+  print $fusi_sort_action  (,,4)
+  print $fusi_sort_recname (,,20)
+end-while
+#end-if
+
+
+end-procedure
+
+#END-IF
+
+begin-procedure CHANGE-AFTER !*
+  !* flushing data on the last info read
+
+  #debug print 'CHANGE-AFTER.fusi-flush' (+1,1)
+  if (#flag_data_to_process = 1)
+    do fusi-flush
+    !watch out!  you can get multiple change-afters due to EMPLID, EMPL_RCD breaks
+    !only one should trigger a flush
+    let #flag_data_to_process = 0
+  end-if
+
+end-procedure
+
+begin-procedure CHANGE-BEFORE !*
+  !* initializing data on a new emplid or empl_rcd
+  !* purging existing jobs (for that emplid, empl_rcd) that are dated after
+  !* the start_date
+
+let $fusi_emplid      = &FUSI_ACTION_EMPLID2
+let #fusi_empl_rcd    = &FUSI_ACTION_EMPL_RCD2
+let $fusi_dt_nt_effdt = &FUSI_ACTION_EFFDT2
+
+!SH 19/06/1997 reinitialize offset
+let #fusi_action_offset = 0
+let #fusi_action_stack  = 0
+!SH 19/06/1997
+
+let #fusi_first = 1
+
+!SH 19/06/1997 ignore emplid/empl_rcd when action is 999
+let #fusi_ignore = 0
+
+!- 8.3 let $_sql-statement = $_ReportID || ',init-fusion-job,Delete,JOB'
+!- 8.3 begin-SQL On-Error=SQL-Error
+!- 8.3 delete from PS_JOB
+!- 8.3 where  EMPLID    =  $fusi_emplid
+!- 8.3 and    EMPL_RCD  =  #fusi_empl_rcd
+!- 8.3 and    EFFDT     >= {DATEIN-PREFIX}$fusi_dt_nt_effdt{DATEIN-SUFFIX}
+!- 8.3 end-SQL
+
+!SH 10/10/2000
+!deleting FPA_CI_JOB
+let $_sql-statement = $_ReportID || ',init-fusion-job,Delete,FPA_CI_JOB'
+begin-SQL On-Error=SQL-Error
+delete from PS_FPA_CI_JOB
+where  EMPLID    =  $fusi_emplid
+and    EMPL_RCD  =  #fusi_empl_rcd
+end-SQL
+
+
+!SH 10/10/2000
+!deleting FPA_CI_COMP
+let $_sql-statement = $_ReportID || ',init-fusion-job,Delete,FPA_CI_COMP'
+begin-SQL On-Error=SQL-Error
+delete from PS_FPA_CI_COMP
+where  EMPLID    =  $fusi_emplid
+and    EMPL_RCD  =  #fusi_empl_rcd
+end-SQL
+
+
+end-procedure
+
+begin-procedure fusi-select-worktable !*
+ !* main processing loop on relevant actions, modifies job
+
+
+!activation trace file
+#ifdef debug
+let  #fic_debug   = 1
+let  $fic_debug   = '{FILEPREFIX}' || 'TRACEDAT2.TXT' || '{FILESUFFIX}'
+open $fic_debug  as #fic_debug
+FOR-WRITING
+RECORD=1000:FIXED
+#end-if
+
+
+#debug print 'entering FPMWORKTABLE select' (+1,1)
+
+let #flag_data_to_process = 0
+
+let $sql-statement = $ReportID || ',fusi-select-worktable,Select,PS_FPMWORKTABLE'
+begin-select On-Error=SQL-Error
+EMPLID    &FUSI_ACTION_EMPLID2    () ON-BREAK PRINT=NEVER LEVEL=1 BEFORE=CHANGE-BEFORE AFTER=CHANGE-AFTER
+EMPL_RCD  &FUSI_ACTION_EMPL_RCD2  () ON-BREAK PRINT=NEVER LEVEL=1 BEFORE=CHANGE-BEFORE AFTER=CHANGE-AFTER
+{DATEOUT-PREFIX}EFFDT{DATEOUT-SUFFIX} &FUSI_ACTION_EFFDT2
+  let $fusi_dt_nt_effdt = &FUSI_ACTION_EFFDT2
+  let #flag_data_to_process = 1
+EFFSEQ &FUSI_ACTION_EFFSEQ2
+  let #fusi_effseq = &FUSI_ACTION_EFFSEQ2
+ACTION &FUSI_ACTION2
+  let $fusi_action = &FUSI_ACTION2
+ACTION_REASON &FUSI_ACTION_REASON2
+  let $fusi_action_reason = &FUSI_ACTION_REASON2
+RECNAME &FUSI_RECNAME2
+  #ifdef debug
+    print 'FUSI_ACTION_EMPLID2 :'   (+1,1)
+    print &FUSI_ACTION_EMPLID2    (,,11)
+    print &FUSI_ACTION_EMPL_RCD2  (,,2) edit 99
+    print &FUSI_ACTION_EFFDT2  (,,10)
+    print &FUSI_ACTION_EFFSEQ2  (,,2) edit 99
+    print &FUSI_ACTION2  (,,3)
+    print &FUSI_ACTION_REASON2  (,,3)
+    print &FUSI_RECNAME2 (,,20)
+
+
+  #end-if
+
+  let $fusi_recname  = rtrim(&FUSI_RECNAME2,' ')
+  #debug print 'do          fusi-process-action' (+1,1)
+  !SH 19/06/1997 ignore emplid/empl_rcd when action is 999
+  if  #fusi_ignore = 0
+    do  fusi-process-action
+  end-if
+  #debug print 'return from fusi-process-action' (+1,1)
+
+from  PS_FPMWORKTABLE
+order by EMPLID, EMPL_RCD, EFFDT, EFFSEQ, ACTION, RECNAME
+end-select
+
+
+!only flush if there is something to write
+!if (#flag_data_to_process = 1)
+!  #debug print 'forced fusi-flush' (+1,1)
+!  do fusi-flush
+!end-if
+
+end-procedure
+
+
+begin-procedure fusi-loop-action !*
+ !* main processing loop on relevant actions, modifies job
+
+#IFNDEF FUSI_WORK_TABLE
+let #action_array_index = 1
+let #fusi_first = 1
+while #action_array_index <= #action_array_upper
+
+  get $fusi_dt_nt_effdt #fusi_effseq $fusi_action $fusi_recname from action_array (#action_array_index) effdt effseq action recname
+  #debug print 'fusi-loop-action.$fusi_dt_nt_effdt :' (+1,1)
+  #debug print $fusi_dt_nt_effdt ()
+  #debug print '                 #fusi_effseq      :' (+1,1)
+  #debug print #fusi_effseq ()   edit 99
+  #debug print '                 $fusi_action      :' (+1,1)
+  #debug print $fusi_action ()
+  #debug print '                 $fusi_recname     :' (+1,1)
+  #debug print $fusi_recname ()
+
+
+  let #fusi_effdt_break = 0
+  do  fusi-process-action
+  let #action_array_index = #action_array_index + 1
+
+end-while
+
+let #fusi_effdt_break = 1
+!only flush if there is something to write
+if (#action_array_upper != 0)
+  #debug print 'fusi-loop-actionj.forced fusi-flush' (+1,1)
+  do fusi-flush
+end-if
+
+
+#ELSE
+
+#debug print 'entering FPMWORKTABLE select' (+1,1)
+
+let #flag_data_to_process = 0
+
+begin-select
+{DATEOUT-PREFIX}EFFDT{DATEOUT-SUFFIX} &FUSI_ACTION_EFFDT
+  let $fusi_dt_nt_effdt = &FUSI_ACTION_EFFDT
+  let #flag_data_to_process = 1
+EFFSEQ &FUSI_ACTION_EFFSEQ
+  let #fusi_effseq = &FUSI_ACTION_EFFSEQ
+ACTION &FUSI_ACTION
+  let $fusi_action = &FUSI_ACTION
+ACTION_REASON &FUSI_ACTION_REASON
+  let $fusi_action_reason = &FUSI_ACTION_REASON
+RECNAME &FUSI_RECNAME
+  let $fusi_recname  = rtrim(&FUSI_RECNAME,' ')
+  #debug print 'do          fusi-process-action' (+1,1)
+  do  fusi-process-action
+  #debug print 'return from fusi-process-action' (+1,1)
+
+from  PS_FPMWORKTABLE
+where EMPLID = $fusi_emplid
+AND   EFFDT  >= {DATEIN-PREFIX}$dt_nt_start_date{DATEIN-SUFFIX}
+order by EFFDT, EFFSEQ, ACTION, RECNAME
+end-select
+
+
+!only flush if there is something to write
+if (#flag_data_to_process = 1)
+  #debug print 'fusi-loop-action.forced fusi-flush' (+1,1)
+  do fusi-flush
+end-if
+
+#END-IF
+
+end-procedure
+
+begin-procedure fusi-process-action !*
+  !* main procedure for handling individual changes
+
+#debug print 'fusi-process-action (' (+1,1)
+#debug print 'fusi_first        :'   (+1,1,20)
+#debug print  #fusi_first            () edit 99
+#debug print 'fusi_dt_nt_effdt  :'   (+1,1,20)
+#debug print $fusi_dt_nt_effdt       ()
+#debug print 'fusi_effdt_prev   :'   (+1,1,20)
+#debug print $fusi_effdt_prev        ()
+#debug print 'fusi_effseq       :'   (+1,1,20)
+#debug print #fusi_effseq            () edit 99
+#debug print '#fusi_effseq_prev :'   (+1,1,20)
+#debug print #fusi_effseq_prev       () edit 99
+#debug print '$fusi_action      :'   (+1,1,20)
+#debug print $fusi_action            ()
+#debug print '$fusi_action_prev :'   (+1,1,20)
+#debug print $fusi_action_prev       ()
+#debug print '$fusi_action_reason :' (+1,1,20)
+#debug print $fusi_action_reason     ()
+#debug print '$fusi_actn_rsn_prev :'   (+1,1,20)
+#debug print $fusi_actn_rsn_prev       ()
+
+
+if (#fusi_first != 1)
+  if ($fusi_dt_nt_effdt != $fusi_effdt_prev)
+    #debug print 'date break.fusi-flush' (+1,5)
+    let #fusi_effdt_break = 1
+    do fusi-flush
+
+    !setting the effseq offset counter back to 0, since the date has changed
+    let #fusi_action_offset = 0
+    let #fusi_action_stack  = 0
+    else
+      if (#fusi_effseq != #fusi_effseq_prev)
+        #debug print 'effseq break.fusi-flush' (+1,5)
+        do fusi-flush
+        let #fusi_action_stack  = 0
+      else
+        if ($fusi_action != $fusi_action_prev)
+          #debug print 'action break' (+1,5)
+          !keeping track of the action for later redundant insertions into the JOB
+          !(each action has its own effseq).  See also fusi_effseq_offset.
+          let #fusi_action_stack = #fusi_action_stack + 1
+          put $fusi_action_prev into fusi_action_stack (#fusi_action_stack) action
+          put $fusi_actn_rsn_prev into fusi_action_reason (#fusi_action_stack) action_reason
+        end-if
+      end-if
+  end-if
+else
+ !SH 19/06/1997 ignore emplid/empl_rcd when action is 999
+ if $fusi_action = '999'
+    let #fusi_ignore = 1
+    goto end_proc
+ end-if
+ do  fusi-select-JOB($fusi_emplid, #fusi_empl_rcd, $fusi_dt_nt_effdt)
+ !SH 14/08/1997
+ do  fusi-select-JOB_JR($fusi_emplid, #fusi_empl_rcd, $fusi_dt_nt_effdt)
+ let #fusi_first = 0
+end-if
+
+do fusi-fusion-JOB($fusi_emplid, #fusi_empl_rcd, $fusi_dt_nt_effdt, #fusi_effseq, $fusi_recname)
+
+let $fusi_effdt_prev  = $fusi_dt_nt_effdt
+let #fusi_effseq_prev = #fusi_effseq
+let $fusi_action_prev = $fusi_action
+let $fusi_actn_rsn_prev = $fusi_action_reason
+
+end_proc:
+
+end-procedure fusi-process-action
+
+begin-procedure fusi-flush  !*
+  !*
+
+#debug print 'fusi-flush' (+1,5)
+
+!getting employee status associated with last action
+!begin-select
+!EMPL_STATUS &FUSI_EMPL_STATUS
+!  let $fusi_empl_status = &FUSI_EMPL_STATUS
+!from PS_FPMACTION_TBL
+!where ACTION = $fusi_action_prev
+!AND EFFDT =
+!  (SELECT MAX(EFFDT)
+!   from PS_FPMACTION_TBL
+!   where ACTION = $fusi_action_prev
+!   and  EFFDT <= $AsOfDate
+!  )
+!end-select
+
+!first, using the effseq offset counter to offset the effseq, if necessary
+!the effseq offset counter is used to keep track of how many extra effseqs have
+!been  generated by the fusion mechanism, in addition to the effseqs on component
+!tables
+
+!tables w.o. effseq can come with a pseudo-effseq of -1
+!this has to be corrected to an insertion effseq of 0
+!(impacts subsequent insertions as well)
+
+if (#fusi_effseq_prev = -1)
+  let #fusi_action_offset = 1
+end-if
+
+let #fusi_effseq_ins = #fusi_effseq_prev + #fusi_action_offset
+
+#IFDEF USER-PRE-CHG
+  do user-pre-chg($fusi_emplid, #fusi_empl_rcd, $fusi_effdt_prev, #fusi_effseq_ins, $fusi_action_prev)
+  do Build-MCOP
+#END-IF
+
+
+do fusi-insert-fpa_ci_job($fusi_emplid, #fusi_empl_rcd, $fusi_effdt_prev, #fusi_effseq_ins,
+        $fusi_action_prev, $fusi_actn_rsn_prev, $sysdatetime, $oprid)
+!SH 14/08/1997
+!8.3 do fusi-insert-JOB_JR($fusi_emplid, #fusi_empl_rcd, $fusi_effdt_prev, #fusi_effseq_ins,
+!8.3         $fusi_action_prev, $fusi_actn_rsn_prev, $sysdatetime, $oprid)
+
+
+#IFDEF USER-POST-CHG
+  do user-post-chg($fusi_emplid, #fusi_empl_rcd, $dt_nt_effdt, #effseq, $action)
+#END-IF
+
+!- 8.3 do fusi-set-FP_ROW_END_DT($fusi_emplid, #fusi_empl_rcd, $fusi_effdt_prev, #fusi_effseq_ins)
+
+let #fusi_action_index = 1
+
+while (#fusi_action_index <= #fusi_action_stack)
+  get $fusi_action_ins from fusi_action_stack (#fusi_action_index) action
+  get $fusi_actn_rsn_ins from fusi_action_reason (#fusi_action_index) action_reason
+  let #fusi_action_offset = #fusi_action_offset + 1
+  let #fusi_effseq_ins = #fusi_effseq_prev +  #fusi_action_offset
+
+
+  #IFDEF USER-PRE-CHG
+     do user-pre-chg($fusi_emplid, #fusi_empl_rcd, $fusi_effdt_prev, #fusi_effseq_ins, $fusi_action_prev)
+     do Build-MCOP
+  #END-IF
+
+
+  do fusi-insert-fpa_ci_job($fusi_emplid, #fusi_empl_rcd, $fusi_effdt_prev, #fusi_effseq_ins,
+        $fusi_action_ins, $fusi_actn_rsn_ins, $sysdatetime, $oprid)
+  !SH 14/08/1997
+  !8.3 do fusi-insert-JOB_JR($fusi_emplid, #fusi_empl_rcd, $fusi_effdt_prev, #fusi_effseq_ins,
+  !8.3       $fusi_action_ins, $fusi_actn_rsn_ins, $sysdatetime, $oprid)
+
+  !- 8.3 do fusi-set-FP_ROW_END_DT($fusi_emplid, #fusi_empl_rcd, $fusi_effdt_prev, #fusi_effseq_ins)
+
+  let #fusi_action_index = #fusi_action_index + 1
+end-while
+
+end-procedure   fusi-flush
+
+#IFNDEF FUSI_WORK_TABLE
+
+begin-procedure fusi-insert-action-no-effseq ($fusi_dt_nt_effdt, $fusi_action, $fusi_recname) !*
+  !* assignment of a pseudo-effseq on tables w.o. effseq, either 0 or less
+  !* CALLS an procedure w.o. parameters, as this relies on processing nosort_action_array
+
+#debug print 'fusi-insert-action-no-effseq (' (+1,1)
+#debug print $fusi_dt_nt_effdt ()
+#debug print ',' ()
+#debug print $fusi_action ()
+#debug print ',' ()
+#debug print $fusi_recname ()
+#debug print ')' ()
+
+
+let $_dt_nt_effdt_0001  = $fusi_dt_nt_effdt
+let $_fusi_action_0001  = $fusi_action
+let $_fusi_recname_0001 = $fusi_recname
+
+do fusi-insert-action-no-effseq-internal
+
+
+end-procedure
+
+
+begin-procedure fusi-insert-action-no-effseq-internal !*
+  !* actual assignment of the pseudo-effseq
+
+!first thing:  is there another event, coming from a table w effseq
+!w effseq = 0 and action, effdt the same?
+
+let #action_array_upper = #action_array_upper + 1
+let #min_effseq    = 0
+let #flag_assigned = 0
+
+#debug print 'fusi-insert-action-no-effseq-internal' (+1,1)
+let #fusi_sort_sort_pos = 1
+while (#fusi_sort_sort_pos <= #action_array_upper)
+  get $fusi_sort_effdt #fusi_sort_effseq $fusi_sort_action  from nosort_action_array (#fusi_sort_sort_pos) effdt effseq action
+
+  #debug print $fusi_sort_effdt   (+1,1,11)
+  #debug print #fusi_sort_effseq  (,,4)     edit 99
+  #debug print $fusi_sort_action  (,,4)
+
+  if ($dt_nt_effdt_0001 = $fusi_sort_effdt) and (#fusi_sort_effseq <= 0)
+    !on that date it's either a component table w. effseq of 0 or
+    !it's another table w.o. effseq
+
+    if ($fusi_action_0001 = $fusi_sort_action)
+      !the action matches:
+      !OK for assignment to pseudo-effseq.
+      !The modifications in the record being processed need to be applied at this effseq
+
+      put $dt_nt_effdt_0001 #fusi_sort_effseq $fusi_action_0001 $fusi_recname_0001 into nosort_action_array (#action_array_upper) effdt effseq action recname
+      let #flag_assigned = 1
+      #debug print 'inserted w. pseudo-effseq: ' (+1,1)
+      #debug print #fusi_sort_effseq () edit 99
+
+      break
+    end-if
+  end-if
+
+  let #fusi_sort_sort_pos = #fusi_sort_sort_pos + 1
+
+end-while
+
+!have we inserted the action with an effseq associated with another event?
+if (#flag_assigned = 0)
+  !no, so we'll insert it at effseq = - 1 for that date
+
+  put $dt_nt_effdt_0001 -1 $fusi_action_0001 $fusi_recname_0001 into nosort_action_array (#action_array_upper) effdt effseq action recname
+  #debug print 'inserted w. pseudo-effseq: -1' (+1,1)
+
+end-if
+
+print 'fusi-sort-action.end of non sorted array' (+1,1)
+
+end-procedure
+
+#END-IF
+
+
+begin-procedure fusi-set-FP_ROW_END_DT($emplid, #empl_rcd, $dt_nt_effdt, #effseq) !*
+  !*setting FP_ROW_END_DT for the row BEFORE the row in parameter
+
+if (#effseq > 0)
+  let #effseq_upd = #effseq - 1
+  !previous row is at current date, so its end date is the current date
+  do fusi-upd-FP_ROW_END_DT($emplid, #empl_rcd, $dt_nt_effdt, #effseq_upd, $dt_nt_effdt)
+else
+  !previous row, at some previous date, is set to the current date
+  !the date is set back one day inside this function, because there's not
+  !always preceding data (case of HIR)
+  do fusi-set-FP_ROW_END_DT-prev($emplid, #empl_rcd, $dt_nt_effdt)
+end-if
+
+end-procedure
+
+begin-procedure fusi-upd-FP_ROW_END_DT($emplid, #empl_rcd, $dt_nt_effdt, #effseq, $dt_nt_fp_row_end_dt) !*
+  !* updating FP_ROW_END_DT for a given JOB row
+
+#debug print 'fusi-upd-FP_ROW_END_DT(' (+1,1)
+#debug print $emplid (,)
+#debug print ',' (,)
+#debug print #empl_rcd (,) edit 99
+#debug print ',' (,)
+#debug print $dt_nt_effdt (,)
+#debug print ',' (,)
+#debug print #effseq (,) edit 99
+#debug print ',' (,)
+#debug print $dt_nt_fp_row_end_dt ()
+#debug print ')' (,)
+
+
+let $_sql-statement = $_ReportID || ',fusi-set-FP_ROW_END_DT-current,Update,JOB_JR'
+begin-SQL On-Error=SQL-Error
+!SH 14/08/1997
+Update PS_JOB_JR
+set    FP_ROW_END_DT = {DATEIN-PREFIX}$dt_nt_fp_row_end_dt{DATEIN-SUFFIX}
+where  EMPLID        = $emplid
+and    EMPL_RCD      = #empl_rcd
+and    EFFDT         = {DATEIN-PREFIX}$dt_nt_effdt{DATEIN-SUFFIX}
+and    EFFSEQ        = #effseq
+end-SQL
+
+end-procedure
+
+begin-procedure fusi-set-FP_ROW_END_DT-prev($emplid, #empl_rcd, $dt_nt_effdt) !*
+  !* updating FP_ROW_END_DT for a JOB row at some previous date
+
+let #num_rows = 0
+
+let $_sql-statement = $_ReportID || ',fusi-set-FP_ROW_END_DT-current,select,JOB_JR'
+begin-select On-Error=SQL-Error
+!SH 14/08/1997
+{DATEOUT-PREFIX}EFFDT{DATEOUT-SUFFIX} &TGT_EFFDT
+EFFSEQ &TGT_EFFSEQ
+  let #num_rows = 1
+from   PS_JOB_JR J
+where  EMPLID       = $emplid
+and    EMPL_RCD     = #empl_rcd
+and    EFFDT        =
+  (select max(EFFDT)
+   from  PS_JOB_JR J2
+   where J2.EMPLID    = J.EMPLID
+   and   J2.EMPL_RCD  = J.EMPL_RCD
+   and   J2.EFFDT     < {DATEIN-PREFIX}$dt_nt_effdt{DATEIN-SUFFIX})
+and    EFFSEQ       =
+  (select max(EFFSEQ)
+   from  PS_JOB_JR J3
+   where J3.EMPLID = J.EMPLID
+   and   J3.EMPL_RCD = J.EMPL_RCD
+   and   J3.EFFDT = J.EFFDT)
+end-select
+
+
+if (#num_rows = 1)
+  !calculating the day before
+
+
+  do Convert-To-DTU-Date($dt_nt_effdt, $dtu_date)
+  do dtu-subtract-days($dtu_date, 1, $dtu_eve)
+  do Convert-From-DTU-Date($dtu_eve, $dt_nt_eve)
+
+  do fusi-upd-FP_ROW_END_DT($emplid, #empl_rcd, &TGT_EFFDT, &TGT_EFFSEQ, $dt_nt_eve)
+end-if
+
+end-procedure
+
+
+begin-procedure fusi-insert-action-worktable-no-effseq ($emplid, #empl_rcd, $dt_nt_EFFDT, $ACTION, $ACTION_REASON, $recname)
+  !* AREA:  inserts actions into the FUSI_WORK_TABLE for component tables w.o. EFFSEQ
+
+#debug print 'fusi-insert-action-worktable-no-effseq (' (+1,1)
+#debug print $emplid ()
+#debug print ',' ()
+#debug print #empl_rcd ()
+#debug print ',' ()
+#debug print $dt_nt_EFFDT ()
+#debug print ',' ()
+#debug print $ACTION ()
+#debug print ',' ()
+#debug print $RECNAME ()
+#debug print ')' ()
+
+!first thing:  is there another event, coming from a table w effseq
+!where effseq = 0 and action, effdt the same?
+
+let #num_rows = 0
+!let #PSEUDO_EFFSEQ = -1
+let #PSEUDO_EFFSEQ = 0
+
+let $_sql-statement = $_ReportID || ',fusi-insert-action-worktable-no-effseq,Select,FPMWORKTABLE'
+begin-select On-Error=SQL-Error
+1
+#ifdef debug
+EMPLID (+1,3,11)
+EMPL_RCD (,,2) edit 99
+{DATEOUT-PREFIX}EFFDT{DATEOUT-SUFFIX}  (,+1,11)
+ACTION (,,3)
+ACTION_REASON (,,3)
+EFFSEQ (,,2) edit 99
+RECNAME (,+1,)
+#end-if
+  let #PSEUDO_EFFSEQ = 0
+from   PS_FPMWORKTABLE
+where  EMPLID    = $emplid
+and    EMPL_RCD  = #empl_rcd
+and    EFFDT     = {DATEIN-PREFIX}$dt_nt_EFFDT{DATEIN-SUFFIX}
+and    ACTION    = $action
+and    ACTION_REASON = $action_reason
+and    EFFSEQ    = 0
+end-select
+
+#debug print '#PSEUDO_EFFSEQ :' (+1,3)
+#debug print #PSEUDO_EFFSEQ  (,) edit 99
+
+
+
+let $_sql-statement = $_ReportID || ',fusi-insert-action-worktable-no-effseq,Insert,FPMWORKTABLE'
+begin-SQL On-Error=SQL-Error
+insert into PS_FPMWORKTABLE
+(EMPLID,
+EMPL_RCD,
+EFFDT,
+EFFSEQ,
+ACTION,
+ACTION_REASON,
+RECNAME)
+VALUES
+($EMPLID,
+#EMPL_RCD,
+{DATEIN-PREFIX}$dt_nt_EFFDT{DATEIN-SUFFIX},
+#PSEUDO_EFFSEQ,
+$ACTION,
+$ACTION_REASON,
+$RECNAME)
+end-SQL
+
+
+end-procedure
+
+
+
+begin-procedure fusi-select-action-FPAEECAREER ($emplid, #empl_rcd, $dt_nt_start_date)!*
+  !* AREA:              selects relevant actions for FPAEECAREER
+  !* GENERATED BY:      gnr-select-action
+  !* CALLED BY:         fusi-select-action
+  !* CALLS:
+
+let $_sql-statement = $_ReportID || ',fusi-select-action-FPAEECAREER,select,FPAEECAREER'
+begin-select On-Error=SQL-Error
+{DATEOUT-PREFIX}EFFDT{DATEOUT-SUFFIX} &EFFDT
+EFFSEQ  &EFFSEQ
+ACTION  &ACTION
+ACTION_REASON &ACTION_REASON
+#IFNDEF FUSI_WORK_TABLE
+  do fusi-insert-action (&EFFDT, &EFFSEQ, &ACTION, 'FPAEECAREER')
+#ELSE
+  do fusi-insert-action-worktable ($emplid, #empl_rcd, &EFFDT, &EFFSEQ, &ACTION, &ACTION_REASON, 'FPAEECAREER')
+#END-IF
+from  PS_FPAEECAREER
+where EMPLID     =  $emplid
+AND   EMPL_RCD   =  #empl_rcd
+AND   FP_CNL_ROW =  'N'
+AND   FP_INST_STAT = 'R'        !SH 19/06/1997 select only real rows
+AND   EFFDT      >= {DATEIN-PREFIX}$dt_nt_start_date{DATEIN-SUFFIX}
+end-select
+
+end-procedure
+
+
+
+begin-procedure fusi-select-action-FPAEEOTHER_TBL ($emplid, #empl_rcd, $dt_nt_start_date)!*
+  !* AREA:              selects relevant actions for FPAEEOTHER_TBL
+  !* GENERATED BY:      gnr-select-action
+  !* CALLED BY:         fusi-select-action
+  !* CALLS:
+
+let $_sql-statement = $_ReportID || ',fusi-select-action-FPAEEOTHER_TBL,select,FPAEEOTHER_TBL'
+begin-select On-Error=SQL-Error
+{DATEOUT-PREFIX}EFFDT{DATEOUT-SUFFIX} &EFFDT
+EFFSEQ  &EFFSEQ
+ACTION  &ACTION
+ACTION_REASON &ACTION_REASON
+#IFNDEF FUSI_WORK_TABLE
+  do fusi-insert-action (&EFFDT, &EFFSEQ, &ACTION, 'FPAEEOTHER_TBL')
+#ELSE
+  do fusi-insert-action-worktable ($emplid, #empl_rcd, &EFFDT, &EFFSEQ, &ACTION, &ACTION_REASON, 'FPAEEOTHER_TBL')
+#END-IF
+from  PS_FPAEEOTHER_TBL
+where EMPLID     =  $emplid
+AND   EMPL_RCD   =  #empl_rcd
+AND   FP_CNL_ROW =  'N'
+AND   FP_INST_STAT = 'R'        !SH 19/06/1997 select only real rows
+AND   EFFDT      >= {DATEIN-PREFIX}$dt_nt_start_date{DATEIN-SUFFIX}
+end-select
+
+end-procedure
+
+
+
+begin-procedure fusi-select-action-FPAEEPOST_TBL ($emplid, #empl_rcd, $dt_nt_start_date)!*
+  !* AREA:              selects relevant actions for FPAEEPOST_TBL
+  !* GENERATED BY:      gnr-select-action
+  !* CALLED BY:         fusi-select-action
+  !* CALLS:
+
+let $_sql-statement = $_ReportID || ',fusi-select-action-FPAEEPOST_TBL,select,FPAEEPOST_TBL'
+begin-select On-Error=SQL-Error
+{DATEOUT-PREFIX}EFFDT{DATEOUT-SUFFIX} &EFFDT
+EFFSEQ  &EFFSEQ
+ACTION  &ACTION
+ACTION_REASON &ACTION_REASON
+#IFNDEF FUSI_WORK_TABLE
+  do fusi-insert-action (&EFFDT, &EFFSEQ, &ACTION, 'FPAEEPOST_TBL')
+#ELSE
+  do fusi-insert-action-worktable ($emplid, #empl_rcd, &EFFDT, &EFFSEQ, &ACTION, &ACTION_REASON, 'FPAEEPOST_TBL')
+#END-IF
+from  PS_FPAEEPOST_TBL
+where EMPLID     =  $emplid
+AND   EMPL_RCD   =  #empl_rcd
+AND   FP_CNL_ROW =  'N'
+AND   FP_INST_STAT = 'R'        !SH 19/06/1997 select only real rows
+AND   EFFDT      >= {DATEIN-PREFIX}$dt_nt_start_date{DATEIN-SUFFIX}
+end-select
+
+end-procedure
+
+
+
+begin-procedure fusi-select-action-FPAEESALARY ($emplid, #empl_rcd, $dt_nt_start_date)!*
+  !* AREA:              selects relevant actions for FPAEESALARY
+  !* GENERATED BY:      gnr-select-action
+  !* CALLED BY:         fusi-select-action
+  !* CALLS:
+
+let $_sql-statement = $_ReportID || ',fusi-select-action-FPAEESALARY,select,FPAEESALARY'
+begin-select On-Error=SQL-Error
+{DATEOUT-PREFIX}EFFDT{DATEOUT-SUFFIX} &EFFDT
+EFFSEQ  &EFFSEQ
+ACTION  &ACTION
+ACTION_REASON &ACTION_REASON
+#IFNDEF FUSI_WORK_TABLE
+  do fusi-insert-action (&EFFDT, &EFFSEQ, &ACTION, 'FPAEESALARY')
+#ELSE
+  do fusi-insert-action-worktable ($emplid, #empl_rcd, &EFFDT, &EFFSEQ, &ACTION, &ACTION_REASON, 'FPAEESALARY')
+#END-IF
+from  PS_FPAEESALARY
+where EMPLID     =  $emplid
+AND   EMPL_RCD   =  #empl_rcd
+AND   FP_CNL_ROW =  'N'
+AND   FP_INST_STAT = 'R'        !SH 19/06/1997 select only real rows
+AND   EFFDT      >= {DATEIN-PREFIX}$dt_nt_start_date{DATEIN-SUFFIX}
+end-select
+
+end-procedure
+
+
+
+begin-procedure fusi-select-action-FPAEESALARYBIS ($emplid, #empl_rcd, $dt_nt_start_date)!*
+  !* AREA:              selects relevant actions for FPAEESALARYBIS
+  !* GENERATED BY:      gnr-select-action
+  !* CALLED BY:         fusi-select-action
+  !* CALLS:
+
+let $_sql-statement = $_ReportID || ',fusi-select-action-FPAEESALARYBIS,select,FPAEESALARYBIS'
+begin-select On-Error=SQL-Error
+{DATEOUT-PREFIX}EFFDT{DATEOUT-SUFFIX} &EFFDT
+EFFSEQ  &EFFSEQ
+ACTION  &ACTION
+ACTION_REASON &ACTION_REASON
+#IFNDEF FUSI_WORK_TABLE
+  do fusi-insert-action (&EFFDT, &EFFSEQ, &ACTION, 'FPAEESALARYBIS')
+#ELSE
+  do fusi-insert-action-worktable ($emplid, #empl_rcd, &EFFDT, &EFFSEQ, &ACTION, &ACTION_REASON, 'FPAEESALARYBIS')
+#END-IF
+from  PS_FPAEESALARYBIS
+where EMPLID     =  $emplid
+AND   EMPL_RCD   =  #empl_rcd
+AND   FP_CNL_ROW =  'N'
+AND   FP_INST_STAT = 'R'        !SH 19/06/1997 select only real rows
+AND   EFFDT      >= {DATEIN-PREFIX}$dt_nt_start_date{DATEIN-SUFFIX}
+end-select
+
+end-procedure
+
+
+
+begin-procedure fusi-select-action-FPAEEWORKRT ($emplid, #empl_rcd, $dt_nt_start_date)!*
+  !* AREA:              selects relevant actions for FPAEEWORKRT
+  !* GENERATED BY:      gnr-select-action
+  !* CALLED BY:         fusi-select-action
+  !* CALLS:
+
+let $_sql-statement = $_ReportID || ',fusi-select-action-FPAEEWORKRT,select,FPAEEWORKRT'
+begin-select On-Error=SQL-Error
+{DATEOUT-PREFIX}EFFDT{DATEOUT-SUFFIX} &EFFDT
+EFFSEQ  &EFFSEQ
+ACTION  &ACTION
+ACTION_REASON &ACTION_REASON
+#IFNDEF FUSI_WORK_TABLE
+  do fusi-insert-action (&EFFDT, &EFFSEQ, &ACTION, 'FPAEEWORKRT')
+#ELSE
+  do fusi-insert-action-worktable ($emplid, #empl_rcd, &EFFDT, &EFFSEQ, &ACTION, &ACTION_REASON, 'FPAEEWORKRT')
+#END-IF
+from  PS_FPAEEWORKRT
+where EMPLID     =  $emplid
+AND   EMPL_RCD   =  #empl_rcd
+AND   FP_CNL_ROW =  'N'
+AND   FP_INST_STAT = 'R'        !SH 19/06/1997 select only real rows
+AND   EFFDT      >= {DATEIN-PREFIX}$dt_nt_start_date{DATEIN-SUFFIX}
+end-select
+
+end-procedure
+
+
+
+begin-procedure fusi-select-action-FPAEELEGALSTAT ($emplid, #empl_rcd, $dt_nt_start_date)!*
+  !* AREA:              selects relevant actions for FPAEELEGALSTAT
+  !* GENERATED BY:      gnr-select-action
+  !* CALLED BY:         fusi-select-action
+  !* CALLS:
+
+begin-select
+{DATEOUT-PREFIX}EFFDT{DATEOUT-SUFFIX} &EFFDT
+ACTION  &ACTION
+ACTION_REASON &ACTION_REASON
+#IFNDEF FUSI_WORK_TABLE
+  do fusi-insert-action-no-effseq (&EFFDT, &ACTION, 'FPAEELEGALSTAT')
+#ELSE
+  do fusi-insert-action-worktable-no-effseq ($emplid, #empl_rcd, &EFFDT, &ACTION, &ACTION_REASON, 'FPAEELEGALSTAT')
+#END-IF
+from  PS_FPAEELEGALSTAT
+where EMPLID     =  $emplid
+AND   EMPL_RCD   =  #empl_rcd
+AND   FP_CNL_ROW =  'N'
+AND   FP_INST_STAT = 'R'        !SH 19/06/1997 select only real rows
+AND   EFFDT      >= {DATEIN-PREFIX}$dt_nt_start_date{DATEIN-SUFFIX}
+end-select
+
+end-procedure
+
+
+
+begin-procedure fusi-select-action ($fusi_emplid, #fusi_empl_rcd, $fusi_dt_nt_start_date)!*
+  !* AREA:              calls the individual action select functions for each
+  !*                    tracked record
+  !* GENERATED BY:      gnr-select-action
+  !* CALLED BY:         fusi-init
+  !* CALLS:             fusi-select-action-RECNAME
+
+#debug print 'fusi-select-action (' (+1,1)
+#debug print $fusi_emplid ()
+#debug print ',' ()
+#debug print  #fusi_empl_rcd  () edit 99
+#debug print ',' ()
+#debug print $fusi_dt_nt_start_date ()
+#debug print ')' ()
+
+
+#IFDEF FUSI_WORK_TABLE
+!checking if we don't already have data for this emplid, empl_rcd in the worktable.
+!if we do, good chance the select actions would cause duplicate key problems,
+!so we cancel reading the actions
+
+let #res = 0
+
+let $sql-statement = $ReportID || ',fusi-select-action,Select,FPMWORKTABLE'
+begin-select on-error=sql-error
+1 &res
+ let #res = &res
+
+from PS_FPMWORKTABLE
+where EMPLID = $fusi_emplid
+and   EMPL_RCD = #fusi_empl_rcd
+end-select
+
+if (#res = 1)
+  let $disp = 'Data already in worktable for emplid ' || $emplid || ', empl_rcd :' || to_char(#fusi_empl_rcd)
+  display $disp
+  goto no_select
+end-if
+
+
+#END-IF
+
+
+do fusi-select-action-FPAEECAREER($fusi_emplid, #fusi_empl_rcd, $fusi_dt_nt_start_date)
+do fusi-select-action-FPAEEOTHER_TBL($fusi_emplid, #fusi_empl_rcd, $fusi_dt_nt_start_date)
+do fusi-select-action-FPAEEPOST_TBL($fusi_emplid, #fusi_empl_rcd, $fusi_dt_nt_start_date)
+do fusi-select-action-FPAEESALARY($fusi_emplid, #fusi_empl_rcd, $fusi_dt_nt_start_date)
+do fusi-select-action-FPAEESALARYBIS($fusi_emplid, #fusi_empl_rcd, $fusi_dt_nt_start_date)
+do fusi-select-action-FPAEEWORKRT($fusi_emplid, #fusi_empl_rcd, $fusi_dt_nt_start_date)
+do fusi-select-action-FPAEELEGALSTAT($fusi_emplid, #fusi_empl_rcd, $fusi_dt_nt_start_date)
+no_select:
+end-procedure
+
+begin-procedure fusi-fusion-JOB ($emplid, #empl_rcd, $dt_nt_effdt, #effseq, $recname)!*
+  !* AREA:              calls the individual action merge functions for each
+  !*                    tracked record
+  !* GENERATED BY:      gnr-select-action
+  !* CALLED BY:         fusi-loop-action
+  !* CALLS:             fusi-JOB-RECNAMEs
+
+#debug print 'fusi-fusion-JOB ' (+1,1)
+
+EVALUATE $recname
+WHEN = 'FPAEECAREER'
+  do fusi-JOB-FPAEECAREER($emplid, #empl_rcd, $dt_nt_effdt, #effseq)
+  break
+WHEN = 'FPAEEOTHER_TBL'
+  do fusi-JOB-FPAEEOTHER_TBL($emplid, #empl_rcd, $dt_nt_effdt, #effseq)
+  break
+WHEN = 'FPAEEPOST_TBL'
+  do fusi-JOB-FPAEEPOST_TBL($emplid, #empl_rcd, $dt_nt_effdt, #effseq)
+  break
+WHEN = 'FPAEESALARY'
+  do fusi-JOB-FPAEESALARY($emplid, #empl_rcd, $dt_nt_effdt, #effseq)
+  break
+WHEN = 'FPAEESALARYBIS'
+  do fusi-JOB-FPAEESALARYBIS($emplid, #empl_rcd, $dt_nt_effdt, #effseq)
+  break
+WHEN = 'FPAEEWORKRT'
+  do fusi-JOB-FPAEEWORKRT($emplid, #empl_rcd, $dt_nt_effdt, #effseq)
+  break
+WHEN = 'FPAEELEGALSTAT'
+  do fusi-JOB-FPAEELEGALSTAT($emplid, #empl_rcd, $dt_nt_effdt)
+  break
+END-EVALUATE
+
+end-procedure fusi-fusion-JOB!*
+begin-procedure fusi-JOB-FPAEECAREER  ($emplid, #empl_rcd, $dt_nt_effdt, #effseq)!*
+  !* AREA:  fusioning data from FPAEECAREER to the fusi_buffer values for JOB
+  !* GENERATED BY:  gnr-field-fusion
+  !*
+
+#debug print 'fusi-JOB-FPAEECAREER  (' (+1,1)
+#debug print $emplid ()
+#debug print ',' ()
+#debug print #empl_rcd ()
+#debug print ',' ()
+#debug print $dt_nt_effdt ()
+#debug print ',' ()
+#debug print #effseq ()
+#debug print ')' ()
+
+let $_sql-statement = $_ReportID || ',fusi-JOB-FPAEECAREER,select,FPAEECAREER'
+begin-select On-Error=SQL-Error
+{DATEOUT-PREFIX}FP_APPL_SAL_DT{DATEOUT-SUFFIX} &FP_APPL_SAL_DT
+ let $_fusi_buffer_FP_APPL_SAL_DT = &FP_APPL_SAL_DT
+FP_CATG_FP &FP_CATG_FP
+ let $_fusi_buffer_FP_CATG_FP = &FP_CATG_FP
+FP_CATG_LEVEL &FP_CATG_LEVEL
+ let $_fusi_buffer_FP_CATG_LEVEL = &FP_CATG_LEVEL
+{DATEOUT-PREFIX}FP_CHG_COR_DT{DATEOUT-SUFFIX} &FP_CHG_COR_DT
+ let $_fusi_buffer_FP_CHG_COR_DT = &FP_CHG_COR_DT
+FP_CHG_IND &FP_CHG_IND
+ let $_fusi_buffer_FP_CHG_IND = &FP_CHG_IND
+FP_CLD_INST &FP_CLD_INST
+ let $_fusi_buffer_FP_CLD_INST = &FP_CLD_INST
+FP_CORPS_CD &FP_CORPS_CD
+ let $_fusi_buffer_FP_CORPS_CD = &FP_CORPS_CD
+FP_DOWN_GRA &FP_DOWN_GRA
+ let $_fusi_buffer_FP_DOWN_GRA = &FP_DOWN_GRA
+FP_EQUIV_STEP &FP_EQUIV_STEP
+ let $_fusi_buffer_FP_EQUIV_STEP = &FP_EQUIV_STEP
+{DATEOUT-PREFIX}FP_FOR_PROM_DT{DATEOUT-SUFFIX} &FP_FOR_PROM_DT
+ let $_fusi_buffer_FP_FOR_PROM_DT = &FP_FOR_PROM_DT
+FP_INCS_IND &FP_INCS_IND
+ let #_fusi_buffer_FP_INCS_IND = &FP_INCS_IND
+FP_INST_STAT &FP_INST_STAT
+ let $_fusi_buffer_FP_INST_STAT = &FP_INST_STAT
+FP_RANK_CD &FP_RANK_CD
+ let $_fusi_buffer_FP_RANK_CD = &FP_RANK_CD
+FP_RETROSPECT &FP_RETROSPECT
+ let $_fusi_buffer_FP_RETROSPECT = &FP_RETROSPECT
+{DATEOUT-PREFIX}FP_RK_ENT_DT{DATEOUT-SUFFIX} &FP_RK_ENT_DT
+ let $_fusi_buffer_FP_RK_ENT_DT = &FP_RK_ENT_DT
+{DATEOUT-PREFIX}FP_RK_PD_END_DT{DATEOUT-SUFFIX} &FP_RK_PD_END_DT
+ let $_fusi_buffer_FP_RK_PD_END_DT = &FP_RK_PD_END_DT
+FP_RK_TRIALPD &FP_RK_TRIALPD
+ let $_fusi_buffer_FP_RK_TRIALPD = &FP_RK_TRIALPD
+FP_SANCTION &FP_SANCTION
+ let $_fusi_buffer_FP_SANCTION = &FP_SANCTION
+FP_SETID_RANK &FP_SETID_RANK
+ let $_fusi_buffer_FP_SETID_RANK = &FP_SETID_RANK
+FP_STEP_CD &FP_STEP_CD
+ let $_fusi_buffer_FP_STEP_CD = &FP_STEP_CD
+{DATEOUT-PREFIX}FP_STEP_END_DT{DATEOUT-SUFFIX} &FP_STEP_END_DT
+ let $_fusi_buffer_FP_STEP_END_DT = &FP_STEP_END_DT
+FP_TRAINEE &FP_TRAINEE
+ let $_fusi_buffer_FP_TRAINEE = &FP_TRAINEE
+FP_TRNE_POSN &FP_TRNE_POSN
+ let $_fusi_buffer_FP_TRNE_POSN = &FP_TRNE_POSN
+from  PS_FPAEECAREER
+where EMPLID = $EMPLID
+and   EMPL_RCD  = #empl_rcd
+and   EFFDT  = {DATEIN-PREFIX}$dt_nt_effdt{DATEIN-SUFFIX}
+and   EFFSEQ = #effseq
+end-select
+
+end-procedure
+begin-procedure fusi-JOB-FPAEEOTHER_TBL  ($emplid, #empl_rcd, $dt_nt_effdt, #effseq)!*
+  !* AREA:  fusioning data from FPAEEOTHER_TBL to the fusi_buffer values for JOB
+  !* GENERATED BY:  gnr-field-fusion
+  !*
+
+#debug print 'fusi-JOB-FPAEEOTHER_TBL  (' (+1,1)
+#debug print $emplid ()
+#debug print ',' ()
+#debug print #empl_rcd ()
+#debug print ',' ()
+#debug print $dt_nt_effdt ()
+#debug print ',' ()
+#debug print #effseq ()
+#debug print ')' ()
+
+let $_sql-statement = $_ReportID || ',fusi-JOB-FPAEEOTHER_TBL,select,FPAEEOTHER_TBL'
+begin-select On-Error=SQL-Error
+ACCDNT_CD_FRA &ACCDNT_CD_FRA
+ let $_fusi_buffer_ACCDNT_CD_FRA = &ACCDNT_CD_FRA
+EMPL_CLASS &EMPL_CLASS
+ let $_fusi_buffer_EMPL_CLASS = &EMPL_CLASS
+EMPL_CTG &EMPL_CTG
+ let $_fusi_buffer_EMPL_CTG = &EMPL_CTG
+EMPL_TYPE &EMPL_TYPE
+ let $_fusi_buffer_EMPL_TYPE = &EMPL_TYPE
+FP_INST_STAT &FP_INST_STAT
+ let $_fusi_buffer_FP_INST_STAT = &FP_INST_STAT
+LABOR_AGREEMENT &LABOR_AGREEMENT
+ let $_fusi_buffer_LABOR_AGREEMENT = &LABOR_AGREEMENT
+REG_TEMP &REG_TEMP
+ let $_fusi_buffer_REG_TEMP = &REG_TEMP
+VALUE_1_FRA &VALUE_1_FRA
+ let $_fusi_buffer_VALUE_1_FRA = &VALUE_1_FRA
+VALUE_2_FRA &VALUE_2_FRA
+ let $_fusi_buffer_VALUE_2_FRA = &VALUE_2_FRA
+VALUE_3_FRA &VALUE_3_FRA
+ let $_fusi_buffer_VALUE_3_FRA = &VALUE_3_FRA
+from  PS_FPAEEOTHER_TBL
+where EMPLID = $EMPLID
+and   EMPL_RCD  = #empl_rcd
+and   EFFDT  = {DATEIN-PREFIX}$dt_nt_effdt{DATEIN-SUFFIX}
+and   EFFSEQ = #effseq
+end-select
+
+end-procedure
+begin-procedure fusi-JOB-FPAEEPOST_TBL  ($emplid, #empl_rcd, $dt_nt_effdt, #effseq)!*
+  !* AREA:  fusioning data from FPAEEPOST_TBL to the fusi_buffer values for JOB
+  !* GENERATED BY:  gnr-field-fusion
+  !*
+
+#debug print 'fusi-JOB-FPAEEPOST_TBL  (' (+1,1)
+#debug print $emplid ()
+#debug print ',' ()
+#debug print #empl_rcd ()
+#debug print ',' ()
+#debug print $dt_nt_effdt ()
+#debug print ',' ()
+#debug print #effseq ()
+#debug print ')' ()
+
+let $_sql-statement = $_ReportID || ',fusi-JOB-FPAEEPOST_TBL,select,FPAEEPOST_TBL'
+begin-select On-Error=SQL-Error
+BUSINESS_UNIT &BUSINESS_UNIT
+ let $_fusi_buffer_BUSINESS_UNIT = &BUSINESS_UNIT
+COMPANY &COMPANY
+ let $_fusi_buffer_COMPANY = &COMPANY
+CUR_RT_TYPE &CUR_RT_TYPE
+ let $_fusi_buffer_CUR_RT_TYPE = &CUR_RT_TYPE
+DEPTID &DEPTID
+ let $_fusi_buffer_DEPTID = &DEPTID
+{DATEOUT-PREFIX}DEPT_ENTRY_DT{DATEOUT-SUFFIX} &DEPT_ENTRY_DT
+ let $_fusi_buffer_DEPT_ENTRY_DT = &DEPT_ENTRY_DT
+ESTABID &ESTABID
+ let $_fusi_buffer_ESTABID = &ESTABID
+{DATEOUT-PREFIX}FP_APPL_DT{DATEOUT-SUFFIX} &FP_APPL_DT
+ let $_fusi_buffer_FP_APPL_DT = &FP_APPL_DT
+FP_BUSINESS_CD &FP_BUSINESS_CD
+ let $_fusi_buffer_FP_BUSINESS_CD = &FP_BUSINESS_CD
+FP_CHG_SAL &FP_CHG_SAL
+ let $_fusi_buffer_FP_CHG_SAL = &FP_CHG_SAL
+{DATEOUT-PREFIX}FP_INSTALL_DT{DATEOUT-SUFFIX} &FP_INSTALL_DT
+ let $_fusi_buffer_FP_INSTALL_DT = &FP_INSTALL_DT
+FP_INST_STAT &FP_INST_STAT
+ let $_fusi_buffer_FP_INST_STAT = &FP_INST_STAT
+FP_STEP_CD &FP_STEP_CD
+ let $_fusi_buffer_FP_STEP_CD2 = &FP_STEP_CD
+GP_ASOF_DT_EXG_RT &GP_ASOF_DT_EXG_RT
+ let $_fusi_buffer_GP_ASOF_DT_EXG_RT = &GP_ASOF_DT_EXG_RT
+GP_DFLT_CURRTTYP &GP_DFLT_CURRTTYP
+ let $_fusi_buffer_GP_DFLT_CURRTTYP = &GP_DFLT_CURRTTYP
+GP_DFLT_ELIG_GRP &GP_DFLT_ELIG_GRP
+ let $_fusi_buffer_GP_DFLT_ELIG_GRP = &GP_DFLT_ELIG_GRP
+GP_DFLT_EXRTDT &GP_DFLT_EXRTDT
+ let $_fusi_buffer_GP_DFLT_EXRTDT = &GP_DFLT_EXRTDT
+GP_ELIG_GRP &GP_ELIG_GRP
+ let $_fusi_buffer_GP_ELIG_GRP = &GP_ELIG_GRP
+GP_PAYGROUP &GP_PAYGROUP
+ let $_fusi_buffer_GP_PAYGROUP = &GP_PAYGROUP
+HOLIDAY_SCHEDULE &HOLIDAY_SCHEDULE
+ let $_fusi_buffer_HOLIDAY_SCHEDULE = &HOLIDAY_SCHEDULE
+JOBCODE &JOBCODE
+ let $_fusi_buffer_JOBCODE = &JOBCODE
+{DATEOUT-PREFIX}JOB_ENTRY_DT{DATEOUT-SUFFIX} &JOB_ENTRY_DT
+ let $_fusi_buffer_JOB_ENTRY_DT = &JOB_ENTRY_DT
+LOCATION &LOCATION
+ let $_fusi_buffer_LOCATION = &LOCATION
+PAYGROUP &PAYGROUP
+ let $_fusi_buffer_PAYGROUP = &PAYGROUP
+PAY_SYSTEM_FLG &PAY_SYSTEM_FLG
+ let $_fusi_buffer_PAY_SYSTEM_FLG = &PAY_SYSTEM_FLG
+{DATEOUT-PREFIX}POSITION_ENTRY_DT{DATEOUT-SUFFIX} &POSITION_ENTRY_DT
+ let $_fusi_buffer_POSITION_ENTRY_DT = &POSITION_ENTRY_DT
+POSITION_NBR &POSITION_NBR
+ let $_fusi_buffer_POSITION_NBR = &POSITION_NBR
+POSITION_OVERRIDE &POSITION_OVERRIDE
+ let $_fusi_buffer_POSITION_OVERRIDE = &POSITION_OVERRIDE
+POSN_CHANGE_RECORD &POSN_CHANGE_RECORD
+ let $_fusi_buffer_POSN_CHANGE_RECORD = &POSN_CHANGE_RECORD
+REG_REGION &REG_REGION
+ let $_fusi_buffer_REG_REGION = &REG_REGION
+SETID_DEPT &SETID_DEPT
+ let $_fusi_buffer_SETID_DEPT = &SETID_DEPT
+SETID_JOBCODE &SETID_JOBCODE
+ let $_fusi_buffer_SETID_JOBCODE = &SETID_JOBCODE
+SETID_LOCATION &SETID_LOCATION
+ let $_fusi_buffer_SETID_LOCATION = &SETID_LOCATION
+from  PS_FPAEEPOST_TBL
+where EMPLID = $EMPLID
+and   EMPL_RCD  = #empl_rcd
+and   EFFDT  = {DATEIN-PREFIX}$dt_nt_effdt{DATEIN-SUFFIX}
+and   EFFSEQ = #effseq
+end-select
+
+end-procedure
+begin-procedure fusi-JOB-FPAEESALARY  ($emplid, #empl_rcd, $dt_nt_effdt, #effseq)!*
+  !* AREA:  fusioning data from FPAEESALARY to the fusi_buffer values for JOB
+  !* GENERATED BY:  gnr-field-fusion
+  !*
+
+#debug print 'fusi-JOB-FPAEESALARY  (' (+1,1)
+#debug print $emplid ()
+#debug print ',' ()
+#debug print #empl_rcd ()
+#debug print ',' ()
+#debug print $dt_nt_effdt ()
+#debug print ',' ()
+#debug print #effseq ()
+#debug print ')' ()
+
+let $_sql-statement = $_ReportID || ',fusi-JOB-FPAEESALARY,select,FPAEESALARY'
+begin-select On-Error=SQL-Error
+ANNUAL_RT &ANNUAL_RT
+ let #_fusi_buffer_ANNUAL_RT = &ANNUAL_RT
+COMP_FREQUENCY &COMP_FREQUENCY
+ let $_fusi_buffer_COMP_FREQUENCY = &COMP_FREQUENCY
+COMP_RATECD &COMP_RATECD
+ let $_fusi_buffer_COMP_RATECD = &COMP_RATECD
+CURRENCY_CD &CURRENCY_CD
+ let $_fusi_buffer_CURRENCY_CD = &CURRENCY_CD
+COMPRATE &COMPRATE
+ let #_fusi_buffer_FP_COMPRATE = &COMPRATE
+FP_GROSS_IND &FP_GROSS_IND
+ let #_fusi_buffer_FP_GROSS_IND = &FP_GROSS_IND
+FP_INCS_IND &FP_INCS_IND
+ let #_fusi_buffer_FP_INCS_IND2 = &FP_INCS_IND
+FP_INST_STAT &FP_INST_STAT
+ let $_fusi_buffer_FP_INST_STAT = &FP_INST_STAT
+FP_POINTYP_CD &FP_POINTYP_CD
+ let $_fusi_buffer_FP_POINTYP_CD = &FP_POINTYP_CD
+HOURLY_RT &HOURLY_RT
+ let #_fusi_buffer_HOURLY_RT = &HOURLY_RT
+MONTHLY_RT &MONTHLY_RT
+ let #_fusi_buffer_MONTHLY_RT = &MONTHLY_RT
+from  PS_FPAEESALARY
+where EMPLID = $EMPLID
+and   EMPL_RCD  = #empl_rcd
+and   EFFDT  = {DATEIN-PREFIX}$dt_nt_effdt{DATEIN-SUFFIX}
+and   EFFSEQ = #effseq
+end-select
+
+end-procedure
+begin-procedure fusi-JOB-FPAEESALARYBIS  ($emplid, #empl_rcd, $dt_nt_effdt, #effseq)!*
+  !* AREA:  fusioning data from FPAEESALARYBIS to the fusi_buffer values for JOB
+  !* GENERATED BY:  gnr-field-fusion
+  !*
+
+#debug print 'fusi-JOB-FPAEESALARYBIS  (' (+1,1)
+#debug print $emplid ()
+#debug print ',' ()
+#debug print #empl_rcd ()
+#debug print ',' ()
+#debug print $dt_nt_effdt ()
+#debug print ',' ()
+#debug print #effseq ()
+#debug print ')' ()
+
+let $_sql-statement = $_ReportID || ',fusi-JOB-FPAEESALARYBIS,select,FPAEESALARYBIS'
+begin-select On-Error=SQL-Error
+FP_INST_STAT &FP_INST_STAT
+ let $_fusi_buffer_FP_INST_STAT = &FP_INST_STAT
+from  PS_FPAEESALARYBIS
+where EMPLID = $EMPLID
+and   EMPL_RCD  = #empl_rcd
+and   EFFDT  = {DATEIN-PREFIX}$dt_nt_effdt{DATEIN-SUFFIX}
+and   EFFSEQ = #effseq
+end-select
+
+end-procedure
+begin-procedure fusi-JOB-FPAEEWORKRT  ($emplid, #empl_rcd, $dt_nt_effdt, #effseq)!*
+  !* AREA:  fusioning data from FPAEEWORKRT to the fusi_buffer values for JOB
+  !* GENERATED BY:  gnr-field-fusion
+  !*
+
+#debug print 'fusi-JOB-FPAEEWORKRT  (' (+1,1)
+#debug print $emplid ()
+#debug print ',' ()
+#debug print #empl_rcd ()
+#debug print ',' ()
+#debug print $dt_nt_effdt ()
+#debug print ',' ()
+#debug print #effseq ()
+#debug print ')' ()
+
+let $_sql-statement = $_ReportID || ',fusi-JOB-FPAEEWORKRT,select,FPAEEWORKRT'
+begin-select On-Error=SQL-Error
+FP_INST_STAT &FP_INST_STAT
+ let $_fusi_buffer_FP_INST_STAT = &FP_INST_STAT
+{DATEOUT-PREFIX}FP_END_DT{DATEOUT-SUFFIX} &FP_END_DT
+ let $_fusi_buffer_FP_PT_END_DT = &FP_END_DT
+{DATEOUT-PREFIX}FP_FOREND_DT{DATEOUT-SUFFIX} &FP_FOREND_DT
+ let $_fusi_buffer_FP_PT_FOREND_DT = &FP_FOREND_DT
+FP_PT_PCT &FP_PT_PCT
+ let $_fusi_buffer_FP_PT_PCT = &FP_PT_PCT
+FULL_PART_TIME &FULL_PART_TIME
+ let $_fusi_buffer_FULL_PART_TIME = &FULL_PART_TIME
+HOURLY_RT_FRA &HOURLY_RT_FRA
+ let $_fusi_buffer_HOURLY_RT_FRA = &HOURLY_RT_FRA
+STD_HOURS &STD_HOURS
+ let #_fusi_buffer_STD_HOURS = &STD_HOURS
+STD_HRS_FREQUENCY &STD_HRS_FREQUENCY
+ let $_fusi_buffer_STD_HRS_FREQUENCY = &STD_HRS_FREQUENCY
+from  PS_FPAEEWORKRT
+where EMPLID = $EMPLID
+and   EMPL_RCD  = #empl_rcd
+and   EFFDT  = {DATEIN-PREFIX}$dt_nt_effdt{DATEIN-SUFFIX}
+and   EFFSEQ = #effseq
+end-select
+
+end-procedure
+begin-procedure fusi-JOB-FPAEELEGALSTAT  ($emplid, #empl_rcd, $dt_nt_effdt)!*
+  !* AREA:  fusioning data from FPAEELEGALSTAT to the fusi_buffer values for JOB
+  !* GENERATED BY:  gnr-field-fusion
+  !*
+
+#debug print 'fusi-JOB-FPAEELEGALSTAT  (' (+1,1)
+#debug print $emplid ()
+#debug print ',' ()
+#debug print #empl_rcd ()
+#debug print ',' ()
+#debug print $dt_nt_effdt ()
+#debug print ')' ()
+
+let $sql-statement = $ReportID || ',fusi-JOB-FPAEELEGALSTAT,select,FPAEELEGALSTAT'
+begin-select On-Error=SQL-Error
+CONTRACT_NUM &CONTRACT_NUM
+ let $_fusi_buffer_CONTRACT_NUM = &CONTRACT_NUM
+EMPL_STATUS &EMPL_STATUS
+ let $_fusi_buffer_EMPL_STATUS = &EMPL_STATUS
+FP_BUDGET_NBR &FP_BUDGET_NBR
+ let #_fusi_buffer_FP_BUDGET_NBR = &FP_BUDGET_NBR
+FP_CAREFRZPCT &FP_CAREFRZPCT
+ let #_fusi_buffer_FP_CAREFRZPCT = &FP_CAREFRZPCT
+FP_CIVIL_PENSION &FP_CIVIL_PENSION
+ let $_fusi_buffer_FP_CIVIL_PENSION = &FP_CIVIL_PENSION
+FP_DURATION_PCT &FP_DURATION_PCT
+ let #_fusi_buffer_FP_DURATION_PCT = &FP_DURATION_PCT
+{DATEOUT-PREFIX}FP_END_DT{DATEOUT-SUFFIX} &FP_END_DT
+ let $_fusi_buffer_FP_END_DT = &FP_END_DT
+{DATEOUT-PREFIX}FP_FOREND_DT{DATEOUT-SUFFIX} &FP_FOREND_DT
+ let $_fusi_buffer_FP_FOREND_DT = &FP_FOREND_DT
+FP_HDCNT_NBR &FP_HDCNT_NBR
+ let #_fusi_buffer_FP_HDCNT_NBR = &FP_HDCNT_NBR
+FP_HIR_DOS_SIT &FP_HIR_DOS_SIT
+ let $_fusi_buffer_FP_HIR_DOS_SIT = &FP_HIR_DOS_SIT
+FP_INST_STAT &FP_INST_STAT
+ let $_fusi_buffer_FP_INST_STAT = &FP_INST_STAT
+FP_LEGALSTAT_CD &FP_LEGALSTAT_CD
+ let $_fusi_buffer_FP_LEGALSTAT_CD = &FP_LEGALSTAT_CD
+FP_POTENT_NBR &FP_POTENT_NBR
+ let #_fusi_buffer_FP_POTENT_NBR = &FP_POTENT_NBR
+FP_PT_PCT_DET &FP_PT_PCT_DET
+ let $_fusi_buffer_FP_PT_PCT_DET = &FP_PT_PCT_DET
+FP_RATING_PRS_FLG &FP_RATING_PRS_FLG
+ let $_fusi_buffer_FP_RATING_PRS_FLG = &FP_RATING_PRS_FLG
+FP_RECEP_ORG &FP_RECEP_ORG
+ let $_fusi_buffer_FP_RECEP_ORG = &FP_RECEP_ORG
+FP_RETURN_CD &FP_RETURN_CD
+ let $_fusi_buffer_FP_RETURN_CD = &FP_RETURN_CD
+FP_SCNDMT_CD &FP_SCNDMT_CD
+ let $_fusi_buffer_FP_SCNDMT_CD = &FP_SCNDMT_CD
+FP_SCND_TYP &FP_SCND_TYP
+ let $_fusi_buffer_FP_SCND_TYP = &FP_SCND_TYP
+DESCR50 &DESCR50
+ let $_fusi_buffer_FP_SOURCE_ORG = &DESCR50
+FP_TITLE_NUM &FP_TITLE_NUM
+ let $_fusi_buffer_FP_TITLE_NUM = &FP_TITLE_NUM
+JOB_INDICATOR &JOB_INDICATOR
+ let $_fusi_buffer_JOB_INDICATOR = &JOB_INDICATOR
+ACTION
+from  PS_FPAEELEGALSTAT
+where EMPLID     = $EMPLID
+and   EMPL_RCD   = #empl_rcd
+and   EFFDT      = {DATEIN-PREFIX}$dt_nt_effdt{DATEIN-SUFFIX}
+end-select
+
+!getting employee status associated with the action in FPAEELEGALSTAT
+!keep in mind that action_prev is actually the action we are processing
+
+let $_sql-statement = $ReportID || ',fusi-JOB-FPAEELEGALSTAT,select,PS_FPMACTION_TBL'
+begin-select On-Error=SQL-Error
+EMPL_STATUS &FUSI_EMPL_STATUS
+  let $_fusi_empl_status = &FUSI_EMPL_STATUS
+from PS_FPMACTION_TBL
+where ACTION = &ACTION
+AND EFFDT =
+  (SELECT MAX(EFFDT)
+   from PS_FPMACTION_TBL
+   where ACTION = &ACTION
+   and  EFFDT  <= {DATEIN-PREFIX}$dt_nt_effdt{DATEIN-SUFFIX}
+  )
+end-select
+
+
+end-procedure
+begin-procedure fusi-select-JOB ($emplid, #empl_rcd, $dt_nt_effdt)!*
+  !* AREA :  selects values from existing JOB data
+  !* GENERATED BY:  gnr-field-JOB-handling
+
+let #nb_lignes = 0
+
+#debug print 'fusi-select-JOB (' (+1,1)
+#debug print $emplid (,)
+#debug print ',' (,)
+#debug print #empl_rcd (,) edit 99
+#debug print ',' (,)
+#debug print $dt_nt_effdt (,)
+#debug print ')' (,)
+
+let $_sql-statement = $_ReportID || ',fusi-select-job,select,JOB'
+begin-select On-Error=SQL-Error
+  let #nb_lignes = 1
+ABSENCE_SYSTEM_CD &ABSENCE_SYSTEM_CD
+  let $_fusi_buffer_ABSENCE_SYSTEM_CD = &ABSENCE_SYSTEM_CD
+ACCT_CD &ACCT_CD
+  let $_fusi_buffer_ACCT_CD = &ACCT_CD
+ACTION &ACTION
+  let $action = &ACTION
+{DateOut-Prefix}ACTION_DT{DateOut-Suffix} &ACTION_DT
+  let $_fusi_buffer_ACTION_DT = &ACTION_DT
+ACTION_REASON &ACTION_REASON
+  let $action_reason = &ACTION_REASON
+ADDS_TO_FTE_ACTUAL &ADDS_TO_FTE_ACTUAL
+  let $_fusi_buffer_ADDS_TO_FTE_ACTUAL = &ADDS_TO_FTE_ACTUAL
+ANNL_BENEF_BASE_RT &ANNL_BENEF_BASE_RT
+  let #_fusi_buffer_ANNL_BENEF_BASE_RT = &ANNL_BENEF_BASE_RT
+ANNUAL_RT &ANNUAL_RT
+  let #_fusi_buffer_ANNUAL_RT = &ANNUAL_RT
+APPT_TYPE &APPT_TYPE
+  let $_fusi_buffer_APPT_TYPE = &APPT_TYPE
+BAS_ACTION &BAS_ACTION
+  let $_fusi_buffer_BAS_ACTION = &BAS_ACTION
+BAS_GROUP_ID &BAS_GROUP_ID
+  let $_fusi_buffer_BAS_GROUP_ID = &BAS_GROUP_ID
+BENEFIT_SYSTEM &BENEFIT_SYSTEM
+  let $_fusi_buffer_BENEFIT_SYSTEM = &BENEFIT_SYSTEM
+BEN_STATUS &BEN_STATUS
+  let $_fusi_buffer_BEN_STATUS = &BEN_STATUS
+BORDER_WALKER &BORDER_WALKER
+  let $_fusi_buffer_BORDER_WALKER = &BORDER_WALKER
+BUSINESS_UNIT &BUSINESS_UNIT
+  let $_fusi_buffer_BUSINESS_UNIT = &BUSINESS_UNIT
+CHANGE_AMT &CHANGE_AMT
+  let #_fusi_buffer_CHANGE_AMT = &CHANGE_AMT
+CHANGE_PCT &CHANGE_PCT
+  let #_fusi_buffer_CHANGE_PCT = &CHANGE_PCT
+CLASS_INDC &CLASS_INDC
+  let $_fusi_buffer_CLASS_INDC = &CLASS_INDC
+COBRA_ACTION &COBRA_ACTION
+  let $_fusi_buffer_COBRA_ACTION = &COBRA_ACTION
+COMPANY &COMPANY
+  let $_fusi_buffer_COMPANY = &COMPANY
+COMPRATE &COMPRATE
+  let #_fusi_buffer_COMPRATE = &COMPRATE
+COMP_FREQUENCY &COMP_FREQUENCY
+  let $_fusi_buffer_COMP_FREQUENCY = &COMP_FREQUENCY
+CONTRACT_NUM &CONTRACT_NUM
+  let $_fusi_buffer_CONTRACT_NUM = &CONTRACT_NUM
+CURRENCY_CD &CURRENCY_CD
+  let $_fusi_buffer_CURRENCY_CD = &CURRENCY_CD
+DAILY_RT &DAILY_RT
+  let #_fusi_buffer_DAILY_RT = &DAILY_RT
+DEPTID &DEPTID
+  let $_fusi_buffer_DEPTID = &DEPTID
+{DateOut-Prefix}DEPT_ENTRY_DT{DateOut-Suffix} &DEPT_ENTRY_DT
+  let $_fusi_buffer_DEPT_ENTRY_DT = &DEPT_ENTRY_DT
+DIRECTLY_TIPPED &DIRECTLY_TIPPED
+  let $_fusi_buffer_DIRECTLY_TIPPED = &DIRECTLY_TIPPED
+EARNS_DIST_TYPE &EARNS_DIST_TYPE
+  let $_fusi_buffer_EARNS_DIST_TYPE = &EARNS_DIST_TYPE
+{DateOut-Prefix}EFFDT{DateOut-Suffix} &EFFDT
+  let $dt_nt_effdt = &EFFDT
+EFFSEQ &EFFSEQ
+  let #effseq = &EFFSEQ
+ELIG_CONFIG1 &ELIG_CONFIG1
+  let $_fusi_buffer_ELIG_CONFIG1 = &ELIG_CONFIG1
+ELIG_CONFIG2 &ELIG_CONFIG2
+  let $_fusi_buffer_ELIG_CONFIG2 = &ELIG_CONFIG2
+ELIG_CONFIG3 &ELIG_CONFIG3
+  let $_fusi_buffer_ELIG_CONFIG3 = &ELIG_CONFIG3
+ELIG_CONFIG4 &ELIG_CONFIG4
+  let $_fusi_buffer_ELIG_CONFIG4 = &ELIG_CONFIG4
+ELIG_CONFIG5 &ELIG_CONFIG5
+  let $_fusi_buffer_ELIG_CONFIG5 = &ELIG_CONFIG5
+ELIG_CONFIG6 &ELIG_CONFIG6
+  let $_fusi_buffer_ELIG_CONFIG6 = &ELIG_CONFIG6
+ELIG_CONFIG7 &ELIG_CONFIG7
+  let $_fusi_buffer_ELIG_CONFIG7 = &ELIG_CONFIG7
+ELIG_CONFIG8 &ELIG_CONFIG8
+  let $_fusi_buffer_ELIG_CONFIG8 = &ELIG_CONFIG8
+ELIG_CONFIG9 &ELIG_CONFIG9
+  let $_fusi_buffer_ELIG_CONFIG9 = &ELIG_CONFIG9
+EMPLID &EMPLID
+  let $emplid = &EMPLID
+EMPL_CLASS &EMPL_CLASS
+  let $_fusi_buffer_EMPL_CLASS = &EMPL_CLASS
+EMPL_RCD &EMPL_RCD
+  let #empl_rcd = &EMPL_RCD
+EMPL_STATUS &EMPL_STATUS
+  let $_fusi_buffer_EMPL_STATUS = &EMPL_STATUS
+EMPL_TYPE &EMPL_TYPE
+  let $_fusi_buffer_EMPL_TYPE = &EMPL_TYPE
+ENCUMB_OVERRIDE &ENCUMB_OVERRIDE
+  let $_fusi_buffer_ENCUMB_OVERRIDE = &ENCUMB_OVERRIDE
+ESTABID &ESTABID
+  let $_fusi_buffer_ESTABID = &ESTABID
+FICA_STATUS_EE &FICA_STATUS_EE
+  let $_fusi_buffer_FICA_STATUS_EE = &FICA_STATUS_EE
+{DateOut-Prefix}FORCE_PUBLISH{DateOut-Suffix} &FORCE_PUBLISH
+  let $_fusi_buffer_FORCE_PUBLISH = &FORCE_PUBLISH
+FTE &FTE
+  let #_fusi_buffer_FTE = &FTE
+FULL_PART_TIME &FULL_PART_TIME
+  let $_fusi_buffer_FULL_PART_TIME = &FULL_PART_TIME
+GL_PAY_TYPE &GL_PAY_TYPE
+  let $_fusi_buffer_GL_PAY_TYPE = &GL_PAY_TYPE
+GRADE &GRADE
+  let $_fusi_buffer_GRADE = &GRADE
+{DateOut-Prefix}GRADE_ENTRY_DT{DateOut-Suffix} &GRADE_ENTRY_DT
+  let $_fusi_buffer_GRADE_ENTRY_DT = &GRADE_ENTRY_DT
+HOLIDAY_SCHEDULE &HOLIDAY_SCHEDULE
+  let $_fusi_buffer_HOLIDAY_SCHEDULE = &HOLIDAY_SCHEDULE
+HOURLY_RT &HOURLY_RT
+  let #_fusi_buffer_HOURLY_RT = &HOURLY_RT
+HR_STATUS &HR_STATUS
+  let $_fusi_buffer_HR_STATUS = &HR_STATUS
+JOBCODE &JOBCODE
+  let $_fusi_buffer_JOBCODE = &JOBCODE
+JOB_DATA_SRC_CD &JOB_DATA_SRC_CD
+  let $_fusi_buffer_JOB_DATA_SRC_CD = &JOB_DATA_SRC_CD
+{DateOut-Prefix}JOB_ENTRY_DT{DateOut-Suffix} &JOB_ENTRY_DT
+  let $_fusi_buffer_JOB_ENTRY_DT = &JOB_ENTRY_DT
+JOB_INDICATOR &JOB_INDICATOR
+  let $_fusi_buffer_JOB_INDICATOR = &JOB_INDICATOR
+{DateTimeOut-Prefix}LASTUPDDTTM{DateTimeOut-Suffix} &LASTUPDDTTM
+  let $lastupddttm = &LASTUPDDTTM
+LASTUPDOPRID &LASTUPDOPRID
+  let $lastupdoprid = &LASTUPDOPRID
+LOCATION &LOCATION
+  let $_fusi_buffer_LOCATION = &LOCATION
+LUMP_SUM_PAY &LUMP_SUM_PAY
+  let $_fusi_buffer_LUMP_SUM_PAY = &LUMP_SUM_PAY
+MAIN_APPT_NUM_JPN &MAIN_APPT_NUM_JPN
+  let #_fusi_buffer_MAIN_APPT_NUM_JPN = &MAIN_APPT_NUM_JPN
+MONTHLY_RT &MONTHLY_RT
+  let #_fusi_buffer_MONTHLY_RT = &MONTHLY_RT
+OFFICER_CD &OFFICER_CD
+  let $_fusi_buffer_OFFICER_CD = &OFFICER_CD
+PAYGROUP &PAYGROUP
+  let $_fusi_buffer_PAYGROUP = &PAYGROUP
+PAY_SYSTEM_FLG &PAY_SYSTEM_FLG
+  let $_fusi_buffer_PAY_SYSTEM_FLG = &PAY_SYSTEM_FLG
+PER_ORG &PER_ORG
+  let $_fusi_buffer_PER_ORG = &PER_ORG
+POI_TYPE &POI_TYPE
+  let $_fusi_buffer_POI_TYPE = &POI_TYPE
+{DateOut-Prefix}POSITION_ENTRY_DT{DateOut-Suffix} &POSITION_ENTRY_DT
+  let $_fusi_buffer_POSITION_ENTRY_DT = &POSITION_ENTRY_DT
+POSITION_NBR &POSITION_NBR
+  let $_fusi_buffer_POSITION_NBR = &POSITION_NBR
+POSITION_OVERRIDE &POSITION_OVERRIDE
+  let $_fusi_buffer_POSITION_OVERRIDE = &POSITION_OVERRIDE
+POSN_CHANGE_RECORD &POSN_CHANGE_RECORD
+  let $_fusi_buffer_POSN_CHANGE_RECORD = &POSN_CHANGE_RECORD
+PRORATE_CNT_AMT &PRORATE_CNT_AMT
+  let $_fusi_buffer_PRORATE_CNT_AMT = &PRORATE_CNT_AMT
+REG_REGION &REG_REGION
+  let $_fusi_buffer_REG_REGION = &REG_REGION
+REG_TEMP &REG_TEMP
+  let $_fusi_buffer_REG_TEMP = &REG_TEMP
+REPORTS_TO &REPORTS_TO
+  let $_fusi_buffer_REPORTS_TO = &REPORTS_TO
+SAL_ADMIN_PLAN &SAL_ADMIN_PLAN
+  let $_fusi_buffer_SAL_ADMIN_PLAN = &SAL_ADMIN_PLAN
+SETID_DEPT &SETID_DEPT
+  let $_fusi_buffer_SETID_DEPT = &SETID_DEPT
+SETID_JOBCODE &SETID_JOBCODE
+  let $_fusi_buffer_SETID_JOBCODE = &SETID_JOBCODE
+SETID_LOCATION &SETID_LOCATION
+  let $_fusi_buffer_SETID_LOCATION = &SETID_LOCATION
+SETID_SALARY &SETID_SALARY
+  let $_fusi_buffer_SETID_SALARY = &SETID_SALARY
+SETID_SUPV_LVL &SETID_SUPV_LVL
+  let $_fusi_buffer_SETID_SUPV_LVL = &SETID_SUPV_LVL
+SHIFT &SHIFT
+  let $_fusi_buffer_SHIFT = &SHIFT
+SHIFT_FACTOR &SHIFT_FACTOR
+  let #_fusi_buffer_SHIFT_FACTOR = &SHIFT_FACTOR
+SHIFT_RT &SHIFT_RT
+  let #_fusi_buffer_SHIFT_RT = &SHIFT_RT
+STD_HOURS &STD_HOURS
+  let #_fusi_buffer_STD_HOURS = &STD_HOURS
+STD_HRS_FREQUENCY &STD_HRS_FREQUENCY
+  let $_fusi_buffer_STD_HRS_FREQUENCY = &STD_HRS_FREQUENCY
+STEP &STEP
+  let #_fusi_buffer_STEP = &STEP
+{DateOut-Prefix}STEP_ENTRY_DT{DateOut-Suffix} &STEP_ENTRY_DT
+  let $_fusi_buffer_STEP_ENTRY_DT = &STEP_ENTRY_DT
+SUPERVISOR_ID &SUPERVISOR_ID
+  let $_fusi_buffer_SUPERVISOR_ID = &SUPERVISOR_ID
+SUPV_LVL_ID &SUPV_LVL_ID
+  let $_fusi_buffer_SUPV_LVL_ID = &SUPV_LVL_ID
+TAX_LOCATION_CD &TAX_LOCATION_CD
+  let $_fusi_buffer_TAX_LOCATION_CD = &TAX_LOCATION_CD
+WORK_DAY_HOURS &WORK_DAY_HOURS
+  let #_fusi_buffer_WORK_DAY_HOURS = &WORK_DAY_HOURS
+WRKS_CNCL_ROLE_CHE &WRKS_CNCL_ROLE_CHE
+  let $_fusi_buffer_WRKS_CNCL_ROLE_CHE = &WRKS_CNCL_ROLE_CHE
+{DateOut-Prefix}ASGN_END_DT{DateOut-Suffix} &ASGN_END_DT
+  let $_fusi_buffer_ASGN_END_DT = &ASGN_END_DT
+{DateOut-Prefix}ASGN_START_DT{DateOut-Suffix} &ASGN_START_DT
+  let $_fusi_buffer_ASGN_START_DT = &ASGN_START_DT
+AUTO_END_FLG &AUTO_END_FLG
+  let $_fusi_buffer_AUTO_END_FLG = &AUTO_END_FLG
+{DateOut-Prefix}EXPECTED_END_DATE{DateOut-Suffix} &EXPECTED_END_DATE
+  let $_fusi_buffer_EXPECTED_END_DATE = &EXPECTED_END_DATE
+{DateOut-Prefix}EXPECTED_RETURN_DT{DateOut-Suffix} &EXPECTED_RETURN_DT
+  let $_fusi_buffer_EXPECTED_RETURN_DT = &EXPECTED_RETURN_DT
+{DateOut-Prefix}HIRE_DT{DateOut-Suffix} &HIRE_DT
+  let $_fusi_buffer_HIRE_DT = &HIRE_DT
+{DateOut-Prefix}LAST_DATE_WORKED{DateOut-Suffix} &LAST_DATE_WORKED
+  let $_fusi_buffer_LAST_DATE_WORKED = &LAST_DATE_WORKED
+{DateOut-Prefix}LAST_HIRE_DT{DateOut-Suffix} &LAST_HIRE_DT
+  let $_fusi_buffer_LAST_HIRE_DT = &LAST_HIRE_DT
+LDW_OVR &LDW_OVR
+  let $_fusi_buffer_LDW_OVR = &LDW_OVR
+{DateOut-Prefix}LST_ASGN_START_DT{DateOut-Suffix} &LST_ASGN_START_DT
+  let $_fusi_buffer_LST_ASGN_START_DT = &LST_ASGN_START_DT
+{DateOut-Prefix}TERMINATION_DT{DateOut-Suffix} &TERMINATION_DT
+  let $_fusi_buffer_TERMINATION_DT = &TERMINATION_DT
+CURRENCY_CD1 &CURRENCY_CD1
+  let $_fusi_buffer_CURRENCY_CD1 = &CURRENCY_CD1
+EXEMPT_HOURS_MONTH &EXEMPT_HOURS_MONTH
+  let #_fusi_buffer_EXEMPT_HOURS_MONTH = &EXEMPT_HOURS_MONTH
+EXEMPT_JOB_LBR &EXEMPT_JOB_LBR
+  let $_fusi_buffer_EXEMPT_JOB_LBR = &EXEMPT_JOB_LBR
+INTERCTR_WRKS_CNCL &INTERCTR_WRKS_CNCL
+  let $_fusi_buffer_INTERCTR_WRKS_CNCL = &INTERCTR_WRKS_CNCL
+MATRICULA_NBR &MATRICULA_NBR
+  let #_fusi_buffer_MATRICULA_NBR = &MATRICULA_NBR
+SOC_SEC_RISK_CODE &SOC_SEC_RISK_CODE
+  let $_fusi_buffer_SOC_SEC_RISK_CODE = &SOC_SEC_RISK_CODE
+UNION_FEE_AMOUNT &UNION_FEE_AMOUNT
+  let #_fusi_buffer_UNION_FEE_AMOUNT = &UNION_FEE_AMOUNT
+{DateOut-Prefix}UNION_FEE_END_DT{DateOut-Suffix} &UNION_FEE_END_DT
+  let $_fusi_buffer_UNION_FEE_END_DT = &UNION_FEE_END_DT
+{DateOut-Prefix}UNION_FEE_START_DT{DateOut-Suffix} &UNION_FEE_START_DT
+  let $_fusi_buffer_UNION_FEE_START_DT = &UNION_FEE_START_DT
+WRKS_CNCL_FUNCTION &WRKS_CNCL_FUNCTION
+  let $_fusi_buffer_WRKS_CNCL_FUNCTION = &WRKS_CNCL_FUNCTION
+ACCDNT_CD_FRA &ACCDNT_CD_FRA
+  let $_fusi_buffer_ACCDNT_CD_FRA = &ACCDNT_CD_FRA
+CTG_RATE &CTG_RATE
+  let #_fusi_buffer_CTG_RATE = &CTG_RATE
+HOURLY_RT_FRA &HOURLY_RT_FRA
+  let $_fusi_buffer_HOURLY_RT_FRA = &HOURLY_RT_FRA
+PAID_FTE &PAID_FTE
+  let #_fusi_buffer_PAID_FTE = &PAID_FTE
+PAID_HOURS &PAID_HOURS
+  let #_fusi_buffer_PAID_HOURS = &PAID_HOURS
+PAID_HRS_FREQUENCY &PAID_HRS_FREQUENCY
+  let $_fusi_buffer_PAID_HRS_FREQUENCY = &PAID_HRS_FREQUENCY
+VALUE_1_FRA &VALUE_1_FRA
+  let $_fusi_buffer_VALUE_1_FRA = &VALUE_1_FRA
+VALUE_2_FRA &VALUE_2_FRA
+  let $_fusi_buffer_VALUE_2_FRA = &VALUE_2_FRA
+VALUE_3_FRA &VALUE_3_FRA
+  let $_fusi_buffer_VALUE_3_FRA = &VALUE_3_FRA
+VALUE_4_FRA &VALUE_4_FRA
+  let $_fusi_buffer_VALUE_4_FRA = &VALUE_4_FRA
+VALUE_5_FRA &VALUE_5_FRA
+  let $_fusi_buffer_VALUE_5_FRA = &VALUE_5_FRA
+FUNCTION_CD &FUNCTION_CD
+  let $_fusi_buffer_FUNCTION_CD = &FUNCTION_CD
+LABOR_TYPE_GER &LABOR_TYPE_GER
+  let $_fusi_buffer_LABOR_TYPE_GER = &LABOR_TYPE_GER
+PERFORM_GROUP_GER &PERFORM_GROUP_GER
+  let $_fusi_buffer_PERFORM_GROUP_GER = &PERFORM_GROUP_GER
+SPK_COMM_ID_GER &SPK_COMM_ID_GER
+  let $_fusi_buffer_SPK_COMM_ID_GER = &SPK_COMM_ID_GER
+TARIFF_AREA_GER &TARIFF_AREA_GER
+  let $_fusi_buffer_TARIFF_AREA_GER = &TARIFF_AREA_GER
+TARIFF_GER &TARIFF_GER
+  let $_fusi_buffer_TARIFF_GER = &TARIFF_GER
+CUR_RT_TYPE &CUR_RT_TYPE
+  let $_fusi_buffer_CUR_RT_TYPE = &CUR_RT_TYPE
+GP_ASOF_DT_EXG_RT &GP_ASOF_DT_EXG_RT
+  let $_fusi_buffer_GP_ASOF_DT_EXG_RT = &GP_ASOF_DT_EXG_RT
+GP_DFLT_CURRTTYP &GP_DFLT_CURRTTYP
+  let $_fusi_buffer_GP_DFLT_CURRTTYP = &GP_DFLT_CURRTTYP
+GP_DFLT_ELIG_GRP &GP_DFLT_ELIG_GRP
+  let $_fusi_buffer_GP_DFLT_ELIG_GRP = &GP_DFLT_ELIG_GRP
+GP_DFLT_EXRTDT &GP_DFLT_EXRTDT
+  let $_fusi_buffer_GP_DFLT_EXRTDT = &GP_DFLT_EXRTDT
+GP_ELIG_GRP &GP_ELIG_GRP
+  let $_fusi_buffer_GP_ELIG_GRP = &GP_ELIG_GRP
+GP_PAYGROUP &GP_PAYGROUP
+  let $_fusi_buffer_GP_PAYGROUP = &GP_PAYGROUP
+UNION_FULL_PART &UNION_FULL_PART
+  let $_fusi_buffer_UNION_FULL_PART = &UNION_FULL_PART
+UNION_POS &UNION_POS
+  let $_fusi_buffer_UNION_POS = &UNION_POS
+BARG_UNIT &BARG_UNIT
+  let $_fusi_buffer_BARG_UNIT = &BARG_UNIT
+EMPL_CTG &EMPL_CTG
+  let $_fusi_buffer_EMPL_CTG = &EMPL_CTG
+EMPL_CTG_L1 &EMPL_CTG_L1
+  let $_fusi_buffer_EMPL_CTG_L1 = &EMPL_CTG_L1
+EMPL_CTG_L2 &EMPL_CTG_L2
+  let $_fusi_buffer_EMPL_CTG_L2 = &EMPL_CTG_L2
+{DateOut-Prefix}ENTRY_DATE{DateOut-Suffix} &ENTRY_DATE
+  let $_fusi_buffer_ENTRY_DATE = &ENTRY_DATE
+LABOR_AGREEMENT &LABOR_AGREEMENT
+  let $_fusi_buffer_LABOR_AGREEMENT = &LABOR_AGREEMENT
+LABOR_FACILITY_ID &LABOR_FACILITY_ID
+  let $_fusi_buffer_LABOR_FACILITY_ID = &LABOR_FACILITY_ID
+LAYOFF_EXEMPT_FLAG &LAYOFF_EXEMPT_FLAG
+  let $_fusi_buffer_LAYOFF_EXEMPT_FLAG = &LAYOFF_EXEMPT_FLAG
+LAYOFF_EXEMPT_RSN &LAYOFF_EXEMPT_RSN
+  let $_fusi_buffer_LAYOFF_EXEMPT_RSN = &LAYOFF_EXEMPT_RSN
+{DateOut-Prefix}LBR_FAC_ENTRY_DT{DateOut-Suffix} &LBR_FAC_ENTRY_DT
+  let $_fusi_buffer_LBR_FAC_ENTRY_DT = &LBR_FAC_ENTRY_DT
+PAY_UNION_FEE &PAY_UNION_FEE
+  let $_fusi_buffer_PAY_UNION_FEE = &PAY_UNION_FEE
+SETID_LBR_AGRMNT &SETID_LBR_AGRMNT
+  let $_fusi_buffer_SETID_LBR_AGRMNT = &SETID_LBR_AGRMNT
+UNION_CD &UNION_CD
+  let $_fusi_buffer_UNION_CD = &UNION_CD
+{DateOut-Prefix}UNION_SENIORITY_DT{DateOut-Suffix} &UNION_SENIORITY_DT
+  let $_fusi_buffer_UNION_SENIORITY_DT = &UNION_SENIORITY_DT
+WPP_STOP_FLAG &WPP_STOP_FLAG
+  let $_fusi_buffer_WPP_STOP_FLAG = &WPP_STOP_FLAG
+EEO_CLASS &EEO_CLASS
+  let $_fusi_buffer_EEO_CLASS = &EEO_CLASS
+FLSA_STATUS &FLSA_STATUS
+  let $_fusi_buffer_FLSA_STATUS = &FLSA_STATUS
+FROM PS_JOB  J
+WHERE EMPLID    = $emplid
+AND   EMPL_RCD   = #empl_rcd
+AND   EFFDT     =
+  (SELECT MAX(EFFDT)
+   FROM PS_JOB  J2
+   WHERE EMPLID    = $emplid
+   AND   EMPL_RCD  = #empl_rcd
+   AND   EFFDT <= {DATEIN-PREFIX}$dt_nt_effdt{DATEIN-SUFFIX}
+  )
+AND   EFFSEQ  =
+  (SELECT MAX(EFFSEQ)
+   FROM PS_JOB  J3
+   WHERE EMPLID    = $emplid
+   AND   EMPL_RCD  = #empl_rcd
+   AND   EFFDT =   J.EFFDT
+  )
+end-select
+
+!if no data for this EMPLID (HIR or total JOB reconstruction)
+if (#nb_lignes = 0)
+  do fusi-set-JOB-from-defaults
+end-if
+
+#debug do fusi-debug-print-buffer ($emplid, #empl_rcd, $dt_nt_effdt, #effseq, $action)
+
+end-procedure fusi-select-JOB !*
+begin-procedure fusi-set-JOB-from-defaults ()!*
+  !* AREA :  assigning default values for first-time around JOB creation
+  !*         (hiring or total job reconstruction)
+  !* GENERATED BY:  gnr-field-JOB-handling
+
+#debug print 'fusi-set-JOB-from-defaults' (+1,1)
+
+let $_fusi_buffer_ABSENCE_SYSTEM_CD = ' '
+let $_fusi_buffer_ACCT_CD = ' '
+let $action = ' '
+let $_fusi_buffer_ACTION_DT = ''
+let $action_reason = ' '
+let $_fusi_buffer_ADDS_TO_FTE_ACTUAL = ' '
+let #_fusi_buffer_ANNL_BENEF_BASE_RT = 0
+let #_fusi_buffer_ANNUAL_RT = 0
+let $_fusi_buffer_APPT_TYPE = ' '
+let $_fusi_buffer_BAS_ACTION = ' '
+let $_fusi_buffer_BAS_GROUP_ID = ' '
+let $_fusi_buffer_BENEFIT_SYSTEM = ' '
+let $_fusi_buffer_BEN_STATUS = ' '
+let $_fusi_buffer_BORDER_WALKER = ' '
+let $_fusi_buffer_BUSINESS_UNIT = ' '
+let #_fusi_buffer_CHANGE_AMT = 0
+let #_fusi_buffer_CHANGE_PCT = 0
+let $_fusi_buffer_CLASS_INDC = ' '
+let $_fusi_buffer_COBRA_ACTION = ' '
+let $_fusi_buffer_COMPANY = ' '
+let #_fusi_buffer_COMPRATE = 0
+let $_fusi_buffer_COMP_FREQUENCY = ' '
+let $_fusi_buffer_CONTRACT_NUM = ' '
+let $_fusi_buffer_CURRENCY_CD = ' '
+let #_fusi_buffer_DAILY_RT = 0
+let $_fusi_buffer_DEPTID = ' '
+let $_fusi_buffer_DEPT_ENTRY_DT = ''
+let $_fusi_buffer_DIRECTLY_TIPPED = ' '
+let $_fusi_buffer_EARNS_DIST_TYPE = ' '
+let $dt_nt_effdt = ''
+let #effseq = 0
+let $_fusi_buffer_ELIG_CONFIG1 = ' '
+let $_fusi_buffer_ELIG_CONFIG2 = ' '
+let $_fusi_buffer_ELIG_CONFIG3 = ' '
+let $_fusi_buffer_ELIG_CONFIG4 = ' '
+let $_fusi_buffer_ELIG_CONFIG5 = ' '
+let $_fusi_buffer_ELIG_CONFIG6 = ' '
+let $_fusi_buffer_ELIG_CONFIG7 = ' '
+let $_fusi_buffer_ELIG_CONFIG8 = ' '
+let $_fusi_buffer_ELIG_CONFIG9 = ' '
+let $emplid = ' '
+let $_fusi_buffer_EMPL_CLASS = ' '
+let #empl_rcd = 0
+let $_fusi_buffer_EMPL_STATUS = ' '
+let $_fusi_buffer_EMPL_TYPE = ' '
+let $_fusi_buffer_ENCUMB_OVERRIDE = ' '
+let $_fusi_buffer_ESTABID = ' '
+let $_fusi_buffer_FICA_STATUS_EE = ' '
+let $_fusi_buffer_FORCE_PUBLISH = ''
+let #_fusi_buffer_FTE = 0
+let $_fusi_buffer_FULL_PART_TIME = ' '
+let $_fusi_buffer_GL_PAY_TYPE = ' '
+let $_fusi_buffer_GRADE = ' '
+let $_fusi_buffer_GRADE_ENTRY_DT = ''
+let $_fusi_buffer_HOLIDAY_SCHEDULE = ' '
+let #_fusi_buffer_HOURLY_RT = 0
+let $_fusi_buffer_HR_STATUS = ' '
+let $_fusi_buffer_JOBCODE = ' '
+let $_fusi_buffer_JOB_DATA_SRC_CD = ' '
+let $_fusi_buffer_JOB_ENTRY_DT = ''
+let $_fusi_buffer_JOB_INDICATOR = ' '
+let $lastupddttm = ''
+let $lastupdoprid = ' '
+let $_fusi_buffer_LOCATION = ' '
+let $_fusi_buffer_LUMP_SUM_PAY = ' '
+let #_fusi_buffer_MAIN_APPT_NUM_JPN = 0
+let #_fusi_buffer_MONTHLY_RT = 0
+let $_fusi_buffer_OFFICER_CD = ' '
+let $_fusi_buffer_PAYGROUP = ' '
+let $_fusi_buffer_PAY_SYSTEM_FLG = ' '
+let $_fusi_buffer_PER_ORG = ' '
+let $_fusi_buffer_POI_TYPE = ' '
+let $_fusi_buffer_POSITION_ENTRY_DT = ''
+let $_fusi_buffer_POSITION_NBR = ' '
+let $_fusi_buffer_POSITION_OVERRIDE = ' '
+let $_fusi_buffer_POSN_CHANGE_RECORD = ' '
+let $_fusi_buffer_PRORATE_CNT_AMT = ' '
+let $_fusi_buffer_REG_REGION = ' '
+let $_fusi_buffer_REG_TEMP = ' '
+let $_fusi_buffer_REPORTS_TO = ' '
+let $_fusi_buffer_SAL_ADMIN_PLAN = ' '
+let $_fusi_buffer_SETID_DEPT = ' '
+let $_fusi_buffer_SETID_JOBCODE = ' '
+let $_fusi_buffer_SETID_LOCATION = ' '
+let $_fusi_buffer_SETID_SALARY = ' '
+let $_fusi_buffer_SETID_SUPV_LVL = ' '
+let $_fusi_buffer_SHIFT = ' '
+let #_fusi_buffer_SHIFT_FACTOR = 0
+let #_fusi_buffer_SHIFT_RT = 0
+let #_fusi_buffer_STD_HOURS = 0
+let $_fusi_buffer_STD_HRS_FREQUENCY = ' '
+let #_fusi_buffer_STEP = 0
+let $_fusi_buffer_STEP_ENTRY_DT = ''
+let $_fusi_buffer_SUPERVISOR_ID = ' '
+let $_fusi_buffer_SUPV_LVL_ID = ' '
+let $_fusi_buffer_TAX_LOCATION_CD = ' '
+let #_fusi_buffer_WORK_DAY_HOURS = 0
+let $_fusi_buffer_WRKS_CNCL_ROLE_CHE = ' '
+let $_fusi_buffer_ASGN_END_DT = ''
+let $_fusi_buffer_ASGN_START_DT = ''
+let $_fusi_buffer_AUTO_END_FLG = ' '
+let $_fusi_buffer_EXPECTED_END_DATE = ''
+let $_fusi_buffer_EXPECTED_RETURN_DT = ''
+let $_fusi_buffer_HIRE_DT = ''
+let $_fusi_buffer_LAST_DATE_WORKED = ''
+let $_fusi_buffer_LAST_HIRE_DT = ''
+let $_fusi_buffer_LDW_OVR = ' '
+let $_fusi_buffer_LST_ASGN_START_DT = ''
+let $_fusi_buffer_TERMINATION_DT = ''
+let $_fusi_buffer_CURRENCY_CD1 = ' '
+let #_fusi_buffer_EXEMPT_HOURS_MONTH = 0
+let $_fusi_buffer_EXEMPT_JOB_LBR = ' '
+let $_fusi_buffer_INTERCTR_WRKS_CNCL = ' '
+let #_fusi_buffer_MATRICULA_NBR = 0
+let $_fusi_buffer_SOC_SEC_RISK_CODE = ' '
+let #_fusi_buffer_UNION_FEE_AMOUNT = 0
+let $_fusi_buffer_UNION_FEE_END_DT = ''
+let $_fusi_buffer_UNION_FEE_START_DT = ''
+let $_fusi_buffer_WRKS_CNCL_FUNCTION = ' '
+let $_fusi_buffer_ACCDNT_CD_FRA = ' '
+let #_fusi_buffer_CTG_RATE = 0
+let $_fusi_buffer_HOURLY_RT_FRA = ' '
+let #_fusi_buffer_PAID_FTE = 0
+let #_fusi_buffer_PAID_HOURS = 0
+let $_fusi_buffer_PAID_HRS_FREQUENCY = ' '
+let $_fusi_buffer_VALUE_1_FRA = ' '
+let $_fusi_buffer_VALUE_2_FRA = ' '
+let $_fusi_buffer_VALUE_3_FRA = ' '
+let $_fusi_buffer_VALUE_4_FRA = ' '
+let $_fusi_buffer_VALUE_5_FRA = ' '
+let $_fusi_buffer_FUNCTION_CD = ' '
+let $_fusi_buffer_LABOR_TYPE_GER = ' '
+let $_fusi_buffer_PERFORM_GROUP_GER = ' '
+let $_fusi_buffer_SPK_COMM_ID_GER = ' '
+let $_fusi_buffer_TARIFF_AREA_GER = ' '
+let $_fusi_buffer_TARIFF_GER = ' '
+let $_fusi_buffer_CUR_RT_TYPE = ' '
+let $_fusi_buffer_GP_ASOF_DT_EXG_RT = ' '
+let $_fusi_buffer_GP_DFLT_CURRTTYP = ' '
+let $_fusi_buffer_GP_DFLT_ELIG_GRP = ' '
+let $_fusi_buffer_GP_DFLT_EXRTDT = ' '
+let $_fusi_buffer_GP_ELIG_GRP = ' '
+let $_fusi_buffer_GP_PAYGROUP = ' '
+let $_fusi_buffer_UNION_FULL_PART = ' '
+let $_fusi_buffer_UNION_POS = ' '
+let $_fusi_buffer_BARG_UNIT = ' '
+let $_fusi_buffer_EMPL_CTG = ' '
+let $_fusi_buffer_EMPL_CTG_L1 = ' '
+let $_fusi_buffer_EMPL_CTG_L2 = ' '
+let $_fusi_buffer_ENTRY_DATE = ''
+let $_fusi_buffer_LABOR_AGREEMENT = ' '
+let $_fusi_buffer_LABOR_FACILITY_ID = ' '
+let $_fusi_buffer_LAYOFF_EXEMPT_FLAG = ' '
+let $_fusi_buffer_LAYOFF_EXEMPT_RSN = ' '
+let $_fusi_buffer_LBR_FAC_ENTRY_DT = ''
+let $_fusi_buffer_PAY_UNION_FEE = ' '
+let $_fusi_buffer_SETID_LBR_AGRMNT = ' '
+let $_fusi_buffer_UNION_CD = ' '
+let $_fusi_buffer_UNION_SENIORITY_DT = ''
+let $_fusi_buffer_WPP_STOP_FLAG = ' '
+let $_fusi_buffer_EEO_CLASS = ' '
+let $_fusi_buffer_FLSA_STATUS = ' '
+end-procedure
+begin-procedure fusi-write-trace($emplid, #empl_rcd, $dt_nt_effdt, #effseq, $action)  !*
+  !*AREA:  writes key and character data to a file for non-regression unit testing
+  !*GENERATED BY:  gnr-field-JOB-handling or gnr-field-JOB_JR-handling
+
+#debug print 'fusi-write-trace' (+1,1)
+
+move #empl_rcd to $empl_rcd 99
+move #effseq   to $effseq   99
+
+write #_fic_debug from
+$emplid:11
+$empl_rcd:2
+$dt_nt_effdt:{NATIVE_DATE_LEN}
+$effseq:2
+$action:3
+$_fusi_buffer_ABSENCE_SYSTEM_CD:3
+$_fusi_buffer_ACCT_CD:25
+$action:3
+$_fusi_buffer_ACTION_DT:10
+$action_reason:3
+$_fusi_buffer_ADDS_TO_FTE_ACTUAL:1
+$_fusi_buffer_APPT_TYPE:1
+$_fusi_buffer_BAS_ACTION:3
+$_fusi_buffer_BAS_GROUP_ID:3
+$_fusi_buffer_BENEFIT_SYSTEM:2
+$_fusi_buffer_BEN_STATUS:4
+$_fusi_buffer_BORDER_WALKER:1
+$_fusi_buffer_BUSINESS_UNIT:5
+$_fusi_buffer_CLASS_INDC:1
+$_fusi_buffer_COBRA_ACTION:3
+$_fusi_buffer_COMPANY:3
+$_fusi_buffer_COMP_FREQUENCY:5
+$_fusi_buffer_CONTRACT_NUM:25
+$_fusi_buffer_CURRENCY_CD:3
+$_fusi_buffer_DEPTID:10
+$_fusi_buffer_DEPT_ENTRY_DT:10
+$_fusi_buffer_DIRECTLY_TIPPED:1
+$_fusi_buffer_EARNS_DIST_TYPE:1
+$dt_nt_effdt:10
+$_fusi_buffer_ELIG_CONFIG1:10
+$_fusi_buffer_ELIG_CONFIG2:10
+$_fusi_buffer_ELIG_CONFIG3:10
+$_fusi_buffer_ELIG_CONFIG4:10
+$_fusi_buffer_ELIG_CONFIG5:10
+$_fusi_buffer_ELIG_CONFIG6:10
+$_fusi_buffer_ELIG_CONFIG7:10
+$_fusi_buffer_ELIG_CONFIG8:10
+$_fusi_buffer_ELIG_CONFIG9:10
+$emplid:11
+$_fusi_buffer_EMPL_CLASS:3
+$_fusi_buffer_EMPL_STATUS:1
+$_fusi_buffer_EMPL_TYPE:1
+$_fusi_buffer_ENCUMB_OVERRIDE:1
+$_fusi_buffer_ESTABID:12
+$_fusi_buffer_FICA_STATUS_EE:1
+$_fusi_buffer_FORCE_PUBLISH:10
+$_fusi_buffer_FULL_PART_TIME:1
+$_fusi_buffer_GL_PAY_TYPE:6
+$_fusi_buffer_GRADE:3
+$_fusi_buffer_GRADE_ENTRY_DT:10
+$_fusi_buffer_HOLIDAY_SCHEDULE:6
+$_fusi_buffer_HR_STATUS:1
+$_fusi_buffer_JOBCODE:6
+$_fusi_buffer_JOB_DATA_SRC_CD:3
+$_fusi_buffer_JOB_ENTRY_DT:10
+$_fusi_buffer_JOB_INDICATOR:1
+$lastupddttm:26
+$lastupdoprid:30
+$_fusi_buffer_LOCATION:10
+$_fusi_buffer_LUMP_SUM_PAY:1
+$_fusi_buffer_OFFICER_CD:1
+$_fusi_buffer_PAYGROUP:3
+$_fusi_buffer_PAY_SYSTEM_FLG:2
+$_fusi_buffer_PER_ORG:3
+$_fusi_buffer_POI_TYPE:5
+$_fusi_buffer_POSITION_ENTRY_DT:10
+$_fusi_buffer_POSITION_NBR:8
+$_fusi_buffer_POSITION_OVERRIDE:1
+$_fusi_buffer_POSN_CHANGE_RECORD:1
+$_fusi_buffer_PRORATE_CNT_AMT:1
+$_fusi_buffer_REG_REGION:5
+$_fusi_buffer_REG_TEMP:1
+$_fusi_buffer_REPORTS_TO:8
+$_fusi_buffer_SAL_ADMIN_PLAN:4
+$_fusi_buffer_SETID_DEPT:5
+$_fusi_buffer_SETID_JOBCODE:5
+$_fusi_buffer_SETID_LOCATION:5
+$_fusi_buffer_SETID_SALARY:5
+$_fusi_buffer_SETID_SUPV_LVL:5
+$_fusi_buffer_SHIFT:1
+$_fusi_buffer_STD_HRS_FREQUENCY:5
+$_fusi_buffer_STEP_ENTRY_DT:10
+$_fusi_buffer_SUPERVISOR_ID:11
+$_fusi_buffer_SUPV_LVL_ID:8
+$_fusi_buffer_TAX_LOCATION_CD:10
+$_fusi_buffer_WRKS_CNCL_ROLE_CHE:30
+$_fusi_buffer_ASGN_END_DT:10
+$_fusi_buffer_ASGN_START_DT:10
+$_fusi_buffer_AUTO_END_FLG:1
+$_fusi_buffer_EXPECTED_END_DATE:10
+$_fusi_buffer_EXPECTED_RETURN_DT:10
+$_fusi_buffer_HIRE_DT:10
+$_fusi_buffer_LAST_DATE_WORKED:10
+$_fusi_buffer_LAST_HIRE_DT:10
+$_fusi_buffer_LDW_OVR:1
+$_fusi_buffer_LST_ASGN_START_DT:10
+$_fusi_buffer_TERMINATION_DT:10
+$_fusi_buffer_CURRENCY_CD1:3
+$_fusi_buffer_EXEMPT_JOB_LBR:1
+$_fusi_buffer_INTERCTR_WRKS_CNCL:1
+$_fusi_buffer_SOC_SEC_RISK_CODE:3
+$_fusi_buffer_UNION_FEE_END_DT:10
+$_fusi_buffer_UNION_FEE_START_DT:10
+$_fusi_buffer_WRKS_CNCL_FUNCTION:1
+$_fusi_buffer_ACCDNT_CD_FRA:1
+$_fusi_buffer_HOURLY_RT_FRA:3
+$_fusi_buffer_PAID_HRS_FREQUENCY:5
+$_fusi_buffer_VALUE_1_FRA:5
+$_fusi_buffer_VALUE_2_FRA:5
+$_fusi_buffer_VALUE_3_FRA:5
+$_fusi_buffer_VALUE_4_FRA:5
+$_fusi_buffer_VALUE_5_FRA:5
+$_fusi_buffer_FUNCTION_CD:2
+$_fusi_buffer_LABOR_TYPE_GER:1
+$_fusi_buffer_PERFORM_GROUP_GER:2
+$_fusi_buffer_SPK_COMM_ID_GER:9
+$_fusi_buffer_TARIFF_AREA_GER:3
+$_fusi_buffer_TARIFF_GER:2
+$_fusi_buffer_CUR_RT_TYPE:5
+$_fusi_buffer_GP_ASOF_DT_EXG_RT:1
+$_fusi_buffer_GP_DFLT_CURRTTYP:1
+$_fusi_buffer_GP_DFLT_ELIG_GRP:1
+$_fusi_buffer_GP_DFLT_EXRTDT:1
+$_fusi_buffer_GP_ELIG_GRP:10
+$_fusi_buffer_GP_PAYGROUP:10
+$_fusi_buffer_UNION_FULL_PART:1
+$_fusi_buffer_UNION_POS:1
+$_fusi_buffer_BARG_UNIT:4
+$_fusi_buffer_EMPL_CTG:6
+$_fusi_buffer_EMPL_CTG_L1:6
+$_fusi_buffer_EMPL_CTG_L2:6
+$_fusi_buffer_ENTRY_DATE:10
+$_fusi_buffer_LABOR_AGREEMENT:6
+$_fusi_buffer_LABOR_FACILITY_ID:10
+$_fusi_buffer_LAYOFF_EXEMPT_FLAG:1
+$_fusi_buffer_LAYOFF_EXEMPT_RSN:11
+$_fusi_buffer_LBR_FAC_ENTRY_DT:10
+$_fusi_buffer_PAY_UNION_FEE:1
+$_fusi_buffer_SETID_LBR_AGRMNT:5
+$_fusi_buffer_UNION_CD:3
+$_fusi_buffer_UNION_SENIORITY_DT:10
+$_fusi_buffer_WPP_STOP_FLAG:1
+$_fusi_buffer_EEO_CLASS:1
+$_fusi_buffer_FLSA_STATUS:1
+end-procedure
+begin-procedure fusi-debug-print-buffer ($emplid, #empl_rcd, $dt_nt_effdt, #effseq, $action)!*
+  !* AREA:              DEBUG - prints vimp_buffer_values
+  !* GENERATED BY:
+
+#debug print 'ABSENCE_SYSTEM_CD' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_ABSENCE_SYSTEM_CD (0,0)
+#debug print ':'  (0,0)
+#debug print 'ACCT_CD' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_ACCT_CD (0,0)
+#debug print ':'  (0,0)
+#debug print 'ACTION' (+1,20)
+#debug print ':'  (0,0)
+#debug print $action (0,0)
+#debug print ':'  (0,0)
+#debug print 'ACTION_DT' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_ACTION_DT (0,0)
+#debug print ':'  (0,0)
+#debug print 'ACTION_REASON' (+1,20)
+#debug print ':'  (0,0)
+#debug print $action_reason (0,0)
+#debug print ':'  (0,0)
+#debug print 'ADDS_TO_FTE_ACTUAL' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_ADDS_TO_FTE_ACTUAL (0,0)
+#debug print ':'  (0,0)
+#debug print 'ANNL_BENEF_BASE_RT' (+1,20)
+#debug print ':'  (0,0)
+#debug print #_fusi_buffer_ANNL_BENEF_BASE_RT (0,0)
+#debug print ':'  (0,0)
+#debug print 'ANNUAL_RT' (+1,20)
+#debug print ':'  (0,0)
+#debug print #_fusi_buffer_ANNUAL_RT (0,0)
+#debug print ':'  (0,0)
+#debug print 'APPT_TYPE' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_APPT_TYPE (0,0)
+#debug print ':'  (0,0)
+#debug print 'BAS_ACTION' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_BAS_ACTION (0,0)
+#debug print ':'  (0,0)
+#debug print 'BAS_GROUP_ID' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_BAS_GROUP_ID (0,0)
+#debug print ':'  (0,0)
+#debug print 'BENEFIT_SYSTEM' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_BENEFIT_SYSTEM (0,0)
+#debug print ':'  (0,0)
+#debug print 'BEN_STATUS' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_BEN_STATUS (0,0)
+#debug print ':'  (0,0)
+#debug print 'BORDER_WALKER' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_BORDER_WALKER (0,0)
+#debug print ':'  (0,0)
+#debug print 'BUSINESS_UNIT' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_BUSINESS_UNIT (0,0)
+#debug print ':'  (0,0)
+#debug print 'CHANGE_AMT' (+1,20)
+#debug print ':'  (0,0)
+#debug print #_fusi_buffer_CHANGE_AMT (0,0)
+#debug print ':'  (0,0)
+#debug print 'CHANGE_PCT' (+1,20)
+#debug print ':'  (0,0)
+#debug print #_fusi_buffer_CHANGE_PCT (0,0)
+#debug print ':'  (0,0)
+#debug print 'CLASS_INDC' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_CLASS_INDC (0,0)
+#debug print ':'  (0,0)
+#debug print 'COBRA_ACTION' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_COBRA_ACTION (0,0)
+#debug print ':'  (0,0)
+#debug print 'COMPANY' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_COMPANY (0,0)
+#debug print ':'  (0,0)
+#debug print 'COMPRATE' (+1,20)
+#debug print ':'  (0,0)
+#debug print #_fusi_buffer_COMPRATE (0,0)
+#debug print ':'  (0,0)
+#debug print 'COMP_FREQUENCY' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_COMP_FREQUENCY (0,0)
+#debug print ':'  (0,0)
+#debug print 'CONTRACT_NUM' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_CONTRACT_NUM (0,0)
+#debug print ':'  (0,0)
+#debug print 'CURRENCY_CD' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_CURRENCY_CD (0,0)
+#debug print ':'  (0,0)
+#debug print 'DAILY_RT' (+1,20)
+#debug print ':'  (0,0)
+#debug print #_fusi_buffer_DAILY_RT (0,0)
+#debug print ':'  (0,0)
+#debug print 'DEPTID' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_DEPTID (0,0)
+#debug print ':'  (0,0)
+#debug print 'DEPT_ENTRY_DT' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_DEPT_ENTRY_DT (0,0)
+#debug print ':'  (0,0)
+#debug print 'DIRECTLY_TIPPED' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_DIRECTLY_TIPPED (0,0)
+#debug print ':'  (0,0)
+#debug print 'EARNS_DIST_TYPE' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_EARNS_DIST_TYPE (0,0)
+#debug print ':'  (0,0)
+#debug print 'EFFDT' (+1,20)
+#debug print ':'  (0,0)
+#debug print $dt_nt_effdt (0,0)
+#debug print ':'  (0,0)
+#debug print 'EFFSEQ' (+1,20)
+#debug print ':'  (0,0)
+#debug print #effseq (0,0)
+#debug print ':'  (0,0)
+#debug print 'ELIG_CONFIG1' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_ELIG_CONFIG1 (0,0)
+#debug print ':'  (0,0)
+#debug print 'ELIG_CONFIG2' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_ELIG_CONFIG2 (0,0)
+#debug print ':'  (0,0)
+#debug print 'ELIG_CONFIG3' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_ELIG_CONFIG3 (0,0)
+#debug print ':'  (0,0)
+#debug print 'ELIG_CONFIG4' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_ELIG_CONFIG4 (0,0)
+#debug print ':'  (0,0)
+#debug print 'ELIG_CONFIG5' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_ELIG_CONFIG5 (0,0)
+#debug print ':'  (0,0)
+#debug print 'ELIG_CONFIG6' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_ELIG_CONFIG6 (0,0)
+#debug print ':'  (0,0)
+#debug print 'ELIG_CONFIG7' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_ELIG_CONFIG7 (0,0)
+#debug print ':'  (0,0)
+#debug print 'ELIG_CONFIG8' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_ELIG_CONFIG8 (0,0)
+#debug print ':'  (0,0)
+#debug print 'ELIG_CONFIG9' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_ELIG_CONFIG9 (0,0)
+#debug print ':'  (0,0)
+#debug print 'EMPLID' (+1,20)
+#debug print ':'  (0,0)
+#debug print $emplid (0,0)
+#debug print ':'  (0,0)
+#debug print 'EMPL_CLASS' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_EMPL_CLASS (0,0)
+#debug print ':'  (0,0)
+#debug print 'EMPL_RCD' (+1,20)
+#debug print ':'  (0,0)
+#debug print #empl_rcd (0,0)
+#debug print ':'  (0,0)
+#debug print 'EMPL_STATUS' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_EMPL_STATUS (0,0)
+#debug print ':'  (0,0)
+#debug print 'EMPL_TYPE' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_EMPL_TYPE (0,0)
+#debug print ':'  (0,0)
+#debug print 'ENCUMB_OVERRIDE' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_ENCUMB_OVERRIDE (0,0)
+#debug print ':'  (0,0)
+#debug print 'ESTABID' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_ESTABID (0,0)
+#debug print ':'  (0,0)
+#debug print 'FICA_STATUS_EE' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_FICA_STATUS_EE (0,0)
+#debug print ':'  (0,0)
+#debug print 'FORCE_PUBLISH' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_FORCE_PUBLISH (0,0)
+#debug print ':'  (0,0)
+#debug print 'FTE' (+1,20)
+#debug print ':'  (0,0)
+#debug print #_fusi_buffer_FTE (0,0)
+#debug print ':'  (0,0)
+#debug print 'FULL_PART_TIME' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_FULL_PART_TIME (0,0)
+#debug print ':'  (0,0)
+#debug print 'GL_PAY_TYPE' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_GL_PAY_TYPE (0,0)
+#debug print ':'  (0,0)
+#debug print 'GRADE' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_GRADE (0,0)
+#debug print ':'  (0,0)
+#debug print 'GRADE_ENTRY_DT' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_GRADE_ENTRY_DT (0,0)
+#debug print ':'  (0,0)
+#debug print 'HOLIDAY_SCHEDULE' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_HOLIDAY_SCHEDULE (0,0)
+#debug print ':'  (0,0)
+#debug print 'HOURLY_RT' (+1,20)
+#debug print ':'  (0,0)
+#debug print #_fusi_buffer_HOURLY_RT (0,0)
+#debug print ':'  (0,0)
+#debug print 'HR_STATUS' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_HR_STATUS (0,0)
+#debug print ':'  (0,0)
+#debug print 'JOBCODE' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_JOBCODE (0,0)
+#debug print ':'  (0,0)
+#debug print 'JOB_DATA_SRC_CD' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_JOB_DATA_SRC_CD (0,0)
+#debug print ':'  (0,0)
+#debug print 'JOB_ENTRY_DT' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_JOB_ENTRY_DT (0,0)
+#debug print ':'  (0,0)
+#debug print 'JOB_INDICATOR' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_JOB_INDICATOR (0,0)
+#debug print ':'  (0,0)
+#debug print 'LASTUPDDTTM' (+1,20)
+#debug print ':'  (0,0)
+#debug print $lastupddttm (0,0)
+#debug print ':'  (0,0)
+#debug print 'LASTUPDOPRID' (+1,20)
+#debug print ':'  (0,0)
+#debug print $lastupdoprid (0,0)
+#debug print ':'  (0,0)
+#debug print 'LOCATION' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_LOCATION (0,0)
+#debug print ':'  (0,0)
+#debug print 'LUMP_SUM_PAY' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_LUMP_SUM_PAY (0,0)
+#debug print ':'  (0,0)
+#debug print 'MAIN_APPT_NUM_JPN' (+1,20)
+#debug print ':'  (0,0)
+#debug print #_fusi_buffer_MAIN_APPT_NUM_JPN (0,0)
+#debug print ':'  (0,0)
+#debug print 'MONTHLY_RT' (+1,20)
+#debug print ':'  (0,0)
+#debug print #_fusi_buffer_MONTHLY_RT (0,0)
+#debug print ':'  (0,0)
+#debug print 'OFFICER_CD' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_OFFICER_CD (0,0)
+#debug print ':'  (0,0)
+#debug print 'PAYGROUP' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_PAYGROUP (0,0)
+#debug print ':'  (0,0)
+#debug print 'PAY_SYSTEM_FLG' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_PAY_SYSTEM_FLG (0,0)
+#debug print ':'  (0,0)
+#debug print 'PER_ORG' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_PER_ORG (0,0)
+#debug print ':'  (0,0)
+#debug print 'POI_TYPE' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_POI_TYPE (0,0)
+#debug print ':'  (0,0)
+#debug print 'POSITION_ENTRY_DT' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_POSITION_ENTRY_DT (0,0)
+#debug print ':'  (0,0)
+#debug print 'POSITION_NBR' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_POSITION_NBR (0,0)
+#debug print ':'  (0,0)
+#debug print 'POSITION_OVERRIDE' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_POSITION_OVERRIDE (0,0)
+#debug print ':'  (0,0)
+#debug print 'POSN_CHANGE_RECORD' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_POSN_CHANGE_RECORD (0,0)
+#debug print ':'  (0,0)
+#debug print 'PRORATE_CNT_AMT' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_PRORATE_CNT_AMT (0,0)
+#debug print ':'  (0,0)
+#debug print 'REG_REGION' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_REG_REGION (0,0)
+#debug print ':'  (0,0)
+#debug print 'REG_TEMP' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_REG_TEMP (0,0)
+#debug print ':'  (0,0)
+#debug print 'REPORTS_TO' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_REPORTS_TO (0,0)
+#debug print ':'  (0,0)
+#debug print 'SAL_ADMIN_PLAN' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_SAL_ADMIN_PLAN (0,0)
+#debug print ':'  (0,0)
+#debug print 'SETID_DEPT' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_SETID_DEPT (0,0)
+#debug print ':'  (0,0)
+#debug print 'SETID_JOBCODE' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_SETID_JOBCODE (0,0)
+#debug print ':'  (0,0)
+#debug print 'SETID_LOCATION' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_SETID_LOCATION (0,0)
+#debug print ':'  (0,0)
+#debug print 'SETID_SALARY' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_SETID_SALARY (0,0)
+#debug print ':'  (0,0)
+#debug print 'SETID_SUPV_LVL' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_SETID_SUPV_LVL (0,0)
+#debug print ':'  (0,0)
+#debug print 'SHIFT' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_SHIFT (0,0)
+#debug print ':'  (0,0)
+#debug print 'SHIFT_FACTOR' (+1,20)
+#debug print ':'  (0,0)
+#debug print #_fusi_buffer_SHIFT_FACTOR (0,0)
+#debug print ':'  (0,0)
+#debug print 'SHIFT_RT' (+1,20)
+#debug print ':'  (0,0)
+#debug print #_fusi_buffer_SHIFT_RT (0,0)
+#debug print ':'  (0,0)
+#debug print 'STD_HOURS' (+1,20)
+#debug print ':'  (0,0)
+#debug print #_fusi_buffer_STD_HOURS (0,0)
+#debug print ':'  (0,0)
+#debug print 'STD_HRS_FREQUENCY' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_STD_HRS_FREQUENCY (0,0)
+#debug print ':'  (0,0)
+#debug print 'STEP' (+1,20)
+#debug print ':'  (0,0)
+#debug print #_fusi_buffer_STEP (0,0)
+#debug print ':'  (0,0)
+#debug print 'STEP_ENTRY_DT' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_STEP_ENTRY_DT (0,0)
+#debug print ':'  (0,0)
+#debug print 'SUPERVISOR_ID' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_SUPERVISOR_ID (0,0)
+#debug print ':'  (0,0)
+#debug print 'SUPV_LVL_ID' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_SUPV_LVL_ID (0,0)
+#debug print ':'  (0,0)
+#debug print 'TAX_LOCATION_CD' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_TAX_LOCATION_CD (0,0)
+#debug print ':'  (0,0)
+#debug print 'WORK_DAY_HOURS' (+1,20)
+#debug print ':'  (0,0)
+#debug print #_fusi_buffer_WORK_DAY_HOURS (0,0)
+#debug print ':'  (0,0)
+#debug print 'WRKS_CNCL_ROLE_CHE' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_WRKS_CNCL_ROLE_CHE (0,0)
+#debug print ':'  (0,0)
+#debug print 'ASGN_END_DT' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_ASGN_END_DT (0,0)
+#debug print ':'  (0,0)
+#debug print 'ASGN_START_DT' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_ASGN_START_DT (0,0)
+#debug print ':'  (0,0)
+#debug print 'AUTO_END_FLG' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_AUTO_END_FLG (0,0)
+#debug print ':'  (0,0)
+#debug print 'EXPECTED_END_DATE' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_EXPECTED_END_DATE (0,0)
+#debug print ':'  (0,0)
+#debug print 'EXPECTED_RETURN_DT' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_EXPECTED_RETURN_DT (0,0)
+#debug print ':'  (0,0)
+#debug print 'HIRE_DT' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_HIRE_DT (0,0)
+#debug print ':'  (0,0)
+#debug print 'LAST_DATE_WORKED' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_LAST_DATE_WORKED (0,0)
+#debug print ':'  (0,0)
+#debug print 'LAST_HIRE_DT' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_LAST_HIRE_DT (0,0)
+#debug print ':'  (0,0)
+#debug print 'LDW_OVR' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_LDW_OVR (0,0)
+#debug print ':'  (0,0)
+#debug print 'LST_ASGN_START_DT' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_LST_ASGN_START_DT (0,0)
+#debug print ':'  (0,0)
+#debug print 'TERMINATION_DT' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_TERMINATION_DT (0,0)
+#debug print ':'  (0,0)
+#debug print 'CURRENCY_CD1' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_CURRENCY_CD1 (0,0)
+#debug print ':'  (0,0)
+#debug print 'EXEMPT_HOURS_MONTH' (+1,20)
+#debug print ':'  (0,0)
+#debug print #_fusi_buffer_EXEMPT_HOURS_MONTH (0,0)
+#debug print ':'  (0,0)
+#debug print 'EXEMPT_JOB_LBR' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_EXEMPT_JOB_LBR (0,0)
+#debug print ':'  (0,0)
+#debug print 'INTERCTR_WRKS_CNCL' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_INTERCTR_WRKS_CNCL (0,0)
+#debug print ':'  (0,0)
+#debug print 'MATRICULA_NBR' (+1,20)
+#debug print ':'  (0,0)
+#debug print #_fusi_buffer_MATRICULA_NBR (0,0)
+#debug print ':'  (0,0)
+#debug print 'SOC_SEC_RISK_CODE' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_SOC_SEC_RISK_CODE (0,0)
+#debug print ':'  (0,0)
+#debug print 'UNION_FEE_AMOUNT' (+1,20)
+#debug print ':'  (0,0)
+#debug print #_fusi_buffer_UNION_FEE_AMOUNT (0,0)
+#debug print ':'  (0,0)
+#debug print 'UNION_FEE_END_DT' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_UNION_FEE_END_DT (0,0)
+#debug print ':'  (0,0)
+#debug print 'UNION_FEE_START_DT' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_UNION_FEE_START_DT (0,0)
+#debug print ':'  (0,0)
+#debug print 'WRKS_CNCL_FUNCTION' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_WRKS_CNCL_FUNCTION (0,0)
+#debug print ':'  (0,0)
+#debug print 'ACCDNT_CD_FRA' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_ACCDNT_CD_FRA (0,0)
+#debug print ':'  (0,0)
+#debug print 'CTG_RATE' (+1,20)
+#debug print ':'  (0,0)
+#debug print #_fusi_buffer_CTG_RATE (0,0)
+#debug print ':'  (0,0)
+#debug print 'HOURLY_RT_FRA' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_HOURLY_RT_FRA (0,0)
+#debug print ':'  (0,0)
+#debug print 'PAID_FTE' (+1,20)
+#debug print ':'  (0,0)
+#debug print #_fusi_buffer_PAID_FTE (0,0)
+#debug print ':'  (0,0)
+#debug print 'PAID_HOURS' (+1,20)
+#debug print ':'  (0,0)
+#debug print #_fusi_buffer_PAID_HOURS (0,0)
+#debug print ':'  (0,0)
+#debug print 'PAID_HRS_FREQUENCY' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_PAID_HRS_FREQUENCY (0,0)
+#debug print ':'  (0,0)
+#debug print 'VALUE_1_FRA' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_VALUE_1_FRA (0,0)
+#debug print ':'  (0,0)
+#debug print 'VALUE_2_FRA' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_VALUE_2_FRA (0,0)
+#debug print ':'  (0,0)
+#debug print 'VALUE_3_FRA' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_VALUE_3_FRA (0,0)
+#debug print ':'  (0,0)
+#debug print 'VALUE_4_FRA' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_VALUE_4_FRA (0,0)
+#debug print ':'  (0,0)
+#debug print 'VALUE_5_FRA' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_VALUE_5_FRA (0,0)
+#debug print ':'  (0,0)
+#debug print 'FUNCTION_CD' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_FUNCTION_CD (0,0)
+#debug print ':'  (0,0)
+#debug print 'LABOR_TYPE_GER' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_LABOR_TYPE_GER (0,0)
+#debug print ':'  (0,0)
+#debug print 'PERFORM_GROUP_GER' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_PERFORM_GROUP_GER (0,0)
+#debug print ':'  (0,0)
+#debug print 'SPK_COMM_ID_GER' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_SPK_COMM_ID_GER (0,0)
+#debug print ':'  (0,0)
+#debug print 'TARIFF_AREA_GER' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_TARIFF_AREA_GER (0,0)
+#debug print ':'  (0,0)
+#debug print 'TARIFF_GER' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_TARIFF_GER (0,0)
+#debug print ':'  (0,0)
+#debug print 'CUR_RT_TYPE' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_CUR_RT_TYPE (0,0)
+#debug print ':'  (0,0)
+#debug print 'GP_ASOF_DT_EXG_RT' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_GP_ASOF_DT_EXG_RT (0,0)
+#debug print ':'  (0,0)
+#debug print 'GP_DFLT_CURRTTYP' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_GP_DFLT_CURRTTYP (0,0)
+#debug print ':'  (0,0)
+#debug print 'GP_DFLT_ELIG_GRP' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_GP_DFLT_ELIG_GRP (0,0)
+#debug print ':'  (0,0)
+#debug print 'GP_DFLT_EXRTDT' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_GP_DFLT_EXRTDT (0,0)
+#debug print ':'  (0,0)
+#debug print 'GP_ELIG_GRP' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_GP_ELIG_GRP (0,0)
+#debug print ':'  (0,0)
+#debug print 'GP_PAYGROUP' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_GP_PAYGROUP (0,0)
+#debug print ':'  (0,0)
+#debug print 'UNION_FULL_PART' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_UNION_FULL_PART (0,0)
+#debug print ':'  (0,0)
+#debug print 'UNION_POS' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_UNION_POS (0,0)
+#debug print ':'  (0,0)
+#debug print 'BARG_UNIT' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_BARG_UNIT (0,0)
+#debug print ':'  (0,0)
+#debug print 'EMPL_CTG' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_EMPL_CTG (0,0)
+#debug print ':'  (0,0)
+#debug print 'EMPL_CTG_L1' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_EMPL_CTG_L1 (0,0)
+#debug print ':'  (0,0)
+#debug print 'EMPL_CTG_L2' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_EMPL_CTG_L2 (0,0)
+#debug print ':'  (0,0)
+#debug print 'ENTRY_DATE' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_ENTRY_DATE (0,0)
+#debug print ':'  (0,0)
+#debug print 'LABOR_AGREEMENT' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_LABOR_AGREEMENT (0,0)
+#debug print ':'  (0,0)
+#debug print 'LABOR_FACILITY_ID' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_LABOR_FACILITY_ID (0,0)
+#debug print ':'  (0,0)
+#debug print 'LAYOFF_EXEMPT_FLAG' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_LAYOFF_EXEMPT_FLAG (0,0)
+#debug print ':'  (0,0)
+#debug print 'LAYOFF_EXEMPT_RSN' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_LAYOFF_EXEMPT_RSN (0,0)
+#debug print ':'  (0,0)
+#debug print 'LBR_FAC_ENTRY_DT' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_LBR_FAC_ENTRY_DT (0,0)
+#debug print ':'  (0,0)
+#debug print 'PAY_UNION_FEE' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_PAY_UNION_FEE (0,0)
+#debug print ':'  (0,0)
+#debug print 'SETID_LBR_AGRMNT' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_SETID_LBR_AGRMNT (0,0)
+#debug print ':'  (0,0)
+#debug print 'UNION_CD' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_UNION_CD (0,0)
+#debug print ':'  (0,0)
+#debug print 'UNION_SENIORITY_DT' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_UNION_SENIORITY_DT (0,0)
+#debug print ':'  (0,0)
+#debug print 'WPP_STOP_FLAG' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_WPP_STOP_FLAG (0,0)
+#debug print ':'  (0,0)
+#debug print 'EEO_CLASS' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_EEO_CLASS (0,0)
+#debug print ':'  (0,0)
+#debug print 'FLSA_STATUS' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_FLSA_STATUS (0,0)
+#debug print ':'  (0,0)
+end-procedure
+begin-procedure fusi-select-JOB_JR ($emplid, #empl_rcd, $dt_nt_effdt)!*
+  !* AREA :  selects values from existing JOB_JR data
+  !* GENERATED BY:  gnr-field-JOB_JR-handling
+
+let #nb_lignes = 0
+
+#debug print 'fusi-select-JOB_JR (' (+1,1)
+#debug print $emplid (,)
+#debug print ',' (,)
+#debug print #empl_rcd (,) edit 99
+#debug print ',' (,)
+#debug print $dt_nt_effdt (,)
+#debug print ')' (,)
+
+let $_sql-statement = $_ReportID || ',fusi-select-JOB_JR,select,JOB_JR'
+begin-select On-Error=SQL-Error
+  let #nb_lignes = 1
+{DateOut-Prefix}EFFDT{DateOut-Suffix} &EFFDT
+  let $dt_nt_effdt = &EFFDT
+EFFSEQ &EFFSEQ
+  let #effseq = &EFFSEQ
+EMPLID &EMPLID
+  let $emplid = &EMPLID
+EMPL_RCD &EMPL_RCD
+  let #empl_rcd = &EMPL_RCD
+{DateTimeOut-Prefix}LASTUPDDTTM{DateTimeOut-Suffix} &LASTUPDDTTM
+  let $lastupddttm = &LASTUPDDTTM
+LASTUPDOPRID &LASTUPDOPRID
+  let $lastupdoprid = &LASTUPDOPRID
+CBO_CD_BRA &CBO_CD_BRA
+  let $_fusi_buffer_CBO_CD_BRA = &CBO_CD_BRA
+CONT_SAL_TYPE_BRA &CONT_SAL_TYPE_BRA
+  let $_fusi_buffer_CONT_SAL_TYPE_BRA = &CONT_SAL_TYPE_BRA
+SEFIP_CATEGORY_BRA &SEFIP_CATEGORY_BRA
+  let $_fusi_buffer_SEFIP_CATEGORY_BRA = &SEFIP_CATEGORY_BRA
+UNION_CD_ALT_BRA &UNION_CD_ALT_BRA
+  let $_fusi_buffer_UNION_CD_ALT_BRA = &UNION_CD_ALT_BRA
+SSN_EMPLOYER &SSN_EMPLOYER
+  let $_fusi_buffer_SSN_EMPLOYER = &SSN_EMPLOYER
+CTG_RATE &CTG_RATE
+  let #_fusi_buffer_CTG_RATE = &CTG_RATE
+FP_ACTION_2 &FP_ACTION_2
+  let $_fusi_buffer_FP_ACTION_2 = &FP_ACTION_2
+{DateOut-Prefix}FP_APPL_DT{DateOut-Suffix} &FP_APPL_DT
+  let $_fusi_buffer_FP_APPL_DT = &FP_APPL_DT
+{DateOut-Prefix}FP_APPL_SAL_DT{DateOut-Suffix} &FP_APPL_SAL_DT
+  let $_fusi_buffer_FP_APPL_SAL_DT = &FP_APPL_SAL_DT
+FP_BUDGET_NBR &FP_BUDGET_NBR
+  let #_fusi_buffer_FP_BUDGET_NBR = &FP_BUDGET_NBR
+FP_BUSINESS_CD &FP_BUSINESS_CD
+  let $_fusi_buffer_FP_BUSINESS_CD = &FP_BUSINESS_CD
+FP_CAREFRZPCT &FP_CAREFRZPCT
+  let #_fusi_buffer_FP_CAREFRZPCT = &FP_CAREFRZPCT
+FP_CATG_FP &FP_CATG_FP
+  let $_fusi_buffer_FP_CATG_FP = &FP_CATG_FP
+FP_CATG_LEVEL &FP_CATG_LEVEL
+  let $_fusi_buffer_FP_CATG_LEVEL = &FP_CATG_LEVEL
+{DateOut-Prefix}FP_CHG_COR_DT{DateOut-Suffix} &FP_CHG_COR_DT
+  let $_fusi_buffer_FP_CHG_COR_DT = &FP_CHG_COR_DT
+FP_CHG_IND &FP_CHG_IND
+  let $_fusi_buffer_FP_CHG_IND = &FP_CHG_IND
+FP_CHG_SAL &FP_CHG_SAL
+  let $_fusi_buffer_FP_CHG_SAL = &FP_CHG_SAL
+FP_CIVIL_PENSION &FP_CIVIL_PENSION
+  let $_fusi_buffer_FP_CIVIL_PENSION = &FP_CIVIL_PENSION
+FP_CLD_INST &FP_CLD_INST
+  let $_fusi_buffer_FP_CLD_INST = &FP_CLD_INST
+FP_COMPRATE &FP_COMPRATE
+  let #_fusi_buffer_FP_COMPRATE = &FP_COMPRATE
+FP_CORPS_CD &FP_CORPS_CD
+  let $_fusi_buffer_FP_CORPS_CD = &FP_CORPS_CD
+FP_DOWN_GRA &FP_DOWN_GRA
+  let $_fusi_buffer_FP_DOWN_GRA = &FP_DOWN_GRA
+FP_DURATION_PCT &FP_DURATION_PCT
+  let #_fusi_buffer_FP_DURATION_PCT = &FP_DURATION_PCT
+{DateOut-Prefix}FP_END_DT{DateOut-Suffix} &FP_END_DT
+  let $_fusi_buffer_FP_END_DT = &FP_END_DT
+FP_EQUIV_STEP &FP_EQUIV_STEP
+  let $_fusi_buffer_FP_EQUIV_STEP = &FP_EQUIV_STEP
+{DateOut-Prefix}FP_FOREND_DT{DateOut-Suffix} &FP_FOREND_DT
+  let $_fusi_buffer_FP_FOREND_DT = &FP_FOREND_DT
+{DateOut-Prefix}FP_FOR_PROM_DT{DateOut-Suffix} &FP_FOR_PROM_DT
+  let $_fusi_buffer_FP_FOR_PROM_DT = &FP_FOR_PROM_DT
+FP_GROSS_IND &FP_GROSS_IND
+  let #_fusi_buffer_FP_GROSS_IND = &FP_GROSS_IND
+FP_HDCNT_NBR &FP_HDCNT_NBR
+  let #_fusi_buffer_FP_HDCNT_NBR = &FP_HDCNT_NBR
+FP_HIR_DOS_SIT &FP_HIR_DOS_SIT
+  let $_fusi_buffer_FP_HIR_DOS_SIT = &FP_HIR_DOS_SIT
+FP_INCS_IND &FP_INCS_IND
+  let #_fusi_buffer_FP_INCS_IND = &FP_INCS_IND
+FP_INCS_IND2 &FP_INCS_IND2
+  let #_fusi_buffer_FP_INCS_IND2 = &FP_INCS_IND2
+{DateOut-Prefix}FP_INSTALL_DT{DateOut-Suffix} &FP_INSTALL_DT
+  let $_fusi_buffer_FP_INSTALL_DT = &FP_INSTALL_DT
+FP_INST_STAT &FP_INST_STAT
+  let $_fusi_buffer_FP_INST_STAT = &FP_INST_STAT
+FP_LEGALSTAT_CD &FP_LEGALSTAT_CD
+  let $_fusi_buffer_FP_LEGALSTAT_CD = &FP_LEGALSTAT_CD
+{DateOut-Prefix}FP_NOMINATION_DT{DateOut-Suffix} &FP_NOMINATION_DT
+  let $_fusi_buffer_FP_NOMINATION_DT = &FP_NOMINATION_DT
+FP_POINTYP_CD &FP_POINTYP_CD
+  let $_fusi_buffer_FP_POINTYP_CD = &FP_POINTYP_CD
+FP_POTENT_NBR &FP_POTENT_NBR
+  let #_fusi_buffer_FP_POTENT_NBR = &FP_POTENT_NBR
+FP_PR_LEGSTA &FP_PR_LEGSTA
+  let $_fusi_buffer_FP_PR_LEGSTA = &FP_PR_LEGSTA
+{DateOut-Prefix}FP_PT_END_DT{DateOut-Suffix} &FP_PT_END_DT
+  let $_fusi_buffer_FP_PT_END_DT = &FP_PT_END_DT
+{DateOut-Prefix}FP_PT_FOREND_DT{DateOut-Suffix} &FP_PT_FOREND_DT
+  let $_fusi_buffer_FP_PT_FOREND_DT = &FP_PT_FOREND_DT
+FP_PT_PCT &FP_PT_PCT
+  let $_fusi_buffer_FP_PT_PCT = &FP_PT_PCT
+FP_PT_PCT_DET &FP_PT_PCT_DET
+  let $_fusi_buffer_FP_PT_PCT_DET = &FP_PT_PCT_DET
+FP_RANK_CD &FP_RANK_CD
+  let $_fusi_buffer_FP_RANK_CD = &FP_RANK_CD
+FP_RATING_PRS_FLG &FP_RATING_PRS_FLG
+  let $_fusi_buffer_FP_RATING_PRS_FLG = &FP_RATING_PRS_FLG
+FP_RECEP_ORG &FP_RECEP_ORG
+  let $_fusi_buffer_FP_RECEP_ORG = &FP_RECEP_ORG
+FP_RETROSPECT &FP_RETROSPECT
+  let $_fusi_buffer_FP_RETROSPECT = &FP_RETROSPECT
+FP_RETURN_CD &FP_RETURN_CD
+  let $_fusi_buffer_FP_RETURN_CD = &FP_RETURN_CD
+{DateOut-Prefix}FP_RK_ENT_DT{DateOut-Suffix} &FP_RK_ENT_DT
+  let $_fusi_buffer_FP_RK_ENT_DT = &FP_RK_ENT_DT
+{DateOut-Prefix}FP_RK_PD_END_DT{DateOut-Suffix} &FP_RK_PD_END_DT
+  let $_fusi_buffer_FP_RK_PD_END_DT = &FP_RK_PD_END_DT
+FP_RK_TRIALPD &FP_RK_TRIALPD
+  let $_fusi_buffer_FP_RK_TRIALPD = &FP_RK_TRIALPD
+{DateOut-Prefix}FP_ROW_END_DT{DateOut-Suffix} &FP_ROW_END_DT
+  let $_fusi_buffer_FP_ROW_END_DT = &FP_ROW_END_DT
+FP_SANCTION &FP_SANCTION
+  let $_fusi_buffer_FP_SANCTION = &FP_SANCTION
+FP_SCNDMT_CD &FP_SCNDMT_CD
+  let $_fusi_buffer_FP_SCNDMT_CD = &FP_SCNDMT_CD
+FP_SCND_TYP &FP_SCND_TYP
+  let $_fusi_buffer_FP_SCND_TYP = &FP_SCND_TYP
+FP_SETID_RANK &FP_SETID_RANK
+  let $_fusi_buffer_FP_SETID_RANK = &FP_SETID_RANK
+FP_SOURCE_ORG &FP_SOURCE_ORG
+  let $_fusi_buffer_FP_SOURCE_ORG = &FP_SOURCE_ORG
+FP_STEP_CD &FP_STEP_CD
+  let $_fusi_buffer_FP_STEP_CD = &FP_STEP_CD
+FP_STEP_CD2 &FP_STEP_CD2
+  let $_fusi_buffer_FP_STEP_CD2 = &FP_STEP_CD2
+{DateOut-Prefix}FP_STEP_END_DT{DateOut-Suffix} &FP_STEP_END_DT
+  let $_fusi_buffer_FP_STEP_END_DT = &FP_STEP_END_DT
+FP_TITLE_NUM &FP_TITLE_NUM
+  let $_fusi_buffer_FP_TITLE_NUM = &FP_TITLE_NUM
+FP_TRAINEE &FP_TRAINEE
+  let $_fusi_buffer_FP_TRAINEE = &FP_TRAINEE
+FP_TRNE_POSN &FP_TRNE_POSN
+  let $_fusi_buffer_FP_TRNE_POSN = &FP_TRNE_POSN
+{DateOut-Prefix}LAST_UPDATE_DATE{DateOut-Suffix} &LAST_UPDATE_DATE
+  let $_fusi_buffer_LAST_UPDATE_DATE = &LAST_UPDATE_DATE
+BALANCE_GRP_NUM &BALANCE_GRP_NUM
+  let $_fusi_buffer_BALANCE_GRP_NUM = &BALANCE_GRP_NUM
+ASSIGNMENT_ID &ASSIGNMENT_ID
+  let #_fusi_buffer_ASSIGNMENT_ID = &ASSIGNMENT_ID
+CMP_DONT_ABSORB &CMP_DONT_ABSORB
+  let $_fusi_buffer_CMP_DONT_ABSORB = &CMP_DONT_ABSORB
+DUTIES_TYPE &DUTIES_TYPE
+  let $_fusi_buffer_DUTIES_TYPE = &DUTIES_TYPE
+TARGET_COMPRATE &TARGET_COMPRATE
+  let #_fusi_buffer_TARGET_COMPRATE = &TARGET_COMPRATE
+ACTION_ITA &ACTION_ITA
+  let $_fusi_buffer_ACTION_ITA = &ACTION_ITA
+ACTION_REASON_ITA &ACTION_REASON_ITA
+  let $_fusi_buffer_ACTION_REASON_ITA = &ACTION_REASON_ITA
+{DateOut-Prefix}PARTTIME_ENDDT_ITA{DateOut-Suffix} &PARTTIME_ENDDT_ITA
+  let $_fusi_buffer_PARTTIME_ENDDT_ITA = &PARTTIME_ENDDT_ITA
+PART_TIME_PERC_ITA &PART_TIME_PERC_ITA
+  let #_fusi_buffer_PART_TIME_PERC_ITA = &PART_TIME_PERC_ITA
+PART_TIME_TYPE_ITA &PART_TIME_TYPE_ITA
+  let $_fusi_buffer_PART_TIME_TYPE_ITA = &PART_TIME_TYPE_ITA
+SPECIAL_HIRCTG_ITA &SPECIAL_HIRCTG_ITA
+  let $_fusi_buffer_SPECIAL_HIRCTG_ITA = &SPECIAL_HIRCTG_ITA
+UNITA_PROD_CD &UNITA_PROD_CD
+  let $_fusi_buffer_UNITA_PROD_CD = &UNITA_PROD_CD
+{DateOut-Prefix}END_DATE_JPN{DateOut-Suffix} &END_DATE_JPN
+  let $_fusi_buffer_END_DATE_JPN = &END_DATE_JPN
+{DateOut-Prefix}EXP_END_DATE_JPN{DateOut-Suffix} &EXP_END_DATE_JPN
+  let $_fusi_buffer_EXP_END_DATE_JPN = &EXP_END_DATE_JPN
+INTCP_BUS_UNIT &INTCP_BUS_UNIT
+  let $_fusi_buffer_INTCP_BUS_UNIT = &INTCP_BUS_UNIT
+INTCP_COMPANY &INTCP_COMPANY
+  let $_fusi_buffer_INTCP_COMPANY = &INTCP_COMPANY
+INTCP_COMPANY2 &INTCP_COMPANY2
+  let $_fusi_buffer_INTCP_COMPANY2 = &INTCP_COMPANY2
+INTCP_DEPTID &INTCP_DEPTID
+  let $_fusi_buffer_INTCP_DEPTID = &INTCP_DEPTID
+INTCP_DEPTID2 &INTCP_DEPTID2
+  let $_fusi_buffer_INTCP_DEPTID2 = &INTCP_DEPTID2
+INTCP_SETID_DEPT &INTCP_SETID_DEPT
+  let $_fusi_buffer_INTCP_SETID_DEPT = &INTCP_SETID_DEPT
+INTCP_SUPV_LVL_ID &INTCP_SUPV_LVL_ID
+  let $_fusi_buffer_INTCP_SUPV_LVL_ID = &INTCP_SUPV_LVL_ID
+INTCP_SUPV_LVL_ID2 &INTCP_SUPV_LVL_ID2
+  let $_fusi_buffer_INTCP_SUPV_LVL_ID2 = &INTCP_SUPV_LVL_ID2
+{DateOut-Prefix}INTCP_XFR_END_DT{DateOut-Suffix} &INTCP_XFR_END_DT
+  let $_fusi_buffer_INTCP_XFR_END_DT = &INTCP_XFR_END_DT
+INTCP_XFR_FLG &INTCP_XFR_FLG
+  let $_fusi_buffer_INTCP_XFR_FLG = &INTCP_XFR_FLG
+{DateOut-Prefix}INTCP_XFR_START_DT{DateOut-Suffix} &INTCP_XFR_START_DT
+  let $_fusi_buffer_INTCP_XFR_START_DT = &INTCP_XFR_START_DT
+OTHER_ID_JPN &OTHER_ID_JPN
+  let $_fusi_buffer_OTHER_ID_JPN = &OTHER_ID_JPN
+{DateOut-Prefix}START_DATE_JPN{DateOut-Suffix} &START_DATE_JPN
+  let $_fusi_buffer_START_DATE_JPN = &START_DATE_JPN
+{DateOut-Prefix}IMS_TERM_DT_MEX{DateOut-Suffix} &IMS_TERM_DT_MEX
+  let $_fusi_buffer_IMS_TERM_DT_MEX = &IMS_TERM_DT_MEX
+LOCATED_CD_MEX &LOCATED_CD_MEX
+  let $_fusi_buffer_LOCATED_CD_MEX = &LOCATED_CD_MEX
+REDUCED_WEEK_MEX &REDUCED_WEEK_MEX
+  let $_fusi_buffer_REDUCED_WEEK_MEX = &REDUCED_WEEK_MEX
+SALARY_TYPE_MEX &SALARY_TYPE_MEX
+  let $_fusi_buffer_SALARY_TYPE_MEX = &SALARY_TYPE_MEX
+WORKER_TYPE_MEX &WORKER_TYPE_MEX
+  let $_fusi_buffer_WORKER_TYPE_MEX = &WORKER_TYPE_MEX
+WORKDAYS_NLD &WORKDAYS_NLD
+  let #_fusi_buffer_WORKDAYS_NLD = &WORKDAYS_NLD
+TAXCODE_UK &TAXCODE_UK
+  let $_fusi_buffer_TAXCODE_UK = &TAXCODE_UK
+TAX_BASIS_UK &TAX_BASIS_UK
+  let $_fusi_buffer_TAX_BASIS_UK = &TAX_BASIS_UK
+FROM PS_JOB_JR  J
+WHERE EMPLID    = $emplid
+AND   EMPL_RCD  = #empl_rcd
+AND   EFFDT     =
+  (SELECT MAX(EFFDT)
+   FROM PS_JOB_JR  J2
+   WHERE EMPLID    = $emplid
+   AND   EMPL_RCD  = #empl_rcd
+   AND   EFFDT <= {DATEIN-PREFIX}$dt_nt_effdt{DATEIN-SUFFIX}
+  )
+AND   EFFSEQ  =
+  (SELECT MAX(EFFSEQ)
+   FROM PS_JOB_JR  J3
+   WHERE EMPLID    = $emplid
+   AND   EMPL_RCD  = #empl_rcd
+   AND   EFFDT =   J.EFFDT
+  )
+end-select
+
+!if no data for this EMPLID (HIR or total JOB_JR reconstruction)
+if (#nb_lignes = 0)
+  do fusi-set-JOB_JR-from-defaults
+end-if
+
+#debug do fusi-debug-print-buffer-fra ($emplid, #empl_rcd, $dt_nt_effdt, #effseq, $action)
+
+end-procedure fusi-select-JOB_JR !*
+begin-procedure fusi-set-JOB_JR-from-defaults ()!*
+  !* AREA :  assigning default values for first-time around JOB_JR creation
+  !*         (hiring or total JOB_JR reconstruction)
+  !* GENERATED BY:  gnr-field-JOB_JR-handling
+
+#debug print 'fusi-set-JOB_JR-from-defaults' (+1,1)
+
+let $dt_nt_effdt = ''
+let #effseq = 0
+let $emplid = ' '
+let #empl_rcd = 0
+let $lastupddttm = ''
+let $lastupdoprid = ' '
+let $_fusi_buffer_CBO_CD_BRA = ' '
+let $_fusi_buffer_CONT_SAL_TYPE_BRA = ' '
+let $_fusi_buffer_SEFIP_CATEGORY_BRA = ' '
+let $_fusi_buffer_UNION_CD_ALT_BRA = ' '
+let $_fusi_buffer_SSN_EMPLOYER = ' '
+let #_fusi_buffer_CTG_RATE = 0
+let $_fusi_buffer_FP_ACTION_2 = ' '
+let $_fusi_buffer_FP_APPL_DT = ''
+let $_fusi_buffer_FP_APPL_SAL_DT = ''
+let #_fusi_buffer_FP_BUDGET_NBR = 0
+let $_fusi_buffer_FP_BUSINESS_CD = ' '
+let #_fusi_buffer_FP_CAREFRZPCT = 0
+let $_fusi_buffer_FP_CATG_FP = ' '
+let $_fusi_buffer_FP_CATG_LEVEL = ' '
+let $_fusi_buffer_FP_CHG_COR_DT = ''
+let $_fusi_buffer_FP_CHG_IND = ' '
+let $_fusi_buffer_FP_CHG_SAL = ' '
+let $_fusi_buffer_FP_CIVIL_PENSION = ' '
+let $_fusi_buffer_FP_CLD_INST = ' '
+let #_fusi_buffer_FP_COMPRATE = 0
+let $_fusi_buffer_FP_CORPS_CD = ' '
+let $_fusi_buffer_FP_DOWN_GRA = ' '
+let #_fusi_buffer_FP_DURATION_PCT = 0
+let $_fusi_buffer_FP_END_DT = ''
+let $_fusi_buffer_FP_EQUIV_STEP = ' '
+let $_fusi_buffer_FP_FOREND_DT = ''
+let $_fusi_buffer_FP_FOR_PROM_DT = ''
+let #_fusi_buffer_FP_GROSS_IND = 0
+let #_fusi_buffer_FP_HDCNT_NBR = 0
+let $_fusi_buffer_FP_HIR_DOS_SIT = ' '
+let #_fusi_buffer_FP_INCS_IND = 0
+let #_fusi_buffer_FP_INCS_IND2 = 0
+let $_fusi_buffer_FP_INSTALL_DT = ''
+let $_fusi_buffer_FP_INST_STAT = ' '
+let $_fusi_buffer_FP_LEGALSTAT_CD = ' '
+let $_fusi_buffer_FP_NOMINATION_DT = ''
+let $_fusi_buffer_FP_POINTYP_CD = ' '
+let #_fusi_buffer_FP_POTENT_NBR = 0
+let $_fusi_buffer_FP_PR_LEGSTA = ' '
+let $_fusi_buffer_FP_PT_END_DT = ''
+let $_fusi_buffer_FP_PT_FOREND_DT = ''
+let $_fusi_buffer_FP_PT_PCT = ' '
+let $_fusi_buffer_FP_PT_PCT_DET = ' '
+let $_fusi_buffer_FP_RANK_CD = ' '
+let $_fusi_buffer_FP_RATING_PRS_FLG = ' '
+let $_fusi_buffer_FP_RECEP_ORG = ' '
+let $_fusi_buffer_FP_RETROSPECT = ' '
+let $_fusi_buffer_FP_RETURN_CD = ' '
+let $_fusi_buffer_FP_RK_ENT_DT = ''
+let $_fusi_buffer_FP_RK_PD_END_DT = ''
+let $_fusi_buffer_FP_RK_TRIALPD = ' '
+let $_fusi_buffer_FP_ROW_END_DT = ''
+let $_fusi_buffer_FP_SANCTION = ' '
+let $_fusi_buffer_FP_SCNDMT_CD = ' '
+let $_fusi_buffer_FP_SCND_TYP = ' '
+let $_fusi_buffer_FP_SETID_RANK = ' '
+let $_fusi_buffer_FP_SOURCE_ORG = ' '
+let $_fusi_buffer_FP_STEP_CD = ' '
+let $_fusi_buffer_FP_STEP_CD2 = ' '
+let $_fusi_buffer_FP_STEP_END_DT = ''
+let $_fusi_buffer_FP_TITLE_NUM = ' '
+let $_fusi_buffer_FP_TRAINEE = ' '
+let $_fusi_buffer_FP_TRNE_POSN = ' '
+let $_fusi_buffer_LAST_UPDATE_DATE = ''
+let $_fusi_buffer_BALANCE_GRP_NUM = ' '
+let #_fusi_buffer_ASSIGNMENT_ID = 0
+let $_fusi_buffer_CMP_DONT_ABSORB = ' '
+let $_fusi_buffer_DUTIES_TYPE = ' '
+let #_fusi_buffer_TARGET_COMPRATE = 0
+let $_fusi_buffer_ACTION_ITA = ' '
+let $_fusi_buffer_ACTION_REASON_ITA = ' '
+let $_fusi_buffer_PARTTIME_ENDDT_ITA = ''
+let #_fusi_buffer_PART_TIME_PERC_ITA = 0
+let $_fusi_buffer_PART_TIME_TYPE_ITA = ' '
+let $_fusi_buffer_SPECIAL_HIRCTG_ITA = ' '
+let $_fusi_buffer_UNITA_PROD_CD = ' '
+let $_fusi_buffer_END_DATE_JPN = ''
+let $_fusi_buffer_EXP_END_DATE_JPN = ''
+let $_fusi_buffer_INTCP_BUS_UNIT = ' '
+let $_fusi_buffer_INTCP_COMPANY = ' '
+let $_fusi_buffer_INTCP_COMPANY2 = ' '
+let $_fusi_buffer_INTCP_DEPTID = ' '
+let $_fusi_buffer_INTCP_DEPTID2 = ' '
+let $_fusi_buffer_INTCP_SETID_DEPT = ' '
+let $_fusi_buffer_INTCP_SUPV_LVL_ID = ' '
+let $_fusi_buffer_INTCP_SUPV_LVL_ID2 = ' '
+let $_fusi_buffer_INTCP_XFR_END_DT = ''
+let $_fusi_buffer_INTCP_XFR_FLG = ' '
+let $_fusi_buffer_INTCP_XFR_START_DT = ''
+let $_fusi_buffer_OTHER_ID_JPN = ' '
+let $_fusi_buffer_START_DATE_JPN = ''
+let $_fusi_buffer_IMS_TERM_DT_MEX = ''
+let $_fusi_buffer_LOCATED_CD_MEX = ' '
+let $_fusi_buffer_REDUCED_WEEK_MEX = ' '
+let $_fusi_buffer_SALARY_TYPE_MEX = ' '
+let $_fusi_buffer_WORKER_TYPE_MEX = ' '
+let #_fusi_buffer_WORKDAYS_NLD = 0
+let $_fusi_buffer_TAXCODE_UK = ' '
+let $_fusi_buffer_TAX_BASIS_UK = ' '
+end-procedure
+begin-procedure fusi-write-trace-fra($emplid, #empl_rcd, $dt_nt_effdt, #effseq, $action)  !*
+  !*AREA:  writes key and character data to a file for non-regression unit testing
+  !*GENERATED BY:  gnr-field-JOB_JR-handling
+
+#debug print 'fusi-write-trace-fra' (+1,1)
+
+move #empl_rcd to $empl_rcd 99
+move #effseq   to $effseq   99
+
+write #_fic_debug from
+$emplid:11
+$empl_rcd:2
+$dt_nt_effdt:{NATIVE_DATE_LEN}
+$effseq:2
+$action:3
+$dt_nt_effdt:10
+$emplid:11
+$lastupddttm:26
+$lastupdoprid:30
+$_fusi_buffer_CBO_CD_BRA:7
+$_fusi_buffer_CONT_SAL_TYPE_BRA:1
+$_fusi_buffer_SEFIP_CATEGORY_BRA:2
+$_fusi_buffer_UNION_CD_ALT_BRA:3
+$_fusi_buffer_SSN_EMPLOYER:13
+$_fusi_buffer_FP_ACTION_2:3
+$_fusi_buffer_FP_APPL_DT:10
+$_fusi_buffer_FP_APPL_SAL_DT:10
+$_fusi_buffer_FP_BUSINESS_CD:4
+$_fusi_buffer_FP_CATG_FP:2
+$_fusi_buffer_FP_CATG_LEVEL:3
+$_fusi_buffer_FP_CHG_COR_DT:10
+$_fusi_buffer_FP_CHG_IND:1
+$_fusi_buffer_FP_CHG_SAL:1
+$_fusi_buffer_FP_CIVIL_PENSION:1
+$_fusi_buffer_FP_CLD_INST:1
+$_fusi_buffer_FP_CORPS_CD:6
+$_fusi_buffer_FP_DOWN_GRA:1
+$_fusi_buffer_FP_END_DT:10
+$_fusi_buffer_FP_EQUIV_STEP:4
+$_fusi_buffer_FP_FOREND_DT:10
+$_fusi_buffer_FP_FOR_PROM_DT:10
+$_fusi_buffer_FP_HIR_DOS_SIT:2
+$_fusi_buffer_FP_INSTALL_DT:10
+$_fusi_buffer_FP_INST_STAT:1
+$_fusi_buffer_FP_LEGALSTAT_CD:3
+$_fusi_buffer_FP_NOMINATION_DT:10
+$_fusi_buffer_FP_POINTYP_CD:2
+$_fusi_buffer_FP_PR_LEGSTA:3
+$_fusi_buffer_FP_PT_END_DT:10
+$_fusi_buffer_FP_PT_FOREND_DT:10
+$_fusi_buffer_FP_PT_PCT:3
+$_fusi_buffer_FP_PT_PCT_DET:3
+$_fusi_buffer_FP_RANK_CD:6
+$_fusi_buffer_FP_RATING_PRS_FLG:1
+$_fusi_buffer_FP_RECEP_ORG:30
+$_fusi_buffer_FP_RETROSPECT:1
+$_fusi_buffer_FP_RETURN_CD:1
+$_fusi_buffer_FP_RK_ENT_DT:10
+$_fusi_buffer_FP_RK_PD_END_DT:10
+$_fusi_buffer_FP_RK_TRIALPD:1
+$_fusi_buffer_FP_ROW_END_DT:10
+$_fusi_buffer_FP_SANCTION:1
+$_fusi_buffer_FP_SCNDMT_CD:1
+$_fusi_buffer_FP_SCND_TYP:1
+$_fusi_buffer_FP_SETID_RANK:5
+$_fusi_buffer_FP_SOURCE_ORG:50
+$_fusi_buffer_FP_STEP_CD:4
+$_fusi_buffer_FP_STEP_CD2:4
+$_fusi_buffer_FP_STEP_END_DT:10
+$_fusi_buffer_FP_TITLE_NUM:10
+$_fusi_buffer_FP_TRAINEE:1
+$_fusi_buffer_FP_TRNE_POSN:1
+$_fusi_buffer_LAST_UPDATE_DATE:10
+$_fusi_buffer_BALANCE_GRP_NUM:3
+$_fusi_buffer_CMP_DONT_ABSORB:1
+$_fusi_buffer_DUTIES_TYPE:2
+$_fusi_buffer_ACTION_ITA:3
+$_fusi_buffer_ACTION_REASON_ITA:3
+$_fusi_buffer_PARTTIME_ENDDT_ITA:10
+$_fusi_buffer_PART_TIME_TYPE_ITA:1
+$_fusi_buffer_SPECIAL_HIRCTG_ITA:1
+$_fusi_buffer_UNITA_PROD_CD:6
+$_fusi_buffer_END_DATE_JPN:10
+$_fusi_buffer_EXP_END_DATE_JPN:10
+$_fusi_buffer_INTCP_BUS_UNIT:5
+$_fusi_buffer_INTCP_COMPANY:3
+$_fusi_buffer_INTCP_COMPANY2:3
+$_fusi_buffer_INTCP_DEPTID:10
+$_fusi_buffer_INTCP_DEPTID2:10
+$_fusi_buffer_INTCP_SETID_DEPT:5
+$_fusi_buffer_INTCP_SUPV_LVL_ID:8
+$_fusi_buffer_INTCP_SUPV_LVL_ID2:8
+$_fusi_buffer_INTCP_XFR_END_DT:10
+$_fusi_buffer_INTCP_XFR_FLG:1
+$_fusi_buffer_INTCP_XFR_START_DT:10
+$_fusi_buffer_OTHER_ID_JPN:11
+$_fusi_buffer_START_DATE_JPN:10
+$_fusi_buffer_IMS_TERM_DT_MEX:10
+$_fusi_buffer_LOCATED_CD_MEX:18
+$_fusi_buffer_REDUCED_WEEK_MEX:4
+$_fusi_buffer_SALARY_TYPE_MEX:4
+$_fusi_buffer_WORKER_TYPE_MEX:4
+$_fusi_buffer_TAXCODE_UK:15
+$_fusi_buffer_TAX_BASIS_UK:1
+end-procedure
+begin-procedure fusi-debug-print-buffer-fra ($emplid, #empl_rcd, $dt_nt_effdt, #effseq, $action)!*
+  !* AREA:              DEBUG - prints vimp_buffer_values
+  !* GENERATED BY:
+
+#debug print 'EFFDT' (+1,20)
+#debug print ':'  (0,0)
+#debug print $dt_nt_effdt (0,0)
+#debug print ':'  (0,0)
+#debug print 'EFFSEQ' (+1,20)
+#debug print ':'  (0,0)
+#debug print #effseq (0,0)
+#debug print ':'  (0,0)
+#debug print 'EMPLID' (+1,20)
+#debug print ':'  (0,0)
+#debug print $emplid (0,0)
+#debug print ':'  (0,0)
+#debug print 'EMPL_RCD' (+1,20)
+#debug print ':'  (0,0)
+#debug print #empl_rcd (0,0)
+#debug print ':'  (0,0)
+#debug print 'LASTUPDDTTM' (+1,20)
+#debug print ':'  (0,0)
+#debug print $lastupddttm (0,0)
+#debug print ':'  (0,0)
+#debug print 'LASTUPDOPRID' (+1,20)
+#debug print ':'  (0,0)
+#debug print $lastupdoprid (0,0)
+#debug print ':'  (0,0)
+#debug print 'CBO_CD_BRA' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_CBO_CD_BRA (0,0)
+#debug print ':'  (0,0)
+#debug print 'CONT_SAL_TYPE_BRA' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_CONT_SAL_TYPE_BRA (0,0)
+#debug print ':'  (0,0)
+#debug print 'SEFIP_CATEGORY_BRA' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_SEFIP_CATEGORY_BRA (0,0)
+#debug print ':'  (0,0)
+#debug print 'UNION_CD_ALT_BRA' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_UNION_CD_ALT_BRA (0,0)
+#debug print ':'  (0,0)
+#debug print 'SSN_EMPLOYER' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_SSN_EMPLOYER (0,0)
+#debug print ':'  (0,0)
+#debug print 'CTG_RATE' (+1,20)
+#debug print ':'  (0,0)
+#debug print #_fusi_buffer_CTG_RATE (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_ACTION_2' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_FP_ACTION_2 (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_APPL_DT' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_FP_APPL_DT (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_APPL_SAL_DT' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_FP_APPL_SAL_DT (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_BUDGET_NBR' (+1,20)
+#debug print ':'  (0,0)
+#debug print #_fusi_buffer_FP_BUDGET_NBR (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_BUSINESS_CD' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_FP_BUSINESS_CD (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_CAREFRZPCT' (+1,20)
+#debug print ':'  (0,0)
+#debug print #_fusi_buffer_FP_CAREFRZPCT (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_CATG_FP' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_FP_CATG_FP (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_CATG_LEVEL' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_FP_CATG_LEVEL (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_CHG_COR_DT' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_FP_CHG_COR_DT (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_CHG_IND' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_FP_CHG_IND (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_CHG_SAL' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_FP_CHG_SAL (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_CIVIL_PENSION' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_FP_CIVIL_PENSION (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_CLD_INST' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_FP_CLD_INST (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_COMPRATE' (+1,20)
+#debug print ':'  (0,0)
+#debug print #_fusi_buffer_FP_COMPRATE (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_CORPS_CD' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_FP_CORPS_CD (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_DOWN_GRA' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_FP_DOWN_GRA (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_DURATION_PCT' (+1,20)
+#debug print ':'  (0,0)
+#debug print #_fusi_buffer_FP_DURATION_PCT (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_END_DT' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_FP_END_DT (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_EQUIV_STEP' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_FP_EQUIV_STEP (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_FOREND_DT' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_FP_FOREND_DT (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_FOR_PROM_DT' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_FP_FOR_PROM_DT (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_GROSS_IND' (+1,20)
+#debug print ':'  (0,0)
+#debug print #_fusi_buffer_FP_GROSS_IND (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_HDCNT_NBR' (+1,20)
+#debug print ':'  (0,0)
+#debug print #_fusi_buffer_FP_HDCNT_NBR (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_HIR_DOS_SIT' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_FP_HIR_DOS_SIT (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_INCS_IND' (+1,20)
+#debug print ':'  (0,0)
+#debug print #_fusi_buffer_FP_INCS_IND (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_INCS_IND2' (+1,20)
+#debug print ':'  (0,0)
+#debug print #_fusi_buffer_FP_INCS_IND2 (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_INSTALL_DT' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_FP_INSTALL_DT (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_INST_STAT' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_FP_INST_STAT (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_LEGALSTAT_CD' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_FP_LEGALSTAT_CD (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_NOMINATION_DT' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_FP_NOMINATION_DT (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_POINTYP_CD' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_FP_POINTYP_CD (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_POTENT_NBR' (+1,20)
+#debug print ':'  (0,0)
+#debug print #_fusi_buffer_FP_POTENT_NBR (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_PR_LEGSTA' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_FP_PR_LEGSTA (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_PT_END_DT' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_FP_PT_END_DT (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_PT_FOREND_DT' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_FP_PT_FOREND_DT (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_PT_PCT' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_FP_PT_PCT (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_PT_PCT_DET' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_FP_PT_PCT_DET (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_RANK_CD' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_FP_RANK_CD (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_RATING_PRS_FLG' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_FP_RATING_PRS_FLG (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_RECEP_ORG' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_FP_RECEP_ORG (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_RETROSPECT' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_FP_RETROSPECT (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_RETURN_CD' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_FP_RETURN_CD (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_RK_ENT_DT' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_FP_RK_ENT_DT (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_RK_PD_END_DT' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_FP_RK_PD_END_DT (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_RK_TRIALPD' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_FP_RK_TRIALPD (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_ROW_END_DT' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_FP_ROW_END_DT (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_SANCTION' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_FP_SANCTION (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_SCNDMT_CD' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_FP_SCNDMT_CD (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_SCND_TYP' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_FP_SCND_TYP (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_SETID_RANK' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_FP_SETID_RANK (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_SOURCE_ORG' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_FP_SOURCE_ORG (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_STEP_CD' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_FP_STEP_CD (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_STEP_CD2' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_FP_STEP_CD2 (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_STEP_END_DT' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_FP_STEP_END_DT (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_TITLE_NUM' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_FP_TITLE_NUM (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_TRAINEE' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_FP_TRAINEE (0,0)
+#debug print ':'  (0,0)
+#debug print 'FP_TRNE_POSN' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_FP_TRNE_POSN (0,0)
+#debug print ':'  (0,0)
+#debug print 'LAST_UPDATE_DATE' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_LAST_UPDATE_DATE (0,0)
+#debug print ':'  (0,0)
+#debug print 'BALANCE_GRP_NUM' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_BALANCE_GRP_NUM (0,0)
+#debug print ':'  (0,0)
+#debug print 'ASSIGNMENT_ID' (+1,20)
+#debug print ':'  (0,0)
+#debug print #_fusi_buffer_ASSIGNMENT_ID (0,0)
+#debug print ':'  (0,0)
+#debug print 'CMP_DONT_ABSORB' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_CMP_DONT_ABSORB (0,0)
+#debug print ':'  (0,0)
+#debug print 'DUTIES_TYPE' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_DUTIES_TYPE (0,0)
+#debug print ':'  (0,0)
+#debug print 'TARGET_COMPRATE' (+1,20)
+#debug print ':'  (0,0)
+#debug print #_fusi_buffer_TARGET_COMPRATE (0,0)
+#debug print ':'  (0,0)
+#debug print 'ACTION_ITA' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_ACTION_ITA (0,0)
+#debug print ':'  (0,0)
+#debug print 'ACTION_REASON_ITA' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_ACTION_REASON_ITA (0,0)
+#debug print ':'  (0,0)
+#debug print 'PARTTIME_ENDDT_ITA' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_PARTTIME_ENDDT_ITA (0,0)
+#debug print ':'  (0,0)
+#debug print 'PART_TIME_PERC_ITA' (+1,20)
+#debug print ':'  (0,0)
+#debug print #_fusi_buffer_PART_TIME_PERC_ITA (0,0)
+#debug print ':'  (0,0)
+#debug print 'PART_TIME_TYPE_ITA' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_PART_TIME_TYPE_ITA (0,0)
+#debug print ':'  (0,0)
+#debug print 'SPECIAL_HIRCTG_ITA' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_SPECIAL_HIRCTG_ITA (0,0)
+#debug print ':'  (0,0)
+#debug print 'UNITA_PROD_CD' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_UNITA_PROD_CD (0,0)
+#debug print ':'  (0,0)
+#debug print 'END_DATE_JPN' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_END_DATE_JPN (0,0)
+#debug print ':'  (0,0)
+#debug print 'EXP_END_DATE_JPN' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_EXP_END_DATE_JPN (0,0)
+#debug print ':'  (0,0)
+#debug print 'INTCP_BUS_UNIT' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_INTCP_BUS_UNIT (0,0)
+#debug print ':'  (0,0)
+#debug print 'INTCP_COMPANY' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_INTCP_COMPANY (0,0)
+#debug print ':'  (0,0)
+#debug print 'INTCP_COMPANY2' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_INTCP_COMPANY2 (0,0)
+#debug print ':'  (0,0)
+#debug print 'INTCP_DEPTID' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_INTCP_DEPTID (0,0)
+#debug print ':'  (0,0)
+#debug print 'INTCP_DEPTID2' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_INTCP_DEPTID2 (0,0)
+#debug print ':'  (0,0)
+#debug print 'INTCP_SETID_DEPT' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_INTCP_SETID_DEPT (0,0)
+#debug print ':'  (0,0)
+#debug print 'INTCP_SUPV_LVL_ID' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_INTCP_SUPV_LVL_ID (0,0)
+#debug print ':'  (0,0)
+#debug print 'INTCP_SUPV_LVL_ID2' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_INTCP_SUPV_LVL_ID2 (0,0)
+#debug print ':'  (0,0)
+#debug print 'INTCP_XFR_END_DT' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_INTCP_XFR_END_DT (0,0)
+#debug print ':'  (0,0)
+#debug print 'INTCP_XFR_FLG' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_INTCP_XFR_FLG (0,0)
+#debug print ':'  (0,0)
+#debug print 'INTCP_XFR_START_DT' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_INTCP_XFR_START_DT (0,0)
+#debug print ':'  (0,0)
+#debug print 'OTHER_ID_JPN' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_OTHER_ID_JPN (0,0)
+#debug print ':'  (0,0)
+#debug print 'START_DATE_JPN' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_START_DATE_JPN (0,0)
+#debug print ':'  (0,0)
+#debug print 'IMS_TERM_DT_MEX' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_IMS_TERM_DT_MEX (0,0)
+#debug print ':'  (0,0)
+#debug print 'LOCATED_CD_MEX' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_LOCATED_CD_MEX (0,0)
+#debug print ':'  (0,0)
+#debug print 'REDUCED_WEEK_MEX' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_REDUCED_WEEK_MEX (0,0)
+#debug print ':'  (0,0)
+#debug print 'SALARY_TYPE_MEX' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_SALARY_TYPE_MEX (0,0)
+#debug print ':'  (0,0)
+#debug print 'WORKER_TYPE_MEX' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_WORKER_TYPE_MEX (0,0)
+#debug print ':'  (0,0)
+#debug print 'WORKDAYS_NLD' (+1,20)
+#debug print ':'  (0,0)
+#debug print #_fusi_buffer_WORKDAYS_NLD (0,0)
+#debug print ':'  (0,0)
+#debug print 'TAXCODE_UK' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_TAXCODE_UK (0,0)
+#debug print ':'  (0,0)
+#debug print 'TAX_BASIS_UK' (+1,20)
+#debug print ':'  (0,0)
+#debug print $_fusi_buffer_TAX_BASIS_UK (0,0)
+#debug print ':'  (0,0)
+end-procedure
+
+begin-procedure fusi-insert-fpa_ci_job($emplid, #empl_rcd, $dt_nt_effdt, #effseq, $action, $action_reason, $lastupddttm, $lastupdoprid)  !*
+  !* AREA:  insert of the FPA_CI_JOB into the database (no updates required)
+  !* GENERATED BY:  gnr-JOB-handling
+
+#debug print 'fusi-insert-fpa_ci_job(' (+1,1)
+#debug print $emplid            ()
+#debug print ','                ()
+#debug print #empl_rcd          () edit 99
+#debug print ','                ()
+#debug print $dt_nt_effdt       ()
+#debug print ','                ()
+#debug print #effseq            () edit 99
+#debug print ','                ()
+#debug print $action            ()
+#debug print ','                ()
+#debug print $action_reason     ()
+#debug print ')'                ()
+
+#debug print 'begin-direct print' (+1,1)
+#debug print $action (+1,1)
+#debug print $action_reason (+1,1)
+#debug print $dt_nt_effdt (+1,1)
+#debug print #effseq (+1,1)
+#debug print $emplid (+1,1)
+#debug print #empl_rcd (+1,1)
+#debug print 'end-direct print' (+1,1)
+
+
+#debugt do fusi-debug-print-buffer ($emplid, #empl_rcd, $dt_nt_effdt, #effseq, $action)
+
+#debug do fusi-write-trace($emplid, #empl_rcd, $dt_nt_effdt, #effseq, $action)
+
+let $_fusi_buffer_DONE_FLAG = 'N'
+
+let $_sql-statement = $_ReportID || ',fusi-insert-fpa_ci_job,insert,FPA_CI_JOB'
+begin-sql On-Error=SQL-Error
+insert into PS_FPA_CI_JOB
+(ACTION,
+ACTION_REASON,
+ANNUAL_RT,
+BUSINESS_UNIT,
+COMPANY,
+COMPRATE,
+COMP_FREQUENCY,
+CONTRACT_NUM,
+CTG_RATE,
+CURRENCY_CD,
+DEPTID,
+DEPT_ENTRY_DT,
+DONE_FLAG,
+EFFDT,
+EFFSEQ,
+EMPLID,
+EMPL_RCD,
+EMPL_STATUS,
+ESTABID,
+FP_APPL_DT,
+FP_APPL_SAL_DT,
+FP_BUDGET_NBR,
+FP_BUSINESS_CD,
+FP_CAREFRZPCT,
+FP_CATG_FP,
+FP_CATG_LEVEL,
+FP_CHG_COR_DT,
+FP_CHG_IND,
+FP_CHG_SAL,
+FP_CIVIL_PENSION,
+FP_CLD_INST,
+FP_COMPRATE,
+FP_CORPS_CD,
+FP_DOWN_GRA,
+FP_DURATION_PCT,
+FP_END_DT,
+FP_EQUIV_STEP,
+FP_FOREND_DT,
+FP_FOR_PROM_DT,
+FP_GROSS_IND,
+FP_HDCNT_NBR,
+FP_HIR_DOS_SIT,
+FP_INCS_IND,
+FP_INCS_IND2,
+FP_INSTALL_DT,
+FP_INST_STAT,
+FP_LEGALSTAT_CD,
+FP_NOMINATION_DT,
+FP_POINTYP_CD,
+FP_POTENT_NBR,
+FP_PR_LEGSTA,
+FP_PT_END_DT,
+FP_PT_FOREND_DT,
+FP_PT_PCT,
+FP_PT_PCT_DET,
+FP_RANK_CD,
+FP_RATING_PRS_FLG,
+FP_RECEP_ORG,
+FP_RETROSPECT,
+FP_RETURN_CD,
+FP_RK_ENT_DT,
+FP_RK_PD_END_DT,
+FP_RK_TRIALPD,
+FP_ROW_END_DT,
+FP_SANCTION,
+FP_SCNDMT_CD,
+FP_SCND_TYP,
+FP_SETID_RANK,
+FP_SOURCE_ORG,
+FP_STEP_CD,
+FP_STEP_CD2,
+FP_STEP_END_DT,
+FP_TITLE_NUM,
+FP_TRAINEE,
+FP_TRNE_POSN,
+FULL_PART_TIME,
+HOLIDAY_SCHEDULE,
+HOURLY_RT,
+HOURLY_RT_FRA,
+JOBCODE,
+JOB_ENTRY_DT,
+JOB_INDICATOR,
+LAST_UPDATE_DATE,
+LOCATION,
+MONTHLY_RT,
+PAYGROUP,
+PAY_SYSTEM_FLG,
+POSITION_ENTRY_DT,
+POSITION_NBR,
+POSITION_OVERRIDE,
+POSN_CHANGE_RECORD,
+REG_REGION,
+SETID_DEPT,
+SETID_JOBCODE,
+SETID_LOCATION,
+STD_HOURS,
+STD_HRS_FREQUENCY,
+STRM_NUM,
+CUR_RT_TYPE,
+GP_ASOF_DT_EXG_RT,
+GP_DFLT_CURRTTYP,
+GP_DFLT_ELIG_GRP,
+GP_DFLT_EXRTDT,
+GP_ELIG_GRP,
+GP_PAYGROUP)
+VALUES ($action,
+$action_reason,
+#_fusi_buffer_ANNUAL_RT,
+$_fusi_buffer_BUSINESS_UNIT,
+$_fusi_buffer_COMPANY,
+#_fusi_buffer_COMPRATE,
+$_fusi_buffer_COMP_FREQUENCY,
+$_fusi_buffer_CONTRACT_NUM,
+#_fusi_buffer_CTG_RATE,
+$_fusi_buffer_CURRENCY_CD,
+$_fusi_buffer_DEPTID,
+{DateIn-Prefix}$_fusi_buffer_DEPT_ENTRY_DT{DateIn-Suffix},
+$_fusi_buffer_DONE_FLAG,
+{DateIn-Prefix}$dt_nt_effdt{DateIn-Suffix},
+#effseq,
+$emplid,
+#empl_rcd,
+$_fusi_buffer_EMPL_STATUS,
+$_fusi_buffer_ESTABID,
+{DateIn-Prefix}$_fusi_buffer_FP_APPL_DT{DateIn-Suffix},
+{DateIn-Prefix}$_fusi_buffer_FP_APPL_SAL_DT{DateIn-Suffix},
+#_fusi_buffer_FP_BUDGET_NBR,
+$_fusi_buffer_FP_BUSINESS_CD,
+#_fusi_buffer_FP_CAREFRZPCT,
+$_fusi_buffer_FP_CATG_FP,
+$_fusi_buffer_FP_CATG_LEVEL,
+{DateIn-Prefix}$_fusi_buffer_FP_CHG_COR_DT{DateIn-Suffix},
+$_fusi_buffer_FP_CHG_IND,
+$_fusi_buffer_FP_CHG_SAL,
+$_fusi_buffer_FP_CIVIL_PENSION,
+$_fusi_buffer_FP_CLD_INST,
+#_fusi_buffer_FP_COMPRATE,
+$_fusi_buffer_FP_CORPS_CD,
+$_fusi_buffer_FP_DOWN_GRA,
+#_fusi_buffer_FP_DURATION_PCT,
+{DateIn-Prefix}$_fusi_buffer_FP_END_DT{DateIn-Suffix},
+$_fusi_buffer_FP_EQUIV_STEP,
+{DateIn-Prefix}$_fusi_buffer_FP_FOREND_DT{DateIn-Suffix},
+{DateIn-Prefix}$_fusi_buffer_FP_FOR_PROM_DT{DateIn-Suffix},
+#_fusi_buffer_FP_GROSS_IND,
+#_fusi_buffer_FP_HDCNT_NBR,
+$_fusi_buffer_FP_HIR_DOS_SIT,
+#_fusi_buffer_FP_INCS_IND,
+#_fusi_buffer_FP_INCS_IND2,
+{DateIn-Prefix}$_fusi_buffer_FP_INSTALL_DT{DateIn-Suffix},
+$_fusi_buffer_FP_INST_STAT,
+$_fusi_buffer_FP_LEGALSTAT_CD,
+{DateIn-Prefix}$_fusi_buffer_FP_NOMINATION_DT{DateIn-Suffix},
+$_fusi_buffer_FP_POINTYP_CD,
+#_fusi_buffer_FP_POTENT_NBR,
+$_fusi_buffer_FP_PR_LEGSTA,
+{DateIn-Prefix}$_fusi_buffer_FP_PT_END_DT{DateIn-Suffix},
+{DateIn-Prefix}$_fusi_buffer_FP_PT_FOREND_DT{DateIn-Suffix},
+$_fusi_buffer_FP_PT_PCT,
+$_fusi_buffer_FP_PT_PCT_DET,
+$_fusi_buffer_FP_RANK_CD,
+$_fusi_buffer_FP_RATING_PRS_FLG,
+$_fusi_buffer_FP_RECEP_ORG,
+$_fusi_buffer_FP_RETROSPECT,
+$_fusi_buffer_FP_RETURN_CD,
+{DateIn-Prefix}$_fusi_buffer_FP_RK_ENT_DT{DateIn-Suffix},
+{DateIn-Prefix}$_fusi_buffer_FP_RK_PD_END_DT{DateIn-Suffix},
+$_fusi_buffer_FP_RK_TRIALPD,
+{DateIn-Prefix}$_fusi_buffer_FP_ROW_END_DT{DateIn-Suffix},
+$_fusi_buffer_FP_SANCTION,
+$_fusi_buffer_FP_SCNDMT_CD,
+$_fusi_buffer_FP_SCND_TYP,
+$_fusi_buffer_FP_SETID_RANK,
+$_fusi_buffer_FP_SOURCE_ORG,
+$_fusi_buffer_FP_STEP_CD,
+$_fusi_buffer_FP_STEP_CD2,
+{DateIn-Prefix}$_fusi_buffer_FP_STEP_END_DT{DateIn-Suffix},
+$_fusi_buffer_FP_TITLE_NUM,
+$_fusi_buffer_FP_TRAINEE,
+$_fusi_buffer_FP_TRNE_POSN,
+$_fusi_buffer_FULL_PART_TIME,
+$_fusi_buffer_HOLIDAY_SCHEDULE,
+#_fusi_buffer_HOURLY_RT,
+$_fusi_buffer_HOURLY_RT_FRA,
+$_fusi_buffer_JOBCODE,
+{DateIn-Prefix}$_fusi_buffer_JOB_ENTRY_DT{DateIn-Suffix},
+$_fusi_buffer_JOB_INDICATOR,
+{DateIn-Prefix}$_fusi_buffer_LAST_UPDATE_DATE{DateIn-Suffix},
+$_fusi_buffer_LOCATION,
+#_fusi_buffer_MONTHLY_RT,
+$_fusi_buffer_PAYGROUP,
+$_fusi_buffer_PAY_SYSTEM_FLG,
+{DateIn-Prefix}$_fusi_buffer_POSITION_ENTRY_DT{DateIn-Suffix},
+$_fusi_buffer_POSITION_NBR,
+$_fusi_buffer_POSITION_OVERRIDE,
+$_fusi_buffer_POSN_CHANGE_RECORD,
+$_fusi_buffer_REG_REGION,
+$_fusi_buffer_SETID_DEPT,
+$_fusi_buffer_SETID_JOBCODE,
+$_fusi_buffer_SETID_LOCATION,
+#_fusi_buffer_STD_HOURS,
+$_fusi_buffer_STD_HRS_FREQUENCY,
+#_fusi_buffer_STRM_NUM,
+$_fusi_buffer_CUR_RT_TYPE,
+$_fusi_buffer_GP_ASOF_DT_EXG_RT,
+$_fusi_buffer_GP_DFLT_CURRTTYP,
+$_fusi_buffer_GP_DFLT_ELIG_GRP,
+$_fusi_buffer_GP_DFLT_EXRTDT,
+$_fusi_buffer_GP_ELIG_GRP,
+$_fusi_buffer_GP_PAYGROUP)
+
+end-sql
+
+#debug print 'end of insert fpa_ci_job' (+1,1)
+
+end-procedure
+

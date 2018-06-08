@@ -1,0 +1,4021 @@
+!***********************************************************************
+!  TAX920US:  Create W-2c/W-3c Print Files - U.S. and Territories      *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module contains confidential and proprietary information        *
+! of Oracle; it is not to be copied, reproduced, or transmitted        *
+! in any form, by any means, in whole or in part, nor is it to         *
+! be used for any purpose other than that for which it is              *
+! expressly provided under the applicable license agreement.           *
+!                                                                      *
+! Copyright (C) 2007 Oracle. All Rights Reserved.                      *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+!          $Date:  2007/10/17:11:06:30                                 !
+!       $Release:  HR9                                                 !
+!    $Resolution:  726639                                              !
+!                                                                      *
+!***********************************************************************
+
+#include 'setenv.sqc'   !Set environment
+#DEFINE WCOLUMN1 4      !Set up first print column of form
+#DEFINE WCOLUMN2 42     !Set up mid-point column of form
+
+
+begin-setup
+    #Include 'setup03i.sqc'  !printer and page-size init
+end-setup
+
+
+begin-report
+
+  do Init-Report
+  do Stdapi-Term
+end-report
+
+begin-procedure Init-Report
+  display ''
+  display 'Creating W-2c print file.'
+  display ''
+
+  date-time () hh:mi:ss &t1
+  display &t1
+
+  move 'TAX920US' to $ReportID
+  move '2C'       to $Program
+  do Init-DateTime
+  do Init-Number
+  do Stdapi-Init
+  do Initialization
+
+!**** XML Publisher
+  if $XMLPublisher = 'Y'
+
+     do Clear-Guide-Temp
+     let $BurstValueSave = ''
+
+     let #FNum  = 0
+     let #FStat = 0
+
+     let $FName2 = 'TXW2C1XM.xml'
+     let $sourceFile2     = $FName2 || '{IMPORTSUFFIX}'
+     let $sourceLocation2 = '{IMPORTPREFIX}' || ''
+     let $sourceFileName2 = rtrim($sourceLocation2,' ') || rtrim($sourceFile2,' ')
+     let #FNum2  = 4
+     let #FStat2 = 0
+     do Open-XML-File($FName2, #FNum2, #FStat2)
+     do XML-Open-Tag('USA_YearEnd', $openTag2)
+     do Write-XML-Line(#Fnum2, $openTag2)
+
+  end-if
+
+  if &W2C.ALIGN_COUNT > 0 and $XMLPublisher = 'N'
+    do Print-Alignment-Forms
+  end-if
+
+  if &W2C.W2C_REG_REPRINT  = 'R'
+    do Read-EEs
+  else
+    do Read-Employee-Data
+  end-if
+
+  if $XMLPublisher = 'Y'
+      do Capture-OS
+      do Insert-YE-Runcontrol
+  end-if
+
+  if $EmployeeFound = 'N'
+    display ' '
+    display '****** No Employee Records Selected ******'
+    display ' '
+    new-page
+    print '********************************'  (+3,1)
+    print '  No Employee Records Selected  '  (+1,1)
+    print '********************************'  (+1,1)
+  else
+    if &W2C.W2C_REG_REPRINT  = 'C'
+      do Update-W2C-Parameters
+    else
+      do Update-Reg-Reprint-Status
+    end-if
+
+    if $XMLPublisher <> 'Y'
+       display ''
+       display 'Upon successful conclusion of this program, one file will have'
+       display 'been created. '
+       display ''
+       display 'Run the W-2c audit program(TAX921US) to get'
+       display 'the totals for the W-3c report.'
+       display ''
+    end-if
+  end-if
+
+!**** XML Publisher
+  if $XMLPublisher = 'Y'
+
+      do XML-Close-Tag('USA_YearEnd', $closeTag)
+      do Write-XML-Line(#Fnum2, $closeTag)
+      do Close-XML-File(#FNum2)
+
+      if $W2C.Py_W2_Copy_Type = '2' and #Fnum <> 0   ! employee copy
+         do Write-XML-Line(#Fnum, $closeTag)
+         do Close-XML-File(#FNum)
+      end-if
+  end-if
+
+  date-time () hh:mi:ss &t2
+  display &t2
+end-procedure
+
+begin-procedure Initialization
+  do Get-Current-DateTime
+  move '1' to $MMLZero
+  move '1' to $Year4
+  do Format-DateTime($AsOfToday, $910Date, {DEFYMD},'','')
+
+  move $910Date to $AsOfYear xxxx   !extract the current year
+  move $AsOfYear  to #AsOfYear
+  move #AsOfYear  to #saveAsOfYear
+  subtract 1    from #AsOfYear
+
+  do Init-Values
+  do Get-W2C-Run-Controls
+  do Get-W2C-Parameters
+
+  if RTRIM(&W2C.FORM_ID ,' ') = ''
+    display '*********************************************************'
+    display 'Form ID not specified on Report- W2c Process Parameters Panel '
+    display 'Program stopped'
+    display '*********************************************************'
+    stop
+  end-if
+
+  let $Form_ID = RTRIM(&W2C.FORM_ID ,' ')
+
+  if $Form_ID = 'XMLP'
+     let $XMLPublisher = 'Y'
+     move #W2c_Def_Cal_Yr to #XMLP_Tax_Year
+     do Get-XMLP-Definitions
+
+     do Format-DateTime($AsOfToday, $out, {DEFYMD},'','')
+     do Format-DateTime($out, $IssueDate, {DEFYMD},'','native')
+
+  else
+     let $XMLPublisher = 'N'
+  end-if
+
+  move &W2C_INSTALL.W2C_DEF_CAL_YR to $CalYear 9999
+  let $AsOfDate = $CalYear || '1231'
+  do Format-DateTime($AsOfDate, $AsOfDate, {DEFCMP}, '', 'native')
+
+  do Assign-Year-End-Variables
+
+  do Load-W2C-PRT
+  let $First_time = 'Y'
+
+
+!  Short edge offset - negative or positive decipoints
+!     Modify the codes below to adjust up or down -
+!     PLC code &lnnZ not effective on HP4000 printers
+
+
+  let $LP8 = ''
+  #if {PRINTER_TYPE} = 'LINEPRINTER'
+  #ifndef EBCDIC
+    encode '<27>&l30Z' into $LP8
+  #else
+  !  encode '<39>&l30Z' into $LP8
+  #endif
+  #endif
+
+  if $XMLPublisher <> 'Y'
+     print $LP8 () code
+  end-if
+
+  if $XMLPublisher <> 'Y'
+     move &W2C.EMPLOYEES_PER_PAGE  to #EmployeesPerPage
+  else
+     move 1 to #EmployeesPerPage
+  end-if
+
+  if $Layout_Style = '2VERTICAL'
+    COLUMNS {WCOLUMN1}
+    move 2 to #FormsPerPage
+  else
+    move 1 to #FormsPerPage
+  end-if
+
+  if #EmployeesPerPage  > #FormsPerPage
+    display '*********************************************************'
+    display 'Employees Per Page specifed on Report- W2c Process Parameters'
+    display 'Panel  is greater than the number of forms per page     '
+    display 'for the Form ID selected.                                '
+    display '*********************************************************'
+    stop
+  end-if
+
+begin-SELECT
+TEMP_SSN_MASK
+FROM PS_INSTALLATION
+end-SELECT
+
+  create-array name=StateLocals size=50
+    field=Box:char
+    field=State:char
+    field=Locality:char
+    field=Amount:number
+    field=PrvAmount:number
+
+  create-array name=StateSWT size=50
+    field=State:char
+    field=SWT:char
+
+  create-array name=LocalPrintName size=80
+    field=State:char
+    field=Locality:char
+    field=LocalName:char
+
+
+end-procedure
+
+
+begin-procedure Read-Employee-Data
+
+  move 'N' to $EmployeeFound
+
+
+begin-SELECT
+E.COMPANY          () ON-BREAK LEVEL=1 PRINT=NEVER BEFORE=BEFORE-COMPANY
+E.W2C_ADD_EMPLID   () ON-BREAK LEVEL=2 PRINT=NEVER BEFORE=BEFORE-EMPLID
+E.W2C_SSN
+E.W2C_FNAME
+E.W2C_MIDDLE_NAME
+E.W2C_LNAME
+E.W2C_SUFFIX
+E.ADDRESS1
+E.ADDRESS2
+E.CITY
+E.STATE
+E.POSTAL
+E.COUNTRY
+E.STATUTORY_EE
+E.PENSION_PLAN
+E.THIRDPARTY_SICKPAY
+E.PRV_SSN
+E.PRV_YE_FNAME
+E.PRV_YE_MIDDLE_NAME
+E.PRV_YE_LNAME
+E.PRV_YE_SUFFIX
+E.PRV_ADDRESS1
+E.PRV_ADDRESS2
+E.PRV_CITY
+E.PRV_STATE
+E.PRV_POSTAL
+E.PRV_COUNTRY
+E.PRV_STATUTORY_EE
+E.PRV_PENSION_PLAN
+E.PRV_THIRDPARTYSICK
+E.W2C_BATCH_NBR
+E.CALENDAR_YEAR
+
+  move 'Y' to $EmployeeFound
+  move &E.CALENDAR_YEAR  to $ER_Year  9999
+
+  if $XMLPublisher = 'Y'
+     if &E.Calendar_Year <> #XMLP_Tax_Year
+        move &E.CALENDAR_YEAR to #XMLP_Tax_Year
+        do Get-XMLP-Definitions
+     end-if
+  end-if
+
+  let $BoxForm = ' '
+
+  evaluate $Taxform_ID
+     when = 'I'
+          let $ER_Year = $ER_Year || '     VI'
+          let $BoxForm = 'VI'
+     when = 'M'
+          let $ER_Year = $ER_Year || '     GU'
+          let $BoxForm = 'GU'
+     when = 'S'
+          let $ER_Year = $ER_Year || '     AS'
+          let $BoxForm = 'AS'
+  end-evaluate
+
+  do Process-W2C
+
+  if &W2C.W2C_REG_REPRINT  = 'C'
+    do Update-W2-History
+  end-if
+
+FROM  PS_YE_W2C_DATA E
+  WHERE E.W2C_STATUS       <> 'V'
+  AND E.W2C_TAXFORM_ID = $Taxform_ID
+  [$E.Batch_Nbr]
+  [$E.SelectedEEs]        !NULL string if SELECT EEs option not used
+ORDER BY E.COMPANY, E.W2C_SSN
+end-SELECT
+end-procedure
+
+begin-procedure Before-Company
+
+begin-SELECT
+A.W2_REPORTING_CO
+A.DESCR
+A.FEDERAL_EIN
+A.ADDRESS1
+A.ADDRESS2
+A.CITY
+A.STATE
+A.POSTAL
+A.COUNTRY
+A.TAXFORM_ID
+
+  move &A.Federal_EIN     to $Federal_EIN 099999999
+  move $Federal_EIN       to $A.Federal_EIN xx-xxxxxxx
+  move &A.Descr           to $A.Descr
+  move &A.Address1        to $A.Address1
+  move &A.Address2        to $A.Address2
+  move &A.Country         to $A.Country
+  let  $A.City            =  RTRIM(&A.City,' ')
+  let  $A.State           =  RTRIM(&A.State,' ')
+  move &A.POSTAL          to $A.Postal
+  move &A.W2_Reporting_Co to $A.W2_Reporting_Co
+
+
+  UPPERCASE $A.Descr
+  UPPERCASE $A.Address1
+  UPPERCASE $A.Address2
+  UPPERCASE $A.Country
+  UPPERCASE $A.City
+
+  do Get-Setup-Viewing-Date
+
+FROM  PS_W2_COMPANY A
+WHERE A.COMPANY  = &E.COMPANY
+  AND A.W2_REPORTING_CO <> ' '
+  AND A.TAXFORM_ID       = 'W'
+  AND A.CALENDAR_YEAR = (SELECT MAX(CALENDAR_YEAR)
+                         FROM PS_W2_COMPANY
+                         WHERE A.COMPANY = COMPANY
+                           AND A.TAXFORM_ID = TAXFORM_ID
+                           AND CALENDAR_YEAR <= &E.CALENDAR_YEAR)
+end-SELECT
+end-procedure
+
+begin-procedure Before-EmplID
+
+  move &E.W2C_ADD_EMPLID   to $E.EmplID
+  move &E.W2C_BATCH_NBR    to #E.W2C_BATCH_NBR
+  let  $BoxC_Printed = 'N'
+  let $Alternate_FName = ' '
+  let $Alternate_LName = ' '
+
+  move &E.W2C_SSN to $S123 xxx
+  if $S123 = &Temp_SSN_Mask or RTRIM(&E.W2C_SSN, ' ') = ''
+    move 'Applied For' to $E.SSN
+  else
+    move &E.W2C_SSN to $E.SSN xxx-xx-xxxx
+  end-if
+
+  move &E.PRV_SSN to $S123 xxx
+  if $S123 = &Temp_SSN_Mask or RTRIM(&E.PRV_SSN, ' ') = ''
+    move 'Applied For' to $E.Prv_SSN
+  else
+    move &E.PRV_SSN to $E.Prv_SSN xxx-xx-xxxx
+  end-if
+
+  let $E.FullFName = rtrim(&E.W2C_FNAME, ' ') || ' ' || rtrim(&E.W2C_MIDDLE_NAME, ' ')
+  let $E.MiddleName = rtrim(&E.W2C_MIDDLE_NAME, ' ')
+  if $E.MiddleName <> ''
+    let $E.FName = rtrim(&E.W2C_FNAME, ' ') || ' ' || substr($E.MiddleName, 1,1)
+  else
+    let $E.FName = rtrim(&E.W2C_FNAME, ' ')
+  end-if
+  let $E.LName = rtrim(&E.W2C_LNAME, ' ')
+  let $E.Suffix = rtrim(&E.W2C_SUFFIX, ' ')
+  let $YE_Name  = $E.FullFName || ' ' || $E.LName || ' ' || $E.Suffix
+
+  move &E.Statutory_Ee       to $E.Statutory_Ee
+  move &E.Pension_Plan       to $E.Pension_Plan
+  move &E.ThirdParty_SickPay to $E.ThirdParty_SickPay
+
+  move &E.Address1        to $E.Address1
+  move &E.Address2        to $E.Address2
+  move &E.Country         to $E.Country
+  let  $E.City            =  RTRIM(&E.City,' ')
+  let  $E.State           =  RTRIM(&E.State,' ')
+  move &E.Postal          to $E.Postal
+
+  let $E.Prv_FullFName = rtrim(&E.PRV_YE_FNAME, ' ') || ' ' || rtrim(&E.PRV_YE_MIDDLE_NAME, ' ')
+  let $E.Prv_FName  = SUBSTR($E.Prv_FullFName,1,#YE_EE_FName_Box_Size)
+  let $E.Prv_FullLName = rtrim(&E.PRV_YE_LNAME, ' ')
+  let $E.Prv_LName  = SUBSTR($E.Prv_FullLName,1,#YE_EE_LName_Box_Size)
+  let $E.Prv_Suffix = rtrim(&E.PRV_YE_SUFFIX, ' ')
+
+!new code
+  let $Use_Alternate_Name = 'N'
+
+  if (Length($E.FName) > (#YE_EE_FName_Box_Size - 1)
+                           or Length($E.LName) > #YE_EE_LName_Box_Size)
+
+      let $Use_Alternate_Name = 'Y'
+
+      if $E.MiddleName <> ''
+          Let $Alternate_Name = substr($E.FName,1,1) || ' ' || substr($E.MiddleName,1,1)  || ' ' ||$E.LName
+      else
+          Let $Alternate_Name = substr($E.FName,1,1) || ' ' ||$E.LName
+      end-if
+      Let $Alternate_Name = substr($Alternate_Name,1,(#YE_EE_FName_Box_Size + #YE_EE_LName_Box_Size))
+
+      let $Alternate_FName = substr($Alternate_Name,1,#YE_EE_FName_Box_Size)
+      let $Alternate_LName = substr($Alternate_Name,(#YE_EE_FName_Box_Size + 1),#YE_EE_LName_Box_Size)
+  end-if
+!new code
+
+  !move &E.PRV_YE_FNAME to $E.Prv_Name
+  !move &E.PRV_YE_FNAME to $E.Prv_Fname
+  !move &E.PRV_YE_MIDDLE_NAME to $E.Prv_MiddleName
+  !move &E.PRV_YE_LNAME to $E.Prv_Lname
+  !move &E.PRV_YE_SUFFIX to $E.Prv_Suffix
+  !let $E.Prv_Name = rtrim($E.Prv_Name, ' ')  || ' '
+  !let $E.Prv_Fname = rtrim($E.Prv_Fname, ' ')  || ' '
+  !let $E.Prv_MiddleName = rtrim($E.Prv_MiddleName, ' ') || ' '
+  !let $E.Prv_Lname = rtrim($E.Prv_Lname, ' ')  || ' '
+  !let $E.Prv_Suffix =rtrim($E.Prv_Suffix, ' ')  || ' '
+  !if $E.Prv_MiddleName <> ' '
+  !  let $E.Prv_W2C_Name = $E.Prv_Name || $E.Prv_MiddleName || $E.Prv_Lname || $E.Prv_Suffix
+  !else
+  !  let $E.Prv_W2C_Name = $E.Prv_Name || $E.Prv_Lname || $E.Prv_Suffix
+  !end-if
+  !
+  !move $E.Prv_W2C_Name to $Prv_Name
+  !move $Prv_Name to $E.Prv_W2C_Name
+  !
+  !if $E.Prv_MiddleName <> ' '
+  !  let $E.Prv_W2C_Fname = $E.Prv_Fname || $E.Prv_MiddleName
+  !else
+  !  let $E.Prv_W2C_Fname = $E.Prv_Fname
+  !end-if
+  !
+  !
+  !if $E.Prv_Suffix <> ' '
+  !  let $E.Prv_W2C_Lname = $E.Prv_Lname ||  $E.Prv_Suffix
+  !else
+  !  let $E.Prv_W2C_Lname = $E.Prv_Lname
+  !end-if
+  !move $E.Prv_W2C_Fname to $Prv_Fname
+  !move $Prv_Fname to $E.Prv_W2C_Fname
+  !
+  !move $E.Prv_W2C_LName to $Prv_LName
+  !move $Prv_LName to $E.Prv_W2C_LName
+
+
+  move &E.Prv_Address1        to $E.Prv_Address1
+  move &E.Prv_Address2        to $E.Prv_Address2
+  move &E.Prv_Country         to $E.Prv_Country
+  let  $E.Prv_City            =  RTRIM(&E.Prv_City,' ')
+  let  $E.Prv_State           =  RTRIM(&E.Prv_State,' ')
+  move &E.Prv_Postal          to $E.Prv_Postal
+
+  move &E.Prv_Statutory_Ee    to $E.Prv_Statutory_Ee
+  move &E.Prv_Pension_Plan    to $E.Prv_Pension_Plan
+  move &E.Prv_ThirdPartySick  to $E.Prv_ThirdParty_SickPay
+
+  uppercase $YE_Name
+  uppercase $E.Address1
+  uppercase $E.Address2
+  uppercase $E.Country
+  uppercase $E.City
+
+  uppercase $E.Prv_Name
+  uppercase $E.Prv_Address1
+  uppercase $E.Prv_Address2
+  uppercase $E.Prv_Country
+  uppercase $E.Prv_City
+
+end-procedure
+
+begin-procedure Process-W2C
+
+  move 0 to #LocalPrintCount
+  move 0 to #StateSWTCount
+  move '' to $Prev_State
+  move 0 to #StateLocalCount
+
+  do Load-Amounts
+  do Print-W2C
+
+  if $XMLPublisher = 'Y' and $TagOpened = 'Y'
+
+     do XML-Close-Tag('W2C_Data', $closeTag)
+     if $W2C.Py_W2_Copy_Type = '2' and #FNum <> 0
+        do Write-XML-Line(#Fnum, $closeTag)
+        let $TagOpened = 'N'
+     end-if
+
+      if ($W2C.Py_W2_Copy_Type  = '2' and $Consent <> 'C') or
+          $W2C.Py_W2_Copy_Type <> '2'
+         do Write-XML-Line(#Fnum2, $closeTag)
+         let $TagOpened = 'N'
+      end-if
+  end-if
+
+  if $XMLPublisher = 'Y' and $W2C.Py_W2_Copy_Type = '2'
+
+     do Insert-Guide-Data
+  end-if
+
+end-procedure
+
+begin-procedure Print-W2C
+  move 1 to #j
+
+  while #j <= #FormsPerPage/#EmployeesPerPage  !loop for individual ee's
+    do Next-Form
+    do Print-ER-Data
+    do Print-EE-Data
+    do Print-Page1-Data
+    do Print-Fed-Amounts
+    if #StateLocalCount > 0
+      move 0 to #NextStateLoc
+      do Print-State-Local-Amounts
+    else
+      if $Print_Test_State_Local = 'Y'
+        do Print-Test-State-Local-Amounts
+      end-if
+    end-if
+    add 1 to #j
+  end-while
+
+  do Init-Values
+
+
+end-procedure
+
+begin-procedure Init-Values
+  move 0 to #Fed_Wages
+  move 0 to #Fed_Tax
+  move 0 to #SS_Wages
+  move 0 to #SS_Tax
+  move 0 to #Med_Wages
+  move 0 to #Med_Tax
+  move 0 to #SS_Tips
+  move 0 to #Alloc_Tips
+  move 0 to #Adv_EIC
+  move 0 to #Dep_Care
+  move 0  to #Non_Qual_457AB
+  move 0 to #BlankBoxCount
+  move 'N' to $AmtNon_Qual_457A
+  move 'N' to $AmtNon_Qual_457B
+  move 0 to #Uncoll_SS_Tax_On_Tips
+  move 0 to #Uncoll_Med_Tax_On_Tips
+  move 0 to #Roth_401K
+  move 0 to #Roth_403B
+  move 0 to #Group_Term_Life
+  move 0 to #401K
+  move 0 to #403B
+  move 0 to #408K6
+  move 0 to #457B
+  move 0 to #501C18D
+  move 0 to #Sick_Pay
+  move 0 to #Excise_Tax
+  move 0 to #Business_Exp
+  move 0 to #Uncoll_SS_Tax_GTL
+  move 0 to #Uncoll_Med_Tax_GTL
+  move 0 to #Excl_Moving_Exp
+  move 0 to #Basic_Qtrs_and_Subsist
+  move 0 to #Combat_Pay
+  move 0 to #Med_Svgs_Acct
+  move 0 to #408P_Simple_Retirement
+  move 0 to #Adoption_Exp
+  move 0 to #NonStatutory_Stock_Opt
+  move 0 to #HSA_Employer_Contrib
+  move 0 to #409A_Def_NQ_Def_Comp
+  move 0 to #409A_Inc_NQ_Def_Comp
+  move 0 to #OtherA
+  move 0 to #OtherB
+  move 0 to #OtherC
+  move 0 to #OtherD
+  move 0 to #OtherE
+  move 0 to #OtherF
+  move 0 to #OtherG
+  move 0 to #OtherH
+  move 0 to #OtherI
+  move 0 to #OtherJ
+  move 0 to #OtherK
+  move 0 to #OtherL
+  move 0 to #OtherM
+  move 0 to #OtherN
+  move 0 to #OtherO
+  move 0 to #OtherP
+  move 0 to #OtherQ
+  move 0 to #OtherR
+  move 0 to #OtherS
+  move 0 to #OtherT
+  move 0 to #OtherU
+  move 0 to #OtherV
+  move 0 to #OtherW
+  move 0 to #OtherX
+  move 0 to #OtherY
+  move 0 to #OtherYN
+  move 0 to #OtherYT
+  move 0 to #OtherZ
+  move 0 to #OtherZN
+
+  move 0 to #Prv_Fed_Wages
+  move 0 to #Prv_Fed_Tax
+  move 0 to #Prv_SS_Wages
+  move 0 to #Prv_SS_Tax
+  move 0 to #Prv_Med_Wages
+  move 0 to #Prv_Med_Tax
+  move 0 to #Prv_SS_Tips
+  move 0 to #Prv_Alloc_Tips
+  move 0 to #Prv_Adv_EIC
+  move 0 to #Prv_Dep_Care
+  move 0  to #Prv_Non_Qual_457AB
+  move 'N' to $Prv_AmtNon_Qual_457A
+  move 'N' to $Prv_AmtNon_Qual_457B
+  move 0 to #Prv_Uncoll_SS_Tax_On_Tips
+  move 0 to #Prv_Uncoll_Med_Tax_On_Tips
+  move 0 to #Prv_Roth_401K
+  move 0 to #Prv_Roth_403B
+  move 0 to #Prv_Group_Term_Life
+  move 0 to #Prv_401K
+  move 0 to #Prv_403B
+  move 0 to #Prv_408K6
+  move 0 to #Prv_457B
+  move 0 to #Prv_501C18D
+  move 0 to #Prv_Sick_Pay
+  move 0 to #Prv_Excise_Tax
+  move 0 to #Prv_Business_Exp
+  move 0 to #Prv_Uncoll_SS_Tax_GTL
+  move 0 to #Prv_Uncoll_Med_Tax_GTL
+  move 0 to #Prv_Excl_Moving_Exp
+  move 0 to #Prv_Basic_Qtrs_and_Subsist
+  move 0 to #Prv_Combat_Pay
+  move 0 to #Prv_Med_Svgs_Acct
+  move 0 to #Prv_408P_Simple_Retirement
+  move 0 to #Prv_Adoption_Exp
+  move 0 to #Prv_NonStatutory_Stock_Opt
+  move 0 to #Prv_HSA_Employer_Contrib
+  move 0 to #Prv_409A_Def_NQ_Def_Comp
+  move 0 to #Prv_409A_Inc_NQ_Def_Comp
+  move 0 to #Prv_OtherA
+  move 0 to #Prv_OtherB
+  move 0 to #Prv_OtherC
+  move 0 to #Prv_OtherD
+  move 0 to #Prv_OtherE
+  move 0 to #Prv_OtherF
+  move 0 to #Prv_OtherG
+  move 0 to #Prv_OtherH
+  move 0 to #Prv_OtherI
+  move 0 to #Prv_OtherJ
+  move 0 to #Prv_OtherK
+  move 0 to #Prv_OtherL
+  move 0 to #Prv_OtherM
+  move 0 to #Prv_OtherN
+  move 0 to #Prv_OtherO
+  move 0 to #Prv_OtherP
+  move 0 to #Prv_OtherQ
+  move 0 to #Prv_OtherR
+  move 0 to #Prv_OtherS
+  move 0 to #Prv_OtherT
+  move 0 to #Prv_OtherU
+  move 0 to #Prv_OtherV
+  move 0 to #Prv_OtherW
+  move 0 to #Prv_OtherX
+  move 0 to #Prv_OtherY
+  move 0 to #Prv_OtherYN
+  move 0 to #Prv_OtherYT
+  move 0 to #Prv_OtherZ
+  move 0 to #Prv_OtherZN
+  move 'N' to $Processed_A
+  move 'N' to $Processed_B
+  move 'N' to $Processed_C
+  move 'N' to $Processed_D
+  move 'N' to $Processed_E
+  move 'N' to $Processed_F
+  move 'N' to $Processed_G
+  move 'N' to $Processed_H
+  move 'N' to $Processed_I
+  move 'N' to $Processed_J
+  move 'N' to $Processed_K
+  move 'N' to $Processed_L
+  move 'N' to $Processed_M
+  move 'N' to $Processed_N
+  move 'N' to $Processed_O
+  move 'N' to $Processed_P
+  move 'N' to $Processed_Q
+  move 'N' to $Processed_R
+  move 'N' to $Processed_S
+  move 'N' to $Processed_T
+  move 'N' to $Processed_U
+  move 'N' to $Processed_V
+  move 'N' to $Processed_W
+  move 'N' to $Processed_X
+  move 'N' to $Processed_Y
+  move 'N' to $Processed_YN
+  move 'N' to $Processed_YT
+  move 'N' to $Processed_Z
+  move 'N' to $Processed_ZN
+
+  clear-array name = StateLocals
+  clear-array name = StateSWT
+  clear-array name = LocalPrintName
+
+end-procedure
+
+begin-procedure Print-ER-Data
+
+  if $XMLPublisher = 'Y'
+
+! create burst value for this slip
+     move &E.Calendar_Year to $CalYR 9999
+     let $BurstValue = rtrim($E.EmplID, ' ') || $CalYR
+     let $BurstValue = $BurstValue || rtrim($A.W2_Reporting_Co, ' ') || 'W2C'
+     let $BoxForm    = rtrim($BoxForm, ' ')
+     let $BurstValue = $BurstValue || $BoxForm
+
+     do format-number(&E.W2C_Batch_Nbr, $W2cBatchNo, '0999')
+     let $BurstValue = $BurstValue || $W2cBatchNo
+!
+     if $W2C.Py_W2_Copy_Type = '2'
+
+        if $BurstValue <> $BurstValueSave
+
+           if $BurstValueSave <> ''
+              do XML-Close-Tag('USA_YearEnd', $closeTag)
+              do Write-XML-Line(#Fnum, $closeTag)
+              do Close-XML-File(#FNum)
+           end-if
+
+           move $BurstValue to $BurstValueSave
+
+           let $FName = rtrim($BurstValue,' ') || '.xml'
+           let $sourceFile     = $FName || '{IMPORTSUFFIX}'
+           let $sourceLocation = '{IMPORTPREFIX}' || ''
+           let $sourceFileName = rtrim($sourceLocation,' ') || rtrim($sourceFile,' ')
+           let #FNum  = 3
+           let #FStat = 0
+           do Open-XML-File($FName, #FNum, #FStat)
+           do XML-Open-Tag('USA_YearEnd', $openTag)
+           do Write-XML-Line(#Fnum, $openTag)
+        end-if
+     end-if
+
+     do XML-Open-Tag('W2C_Data', $openTag)
+
+     if $W2C.Py_W2_Copy_Type = '2' and #FNum <> 0
+        do Write-XML-Line(#Fnum, $openTag)
+        let $TagOpened = 'Y'
+     end-if
+
+     do Get-SS-Consent
+     if ($W2C.Py_W2_Copy_Type = '2' and $Consent <> 'C') or
+         $W2C.Py_W2_Copy_Type <> '2'
+        do Write-XML-Line(#Fnum2, $openTag)
+        let $TagOpened = 'Y'
+     end-if
+
+     do Build-XML-Line('BURST_VALUE', $BurstValue, 'Y', #FNum, #FNum2, $UserFlag)
+
+     let $EmplidValue = rtrim($E.EmplID, ' ')
+     do Build-XML-Line('EMPLID', $EmplidValue, 'Y', #FNum, #FNum2, $UserFlag)
+
+  end-if
+
+
+  if $XMLPublisher = 'Y'
+     do Build-XML-Line('Box_Year', $CalYR, 'Y', #FNum, #FNum2, $UserFlag)
+
+     if $BoxForm <> ''
+        do Build-XML-Line('Box_Form', $BoxForm, 'Y', #FNum, #FNum2, $UserFlag)
+     end-if
+  else
+     do Print-Value($ER_Year,#L_Year_and_Form,#C_Year_and_Form,$YE_W2C_Year_and_Form)
+  end-if
+
+  if $XMLPublisher = 'Y'
+     do Build-XML-Line('ER_EIN', $A.Federal_EIN, 'Y', #FNum, #FNum2, $UserFlag)
+  else
+     do Print-Value($A.Federal_EIN,#L_ER_EIN,#C_ER_EIN,$YE_W2C_ER_EIN)
+  end-if
+
+  if $XMLPublisher = 'Y'
+     do Build-XML-Line('ER_Name', $A.Descr, 'Y', #FNum, #FNum2, $UserFlag)
+  else
+     do Print-Value($A.Descr,#L_ER_Name,#C_ER_Name,$YE_W2C_ER_Name)
+  end-if
+
+  let $A.Address1  = SUBSTR($A.Address1,1,35)
+  let $A.Address2  = SUBSTR($A.Address2,1,35)
+
+  if $XMLPublisher = 'Y'
+     do Build-XML-Line('ER_Address1', $A.Address1, 'Y', #FNum, #FNum2, $UserFlag)
+  else
+     do Print-Value($A.Address1,#L_ER_Address1,#C_ER_Address1,$YE_W2C_ER_Address1)
+  end-if
+
+  if RTRIM($A.Address2, ' ') <> ''
+
+     if $XMLPublisher = 'Y'
+        do Build-XML-Line('ER_Address2', $A.Address2, 'Y', #FNum, #FNum2, $UserFlag)
+     else
+        do Print-Value($A.Address2,#L_ER_Address2,#C_ER_Address2,$YE_W2C_ER_Address2)
+     end-if
+     move 'N' to $LineShift
+  else
+    move 'Y' to $LineShift
+  end-if
+  if #Align_Count = 0
+    if $A.Country = 'USA'
+      move $A.Postal           to $Zip
+      move $Zip                to $ZipExtsn ~~~~~~xxxx
+      if instr($Zip,'-',6) = 0
+      and $ZipExtsn <> '    '
+        let $Zip = substr($Zip,1,5) || '-' || substr($Zip,6,4)
+      end-if
+      let $State_City_Zip = $A.City || ' ' || $A.State || ' ' || $Zip
+    else
+      let $State_City_Zip = $A.City || ' ' || $A.State || ' ' ||
+              $A.Country || ' ' || $A.Postal
+    end-if
+  end-if
+  if $LineShift = 'Y'
+    let #PrintLine = #L_ER_Address2
+  else
+    let #PrintLine = #L_State_City_Zip
+  end-if
+  let $State_City_Zip  = SUBSTR($State_City_Zip,1,31)
+
+  if $XMLPublisher = 'Y'
+     if $LineShift = 'Y'
+        do Build-XML-Line('ER_Address2', $State_City_Zip, 'Y', #FNum, #FNum2, $UserFlag)
+     else
+        do Build-XML-Line('ER_Address3', $State_City_Zip, 'Y', #FNum, #FNum2, $UserFlag)
+     end-if
+  else
+     do Print-Value($State_City_Zip,#PrintLine,#C_State_City_Zip,$YE_W2C_ER_State_City_Zip)
+  end-if
+
+end-procedure
+
+begin-procedure Print-EE-Data
+
+  if $Use_Alternate_Name = 'Y'     and #Align_Count = 0
+      let $YE_W2C_FName = $Alternate_Name
+  else
+      let $YE_W2C_FName  = SUBSTR($E.FName,1,#YE_EE_FName_Box_Size)
+      let $YE_W2C_LName  = SUBSTR($E.LName,1,#YE_EE_LName_Box_Size)
+  end-if
+  let $YE_W2C_Suffix = SUBSTR($E.Suffix,1,3)
+  let $E.Address1  = SUBSTR($E.Address1,1,37)
+  let $E.Address2  = SUBSTR($E.Address2,1,37)
+  let $E.City  = SUBSTR($E.City,1,20)
+  let $E.Address1 = RTRIM($E.Address1, ' ')
+
+  if $XMLPublisher = 'Y'
+
+
+     if $Use_Alternate_Name <> 'Y'
+        do Build-XML-Line('EE_LastName', $YE_W2C_LName, 'Y', #FNum, #FNum2, $UserFlag)
+        do Build-XML-Line('EE_FirstName', $YE_W2C_FName, 'Y', #FNum, #FNum2, $UserFlag)
+     else
+        do Build-XML-Line('EE_LastName', $Alternate_LName, 'Y', #FNum, #FNum2, $UserFlag)
+        do Build-XML-Line('EE_FirstName', $Alternate_FName, 'Y', #FNum, #FNum2, $UserFlag)
+     end-if
+     do Build-XML-Line('EE_Address1', $E.Address1, 'Y', #FNum, #FNum2, $UserFlag)
+     do Build-XML-Line('EE_Suffix', $YE_W2C_Suffix, 'Y', #FNum, #FNum2, $UserFlag)
+  else
+     do Print-Value($YE_W2C_FName,#L_EE_FName,#C_EE_FName,$YE_W2C_EE_FName)
+     if $Use_Alternate_Name <> 'Y'
+        do Print-Value($YE_W2C_LName,#L_EE_LName,#C_EE_LName,$YE_W2C_EE_LName)
+     end-if
+     do Print-Value($E.Address1,#L_EE_Address1,#C_EE_Address1,$YE_W2C_EE_Address1)
+     do Print-Value($YE_W2C_Suffix,#L_EE_Suffix,#C_EE_Suffix,$YE_W2C_EE_Suffix)
+  end-if
+
+  let $E.Address2 = RTRIM($E.Address2, ' ')
+  if RTRIM($E.Address2, ' ') <> ''
+     if $XMLPublisher = 'Y'
+        do Build-XML-Line('EE_Address2', $E.Address2, 'Y', #FNum, #FNum2, $UserFlag)
+     else
+        do Print-Value($E.Address2,#L_EE_Address2,#C_EE_Address2,$YE_W2C_EE_Address2)
+     end-if
+     move 'N' to $LineShift
+  else
+     move 'Y' to $LineShift
+  end-if
+  if #Align_Count = 0
+    if $E.Country = 'USA'
+      move $E.Postal           to $Zip
+      move $Zip                to $ZipExtsn ~~~~~~xxxx
+      if instr($Zip,'-',6) = 0
+      and $ZipExtsn <> '    '
+        let $Zip = substr($Zip,1,5) || '-' || substr($Zip,6,4)
+      end-if
+      let $B4 = $E.City || ' ' || $E.State || ' ' || $Zip
+    else
+      let $B4 = $E.City || ' ' || $E.State || ' ' ||
+                $E.Country || ' ' || $E.Postal
+    end-if
+  end-if
+  if $LineShift = 'Y'
+    let #PrintLine = #L_EE_Address2
+  else
+    let #PrintLine = #L_EE_State_City_Zip
+  end-if
+
+  if $XMLPublisher = 'Y'
+     if $LineShift = 'Y'
+        do Build-XML-Line('EE_Address2', $B4, 'Y', #FNum, #FNum2, $UserFlag)
+     else
+        do Build-XML-Line('EE_Address3', $B4, 'Y', #FNum, #FNum2, $UserFlag)
+     end-if
+  else
+     do Print-Value($B4,#PrintLine,#C_EE_State_City_Zip,$YE_W2C_EE_State_City_Zip)
+  end-if
+
+  if $XMLPublisher = 'Y'
+     do Build-XML-Line('EE_SSN', $E.SSN, 'Y', #FNum, #FNum2, $UserFlag)
+  else
+     do Print-Value($E.SSN,#L_EE_SSN,#C_EE_SSN,$YE_EE_SSN)
+  end-if
+
+end-procedure
+
+begin-procedure Load-Amounts
+
+begin-SELECT
+D.STATE
+D.LOCALITY
+D.BOX
+D.CURRENT_AMOUNT
+D.PRV_AMOUNT
+
+  let $D.STATE = RTRIM(&D.STATE,' ')
+  if $D.STATE <> $Prev_State
+    if $Prev_State <> ''
+      do  Print-W2C
+      move 0 to #StateLocalCount
+    end-if
+    let $Prev_State = $D.STATE
+  end-if
+
+  move &D.CURRENT_AMOUNT to #Amount
+  move &D.PRV_AMOUNT to #Prv_Amount
+  if #Amount <> #Prv_Amount
+
+   let $D.Box = &D.Box
+   move $D.Box to $Box xx
+   let $Pos3 = substr($D.Box, 3,1)
+
+   if $Box = $YE_Box12_StartPos  or
+      $Box = $YE_Other
+     and $Pos3 > ' '
+     let $D.Box = &D.Box
+     let $D.Box = rpad($D.Box,4,' ')
+   else
+     let $D.Box = RTRIM(&D.Box,' ')
+   end-if
+
+   do Evaluate-Box
+
+   if $D.Box = $YE_State_Wages                            !State wages
+         add 1 to #StateLocalCount
+
+         PUT &D.BOX      INTO STATELOCALS(#STATELOCALCOUNT) BOX
+         PUT &D.STATE    INTO STATELOCALS(#STATELOCALCOUNT) STATE
+         PUT ' '         INTO STATELOCALS(#STATELOCALCOUNT) LOCALITY
+
+         PUT #Amount INTO STATELOCALS(#STATELOCALCOUNT) AMOUNT
+         PUT #Prv_Amount INTO STATELOCALS(#STATELOCALCOUNT) PRVAMOUNT
+     end-if
+     if $D.Box = $YE_State_Tax                                  !State tax
+         add 1 to #StateLocalCount
+
+         PUT &D.BOX      INTO STATELOCALS(#STATELOCALCOUNT) BOX
+         PUT &D.STATE    INTO STATELOCALS(#STATELOCALCOUNT) STATE
+         PUT ' '         INTO STATELOCALS(#STATELOCALCOUNT) LOCALITY
+
+         PUT #Amount INTO STATELOCALS(#STATELOCALCOUNT) AMOUNT
+         PUT #Prv_Amount INTO STATELOCALS(#STATELOCALCOUNT) PRVAMOUNT
+     end-if
+     if $D.Box = $YE_Local_Wages                          !Local wages
+         add 1 to #StateLocalCount
+
+         PUT &D.BOX      INTO STATELOCALS(#STATELOCALCOUNT) BOX
+         PUT &D.STATE    INTO STATELOCALS(#STATELOCALCOUNT) STATE
+         PUT &D.LOCALITY INTO STATELOCALS(#STATELOCALCOUNT)LOCALITY
+
+         PUT #Amount INTO STATELOCALS(#STATELOCALCOUNT) AMOUNT
+         PUT #Prv_Amount INTO STATELOCALS(#STATELOCALCOUNT) PRVAMOUNT
+     end-if
+     if $D.Box = $YE_W2_Local_Tax                           !Local tax
+         add 1 to #StateLocalCount
+
+         PUT &D.BOX      INTO STATELOCALS(#STATELOCALCOUNT) BOX
+         PUT &D.STATE    INTO STATELOCALS(#STATELOCALCOUNT) STATE
+         PUT &D.LOCALITY INTO STATELOCALS(#STATELOCALCOUNT) LOCALITY
+
+         PUT #Amount INTO STATELOCALS(#STATELOCALCOUNT) AMOUNT
+         PUT #Prv_Amount INTO STATELOCALS(#STATELOCALCOUNT) PRVAMOUNT
+     end-if
+
+  end-if
+
+
+FROM  PS_YE_W2C_AMOUNTS D
+WHERE D.W2C_BATCH_NBR   = &E.W2C_BATCH_NBR
+AND   D.COMPANY         = &E.COMPANY
+AND   D.W2C_ADD_EMPLID  = &E.W2C_ADD_EMPLID
+AND   D.CALENDAR_YEAR   = &E.CALENDAR_YEAR
+AND   D.W2C_TAXFORM_ID = $Taxform_ID
+ORDER BY D.STATE, D.LOCALITY, D.BOX
+end-SELECT
+end-procedure
+
+begin-procedure Print-Fed-Amounts
+
+  if #Fed_Wages <> #Prv_Fed_Wages                                          !Federal wages
+
+     if $XMLPublisher = 'Y'
+        do Format-W2c-Number(#Prv_Fed_Wages, $out, '99999999.99')
+        do Build-XML-Line('Fed_Wages_PRV', $out, 'Y', #FNum, #FNum2, $UserFlag)
+
+        do Format-W2c-Number(#Fed_Wages, $out, '99999999.99')
+        do Build-XML-Line('Fed_Wages_COR', $out, 'Y', #FNum, #FNum2, $UserFlag)
+    else
+        do Format-W2c-Number(#Prv_Fed_Wages, $out, $FFed_Wages)
+        do Print-Value($out,#L_Fed_Wages,#C_Fed_Wages,$YE_Fed_Wages)
+
+        do Format-W2c-Number(#Fed_Wages, $out, $FFed_Wages)
+        print $out (,+5)
+    end-if
+  end-if
+
+
+  if #Fed_Tax <> #Prv_Fed_Tax                                             !Federal tax
+
+    if $XMLPublisher = 'Y'
+       do Format-W2c-Number(#Prv_Fed_Tax, $out, '99999999.99')
+       do Build-XML-Line('Fed_Tax_PRV', $out, 'Y', #FNum, #FNum2, $UserFlag)
+
+       do Format-W2c-Number(#Fed_Tax, $out, '99999999.99')
+       do Build-XML-Line('Fed_Tax_COR', $out, 'Y', #FNum, #FNum2, $UserFlag)
+    else
+       do Format-W2c-Number(#Prv_Fed_Tax, $out, $FFed_Tax)
+       do Print-Value($out,#L_Fed_Tax,#C_Fed_Tax,$YE_Fed_Tax)
+
+       do Format-W2c-Number(#Fed_Tax, $out, $FFed_Tax)
+       print $out (,+5)
+    end-if
+
+  end-if
+
+  if #SS_Wages <> #Prv_SS_Wages                                           !SS wages
+
+    if $XMLPublisher = 'Y'
+       do Format-W2c-Number(#Prv_SS_Wages, $out, '99999999.99')
+       do Build-XML-Line('SS_Wages_PRV', $out, 'Y', #FNum, #FNum2, $UserFlag)
+
+       do Format-W2c-Number(#SS_Wages, $out, '99999999.99')
+       do Build-XML-Line('SS_Wages_COR', $out, 'Y', #FNum, #FNum2, $UserFlag)
+    else
+       do Format-W2c-Number(#Prv_SS_Wages, $out, $FSS_Wages)
+       do Print-Value($out,#L_SS_Wages,#C_SS_Wages,$YE_SS_Wages)
+
+       do Format-W2c-Number(#SS_Wages, $out, $FSS_Wages)
+       print $out (,+5)
+    end-if
+
+  end-if
+
+  if #SS_Tax <> #Prv_SS_Tax                                               !SS Tax
+
+    if $XMLPublisher = 'Y'
+
+       do Format-W2c-Number(#Prv_SS_Tax, $out, '99999999.99')
+       do Build-XML-Line('SS_Tax_PRV', $out, 'Y', #FNum, #FNum2, $UserFlag)
+
+       do Format-W2c-Number(#SS_Tax, $out, '99999999.99')
+       do Build-XML-Line('SS_Tax_COR', $out, 'Y', #FNum, #FNum2, $UserFlag)
+    else
+       do Format-W2c-Number(#Prv_SS_Tax, $out, $FSS_Tax)
+       do Print-Value($out,#L_SS_Tax,#C_SS_Tax,$YE_SS_Tax)
+
+       do Format-W2c-Number(#SS_Tax, $out, $FSS_Tax)
+       print $out (,+5)
+    end-if
+  end-if
+
+  if #Med_Wages <> #Prv_Med_Wages                                         !Medicare wages
+
+    if $XMLPublisher = 'Y'
+
+       do Format-W2c-Number(#Prv_Med_Wages, $out, '99999999.99')
+       do Build-XML-Line('MED_Wages_PRV', $out, 'Y', #FNum, #FNum2, $UserFlag)
+
+       do Format-W2c-Number(#Med_Wages, $out, '99999999.99')
+       do Build-XML-Line('MED_Wages_COR', $out, 'Y', #FNum, #FNum2, $UserFlag)
+    else
+       do Format-W2c-Number(#Prv_Med_Wages, $out, $FMed_Wages)
+       do Print-Value($out,#L_Med_Wages,#C_Med_Wages,$YE_Med_Wages)
+
+       do Format-W2c-Number(#Med_Wages, $out, $FMed_Wages)
+       print $out (,+5)
+    end-if
+  end-if
+
+
+  if #Med_Tax <> #Prv_Med_Tax                                            !Medicare tax
+
+    if $XMLPublisher = 'Y'
+
+       do Format-W2c-Number(#Prv_Med_Tax, $out, '99999999.99')
+       do Build-XML-Line('MED_Tax_PRV', $out, 'Y', #FNum, #FNum2, $UserFlag)
+
+       do Format-W2c-Number(#Med_Tax, $out, '99999999.99')
+       do Build-XML-Line('MED_Tax_COR', $out, 'Y', #FNum, #FNum2, $UserFlag)
+    else
+       do Format-W2c-Number(#Prv_Med_Tax, $out, $FMed_Tax)
+       do Print-Value($out,#L_Med_Tax,#C_Med_Tax,$YE_Med_Tax)
+
+       do Format-W2c-Number(#Med_Tax, $out, $FMed_Tax)
+       print $out (,+5)
+    end-if
+  end-if
+
+  if #SS_Tips <> #Prv_SS_Tips                                            !SS tips
+
+    if $XMLPublisher = 'Y'
+
+       do Format-W2c-Number(#Prv_SS_Tips, $out, '99999999.99')
+       do Build-XML-Line('SS_Tips_PRV', $out, 'Y', #FNum, #FNum2, $UserFlag)
+
+       do Format-W2c-Number(#SS_Tips, $out, '99999999.99')
+       do Build-XML-Line('SS_Tips_COR', $out, 'Y', #FNum, #FNum2, $UserFlag)
+    else
+       do Format-W2c-Number(#Prv_SS_Tips, $out, $FSS_Tips)
+       do Print-Value($out,#L_SS_Tips,#C_SS_Tips,$YE_SS_Tips)
+
+       do Format-W2c-Number(#SS_Tips, $out, $FSS_Tips)
+       print $out (,+5)
+    end-if
+  end-if
+
+  if #Alloc_Tips <> #Prv_Alloc_Tips                                      !Allocated tips
+
+    if $XMLPublisher = 'Y'
+
+       do Format-W2c-Number(#Prv_Alloc_Tips, $out, '99999999.99')
+       do Build-XML-Line('Alloc_Tips_PRV', $out, 'Y', #FNum, #FNum2, $UserFlag)
+
+       do Format-W2c-Number(#Alloc_Tips, $out, '99999999.99')
+       do Build-XML-Line('Alloc_Tips_COR', $out, 'Y', #FNum, #FNum2, $UserFlag)
+    else
+       do Format-W2c-Number(#Prv_Alloc_Tips, $out, $FAlloc_Tips)
+       do Print-Value($out,#L_Alloc_Tips,#C_Alloc_Tips,$YE_Alloc_Tips)
+
+       do Format-W2c-Number(#Alloc_Tips, $out, $FAlloc_Tips)
+       print $out (,+5)
+    end-if
+  end-if
+
+  if #Adv_EIC <> #Prv_Adv_EIC                                            !Advance EIC paymt
+
+    if $XMLPublisher = 'Y'
+
+       do Format-W2c-Number(#Prv_Adv_EIC, $out, '99999999.99')
+       do Build-XML-Line('Adv_EIC_PRV', $out, 'Y', #FNum, #FNum2, $UserFlag)
+
+       do Format-W2c-Number(#Adv_EIC, $out, '99999999.99')
+       do Build-XML-Line('Adv_EIC_COR', $out, 'Y', #FNum, #FNum2, $UserFlag)
+    else
+       do Format-W2c-Number(#Prv_Adv_EIC, $out, $FAdv_EIC)
+       do Print-Value($out,#L_Adv_EIC,#C_Adv_EIC,$YE_Adv_EIC)
+
+       do Format-W2c-Number(#Adv_EIC, $out, $FAdv_EIC)
+       print $out (,+5)
+    end-if
+  end-if
+
+  if #Dep_Care <> #Prv_Dep_Care                                          !Depend care
+
+    if $XMLPublisher = 'Y'
+
+       do Format-W2c-Number(#Prv_Dep_Care, $out, '99999999.99')
+       do Build-XML-Line('DEP_Care_PRV', $out, 'Y', #FNum, #FNum2, $UserFlag)
+
+       do Format-W2c-Number(#Dep_Care, $out, '99999999.99')
+       do Build-XML-Line('DEP_Care_COR', $out, 'Y', #FNum, #FNum2, $UserFlag)
+    else
+       do Format-W2c-Number(#Prv_Dep_Care, $out, $FDep_Care)
+       do Print-Value($out,#L_Dep_Care,#C_Dep_Care,$YE_Dep_Care)
+
+       do Format-W2c-Number(#Dep_Care, $out, $FDep_Care)
+       print $out (,+5)
+    end-if
+  end-if
+
+  if #Non_Qual_457AB <> #Prv_Non_Qual_457AB                              !Nonqual plans
+
+    if $XMLPublisher = 'Y'
+
+       do Format-W2c-Number(#Prv_Non_Qual_457AB, $out, '99999999.99')
+       do Build-XML-Line('NonQual_457AB_PRV', $out, 'Y', #FNum, #FNum2, $UserFlag)
+
+       do Format-W2c-Number(#Non_Qual_457AB, $out, '99999999.99')
+       do Build-XML-Line('NonQual_457AB_COR', $out, 'Y', #FNum, #FNum2, $UserFlag)
+    else
+
+       if  $Prv_AmtNon_Qual_457A = 'Y'
+              and $Prv_AmtNon_Qual_457B = 'N' and $ER_Year = '2001'
+          print 'G' (,1)
+       end-if
+
+       do Format-W2c-Number(#Prv_Non_Qual_457AB, $out, $FNon_Qual_457)
+       do Print-Value($out,#L_Non_Qual_457,#C_Non_Qual_457,$YE_Non_Qual_457)
+
+       do Format-W2c-Number(#Non_Qual_457AB, $out, $FNon_Qual_457)
+       print $out (,+5)
+
+       if  $AmtNon_Qual_457A = 'Y'
+             and $AmtNon_Qual_457B = 'N' and $ER_Year = '2001'
+          print 'G' (,17)
+       end-if
+    end-if
+  end-if
+
+  let #Other_Box_Line_Count = 1
+  let $Print_One_Page = 'Y'
+  do Print-Other-Box
+
+  do Print-Blank-Boxes
+
+  let #Other_Box_Line_Count = 0
+  let $Print_One_Page = 'N'
+  do Print-Other-Box
+
+end-procedure
+
+
+begin-procedure Print-Blank-Boxes
+
+  let #Blank_Line_Count = 1
+
+  if #Uncoll_SS_Tax_On_Tips <> #Prv_Uncoll_SS_Tax_On_Tips
+    let #Previous =  #Prv_Uncoll_SS_Tax_On_Tips
+    let #Current  =  #Uncoll_SS_Tax_On_Tips
+    let $Box_Text = substr($T_Uncoll_SS_Tax_On_Tips,1,2)
+    let $Box_Format  = $FUncoll_SS_Tax_On_Tips
+    do Print-Blank-Line
+  end-if
+  if #Uncoll_Med_Tax_On_Tips <> #Prv_Uncoll_Med_Tax_On_Tips
+    let #Previous =  #Prv_Uncoll_Med_Tax_On_Tips
+    let #Current  =  #Uncoll_Med_Tax_On_Tips
+    let $Box_Text = substr($T_Uncoll_Med_Tax_On_Tips,1,2)
+    let $Box_Format  = $FUncoll_Med_Tax_On_Tips
+    do Print-Blank-Line
+  end-if
+  if #Roth_401K <> #Prv_Roth_401K
+    let #Previous =  #Prv_Roth_401K
+    let #Current  =  #Roth_401K
+    let $Box_Text = substr($T_Roth_401K,1,2)
+    let $Box_Format  = $FRoth_401K
+    do Print-Blank-Line
+  end-if
+  if #Group_Term_Life <> #Prv_Group_Term_Life
+    let #Previous =  #Prv_Group_Term_Life
+    let #Current  =  #Group_Term_Life
+    let $Box_Text = substr($T_Group_Term_Life,1,2)
+    let $Box_Format  = $FGroup_Term_Life
+    do Print-Blank-Line
+  end-if
+  if #Roth_403B <> #Prv_Roth_403B
+    let #Previous =  #Prv_Roth_403B
+    let #Current  =  #Roth_403B
+    let $Box_Text = substr($T_Roth_403B,1,2)
+    let $Box_Format  = $FRoth_403B
+    do Print-Blank-Line
+  end-if
+  if #401K <> #Prv_401K
+    let #Previous =  #Prv_401K
+    let #Current  =  #401K
+    let $Box_Text = substr($T_401K,1,1)
+    let $Box_Format  = $F401K
+    do Print-Blank-Line
+  end-if
+  if #403B <> #Prv_403B
+    let #Previous =  #Prv_403B
+    let #Current  =  #403B
+    let $Box_Text = substr($T_403B,1,1)
+    let $Box_Format  = $F403B
+    do Print-Blank-Line
+  end-if
+  if #408K6 <> #Prv_408K6
+    let #Previous =  #Prv_408K6
+    let #Current  =  #408K6
+    let $Box_Text = substr($T_408K6,1,1)
+    let $Box_Format  = $F408K6
+    do Print-Blank-Line
+  end-if
+  if #457B <> #Prv_457B
+    let #Previous =  #Prv_457B
+    let #Current  =  #457B
+    let $Box_Text = substr($T_457B,1,1)
+    let $Box_Format  = $F457B
+    do Print-Blank-Line
+  end-if
+  if #501C18D <> #Prv_501C18D
+    let #Previous =  #Prv_501C18D
+    let #Current  =  #501C18D
+    let $Box_Text = substr($T_501C18D,1,1)
+    let $Box_Format  = $F501C18D
+    do Print-Blank-Line
+  end-if
+  if #Sick_Pay <> #Prv_Sick_Pay
+    let #Previous =  #Prv_Sick_Pay
+    let #Current  =  #Sick_Pay
+    let $Box_Text = substr($T_Sick_Pay,1,1)
+    let $Box_Format  = $FSick_Pay
+    do Print-Blank-Line
+  end-if
+  if #Excise_Tax <> #Prv_Excise_Tax
+    let #Previous =  #Prv_Excise_Tax
+    let #Current  =  #Excise_Tax
+    let $Box_Text = substr($T_Excise_Tax,1,1)
+    let $Box_Format  = $FExcise_Tax
+    do Print-Blank-Line
+  end-if
+  if #Business_Exp <> #Prv_Business_Exp
+    let #Previous =  #Prv_Business_Exp
+    let #Current  =  #Business_Exp
+    let $Box_Text = substr($T_Business_Exp,1,1)
+    let $Box_Format  = $FBusiness_Exp
+    do Print-Blank-Line
+  end-if
+  if #Uncoll_SS_Tax_GTL <> #Prv_Uncoll_SS_Tax_GTL
+    let #Previous =  #Prv_Uncoll_SS_Tax_GTL
+    let #Current  =  #Uncoll_SS_Tax_GTL
+    let $Box_Text = substr($T_Uncoll_SS_Tax_GTL,1,1)
+    let $Box_Format  = $FUncoll_SS_Tax_GTL
+    do Print-Blank-Line
+  end-if
+  if #Uncoll_Med_Tax_GTL <> #Prv_Uncoll_Med_Tax_GTL
+    let #Previous =  #Prv_Uncoll_Med_Tax_GTL
+    let #Current  =  #Uncoll_Med_Tax_GTL
+    let $Box_Text = substr($T_Uncoll_Med_Tax_GTL,1,1)
+    let $Box_Format  = $FUncoll_Med_Tax_GTL
+    do Print-Blank-Line
+  end-if
+  if #Excl_Moving_Exp <> #Prv_Excl_Moving_Exp
+    let #Previous =  #Prv_Excl_Moving_Exp
+    let #Current  =  #Excl_Moving_Exp
+    let $Box_Text = substr($T_Excl_Moving_Exp,1,1)
+    let $Box_Format  = $FExcl_Moving_Exp
+    do Print-Blank-Line
+  end-if
+  if #Basic_Qtrs_and_Subsist <> #Prv_Basic_Qtrs_and_Subsist
+    let #Previous =  #Prv_Basic_Qtrs_and_Subsist
+    let #Current  =  #Basic_Qtrs_and_Subsist
+    let $Box_Text = substr($T_Basic_Qtrs_and_Subsist,1,1)
+    let $Box_Format  = $FBasic_Qtrs_and_Subsist
+    do Print-Blank-Line
+  end-if
+  if #Combat_Pay <> #Prv_Combat_Pay
+    let #Previous =  #Prv_Combat_Pay
+    let #Current  =  #Combat_Pay
+    let $Box_Text = substr($T_Combat_Pay,1,1)
+    let $Box_Format  = $FCombat_Pay
+    do Print-Blank-Line
+  end-if
+  if #Med_Svgs_Acct <> #Prv_Med_Svgs_Acct
+    let #Previous =  #Prv_Med_Svgs_Acct
+    let #Current  =  #Med_Svgs_Acct
+    let $Box_Text = substr($T_Med_Svgs_Acct ,1,1)
+    let $Box_Format  = $FMed_Svgs_Acct
+    do Print-Blank-Line
+  end-if
+  if #408P_Simple_Retirement <> #Prv_408P_Simple_Retirement
+    let #Previous =  #Prv_408P_Simple_Retirement
+    let #Current  =  #408P_Simple_Retirement
+    let $Box_Text = substr($T_408P_Simple_Retirement ,1,1)
+    let $Box_Format  = $F408P_Simple_Retirement
+    do Print-Blank-Line
+  end-if
+  if #Adoption_Exp <> #Prv_Adoption_Exp
+    let #Previous =  #Prv_Adoption_Exp
+    let #Current  =  #Adoption_Exp
+    let $Box_Text = substr($T_Adoption_Exp ,1,1)
+    let $Box_Format  = $FAdoption_Exp
+    do Print-Blank-Line
+  end-if
+  if #NonStatutory_Stock_Opt <> #Prv_NonStatutory_Stock_Opt
+    let #Previous =  #Prv_NonStatutory_Stock_Opt
+    let #Current  =  #NonStatutory_Stock_Opt
+    let $Box_Text = substr($T_NonStatutory_Stock_Opt ,1,1)
+    let $Box_Format  = $FNonStatutory_Stock_Opt
+    do Print-Blank-Line
+  end-if
+  if #HSA_Employer_Contrib <> #Prv_HSA_Employer_Contrib
+    let #Previous =  #Prv_HSA_Employer_Contrib
+    let #Current  =  #HSA_Employer_Contrib
+    let $Box_Text = substr($T_HSA_Employer_Contrib ,1,1)
+    let $Box_Format  = $FHSA_Employer_Contrib
+    do Print-Blank-Line
+  end-if
+  if #409A_Def_NQ_Def_Comp <> #Prv_409A_Def_NQ_Def_Comp
+    let #Previous =  #Prv_409A_Def_NQ_Def_Comp
+    let #Current  =  #409A_Def_NQ_Def_Comp
+    let $Box_Text = substr($T_409A_Def_NQ_Def_Comp ,1,1)
+    let $Box_Format  = $F409A_Def_NQ_Def_Comp
+    do Print-Blank-Line
+  end-if
+  if #409A_Inc_NQ_Def_Comp <> #Prv_409A_Inc_NQ_Def_Comp
+    let #Previous =  #Prv_409A_Inc_NQ_Def_Comp
+    let #Current  =  #409A_Inc_NQ_Def_Comp
+    let $Box_Text = substr($T_409A_Inc_NQ_Def_Comp ,1,1)
+    let $Box_Format  = $F409A_Inc_NQ_Def_Comp
+    do Print-Blank-Line
+  end-if
+
+end-procedure
+
+
+begin-procedure Print-Blank-Line
+
+  if #Blank_Line_Count = 0
+    do Next-Form
+    do Print-ER-Data
+    do Print-EE-Data
+
+    let #Other_Box_Line_Count = 1
+    let $Print_One_Page = 'Y'
+    do Print-Other-Box
+
+    add 1 to #Blank_Line_Count
+
+  end-if
+
+  evaluate #Blank_Line_Count
+    when = 1
+
+       if $XMLPublisher = 'Y'
+
+          do Format-W2c-Number(#Previous, $out, '9999999.99')
+          let $B12Lbl = substr($Box_Text,1,2)
+          do Build-XML-Line('B12_AMT1_PRV', $out, 'Y', #FNum, #FNum2, $UserFlag)
+          do Build-XML-Line('B12_LBL1_PRV', $B12Lbl, 'Y', #FNum, #FNum2, $UserFlag)
+
+          do Format-W2c-Number(#Current, $out, '9999999.99')
+          do Build-XML-Line('B12_AMT1_COR', $out, 'Y', #FNum, #FNum2, $UserFlag)
+          do Build-XML-Line('B12_LBL1_COR', $B12Lbl, 'Y', #FNum, #FNum2, $UserFlag)
+       else
+
+          do Format-W2c-Number(#Previous, $out, $Box_Format)   !First blank box
+          do Print-Value($Box_Text,#L_X1,#C_X1,'Box X1')
+          do Print-Value($out,#L_X1A,#C_X1A,'Box X1A')
+
+          do Print-Value($Box_Text,#L_X1B,#C_X1B,'Box X1B')
+          do Format-W2c-Number(#Current, $out, $Box_Format)
+          do Print-Value($out,#L_X1C,#C_X1C,'Box X1C')
+       end-if
+
+       add 1 to #Blank_Line_Count
+
+       break
+
+    when = 2
+
+       if $XMLPublisher = 'Y'
+
+          do Format-W2c-Number(#Previous, $out, '9999999.99')
+          let $B12Lbl = substr($Box_Text,1,2)
+          do Build-XML-Line('B12_AMT2_PRV', $out, 'Y', #FNum, #FNum2, $UserFlag)
+          do Build-XML-Line('B12_LBL2_PRV', $B12Lbl, 'Y', #FNum, #FNum2, $UserFlag)
+
+          do Format-W2c-Number(#Current, $out, '9999999.99')
+          do Build-XML-Line('B12_AMT2_COR', $out, 'Y', #FNum, #FNum2, $UserFlag)
+          do Build-XML-Line('B12_LBL2_COR', $B12Lbl, 'Y', #FNum, #FNum2, $UserFlag)
+       else
+
+          do Format-W2c-Number(#Previous, $out, $Box_Format)        !Second blank box
+          do Print-Value($Box_Text,#L_X2,#C_X2,'Box X2')
+          do Print-Value($out,#L_X2A,#C_X2A,'Box X2A')
+
+          do Print-Value($Box_Text,#L_X2B,#C_X2B,'Box X2B')
+          do Format-W2c-Number(#Current, $out, $Box_Format)
+          do Print-Value($out,#L_X2C,#C_X2C,'Box X2C')
+       end-if
+
+       add 1 to #Blank_Line_Count
+
+       break
+
+    when = 3
+
+       if $XMLPublisher = 'Y'
+
+          do Format-W2c-Number(#Previous, $out, '9999999.99')
+          let $B12Lbl = substr($Box_Text,1,2)
+          do Build-XML-Line('B12_AMT3_PRV', $out, 'Y', #FNum, #FNum2, $UserFlag)
+          do Build-XML-Line('B12_LBL3_PRV', $B12Lbl, 'Y', #FNum, #FNum2, $UserFlag)
+
+          do Format-W2c-Number(#Current, $out, '9999999.99')
+          do Build-XML-Line('B12_AMT3_COR', $out, 'Y', #FNum, #FNum2, $UserFlag)
+          do Build-XML-Line('B12_LBL3_COR', $B12Lbl, 'Y', #FNum, #FNum2, $UserFlag)
+       else
+
+          do Format-W2c-Number(#Previous, $out, $Box_Format)        !Third blank box
+          do Print-Value($Box_Text,#L_X3,#C_X3,'Box X3')
+          do Print-Value($out,#L_X3A,#C_X3A,'Box X3A')
+
+          do Print-Value($Box_Text,#L_X3B,#C_X3B,'Box X3B')
+          do Format-W2c-Number(#Current, $out, $Box_Format)
+          do Print-Value($out,#L_X3C,#C_X3C,'Box X3C')
+       end-if
+
+       add 1 to #Blank_Line_Count
+
+       break
+
+    when = 4
+
+       if $XMLPublisher = 'Y'
+
+          do Format-W2c-Number(#Previous, $out, '9999999.99')
+          let $B12Lbl = substr($Box_Text,1,2)
+          do Build-XML-Line('B12_AMT4_PRV', $out, 'Y', #FNum, #FNum2, $UserFlag)
+          do Build-XML-Line('B12_LBL4_PRV', $B12Lbl, 'Y', #FNum, #FNum2, $UserFlag)
+
+          do Format-W2c-Number(#Current, $out, '9999999.99')
+          do Build-XML-Line('B12_AMT4_COR', $out, 'Y', #FNum, #FNum2, $UserFlag)
+          do Build-XML-Line('B12_LBL4_COR', $B12Lbl, 'Y', #FNum, #FNum2, $UserFlag)
+       else
+
+          do Format-W2c-Number(#Previous, $out, $Box_Format)        !Fourth blank box
+          do Print-Value($Box_Text,#L_X4,#C_X4,'Box X4')
+          do Print-Value($out,#L_X4A,#C_X4A,'Box X4A')
+
+          do Print-Value($Box_Text,#L_X4B,#C_X4B,'Box X4B')
+          do Format-W2c-Number(#Current, $out, $Box_Format)
+          do Print-Value($out,#L_X4C,#C_X4C,'Box X4C')
+       end-if
+
+       let #Blank_Line_Count = 0
+
+       break
+
+    end-evaluate
+
+end-procedure
+
+begin-procedure Print-Other-Box
+
+  let $Process_More_Other_Box_Entries = 'Y'
+
+  if #OtherA <> #Prv_OtherA
+  and $Processed_A = 'N'
+    let #Previous_Oth =  #Prv_OtherA
+    let #Current_Oth  =  #OtherA
+    let $Box_Text_Oth = $T_OtherA
+    let $Box_Format_Oth  = $FOtherA
+    do Print-Other-Box-Line
+    let $Processed_A = 'Y'
+  end-if
+  if #OtherB <> #Prv_OtherB
+  and $Processed_B = 'N'
+    let #Previous_Oth =  #Prv_OtherB
+    let #Current_Oth  =  #OtherB
+    let $Box_Text_Oth = $T_OtherB
+    let $Box_Format_Oth  = $FOtherB
+    do Print-Other-Box-Line
+    let $Processed_B = 'Y'
+  end-if
+  if #OtherC <> #Prv_OtherC
+  and $Processed_C = 'N'
+  and $Process_More_Other_Box_Entries = 'Y'
+    let #Previous_Oth =  #Prv_OtherC
+    let #Current_Oth  =  #OtherC
+    let $Box_Text_Oth = $T_OtherC
+    let $Box_Format_Oth  = $FOtherC
+    do Print-Other-Box-Line
+    let $Processed_C = 'Y'
+  end-if
+  if #OtherD <> #Prv_OtherD
+  and $Processed_D = 'N'
+  and $Process_More_Other_Box_Entries = 'Y'
+    let #Previous_Oth =  #Prv_OtherD
+    let #Current_Oth  =  #OtherD
+    let $Box_Text_Oth = $T_OtherD
+    let $Box_Format_Oth  = $FOtherD
+    do Print-Other-Box-Line
+    let $Processed_D = 'Y'
+  end-if
+  if #OtherE <> #Prv_OtherE
+  and $Processed_E = 'N'
+  and $Process_More_Other_Box_Entries = 'Y'
+    let #Previous_Oth =  #Prv_OtherE
+    let #Current_Oth  =  #OtherE
+    let $Box_Text_Oth = $T_OtherE
+    let $Box_Format_Oth  = $FOtherE
+    do Print-Other-Box-Line
+    let $Processed_E = 'Y'
+  end-if
+  if #OtherF <> #Prv_OtherF
+  and $Processed_F = 'N'
+  and $Process_More_Other_Box_Entries = 'Y'
+    let #Previous_Oth =  #Prv_OtherF
+    let #Current_Oth  =  #OtherF
+    let $Box_Text_Oth = $T_OtherF
+    let $Box_Format_Oth  = $FOtherF
+    do Print-Other-Box-Line
+    let $Processed_F = 'Y'
+  end-if
+  if #OtherG <> #Prv_OtherG
+  and $Processed_G = 'N'
+  and $Process_More_Other_Box_Entries = 'Y'
+    let #Previous_Oth =  #Prv_OtherG
+    let #Current_Oth  =  #OtherG
+    let $Box_Text_Oth = $T_OtherG
+    let $Box_Format_Oth  = $FOtherG
+    do Print-Other-Box-Line
+    let $Processed_G = 'Y'
+  end-if
+  if #OtherH <> #Prv_OtherH
+  and $Processed_H = 'N'
+  and $Process_More_Other_Box_Entries = 'Y'
+    let #Previous_Oth =  #Prv_OtherH
+    let #Current_Oth  =  #OtherH
+    let $Box_Text_Oth = $T_OtherH
+    let $Box_Format_Oth  = $FOtherH
+    do Print-Other-Box-Line
+    let $Processed_H = 'Y'
+  end-if
+  if #OtherI <> #Prv_OtherI
+  and $Processed_I = 'N'
+  and $Process_More_Other_Box_Entries = 'Y'
+    let #Previous_Oth =  #Prv_OtherI
+    let #Current_Oth  =  #OtherI
+    let $Box_Text_Oth = $T_OtherI
+    let $Box_Format_Oth  = $FOtherI
+    do Print-Other-Box-Line
+    let $Processed_I = 'Y'
+  end-if
+  if #OtherJ <> #Prv_OtherJ
+  and $Processed_J = 'N'
+  and $Process_More_Other_Box_Entries = 'Y'
+    let #Previous_Oth =  #Prv_OtherJ
+    let #Current_Oth  =  #OtherJ
+    let $Box_Text_Oth = $T_OtherJ
+    let $Box_Format_Oth  = $FOtherJ
+    do Print-Other-Box-Line
+    let $Processed_J = 'Y'
+  end-if
+  if #OtherK <> #Prv_OtherK
+  and $Processed_K = 'N'
+  and $Process_More_Other_Box_Entries = 'Y'
+    let #Previous_Oth =  #Prv_OtherK
+    let #Current_Oth  =  #OtherK
+    let $Box_Text_Oth = $T_OtherK
+    let $Box_Format_Oth  = $FOtherK
+    do Print-Other-Box-Line
+    let $Processed_K = 'Y'
+  end-if
+  if #OtherL <> #Prv_OtherL
+  and $Processed_L = 'N'
+  and $Process_More_Other_Box_Entries = 'Y'
+    let #Previous_Oth =  #Prv_OtherL
+    let #Current_Oth  =  #OtherL
+    let $Box_Text_Oth = $T_OtherL
+    let $Box_Format_Oth  = $FOtherL
+    do Print-Other-Box-Line
+    let $Processed_L = 'Y'
+  end-if
+  if #OtherM <> #Prv_OtherM
+  and $Processed_M = 'N'
+  and $Process_More_Other_Box_Entries = 'Y'
+    let #Previous_Oth =  #Prv_OtherM
+    let #Current_Oth  =  #OtherM
+    let $Box_Text_Oth = $T_OtherM
+    let $Box_Format_Oth  = $FOtherM
+    do Print-Other-Box-Line
+    let $Processed_M = 'Y'
+  end-if
+  if #OtherN <> #Prv_OtherN
+  and $Processed_N = 'N'
+  and $Process_More_Other_Box_Entries = 'Y'
+    let #Previous_Oth =  #Prv_OtherN
+    let #Current_Oth  =  #OtherN
+    let $Box_Text_Oth = $T_OtherN
+    let $Box_Format_Oth  = $FOtherN
+    do Print-Other-Box-Line
+    let $Processed_N = 'Y'
+  end-if
+  if #OtherO <> #Prv_OtherO
+  and $Processed_O = 'N'
+  and $Process_More_Other_Box_Entries = 'Y'
+    let #Previous_Oth =  #Prv_OtherO
+    let #Current_Oth  =  #OtherO
+    let $Box_Text_Oth = $T_OtherO
+    let $Box_Format_Oth  = $FOtherO
+    do Print-Other-Box-Line
+    let $Processed_O = 'Y'
+  end-if
+  if #OtherP <> #Prv_OtherP
+  and $Processed_P = 'N'
+  and $Process_More_Other_Box_Entries = 'Y'
+    let #Previous_Oth =  #Prv_OtherP
+    let #Current_Oth  =  #OtherP
+    let $Box_Text_Oth = $T_OtherP
+    let $Box_Format_Oth  = $FOtherP
+    do Print-Other-Box-Line
+    let $Processed_P = 'Y'
+  end-if
+  if #OtherQ <> #Prv_OtherQ
+  and $Processed_Q = 'N'
+  and $Process_More_Other_Box_Entries = 'Y'
+    let #Previous_Oth =  #Prv_OtherQ
+    let #Current_Oth  =  #OtherQ
+    let $Box_Text_Oth = $T_OtherQ
+    let $Box_Format_Oth  = $FOtherQ
+    do Print-Other-Box-Line
+    let $Processed_Q = 'Y'
+  end-if
+  if #OtherR <> #Prv_OtherR
+  and $Processed_R = 'N'
+  and $Process_More_Other_Box_Entries = 'Y'
+    let #Previous_Oth =  #Prv_OtherR
+    let #Current_Oth  =  #OtherR
+    let $Box_Text_Oth = $T_OtherR
+    let $Box_Format_Oth  = $FOtherR
+    do Print-Other-Box-Line
+    let $Processed_R = 'Y'
+  end-if
+  if #OtherS <> #Prv_OtherS
+  and $Processed_S = 'N'
+  and $Process_More_Other_Box_Entries = 'Y'
+    let #Previous_Oth =  #Prv_OtherS
+    let #Current_Oth  =  #OtherS
+    let $Box_Text_Oth = $T_OtherS
+    let $Box_Format_Oth  = $FOtherS
+    do Print-Other-Box-Line
+    let $Processed_S = 'Y'
+  end-if
+  if #OtherT <> #Prv_OtherT
+  and $Processed_T = 'N'
+  and $Process_More_Other_Box_Entries = 'Y'
+    let #Previous_Oth =  #Prv_OtherT
+    let #Current_Oth  =  #OtherT
+    let $Box_Text_Oth = $T_OtherT
+    let $Box_Format_Oth  = $FOtherT
+    do Print-Other-Box-Line
+    let $Processed_T = 'Y'
+  end-if
+  if #OtherU <> #Prv_OtherU
+  and $Processed_U = 'N'
+  and $Process_More_Other_Box_Entries = 'Y'
+    let #Previous_Oth =  #Prv_OtherU
+    let #Current_Oth  =  #OtherU
+    let $Box_Text_Oth = $T_OtherU
+    let $Box_Format_Oth  = $FOtherU
+    do Print-Other-Box-Line
+    let $Processed_U = 'Y'
+  end-if
+  if #OtherV <> #Prv_OtherV
+  and $Processed_V = 'N'
+  and $Process_More_Other_Box_Entries = 'Y'
+    let #Previous_Oth =  #Prv_OtherV
+    let #Current_Oth  =  #OtherV
+    let $Box_Text_Oth = $T_OtherV
+    let $Box_Format_Oth  = $FOtherV
+    do Print-Other-Box-Line
+    let $Processed_V = 'Y'
+  end-if
+  if #OtherW <> #Prv_OtherW
+  and $Processed_W = 'N'
+  and $Process_More_Other_Box_Entries = 'Y'
+    let #Previous_Oth =  #Prv_OtherW
+    let #Current_Oth  =  #OtherW
+    let $Box_Text_Oth = $T_OtherW
+    let $Box_Format_Oth  = $FOtherW
+    do Print-Other-Box-Line
+    let $Processed_W = 'Y'
+  end-if
+  if #OtherX <> #Prv_OtherX
+  and $Processed_X = 'N'
+  and $Process_More_Other_Box_Entries = 'Y'
+    let #Previous_Oth =  #Prv_OtherX
+    let #Current_Oth  =  #OtherX
+    let $Box_Text_Oth = $T_OtherX
+    let $Box_Format_Oth  = $FOtherX
+    do Print-Other-Box-Line
+    let $Processed_X = 'Y'
+  end-if
+  if #OtherY <> #Prv_OtherY
+  and $Processed_Y = 'N'
+  and $Process_More_Other_Box_Entries = 'Y'
+    let #Previous_Oth =  #Prv_OtherY
+    let #Current_Oth  =  #OtherY
+    let $Box_Text_Oth = $T_OtherY
+    let $Box_Format_Oth  = $FOtherY
+    do Print-Other-Box-Line
+    let $Processed_Y = 'Y'
+  end-if
+  if #OtherYN <> #Prv_OtherYN
+  and $Processed_YN = 'N'
+  and $Process_More_Other_Box_Entries = 'Y'
+    let #Previous_Oth =  #Prv_OtherYN
+    let #Current_Oth  =  #OtherYN
+    let $Box_Text_Oth = $T_OtherYN
+    let $Box_Format_Oth  = $FOtherYN
+    do Print-Other-Box-Line
+    let $Processed_YN = 'Y'
+  end-if
+  if #OtherYT <> #Prv_OtherYT
+  and $Processed_YT = 'N'
+  and $Process_More_Other_Box_Entries = 'Y'
+    let #Previous_Oth =  #Prv_OtherYT
+    let #Current_Oth  =  #OtherYT
+    let $Box_Text_Oth = $T_OtherYT
+    let $Box_Format_Oth  = $FOtherYT
+    do Print-Other-Box-Line
+    let $Processed_YT = 'Y'
+  end-if
+  if #OtherZ <> #Prv_OtherZ
+  and $Processed_Z = 'N'
+  and $Process_More_Other_Box_Entries = 'Y'
+    let #Previous_Oth =  #Prv_OtherZ
+    let #Current_Oth  =  #OtherZ
+    let $Box_Text_Oth = $T_OtherZ
+    let $Box_Format_Oth  = $FOtherZ
+    do Print-Other-Box-Line
+    let $Processed_Z = 'Y'
+  end-if
+  if #OtherZN <> #Prv_OtherZN
+  and $Processed_ZN = 'N'
+  and $Process_More_Other_Box_Entries = 'Y'
+    let #Previous_Oth =  #Prv_OtherZN
+    let #Current_Oth  =  #OtherZN
+    let $Box_Text_Oth = $T_OtherZN
+    let $Box_Format_Oth  = $FOtherZN
+    do Print-Other-Box-Line
+    let $Processed_Z = 'Y'
+  end-if
+
+end-procedure
+
+
+begin-procedure Print-Other-Box-Line
+
+  if #Other_Box_Line_Count = 0
+    do Next-Form
+    do Print-ER-Data
+    do Print-EE-Data
+    add 1 to #Other_Box_Line_Count
+    let $Process_More_Other_Box_Entries = 'Y'
+  end-if
+
+  evaluate #Other_Box_Line_Count
+    when = 1
+
+       if $XMLPublisher = 'Y'
+
+          do Format-W2c-Number(#Previous_Oth, $out, 'B999999.99')
+          let $out = ltrim(rtrim($out,' '),' ')
+          let $bOthAmt = lpad($out,10,' ')
+          move $Box_Text_Oth to $bOthLbl xxxxxxxxxx
+          let $bOth    = $bOthLbl || ' ' || $bOthAmt
+
+          do Build-XML-Line('Other1_PRV', $bOth, 'Y', #FNum, #FNum2, $UserFlag)
+
+          do Format-W2c-Number(#Current_Oth, $out, 'B999999.99')
+          let $out = ltrim(rtrim($out,' '),' ')
+          let $bOthAmt = lpad($out,10,' ')
+          move $Box_Text_Oth to $bOthLbl xxxxxxxxxx
+          let $bOth    = $bOthLbl || ' ' || $bOthAmt
+
+          do Build-XML-Line('Other1_COR', $bOth, 'Y', #FNum, #FNum2, $UserFlag)
+       else
+          do Format-W2c-Number(#Previous_Oth, $out, $Box_Format_Oth)   !First blank box
+          do Print-Value($Box_Text_Oth,#L_Y1,#C_Y1,'Box Y1')
+          do Print-Value($out,#L_Y1A,#C_Y1A,'Box Y1A')
+
+          do Format-W2c-Number(#Current_Oth, $out, $Box_Format_Oth)
+          do Print-Value($out,#L_Y1B,#C_Y1B,'Box Y1B')
+       end-if
+
+       add 1 to #Other_Box_Line_Count
+
+       break
+
+    when = 2
+
+       if $XMLPublisher = 'Y'
+
+          do Format-W2c-Number(#Previous_Oth, $out, 'B999999.99')
+          let $out = ltrim(rtrim($out,' '),' ')
+          let $bOthAmt = lpad($out,10,' ')
+          move $Box_Text_Oth to $bOthLbl xxxxxxxxxx
+          let $bOth    = $bOthLbl || ' ' || $bOthAmt
+
+          do Build-XML-Line('Other2_PRV', $bOth, 'Y', #FNum, #FNum2, $UserFlag)
+
+          do Format-W2c-Number(#Current_Oth, $out, 'B999999.99')
+          let $out = ltrim(rtrim($out,' '),' ')
+          let $bOthAmt = lpad($out,10,' ')
+          move $Box_Text_Oth to $bOthLbl xxxxxxxxxx
+          let $bOth    = $bOthLbl || ' ' || $bOthAmt
+
+          do Build-XML-Line('Other2_COR', $bOth, 'Y', #FNum, #FNum2, $UserFlag)
+       else
+
+          do Format-W2c-Number(#Previous_Oth, $out, $Box_Format_Oth)        !Second blank box
+          do Print-Value($Box_Text_Oth,#L_Y2,#C_Y2,'Box Y2')
+          do Print-Value($out,#L_Y2A,#C_Y2A,'Box Y2A')
+
+          do Format-W2c-Number(#Current_Oth, $out, $Box_Format_Oth)
+          do Print-Value($out,#L_Y2B,#C_Y2B,'Box Y2B')
+       end-if
+
+       let #Other_Box_Line_Count = 0
+       if $Print_One_Page = 'Y'
+          let $Process_More_Other_Box_Entries = 'N'
+       end-if
+
+       break
+
+    end-evaluate
+
+end-procedure
+
+begin-procedure Print-State-Local-Amounts
+
+  let $StatePrinted = 'N'
+  let $Loc1Printed = 'N'
+  let $Loc2Printed = 'N'
+  move 1 to #NextStateLoc
+
+  get $Box $State $Locality #Amount #PrvAmount
+                         from StateLocals(#NextStateLoc)
+  let $Prv_Box = RTRIM($Box,' ')
+  let $Prv_State = RTRIM($State,' ')
+  let $Prv_Locality = RTRIM($Locality,' ')
+
+  move ''  to $LocalityPrintName               !RE-INITIALIZE PRIOR VALUES
+
+  while #NextStateLoc <= #StateLocalCount
+
+    let $Box = RTRIM($Box,' ')
+    let $State = RTRIM($State,' ')
+    let $Locality = RTRIM($Locality,' ')
+
+    evaluate $Box
+
+    when = $YE_State_Wages                       !State wages
+      if $State <> $Prv_State
+        do Next-Form
+        do Print-ER-Data
+        do Print-EE-Data
+        let $StatePrinted = 'N'
+      end-if
+
+      if RTRIM($State,' ') <> ''
+        do Get-State-SWT
+      end-if
+
+      if $XMLPublisher = 'Y'
+
+         do Build-XML-Line('ST1_StateID_PRV', $S.EMPLOYER_ID_SWT, 'Y', #FNum, #FNum2, $UserFlag)
+         do Build-XML-Line('ST1_STATE_PRV', $State, 'Y', #FNum, #FNum2, $UserFlag)
+         let $StatePrinted = 'Y'
+
+         do Format-W2c-Number(#PrvAmount, $out, '99999999.99')
+         do Build-XML-Line('ST1_WAGES_PRV', $out, 'Y', #FNum, #FNum2, $UserFlag)
+
+         do Format-W2c-Number(#Amount, $out, '9999999.99')
+         do Build-XML-Line('ST1_WAGES_COR', $out, 'Y', #FNum, #FNum2, $UserFlag)
+      else
+
+         do Print-Value($S.EMPLOYER_ID_SWT,#L_ER_State_ID,#C_ER_State_ID,$YE_W2C_ER_State_ID)
+                                                                   !State employer ID
+         do Print-Value($State,#L_State_Wages,#C_State_Wages,$YE_State_Wages)
+
+         do Format-W2c-Number(#PrvAmount, $out, $FState_WagesA)         !State wages
+         do Print-Value($out,#L_State_WagesA,#C_State_WagesA,$YE_State_Wages)
+
+         do Format-W2c-Number(#Amount, $out, $FState_WagesA)
+         print $out (,+5)
+      end-if
+
+      let $Prv_Box = RTRIM($Box,' ')
+      let $Prv_State = RTRIM($State,' ')
+      let $Prv_Locality = RTRIM($Locality,' ')
+      add 1 to #NextStateLoc
+
+      if #NextStateLoc <= #StateLocalCount
+         get $Box $State $Locality #Amount #PrvAmount
+                      from StateLocals(#NextStateLoc)
+      end-if
+
+      break
+
+    when = $YE_State_Tax                                 !State taxes
+      if $State <> $Prv_State or $Prv_Box = $YE_Local_Wages  or $Prv_Box = $YE_W2_Local_Tax
+        do Next-Form
+        do Print-ER-Data
+        do Print-EE-Data
+        let $StatePrinted = 'N'
+      end-if
+
+      if $Prv_Box <> $YE_State_Wages or $State <> $Prv_State
+
+
+        if RTRIM($State,' ') <> ''
+          do Get-State-SWT
+        end-if
+
+
+      end-if
+
+
+      if $XMLPublisher = 'Y'
+
+         if $StatePrinted = 'N'
+            do Build-XML-Line('ST1_StateID_PRV', $S.EMPLOYER_ID_SWT, 'Y', #FNum, #FNum2, $UserFlag)
+            do Build-XML-Line('ST1_STATE_PRV', $State, 'Y', #FNum, #FNum2, $UserFlag)
+            let $StatePrinted = 'Y'
+         end-if
+
+         do Format-W2c-Number(#PrvAmount, $out, '99999999.99')
+         do Build-XML-Line('ST1_TAXES_PRV', $out, 'Y', #FNum, #FNum2, $UserFlag)
+
+         do Format-W2c-Number(#Amount, $out, '9999999.99')
+         do Build-XML-Line('ST1_TAXES_COR', $out, 'Y', #FNum, #FNum2, $UserFlag)
+      else
+
+         do Print-Value($S.EMPLOYER_ID_SWT,#L_ER_State_ID,#C_ER_State_ID,$YE_W2C_ER_State_ID)
+                                                                   !State employer ID
+         do Print-Value($State,#L_State_Wages,#C_State_Wages,$YE_State_Wages)
+
+         do Format-W2c-Number(#PrvAmount, $out, $FState_Tax)         !State taxes
+         do Print-Value($out,#L_State_Tax,#C_State_Tax,$YE_State_Tax)
+
+         do Format-W2c-Number(#Amount, $out, $FState_Tax)
+         print $out (,+5)
+      end-if
+
+      let $Prv_Box = RTRIM($Box,' ')
+      let $Prv_State = RTRIM($State,' ')
+      let $Prv_Locality = RTRIM($Locality,' ')
+      add 1 to #NextStateLoc
+
+
+      if #NextStateLoc <= #StateLocalCount
+         get $Box $State $Locality #Amount #PrvAmount
+                      from StateLocals(#NextStateLoc)
+      end-if
+
+      break
+
+    when = $YE_Local_Wages                                       !Local wages
+     ! if $State <> $Prv_State or $Prv_Box = $YE_W2_Local_Tax
+      if $State <> $Prv_State or #Locality_wages_count > 2       !DO A NEW FORM BREAK WHEN STATE BREAK,
+          or #Locality_tax_count > 2                             !OR LEFT SIDE AND RIGHT SIDE HAS LOCAL
+              do Next-Form                                       !WAGE CHGS, OR RIGHT SIDE HAS LOCAL TAX
+              do Print-ER-Data                                   !CHG AND A NEW LOCAL BREAK HAS OCCURED
+              do Print-EE-Data                                   !WITH A LOCAL WAGE CHG
+              let $StatePrinted = 'N'
+              let $Loc1Printed = 'N'
+              let $Loc2Printed = 'N'
+       else
+           if  $Prv_Box = $YE_W2_Local_Tax  and                  !LEFT SIDE OF FORM HAS A LOCAL TAX CHG
+               #Locality_tax_count = 2      and                  !BUT NO LOCAL WAGE CHG; NEW LOCAL BREAK
+               #Locality_wages_count = 1                         !HAS OCCURED WITH A LOCAL WAGE CHG
+                add 1 to #Locality_wages_count
+           end-if
+
+     ! else
+     !   if $Prv_Box = $YE_Local_Wages  and $Prv_Locality <> $Locality
+     !     do Next-Form
+     !     do Print-ER-Data
+     !     do Print-EE-Data
+     !   end-if
+      end-if
+
+      if $State <> $Prv_State
+
+        if RTRIM($State,' ') <> ''
+          do Get-State-SWT
+        end-if
+      else
+        if $Prv_Locality = $Locality and $Prv_Box = $Box
+          if RTRIM($State,' ') <> ''
+            do Get-State-SWT
+          end-if
+        end-if
+      end-if
+
+      if $XMLPublisher = 'Y'
+         if $StatePrinted = 'N'
+            do Build-XML-Line('ST1_StateID_PRV', $S.EMPLOYER_ID_SWT, 'Y', #FNum, #FNum2, $UserFlag)
+            do Build-XML-Line('ST1_STATE_PRV', $State, 'Y', #FNum, #FNum2, $UserFlag)
+            let $StatePrinted = 'Y'
+         end-if
+      else
+         do Print-Value($S.EMPLOYER_ID_SWT,#L_ER_State_ID,#C_ER_State_ID,$YE_W2C_ER_State_ID)
+                                                                   !State employer ID
+         do Print-Value($State,#L_State_Wages,#C_State_Wages,$YE_State_Wages)
+      end-if
+
+      if #Locality_wages_count = 1
+         let #L_Local_Wages  = #L_Local_WagesA
+         let #C_Local_Wages  = #C_Local_WagesA
+         let #L_Locality     = #L_LocalityA
+         let #C_Locality     = #C_LocalityA
+         let $FLocal_Wages   = $FLocal_WagesA
+      else
+         let #L_Local_Wages  = #L_Local_WagesB
+         let #C_Local_Wages  = #C_Local_WagesB
+         let #L_Locality     = #L_LocalityB
+         let #C_Locality     = #C_LocalityB
+         let $FLocal_Wages   = $FLocal_WagesB
+      end-if
+
+      do Get-Locality-Print-Name
+
+      if $XMLPublisher = 'Y'
+
+         if #Locality_wages_count = 1
+
+            do Format-W2c-Number(#PrvAmount, $out, '99999999.99')
+            do Build-XML-Line('LOC1_WAGES_PRV', $out, 'Y', #FNum, #FNum2, $UserFlag)
+            do Format-W2c-Number(#Amount, $out, '99999999.99')
+            do Build-XML-Line('LOC1_WAGES_COR', $out, 'Y', #FNum, #FNum2, $UserFlag)
+
+            if $Loc1Printed = 'N'
+               do Build-XML-Line('LOC1_LOC_PRV', $LocalityPrintName, 'Y', #FNum, #FNum2, $UserFlag)
+               let $Loc1Printed = 'Y'
+            end-if
+         else
+            do Format-W2c-Number(#PrvAmount, $out, '99999999.99')
+            do Build-XML-Line('LOC2_WAGES_PRV', $out, 'Y', #FNum, #FNum2, $UserFlag)
+            do Format-W2c-Number(#Amount, $out, '99999999.99')
+            do Build-XML-Line('LOC2_WAGES_COR', $out, 'Y', #FNum, #FNum2, $UserFlag)
+
+            if $Loc2Printed = 'N'
+               do Build-XML-Line('LOC2_LOC_PRV', $LocalityPrintName, 'Y', #FNum, #FNum2, $UserFlag)
+               let $Loc2Printed = 'Y'
+            end-if
+         end-if
+
+      else
+
+         do Print-Value($LocalityPrintName ,#L_Locality,#C_Locality,$YE_Local_Wages)
+
+         do Format-W2c-Number(#PrvAmount, $out, $FLocal_Wages)         !Local wages
+         do Print-Value($out ,#L_Local_Wages,#C_Local_Wages,$YE_Local_Wages)
+
+         do Format-W2c-Number(#Amount, $out, $FLocal_Wages)
+         print $out (,+5)
+      end-if
+
+      let $Prv_Box = RTRIM($Box,' ')
+      let $Prv_State = RTRIM($State,' ')
+      let $Prv_Locality = RTRIM($Locality,' ')
+      add 1 to #NextStateLoc
+      add 1 to #Locality_wages_count
+
+
+      if #NextStateLoc <= #StateLocalCount
+         get $Box $State $Locality #Amount #PrvAmount
+                      from StateLocals(#NextStateLoc)
+      end-if
+      break
+
+    when = $YE_W2_Local_Tax                              !Local tax
+      if $State <> $Prv_State or #Locality_tax_count > 2
+          or ($Prv_Box = $YE_Local_Wages and
+              $Prv_Locality <> $Locality and #Locality_wages_count > 2)
+                do Next-Form                              !STATE BREAK, OR FORM IS FILLED
+                do Print-ER-Data                          !WITH 2 TAX CHGS, OR LAST CHG WAS
+                do Print-EE-Data                          !WAGE CHG FOR DIFFERENT LOCAL AND
+                let $StatePrinted = 'N'                   !FORM FILLED
+                let $Loc1Printed = 'N'
+                let $Loc2Printed = 'N'
+      else
+           if ($Prv_Box = $YE_W2_Local_Wages  and         !LEFT SIDE OF FORM HAS A LOCAL WAGE CHG
+               #Locality_wages_count = 2      and         !BUT NO LOCAL TAX CHG; NEW LOCAL BREAK
+               #Locality_tax_count = 1        and         !HAS OCCURED WITH A LOCAL TAX CHG
+               $Locality <> $Prv_Locality)
+              or
+              ($Prv_Box = $YE_W2_Local_Wages  and
+               #Locality_wages_count > 2      and
+               #Locality_tax_count = 1        and
+               $Locality = $Prv_Locality)
+                add 1 to #Locality_tax_count
+           end-if
+
+    !  else
+    !    if $Prv_Box = $YE_W2_Local_Tax and $Prv_Locality <> $Locality
+    !      do Next-Form
+    !      do Print-ER-Data
+    !      do Print-EE-Data
+    !    end-if
+      end-if
+
+      if $State <> $Prv_State
+        if RTRIM($State,' ') <> ''
+          do Get-State-SWT
+        end-if
+      else
+        if $Prv_Locality = $Locality and $Prv_Box = $Box
+          if RTRIM($State,' ') <> ''
+            do Get-State-SWT
+          end-if
+        end-if
+      end-if
+
+
+      if $XMLPublisher = 'Y'
+         if $StatePrinted = 'N'
+            do Build-XML-Line('ST1_StateID_PRV', $S.EMPLOYER_ID_SWT, 'Y', #FNum, #FNum2, $UserFlag)
+            let $StatePrinted = 'Y'
+         end-if
+      else
+          do Print-Value($S.EMPLOYER_ID_SWT,#L_ER_State_ID,#C_ER_State_ID,$YE_W2C_ER_State_ID)
+                                                                   !State employer ID
+      end-if
+
+    !  if $Prv_Locality <> $Locality or $Prv_Box <> $YE_Local_Wages
+      if $Prv_Locality <> $Locality
+         or $Prv_State <> $State
+         or $LocalityPrintName = ''       ! LOCAL NAME FIELD BLANK
+        do Get-Locality-Print-Name
+      end-if
+
+      if #Locality_tax_count = 1
+         let #L_Local_Tax  = #L_Local_TaxA
+         let #C_Local_Tax  = #C_Local_TaxA
+         let #L_Locality     = #L_LocalityA
+         let #C_Locality     = #C_LocalityA
+         let $FLocal_Tax   = $FLocal_TaxA
+      else
+         let #L_Local_Tax  = #L_Local_TaxB
+         let #C_Local_Tax  = #C_Local_TaxB
+         let #L_Locality     = #L_LocalityB
+         let #C_Locality     = #C_LocalityB
+         let $FLocal_Tax   = $FLocal_TaxB
+      end-if
+
+      if $XMLPublisher = 'Y'
+
+         if #Locality_tax_count = 1
+
+            do Format-W2c-Number(#PrvAmount, $out, '99999999.99')
+            do Build-XML-Line('LOC1_TAXES_PRV', $out, 'Y', #FNum, #FNum2, $UserFlag)
+            do Format-W2c-Number(#Amount, $out, '99999999.99')
+            do Build-XML-Line('LOC1_TAXES_COR', $out, 'Y', #FNum, #FNum2, $UserFlag)
+
+            if $Loc1Printed = 'N'
+               do Build-XML-Line('LOC1_LOC_PRV', $LocalityPrintName, 'Y', #FNum, #FNum2, $UserFlag)
+               let $Loc1Printed = 'Y'
+            end-if
+         else
+            do Format-W2c-Number(#PrvAmount, $out, '99999999.99')
+            do Build-XML-Line('LOC2_TAXES_PRV', $out, 'Y', #FNum, #FNum2, $UserFlag)
+            do Format-W2c-Number(#Amount, $out, '99999999.99')
+            do Build-XML-Line('LOC2_TAXES_COR', $out, 'Y', #FNum, #FNum2, $UserFlag)
+
+            if $Loc2Printed = 'N'
+               do Build-XML-Line('LOC2_LOC_PRV', $LocalityPrintName, 'Y', #FNum, #FNum2, $UserFlag)
+               let $Loc2Printed = 'Y'
+            end-if
+         end-if
+
+      else
+
+         do Print-Value($State,#L_State_Wages,#C_State_Wages,$YE_State_Wages)
+         do Print-Value($LocalityPrintName ,#L_Locality,#C_Locality,$YE_W2_Local_Tax)
+
+         do Format-W2c-Number(#PrvAmount, $out, $FLocal_Tax)         !Local taxes
+         do Print-Value($out,#L_Local_Tax,#C_Local_Tax,$YE_Local_Tax)
+
+         do Format-W2c-Number(#Amount, $out, $FLocal_Tax)
+         print $out (,+5)
+      end-if
+
+      let $Prv_Box = RTRIM($Box,' ')
+      let $Prv_State = RTRIM($State,' ')
+      let $Prv_Locality = RTRIM($Locality,' ')
+      add 1 to #NextStateLoc
+      add 1 to #Locality_tax_count
+
+
+      if #NextStateLoc <= #StateLocalCount
+         get $Box $State $Locality #Amount #PrvAmount
+                      from StateLocals(#NextStateLoc)
+      end-if
+      break
+   end-evaluate
+  end-while
+end-procedure
+
+begin-procedure Print-Test-State-Local-Amounts
+
+    let #PrvAmount = 0.00
+    let #Amount = 99999999.99
+
+    do Print-Value('XXXXXXXXX' ,#L_ER_State_ID,#C_ER_State_ID,$YE_W2C_ER_State_ID) !State employer ID
+    do Print-Value('XX',#L_State_Wages,#C_State_Wages,$YE_State_Wages)
+
+    do Format-W2c-Number(#PrvAmount, $out, $FState_WagesA)         !State wages
+    do Print-Value($out,#L_State_WagesA,#C_State_WagesA,$YE_State_Wages)
+
+    do Format-W2c-Number(#Amount, $out, $FState_WagesA)
+    print $out (,+5)
+
+    do Format-W2c-Number(#PrvAmount, $out, $FState_Tax)          !State taxes
+    do Print-Value($out,#L_State_Tax,#C_State_Tax,$YE_State_Tax)
+
+    do Format-W2c-Number(#Amount, $out, $FState_Tax)
+    print $out (,+5)
+
+    do Print-Value('XXXXXXXX' ,#L_LocalityA,#C_LocalityA,$YE_Locality_A)
+
+    do Format-W2c-Number(#PrvAmount, $out, $FLocal_WagesA)         !Local wages
+    do Print-Value($out ,#L_Local_WagesA,#C_Local_WagesA,$YE_Local_Wages)
+
+    do Format-W2c-Number(#Amount, $out, $FLocal_WagesA)
+    print $out (,+5)
+
+    do Print-Value('XXXXXXXX'  ,#L_Local_TaxA,#C_Local_TaxA,$YE_W2_Local_Tax)
+
+
+    do Format-W2c-Number(#PrvAmount, $out, $FLocal_TaxA)         !Local taxes
+    do Print-Value($out,#L_Local_TaxA,#C_Local_TaxA,$YE_Local_Tax)
+
+    do Format-W2c-Number(#Amount, $out, $FLocal_TaxA)
+    print $out (,+5)
+
+    let $Print_Test_State_Local = 'N'
+end-procedure
+
+
+begin-procedure Print-Page1-Data
+  if #Align_Count > 0 and $XMLPublisher <> 'Y'
+    do Print-Value('S',#L_Prv_Statut_EE,#C_Prv_Statut_EE,$YE_W2C_Prv_Statut_EE)
+    do Print-Value('P',#L_Prv_Retire_Plan,#C_Prv_Retire_Plan,$YE_W2C_Prv_Retire_Plan)
+    do Print-Value('T',#L_Prv_3rd_Party_Sick_Pay,#C_Prv_3rd_Party_Sick_Pay,$YE_W2C_Prv_3rd_Party_Sick_Pay)
+    do Print-Value('S',#L_Statut_EE,#C_Statut_EE,$YE_W2C_Statut_EE)
+    do Print-Value('P',#L_Retire_Plan,#C_Retire_Plan,$YE_W2C_Retire_Plan)
+    do Print-Value('T',#L_3rd_Party_Sick_Pay,#C_3rd_Party_Sick_Pay,$YE_W2C_3rd_Party_Sick_Pay)
+  end-if
+
+  let $YE_Name  = $E.FullFName || ' ' || $E.LName || ' ' || $E.Suffix
+  let $Prv_Name = $E.Prv_FullFName || ' ' || $E.Prv_FullLName || ' ' || $E.Prv_Suffix
+
+  if ($YE_Name <> $Prv_Name)
+
+     if $XMLPublisher = 'Y'
+        do Build-XML-Line('BOX_C', 'Y', 'Y', #FNum, #FNum2, $UserFlag)
+        let $BoxC_Printed = 'Y'
+        do Build-XML-Line('BOX_I', $Prv_Name, 'Y', #FNum, #FNum2, $UserFlag)
+     else
+    do Print-Value('X',#L_EE_Corrected_Name,#C_EE_Corrected_Name,$YE_W2C_EE_Corrected_Name)
+    let $Prv_Name = $E.Prv_FName || ' ' || $E.Prv_LName || ' ' || $E.Prv_Suffix  !Need substringed name for printing
+    do Print-Value($Prv_Name,#L_EE_Incorrect_Name,#C_EE_Incorrect_Name,$YE_EE_Incorrect_Name)
+     end-if
+
+  end-if
+
+
+  if ($E.SSN <> $E.Prv_SSN)
+
+     if $XMLPublisher = 'Y'
+        if $BoxC_Printed <> 'Y'
+           do Build-XML-Line('BOX_C', 'Y', 'Y', #FNum, #FNum2, $UserFlag)
+        end-if
+        do Build-XML-Line('BOX_H', $E.Prv_SSN, 'Y', #FNum, #FNum2, $UserFlag)
+     else
+        do Print-Value('X',#L_EE_Corrected_Name,#C_EE_Corrected_Name,$YE_W2C_EE_Corrected_Name)
+        do Print-Value($E.Prv_SSN,#L_EE_Incorrect_SSN,#C_EE_Incorrect_SSN,$YE_W2C_EE_Incorrect_SSN)
+     end-if
+  end-if
+
+
+  if ($E.Prv_Statutory_Ee <> $E.Statutory_Ee)
+  or ($E.Prv_Pension_Plan <> $E.Pension_Plan)
+  or ($E.Prv_ThirdParty_SickPay <>  $E.ThirdParty_SickPay)
+
+
+     if $E.Prv_Statutory_Ee = 'Y'
+        if $XMLPublisher = 'Y'
+           do Build-XML-Line('STAT_EE_PRV', 'Y', 'Y', #FNum, #FNum2, $UserFlag)
+        else
+           do Print-Value('X',#L_Prv_Statut_EE,#C_Prv_Statut_EE,$YE_W2C_Prv_Statut_EE)
+        end-if
+     end-if
+
+     if $E.Prv_Pension_Plan = 'Y'
+        if $XMLPublisher = 'Y'
+           do Build-XML-Line('RETIRE_EE_PRV', 'Y', 'Y', #FNum, #FNum2, $UserFlag)
+        else
+           do Print-Value('X',#L_Prv_Retire_Plan,#C_Prv_Retire_Plan,$YE_W2C_Prv_Retire_Plan)
+        end-if
+     end-if
+
+     if $E.Prv_ThirdParty_SickPay = 'Y'
+        if $XMLPublisher = 'Y'
+           do Build-XML-Line('SICK_EE_PRV', 'Y', 'Y', #FNum, #FNum2, $UserFlag)
+        else
+           do Print-Value('X',#L_Prv_3rd_Party_Sick_Pay,#C_Prv_3rd_Party_Sick_Pay,$YE_W2C_3rd_Party_Sick_Pay)
+        end-if
+     end-if
+
+     if $E.Statutory_Ee = 'Y'
+        if $XMLPublisher = 'Y'
+           do Build-XML-Line('STAT_EE_COR', 'Y', 'Y', #FNum, #FNum2, $UserFlag)
+        else
+           do Print-Value('X',#L_Statut_EE,#C_Statut_EE,$YE_W2C_Statut_EE)
+        end-if
+     end-if
+
+     if $E.Pension_Plan = 'Y'
+        if $XMLPublisher = 'Y'
+           do Build-XML-Line('RETIRE_EE_COR', 'Y', 'Y', #FNum, #FNum2, $UserFlag)
+        else
+           do Print-Value('X',#L_Retire_Plan,#C_Retire_Plan,$YE_W2C_Retire_Plan)
+        end-if
+     end-if
+
+     if $E.ThirdParty_SickPay = 'Y'
+        if $XMLPublisher = 'Y'
+           do Build-XML-Line('SICK_EE_COR', 'Y', 'Y', #FNum, #FNum2, $UserFlag)
+        else
+           do Print-Value('X',#L_3rd_Party_Sick_Pay,#C_3rd_Party_Sick_Pay,$YE_W2C_3rd_Party_Sick_Pay)
+        end-if
+     end-if
+  end-if
+
+
+
+end-procedure
+
+begin-procedure Load-W2C-PRT
+
+begin-SELECT
+F.LAYOUT_STYLE
+F.TOP_MARGIN
+F.TOP_SPLIT
+F.CENTER_SPLIT
+F.BOTTOM_SPLIT
+F.LAST_PRINT_LINE
+F.LOCALS_PER_FORM
+F.FORM_ID
+
+  let $Layout_Style = RTRIM(&F.Layout_Style,' ')
+  let $Form_ID = RTRIM(&F.FORM_ID,' ')
+
+  move &F.Top_Margin       to #Top_Margin
+  move &F.Top_Split        to #Top_Split
+  move &F.Center_Split     to #Center_Split
+  move &F.Bottom_Split     to #Bottom_Split
+  move &F.Last_Print_Line  to #Last_Print_Line
+  move &F.Locals_Per_Form  to #Locals_Per_Form
+
+! encode '<27>E<27>(0N<27>&l6D<27>&l0E<27>&l66F' into $SetupString
+! print $SetupString (1,1)
+!            |    |       |       |       |
+!            |    |       |       |        --> 66 text lines
+!            |    |       |        --> top margin = 0 lines
+!            |    |        --> 6 lines per inch
+!            |     --> ISO 8859-1 symbol set
+!             --> Reset
+
+FROM  PS_TAXFORM_FORM F
+WHERE F.FORM_ID = &W2C.FORM_ID
+  AND F.TAXFORM_ID = $W2c_Taxform_ID
+  AND F.EFFDT   =
+      (SELECT MAX(EFFDT)
+       FROM   PS_TAXFORM_TBL
+       WHERE  TAXFORM_ID = F.TAXFORM_ID
+         AND  EFFDT  <= $AsOfDate)
+end-SELECT
+
+begin-SELECT
+P.BOX
+P.PRINT_LINE
+P.PRINT_COL
+P.PRINT_FORMAT
+P.PRINT_TEXT
+
+  let $P.Box = &P.Box
+  move $P.Box to $Box xx
+  let $Pos3 = substr($P.Box, 3,1)
+
+  if $Box = $YE_Box12_StartPos  or
+     $Box = $YE_Other
+    and $Pos3 > ' '
+    let $P.Box = &P.Box
+    let $P.Box = rpad($P.Box,4,' ')
+  else
+    let $P.Box = RTRIM(&P.Box,' ')
+  end-if
+
+  evaluate $P.Box
+    when = $YE_Fed_Wages                         !Federal wages
+      move &P.Print_Line   to #L_Fed_Wages              ! previous
+      move &P.Print_Col    to #C_Fed_Wages
+      let $FFed_Wages = RTRIM(&P.Print_Format,' ')
+      break
+    when = $YE_Fed_Tax                           !Federal tax
+      move &P.Print_Line   to #L_Fed_Tax              ! previous
+      move &P.Print_Col    to #C_Fed_Tax
+      let $FFed_Tax = RTRIM(&P.Print_Format,' ')
+      break
+    when = $YE_SS_Wages                          !SS wages
+      move &P.Print_Line   to #L_SS_Wages              ! previous
+      move &P.Print_Col    to #C_SS_Wages
+      let $FSS_Wages = RTRIM(&P.Print_Format,' ')
+      break
+    when = $YE_SS_Tax                            !SS Tax
+      move &P.Print_Line   to #L_SS_Tax              ! previous
+      move &P.Print_Col    to #C_SS_Tax
+      let $FSS_Tax = RTRIM(&P.Print_Format,' ')
+      break
+    when = $YE_Med_Wages                         !Medicare wages
+      move &P.Print_Line   to #L_Med_Wages              ! previous
+      move &P.Print_Col    to #C_Med_Wages
+      let $FMed_Wages = RTRIM(&P.Print_Format,' ')
+      break
+    when = $YE_Med_Tax                           !Medicare tax
+      move &P.Print_Line   to #L_Med_Tax              ! previous
+      move &P.Print_Col    to #C_Med_Tax
+      let $FMed_Tax = RTRIM(&P.Print_Format,' ')
+      break
+    when = $YE_SS_Tips                           !SS tips
+      move &P.Print_Line   to #L_SS_Tips              ! previous
+      move &P.Print_Col    to #C_SS_Tips
+      let $FSS_Tips = RTRIM(&P.Print_Format,' ')
+      break
+    when = $YE_Alloc_Tips                        !Allocated tips
+      move &P.Print_Line   to #L_Alloc_Tips              ! previous
+      move &P.Print_Col    to #C_Alloc_Tips
+      let $FAlloc_Tips = RTRIM(&P.Print_Format,' ')
+      break
+    when = $YE_Adv_EIC                           !Advance EIC paymt
+      move &P.Print_Line   to #L_Adv_EIC              ! previous
+      move &P.Print_Col    to #C_Adv_EIC
+      let $FAdv_EIC  = RTRIM(&P.Print_Format,' ')
+      break
+    when = $YE_Dep_Care                          !Depend care
+      move &P.Print_Line   to #L_Dep_Care              ! previous
+      move &P.Print_Col    to #C_Dep_Care
+      let $FDep_Care  = RTRIM(&P.Print_Format,' ')
+      break
+    when = $YE_Non_Qual_457                      !Nonqual plans
+      move &P.Print_Line   to #L_Non_Qual_457              ! previous
+      move &P.Print_Col    to #C_Non_Qual_457
+      let $FNon_Qual_457  = RTRIM(&P.Print_Format,' ')
+      break
+    when = $YE_Uncoll_SS_Tax_On_Tips             !Uncoll SS tax on tips
+      let $FUncoll_SS_Tax_On_Tips  = RTRIM(&P.Print_Format,' ')
+      let $T_Uncoll_SS_Tax_On_Tips = RTRIM(&P.Print_Text,' ')
+      break
+    when = $YE_Roth_401K                         !Earnings on Roth IRA due to 401K
+      let $FRoth_401K  = RTRIM(&P.Print_Format,' ')
+      let $T_Roth_401K = RTRIM(&P.Print_Text,' ')
+      break
+    when = $YE_Uncoll_Med_Tax_On_Tips            !Uncoll Medi tax on tips
+      let $FUncoll_Med_Tax_On_Tips  = RTRIM(&P.Print_Format,' ')
+      let $T_Uncoll_Med_Tax_On_Tips = RTRIM(&P.Print_Text,' ')
+      break
+    when = $YE_Roth_403B                         !Earnings on Roth IRA due to 403B
+      let $FRoth_403B  = RTRIM(&P.Print_Format,' ')
+      let $T_Roth_403B = RTRIM(&P.Print_Text,' ')
+      break
+    when = $YE_Group_Term_Life                   !GTL
+      let $FGroup_Term_Life  = RTRIM(&P.Print_Format,' ')
+      let $T_Group_Term_Life = RTRIM(&P.Print_Text,' ')
+      break
+    when = $YE_401K                              !401(k)
+      let $F401K  = RTRIM(&P.Print_Format,' ')
+      let $T_401K = RTRIM(&P.Print_Text,' ')
+      break
+    when = $YE_403B                              !403(b)
+      let $F403B  = RTRIM(&P.Print_Format,' ')
+      let $T_403B = RTRIM(&P.Print_Text,' ')
+      break
+    when = $YE_408K6                             !408(k)(6)
+      let $F408K6  = RTRIM(&P.Print_Format,' ')
+      let $T_408K6 = RTRIM(&P.Print_Text,' ')
+      break
+    when = $YE_457B                              !457(b)
+      let $F457B  = RTRIM(&P.Print_Format,' ')
+      let $T_457B = RTRIM(&P.Print_Text,' ')
+      break
+    when = $YE_501C18D                           !501(c)(18)(D)
+      let $F501C18D  = RTRIM(&P.Print_Format,' ')
+      let $T_501C18D = RTRIM(&P.Print_Text,' ')
+      break
+    when = $YE_Sick_Pay                          !Sick pay
+      let $FSick_Pay  = RTRIM(&P.Print_Format,' ')
+      let $T_Sick_Pay = RTRIM(&P.Print_Text,' ')
+      break
+    when = $YE_Excise_Tax                        !Excise tax
+      let $FExcise_Tax  = RTRIM(&P.Print_Format,' ')
+      let $T_Excise_Tax = RTRIM(&P.Print_Text,' ')
+      break
+    when = $YE_Business_Exp                      !Business expense
+      let $FBusiness_Exp  = RTRIM(&P.Print_Format,' ')
+      let $T_Business_Exp = RTRIM(&P.Print_Text,' ')
+      break
+    when = $YE_Uncoll_SS_Tax_GTL                 !Uncoll SS tax - GTL
+      let $FUncoll_SS_Tax_GTL  = RTRIM(&P.Print_Format,' ')
+      let $T_Uncoll_SS_Tax_GTL = RTRIM(&P.Print_Text,' ')
+      break
+    when = $YE_Uncoll_Med_Tax_GTL                !Uncoll Medi tax - GTL
+      let $FUncoll_Med_Tax_GTL  = RTRIM(&P.Print_Format,' ')
+      let $T_Uncoll_Med_Tax_GTL = RTRIM(&P.Print_Text,' ')
+      break
+    when = $YE_Excl_Moving_Exp                   !Excl Moving Exp
+      let $FExcl_Moving_Exp  = RTRIM(&P.Print_Format,' ')
+      let $T_Excl_Moving_Exp = RTRIM(&P.Print_Text,' ')
+      break
+    when = $YE_Basic_Qtrs_and_Subsist            !Basic Qtrs and Subsistence
+      let $FBasic_Qtrs_and_Subsist  = RTRIM(&P.Print_Format,' ')
+      let $T_Basic_Qtrs_and_Subsist = RTRIM(&P.Print_Text,' ')
+      break
+    when = $YE_Combat_Pay                        !Combat_Pay
+      let $FCombat_Pay  = RTRIM(&P.Print_Format,' ')
+      let $T_Combat_Pay = RTRIM(&P.Print_Text,' ')
+      break
+    when = $YE_Med_Svgs_Acct                     !Medical spending acct
+      let $FMed_Svgs_Acct  = RTRIM(&P.Print_Format,' ')
+      let $T_Med_Svgs_Acct = RTRIM(&P.Print_Text,' ')
+      break
+    when = $YE_408P_Simple_Retirement            !Section 418(p) simple
+      let $F408P_Simple_Retirement  = RTRIM(&P.Print_Format,' ')    ! retirement
+      let $T_408P_Simple_Retirement = RTRIM(&P.Print_Text,' ')
+      break
+    when = $YE_Adoption_Exp                      !Adoption expense
+      let $FAdoption_Exp  = RTRIM(&P.Print_Format,' ')
+      let $T_Adoption_Exp = RTRIM(&P.Print_Text,' ')
+      break
+    when = $YE_NonStatutory_Stock_Opt            !Non-statutory stock options
+      let $FNonStatutory_Stock_Opt  = RTRIM(&P.Print_Format,' ')
+      let $T_NonStatutory_Stock_Opt = RTRIM(&P.Print_Text,' ')
+      break
+    when = $YE_HSA_Employer_Contrib              !HSA Employer Contributions
+      let $FHSA_Employer_Contrib  = RTRIM(&P.Print_Format,' ')
+      let $T_HSA_Employer_Contrib = RTRIM(&P.Print_Text,' ')
+      break
+    when = $YE_409A_Def_NQ_Def_Comp              !409A_Def_NQ_Def_Comp
+      let $F409A_Def_NQ_Def_Comp  = RTRIM(&P.Print_Format,' ')
+      let $T_409A_Def_NQ_Def_Comp = RTRIM(&P.Print_Text,' ')
+      break
+    when = $YE_409A_Inc_NQ_Def_Comp              !409A_Inc_NQ_Def_Comp
+      let $F409A_Inc_NQ_Def_Comp  = RTRIM(&P.Print_Format,' ')
+      let $T_409A_Inc_NQ_Def_Comp = RTRIM(&P.Print_Text,' ')
+      break
+    when = $YE_OtherA                                 !CASDI
+    when = $YE_OtherB                                 !VPDI
+    when = $YE_OtherC                                 !WD
+    when = $YE_OtherD                                 !UI/HC
+    when = $YE_OtherE                                 !NJSDI
+    when = $YE_OtherF                                 !VPDI
+    when = $YE_OtherG
+    when = $YE_OtherH
+    when = $YE_OtherI
+    when = $YE_OtherJ
+    when = $YE_OtherK
+    when = $YE_OtherL
+    when = $YE_OtherM
+    when = $YE_OtherN
+    when = $YE_OtherO
+    when = $YE_OtherP
+    when = $YE_OtherQ
+    when = $YE_OtherR
+    when = $YE_OtherS
+    when = $YE_OtherT
+    when = $YE_OtherU
+    when = $YE_OtherV
+    when = $YE_OtherW
+    when = $YE_OtherX
+    when = $YE_OtherY
+    when = $YE_OtherZ
+    when = $YE_OtherYN
+    when = $YE_OtherYT
+    when = $YE_OtherZN
+      do Process-Other-Print-Parameters
+      break
+    when = $YE_State_Wages_Name                           !State wages name
+      move &P.Print_Line   to #L_State_Wages
+      move &P.Print_Col    to #C_State_Wages
+      let $FState_Wages = RTRIM(&P.Print_Format,' ')
+      break
+    when = $YE_State_Wages                                !State wages
+      move &P.Print_Line   to #L_State_WagesA
+      move &P.Print_Col    to #C_State_WagesA
+      let $FState_WagesA = RTRIM(&P.Print_Format,' ')
+      break
+    when = $YE_State_Tax                                  !State tax
+      move &P.Print_Line   to #L_State_Tax
+      move &P.Print_Col    to #C_State_Tax
+      let $FState_Tax = RTRIM(&P.Print_Format,' ')
+      break
+    when = $YE_Local_Wages_A                              !Local wages - first
+      move &P.Print_Line   to #L_Local_WagesA
+      move &P.Print_Col    to #C_Local_WagesA
+      let $FLocal_WagesA = RTRIM(&P.Print_Format,' ')
+      break
+    when = $YE_Local_Wages_B                              !Local wages - second
+      move &P.Print_Line   to #L_Local_WagesB
+      move &P.Print_Col    to #C_Local_WagesB
+      let $FLocal_WagesB = RTRIM(&P.Print_Format,' ')
+      break
+    when = $YE_Local_Tax_A                                !Local tax - first
+      move &P.Print_Line   to #L_Local_TaxA
+      move &P.Print_Col    to #C_Local_TaxA
+      let $FLocal_TaxA = RTRIM(&P.Print_Format,' ')
+      break
+    when = $YE_Local_Tax_B                                !Local tax - second
+      move &P.Print_Line   to #L_Local_TaxB
+      move &P.Print_Col    to #C_Local_TaxB
+      let $FLocal_TaxB = RTRIM(&P.Print_Format,' ')
+      break
+    when = $YE_Locality_A                                 !Locality name
+      move &P.Print_Line   to #L_LocalityA                ! - first
+      move &P.Print_Col    to #C_LocalityA
+      let $FLocal_LocalityA = RTRIM(&P.Print_Format,' ')
+      break
+    when = $YE_Locality_B                                 !Locality name
+      move &P.Print_Line   to #L_LocalityB               ! - second
+      move &P.Print_Col    to #C_LocalityB
+      let $FLocal_LocalityB = RTRIM(&P.Print_Format,' ')
+      break
+
+    when = $YE_W2C_Year_and_Form                          !Year/form
+      move &P.Print_Line   to #L_Year_and_Form
+      move &P.Print_Col    to #C_Year_and_Form
+      let $FA = RTRIM(&P.Print_Format,' ')
+      break
+    when = $YE_W2C_EE_FName
+      move &P.Print_Line   to #L_EE_FName
+      move &P.Print_Col    to #C_EE_FName
+      let $FEE_FName = RTRIM(&P.Print_Format,' ')
+      let $YE_EE_FName_Box_Size = TO_NUMBER(SUBSTR($FEE_FName,3,INSTR($FEE_FName,')',1)-2))
+      let #YE_EE_FName_Box_Size = TO_NUMBER(SUBSTR($FEE_FName,3,INSTR($FEE_FName,')',1)-2))
+      break
+    when = $YE_W2C_EE_LName
+      move &P.Print_Line   to #L_EE_LName
+      move &P.Print_Col    to #C_EE_LName
+      let $FEE_LName = RTRIM(&P.Print_Format,' ')
+      let $YE_EE_LName_Box_Size = TO_NUMBER(SUBSTR($FEE_LName,3,INSTR($FEE_LName,')',1)-2))
+      let #YE_EE_LName_Box_Size = TO_NUMBER(SUBSTR($FEE_LName,3,INSTR($FEE_LName,')',1)-2))
+      break
+    when = $YE_W2C_EE_Suffix
+      move &P.Print_Line   to #L_EE_Suffix
+      move &P.Print_Col    to #C_EE_Suffix
+      let $FEE_Suffix = RTRIM(&P.Print_Format,' ')
+      let #FEE_Suffix = RTRIM(&P.Print_Format,' ')
+      break
+    when = $YE_W2C_EE_Address1
+      move &P.Print_Line   to #L_EE_Address1
+      move &P.Print_Col    to #C_EE_Address1
+      let $FB2 = RTRIM(&P.Print_Format,' ')
+      break
+    when = $YE_W2C_EE_Address2
+      move &P.Print_Line   to #L_EE_Address2
+      move &P.Print_Col    to #C_EE_Address2
+      let $FB3 = RTRIM(&P.Print_Format,' ')
+      break
+    when = $YE_W2C_EE_State_City_Zip
+      move &P.Print_Line   to #L_EE_State_City_Zip
+      move &P.Print_Col    to #C_EE_State_City_Zip
+      let $FB4 = RTRIM(&P.Print_Format,' ')
+      break
+    when = $YE_W2C_EE_Corrected_Name
+      move &P.Print_Line   to #L_EE_Corrected_Name
+      move &P.Print_Col    to #C_EE_Corrected_Name
+      let $FB4 = RTRIM(&P.Print_Format,' ')
+      break
+    when = $YE_W2C_ER_Name
+      move &P.Print_Line   to #L_ER_Name
+      move &P.Print_Col    to #C_ER_Name
+      let $FER_Name = RTRIM(&P.Print_Format,' ')
+      break
+    when = $YE_W2C_ER_Address1
+      move &P.Print_Line   to #L_ER_Address1
+      move &P.Print_Col    to #C_ER_Address1
+      let $FER_Address1 = RTRIM(&P.Print_Format,' ')
+      break
+    when = $YE_W2C_ER_Address2
+      move &P.Print_Line   to #L_ER_Address2
+      move &P.Print_Col    to #C_ER_Address2
+      let $FER_Address2 = RTRIM(&P.Print_Format,' ')
+      break
+    when = $YE_W2C_ER_State_City_Zip
+      move &P.Print_Line   to #L_State_City_Zip
+      move &P.Print_Col    to #C_State_City_Zip
+      let $FState_City_Zip = RTRIM(&P.Print_Format,' ')
+      break
+    when = $YE_W2C_EE_SSN
+      move &P.Print_Line   to #L_EE_SSN
+      move &P.Print_Col    to #C_EE_SSN
+      let $FD = RTRIM(&P.Print_Format,' ')
+      break
+    when = $YE_W2C_ER_EIN
+      move &P.Print_Line   to #L_ER_EIN
+      move &P.Print_Col    to #C_ER_EIN
+      let $FF = RTRIM(&P.Print_Format,' ')
+      break
+    when = $YE_W2C_ER_State_ID                                !SWT
+      move &P.Print_Line   to #L_ER_State_ID
+      move &P.Print_Col    to #C_ER_State_ID
+      let $FG = RTRIM(&P.Print_Format,' ')
+      break
+    when = $YE_W2C_Prv_Statut_EE                              !Prv Statutory EE checkbox
+      move &P.Print_Line   to #L_Prv_Statut_EE
+      move &P.Print_Col    to #C_Prv_Statut_EE
+      break
+    when = $YE_W2C_Prv_Retire_Plan                            !Prv Pension plan checkbox
+      move &P.Print_Line   to #L_Prv_Retire_Plan
+      move &P.Print_Col    to #C_Prv_Retire_Plan
+      break
+    when = $YE_W2C_Prv_3rd_Party_Sick_Pay                     !Prv 3rd party sickpay checkbox
+      move &P.Print_Line   to #L_Prv_3rd_Party_Sick_Pay
+      move &P.Print_Col    to #C_Prv_3rd_Party_Sick_Pay
+      break
+    when = $YE_W2C_Statut_EE                                  !Statutory EE checkbox
+      move &P.Print_Line   to #L_Statut_EE
+      move &P.Print_Col    to #C_Statut_EE
+      break
+    when = $YE_W2C_Retire_Plan                                !Pension plan checkbox
+      move &P.Print_Line   to #L_Retire_Plan
+      move &P.Print_Col    to #C_Retire_Plan
+      break
+    when = $YE_W2C_3rd_Party_Sick_Pay                         !3rd party sickpay checkbox
+      move &P.Print_Line   to #L_3rd_Party_Sick_Pay
+      move &P.Print_Col    to #C_3rd_Party_Sick_Pay
+      break
+    when = $YE_W2C_ER_Use                                     !Employer use
+      move &P.Print_Line   to #L_ER_Use
+      move &P.Print_Col    to #C_ER_Use
+      break
+    when = $YE_W2C_EE_Incorrect_SSN                           !EE incorrect SSN
+      move &P.Print_Line   to #L_EE_Incorrect_SSN
+      move &P.Print_Col    to #C_EE_Incorrect_SSN
+      break
+    when = $YE_W2C_EE_Incorrect_Name                          !EE incorrect name
+      move &P.Print_Line   to #L_EE_Incorrect_Name
+      move &P.Print_Col    to #C_EE_Incorrect_Name
+      break
+
+    when = $YE_W2C_Blank_Box_First_Line_Descr                 !First blank box- description
+      move &P.Print_Line   to #L_X1
+      move &P.Print_Col    to #C_X1
+      break
+    when = $YE_W2C_Blank_Box_First_Line_Amt                   !First blank box - dollar amts
+      move &P.Print_Line   to #L_X1A
+      move &P.Print_Col    to #C_X1A
+      break
+    when = $YE_W2C_Blank_Box_First_Line_DescrB                 !First blank box- description
+      move &P.Print_Line   to #L_X1B                           !Current Information
+      move &P.Print_Col    to #C_X1B
+      break
+    when = $YE_W2C_Blank_Box_First_Line_AmtB                   !First blank box - dollar amts
+      move &P.Print_Line   to #L_X1C                           !Current Information
+      move &P.Print_Col    to #C_X1C
+      break
+    when = $YE_W2C_Blank_Box_Second_Line_Descr                !Second blank box - description
+      move &P.Print_Line   to #L_X2
+      move &P.Print_Col    to #C_X2
+      break
+    when = $YE_W2C_Blank_Box_Second_Line_Amt                  !Second blank box- dollar amts
+      move &P.Print_Line   to #L_X2A
+      move &P.Print_Col    to #C_X2A
+      break
+    when = $YE_W2C_Blank_Box_Second_Line_DescrB                !Second blank box - description
+      move &P.Print_Line   to #L_X2B                           !Current Information
+      move &P.Print_Col    to #C_X2B
+      break
+    when = $YE_W2C_Blank_Box_Second_Line_AmtB                  !Second blank box- dollar amts
+      move &P.Print_Line   to #L_X2C                           !Current Information
+      move &P.Print_Col    to #C_X2C
+      break
+    when = $YE_W2C_Blank_Box_Third_Line_Descr                 !Third blank box - description
+      move &P.Print_Line   to #L_X3
+      move &P.Print_Col    to #C_X3
+      break
+    when = $YE_W2C_Blank_Box_Third_Line_Amt                   !Third blank box - dollar amts
+      move &P.Print_Line   to #L_X3A
+      move &P.Print_Col    to #C_X3A
+      break
+    when = $YE_W2C_Blank_Box_Third_Line_DescrB                 !Third blank box - description
+      move &P.Print_Line   to #L_X3B                           !Current Information
+      move &P.Print_Col    to #C_X3B
+      break
+    when = $YE_W2C_Blank_Box_Third_Line_AmtB                   !Third blank box - dollar amts
+      move &P.Print_Line   to #L_X3C                           !Current Information
+      move &P.Print_Col    to #C_X3C
+      break
+    when = $YE_W2C_Blank_Box_Fourth_Line_Descr                !Fourth blank box - description
+      move &P.Print_Line   to #L_X4
+      move &P.Print_Col    to #C_X4
+      break
+    when = $YE_W2C_Blank_Box_Fourth_Line_Amt                  !Fourth blank box - dollar amts
+      move &P.Print_Line   to #L_X4A
+      move &P.Print_Col    to #C_X4A
+      break
+    when = $YE_W2C_Blank_Box_Fourth_Line_DescrB                 !Fourth blank box - description
+      move &P.Print_Line   to #L_X4B                            !Current Information
+      move &P.Print_Col    to #C_X4B
+      break
+    when = $YE_W2C_Blank_Box_Fourth_Line_AmtB                   !Fourth blank box - dollar amts
+      move &P.Print_Line   to #L_X4C                            !Current Information
+      move &P.Print_Col    to #C_X4C
+      break
+    when = $YE_W2C_Other_Box_First_Line_Descr                 !First blank box- description
+      move &P.Print_Line   to #L_Y1
+      move &P.Print_Col    to #C_Y1
+      break
+    when = $YE_W2C_Other_Box_First_Line_Amt                   !First blank box - dollar amts
+      move &P.Print_Line   to #L_Y1A
+      move &P.Print_Col    to #C_Y1A
+      break
+    when = $YE_W2C_Other_Box_First_Line_AmtB                   !First blank box - dollar amts
+      move &P.Print_Line   to #L_Y1B                           !Current Information
+      move &P.Print_Col    to #C_Y1B
+      break
+    when = $YE_W2C_Other_Box_Second_Line_Descr                !Second blank box - description
+      move &P.Print_Line   to #L_Y2
+      move &P.Print_Col    to #C_Y2
+      break
+    when = $YE_W2C_Other_Box_Second_Line_Amt                  !Second blank box- dollar amts
+      move &P.Print_Line   to #L_Y2A
+      move &P.Print_Col    to #C_Y2A
+      break
+    when = $YE_W2C_Other_Box_Second_Line_AmtB                !Second blank box- dollar amts
+      move &P.Print_Line   to #L_Y2B                           !Current Information
+      move &P.Print_Col    to #C_Y2B
+      break
+    when-other
+        move $P.Box to $Box xx
+      break
+  end-evaluate
+
+FROM  PS_TAXFORM_PRT P
+WHERE P.FORM_ID = &W2C.FORM_ID
+  AND P.TAXFORM_ID = $W2c_Taxform_ID
+  AND P.EFFDT   =
+      (SELECT MAX(EFFDT)
+       FROM   PS_TAXFORM_TBL
+       WHERE  TAXFORM_ID = $W2c_Taxform_ID
+         AND  EFFDT  <= $AsOfDate)
+ORDER BY P.BOX
+end-SELECT
+end-procedure
+
+begin-procedure Process-Other-Print-Parameters
+
+  evaluate $P.Box
+    when = $YE_OtherA                                 !CASDI
+      let $FOtherA  = RTRIM(&P.Print_Format,' ')
+      let $T_OtherA = RTRIM(&P.Print_Text,' ')
+      break
+    when = $YE_OtherB                                 !VPDI
+      let $FOtherB  = RTRIM(&P.Print_Format,' ')
+      let $T_OtherB = RTRIM(&P.Print_Text,' ')
+      break
+    when = $YE_OtherC                                 !WD
+      let $FOtherC  = RTRIM(&P.Print_Format,' ')
+      let $T_OtherC = RTRIM(&P.Print_Text,' ')
+      break
+    when = $YE_OtherD                                 !UI/HC
+      let $FOtherD  = RTRIM(&P.Print_Format,' ')
+      let $T_OtherD = RTRIM(&P.Print_Text,' ')
+      break
+    when = $YE_OtherE                                 !NJSDI
+      let $FOtherE  = RTRIM(&P.Print_Format,' ')
+      let $T_OtherE = RTRIM(&P.Print_Text,' ')
+      break
+    when = $YE_OtherF                                 !VPDI
+      let $FOtherF  = RTRIM(&P.Print_Format,' ')
+      let $T_OtherF = RTRIM(&P.Print_Text,' ')
+      break
+    when = $YE_OtherG                                 !
+      let $FOtherG  = RTRIM(&P.Print_Format,' ')
+      let $T_OtherG = RTRIM(&P.Print_Text,' ')
+      break
+    when = $YE_OtherH                                 !
+      let $FOtherH  = RTRIM(&P.Print_Format,' ')
+      let $T_OtherH = RTRIM(&P.Print_Text,' ')
+      break
+    when = $YE_OtherI                                 !
+      let $FOtherI  = RTRIM(&P.Print_Format,' ')
+      let $T_OtherI = RTRIM(&P.Print_Text,' ')
+      break
+    when = $YE_OtherJ                                 !
+      let $FOtherJ  = RTRIM(&P.Print_Format,' ')
+      let $T_OtherJ = RTRIM(&P.Print_Text,' ')
+      break
+    when = $YE_OtherK                                 !
+      let $FOtherK  = RTRIM(&P.Print_Format,' ')
+      let $T_OtherK = RTRIM(&P.Print_Text,' ')
+      break
+    when = $YE_OtherL                                 !
+      let $FOtherL  = RTRIM(&P.Print_Format,' ')
+      let $T_OtherL = RTRIM(&P.Print_Text,' ')
+      break
+    when = $YE_OtherM                                 !
+      let $FOtherM  = RTRIM(&P.Print_Format,' ')
+      let $T_OtherM = RTRIM(&P.Print_Text,' ')
+      break
+    when = $YE_OtherN                                 !
+      let $FOtherN  = RTRIM(&P.Print_Format,' ')
+      let $T_OtherN = RTRIM(&P.Print_Text,' ')
+      break
+    when = $YE_OtherO                                 !
+      let $FOtherO  = RTRIM(&P.Print_Format,' ')
+      let $T_OtherO = RTRIM(&P.Print_Text,' ')
+      break
+    when = $YE_OtherP                                 !
+      let $FOtherP  = RTRIM(&P.Print_Format,' ')
+      let $T_OtherP = RTRIM(&P.Print_Text,' ')
+      break
+    when = $YE_OtherQ                                 !
+      let $FOtherQ  = RTRIM(&P.Print_Format,' ')
+      let $T_OtherQ = RTRIM(&P.Print_Text,' ')
+      break
+    when = $YE_OtherR                                 !
+      let $FOtherR  = RTRIM(&P.Print_Format,' ')
+      let $T_OtherR = RTRIM(&P.Print_Text,' ')
+      break
+    when = $YE_OtherS                                 !
+      let $FOtherS  = RTRIM(&P.Print_Format,' ')
+      let $T_OtherS = RTRIM(&P.Print_Text,' ')
+      break
+    when = $YE_OtherT                                 !
+      let $FOtherT  = RTRIM(&P.Print_Format,' ')
+      let $T_OtherT = RTRIM(&P.Print_Text,' ')
+      break
+    when = $YE_OtherU                                 !
+      let $FOtherU  = RTRIM(&P.Print_Format,' ')
+      let $T_OtherU = RTRIM(&P.Print_Text,' ')
+      break
+    when = $YE_OtherV                                 !
+      let $FOtherV  = RTRIM(&P.Print_Format,' ')
+      let $T_OtherV = RTRIM(&P.Print_Text,' ')
+      break
+    when = $YE_OtherW                                 !
+      let $FOtherW  = RTRIM(&P.Print_Format,' ')
+      let $T_OtherW = RTRIM(&P.Print_Text,' ')
+      break
+    when = $YE_OtherX                                 !
+      let $FOtherX  = RTRIM(&P.Print_Format,' ')
+      let $T_OtherX = RTRIM(&P.Print_Text,' ')
+      break
+    when = $YE_OtherY                                 !
+      let $FOtherY  = RTRIM(&P.Print_Format,' ')
+      let $T_OtherY = RTRIM(&P.Print_Text,' ')
+      break
+    when = $YE_OtherYN                                 !
+      let $FOtherYN  = RTRIM(&P.Print_Format,' ')
+      let $T_OtherYN = RTRIM(&P.Print_Text,' ')
+      break
+    when = $YE_OtherYT                                 !
+      let $FOtherYT  = RTRIM(&P.Print_Format,' ')
+      let $T_OtherYT = RTRIM(&P.Print_Text,' ')
+      break
+    when = $YE_OtherZ                                 !
+      let $FOtherZ  = RTRIM(&P.Print_Format,' ')
+      let $T_OtherZ = RTRIM(&P.Print_Text,' ')
+      break
+    when = $YE_OtherZN                                 !
+      let $FOtherZN  = RTRIM(&P.Print_Format,' ')
+      let $T_OtherZN = RTRIM(&P.Print_Text,' ')
+      break
+  end-evaluate
+
+end-procedure
+
+begin-procedure Get-Locality-Print-Name
+  move 'N' to $LocalityNameFound
+  move ''  to $LocalityPrintName
+
+begin-SELECT
+L2.W2_PRT_NAME
+L2.LOCALITY_ABBRV
+
+  move 'Y' to $LocalityNameFound
+
+FROM  PS_LOCAL_TAX_TBL2 L2
+WHERE L2.STATE     = $State
+  AND L2.LOCALITY  = $Locality
+  AND L2.EFFDT =
+      (SELECT MAX(EFFDT)
+       FROM   PS_LOCAL_TAX_TBL2
+       WHERE  STATE    = L2.STATE
+         AND  LOCALITY = L2.LOCALITY
+         AND  EFFDT   <= $AsOfDate)
+end-SELECT
+
+  if $LocalityNameFound = 'Y' and RTRIM(&L2.W2_Prt_Name,' ') <> ''
+    move &L2.W2_Prt_Name to $LocalityPrintName
+  else
+    if $LocalityNameFound = 'Y' and RTRIM(&L2.Locality_Abbrv,' ') <> ''
+       move &L2.Locality_Abbrv to $LocalityPrintName
+    else
+       do Get-Locality-Abbrv
+    end-if
+  end-if
+
+  uppercase $LocalityPrintName
+  PUT $State INTO LocalPrintName(#LocalPrintCount) State
+  PUT $Locality INTO LocalPrintName(#LocalPrintCount) Locality
+  PUT $LocalityPrintName INTO LocalPrintName(#LocalPrintCount) LocalName
+  add 1 to #LocalPrintCount
+
+end-procedure
+
+begin-procedure Get-Locality-Abbrv
+begin-SELECT
+L.LOCALITY_NAME
+
+  let $LocalityPrintName  = SUBSTR(&L.LOCALITY_NAME,1,16)
+
+FROM  PS_LOCAL_TAX_TBL L
+WHERE L.STATE      = $State
+  AND L.LOCALITY   = $Locality
+  AND L.EFFDT =
+      (SELECT MAX(EFFDT)
+       FROM   PS_LOCAL_TAX_TBL
+       WHERE  STATE    = L.STATE
+         AND  LOCALITY = L.LOCALITY
+         AND  EFFDT   <= $AsOfDate)
+end-SELECT
+
+end-procedure
+
+begin-procedure Load-Test-Data
+
+  let $A.Federal_EIN =
+         LPAD($x,TO_NUMBER(SUBSTR($FF,3,INSTR($FF,')',1)-2)),'X')
+
+  let $A.Descr =
+         LPAD($x,TO_NUMBER(SUBSTR($FER_Name,3,INSTR($FER_Name,')',1)-2)),'X')
+
+  let $A.Address1 =
+         LPAD($x,TO_NUMBER(SUBSTR($FER_Address1,3,INSTR($FER_Address1,')',1)-2)),'X')
+
+  let $A.Address2 =
+         LPAD($x,TO_NUMBER(SUBSTR($FER_Address2,3,INSTR($FER_Address2,')',1)-2)),'X')
+
+  let $State_City_Zip =
+         LPAD($x,TO_NUMBER(SUBSTR($FState_City_Zip,3,INSTR($FState_City_Zip,')',1)-2)),'X')
+
+  let $ER_Year = '9999'
+
+  let $E.SSN =
+         LPAD($x,TO_NUMBER(SUBSTR($FD,3,INSTR($FD,')',1)-2)),'X')
+
+  let $E.Prv_SSN = 'YYYYYYYYYYY'
+
+  let $E.LName =
+         LPAD($x,TO_NUMBER(SUBSTR($FEE_LName,3,INSTR($FEE_LName,')',1)-2)),'X')
+
+  let $E.FName =
+         LPAD($x,TO_NUMBER(SUBSTR($FEE_FName,3,INSTR($FEE_FName,')',1)-2)),'X')
+
+  let $E.Suffix =
+         LPAD($x,TO_NUMBER(SUBSTR($FEE_Suffix,3,INSTR($FEE_Suffix,')',1)-2)), 'X')
+
+  let $Prv_Name = 'YYYYYYYYYYYYYYYYYYYYYYYYYYYYYY'
+  let $E.Prv_FName = 'YYYYYYYYY'
+  let $E.Prv_LName = 'YYYYYYYYYYYYYYYYYY'
+
+  let $E.Address1 =
+         LPAD($x,TO_NUMBER(SUBSTR($FB2F1,3,INSTR($FB2,')',1)-2)),'X')
+
+  let $E.Address2 =
+         LPAD($x,TO_NUMBER(SUBSTR($FB3,3,INSTR($FB3,')',1)-2)),'X')
+
+  let $B4 =
+         LPAD($x,TO_NUMBER(SUBSTR($FB4,3,INSTR($FB4,')',1)-2)),'X')
+
+  let #Fed_Wages = 99999999.99                             !Federal wages
+  let #Prv_Fed_Wages = 0.00
+
+  let #Fed_Tax = 0.00                                    !Federal tax
+  let #Prv_Fed_Tax = 99999999.99
+
+  let #SS_Wages = 99999999.99                             !SS wages
+  let #Prv_SS_Wages = 0.00
+
+  let #SS_Tax = 0                                       !SS Tax
+  let #Prv_SS_Tax = 99999999.99
+
+  let #Med_Wages = 99999999.99                             !Medicare wages
+  let #Prv_Med_Wages = 0.00
+
+  let #Med_Tax = 0                                       !Medicare tax
+  let #Prv_Med_Tax = 99999999.99
+
+  let #SS_Tips = 99999999.99                             !SS tips
+  let #Prv_SS_Tips = 0.00
+
+  let #Alloc_Tips = 0                                      !Allocated tips
+  if $Taxform_ID = 'W'
+     let #Prv_Alloc_Tips = 99999999.99
+  end-if
+
+  if $Taxform_ID = 'W'
+  or $Taxform_ID = 'I'
+     let #Adv_EIC = 99999999.99                             !EIC
+  end-if
+  let #Prv_Adv_EIC = 0.00
+
+  let #Dep_Care = 0                                       !Dep care
+  if $Taxform_ID = 'W'
+      let #Prv_Dep_Care = 99999999.99
+  end-if
+
+
+  if $Taxform_ID = 'W'
+    let $Print_Test_State_Local = 'Y'
+
+    let $E.W2_State =
+         LPAD($x,TO_NUMBER(SUBSTR($FState,3,INSTR($FState,')',1)-2)),'X')
+
+    let $E.Employer_ID_SWT =
+         LPAD($x,TO_NUMBER(SUBSTR($FState_ID,3,INSTR($FState_ID,')',1)-2)),'X')
+
+    move $FState_WagesA to $State_Wages
+    let $State_Wages = TRANSLATE($State_Wages,'Bb','99')            !State wages
+    move $State_Wages to #Prv_State_Wages                           ! previous
+    move $State_Wages to #State_Wages                               ! current
+
+    move $FState_Tax to $State_Tax
+    let $State_Tax = TRANSLATE($State_Tax,'Bb','99')             !State tax
+    move $State_Tax to #Prv_State_Tax                           ! previous
+    move $State_Tax to #State_Tax                               ! current
+
+    let $LocalityPrintName =
+         LPAD($x,TO_NUMBER(SUBSTR($FLocality,3,INSTR($FLocality,')',1)-2)),'X')
+
+    move $FLocal_WagesA to $Local_Wages
+    let $Local_Wages = TRANSLATE($Local_Wages,'Bb','99')              !Local wages
+    move $Local_Wages to #Prv_Local_Wages                           ! previous
+    move $Local_Wages to #Local_Wages                               ! current
+
+    move $FLocal_Tax to $Local_Tax
+    let $Local_Tax = TRANSLATE($Local_Tax,'Bb','99')              !Local tax
+    move $Local_Tax to #Prv_Local_Tax                           ! previous
+    move $Local_Tax to #Local_Tax                               ! current
+  end-if
+
+
+  move 0 to #StateLocalCount
+
+end-procedure
+
+begin-procedure Print-Alignment-Forms
+  move &W2C.ALIGN_COUNT  to #Align_Count
+  let #Align_Count = #Align_Count * #FormsPerPage
+  move #EmployeesPerPage to #temp
+  move #FormsPerPage to #EmployeesPerPage
+  move 1 to #k
+  while #k <= #Align_Count
+    do Load-Test-Data
+    do Print-W2C
+    add 1 to #k
+  end-while
+  move 0 to #Align_Count
+  move #temp to #EmployeesPerPage
+  move '' to $priorState
+  move '' to $priorLocality
+  move '' to $LocalityPrintName
+
+end-procedure
+
+begin-procedure Print-Value($String,#Line,#Col,$Identifier)
+
+  if #Line > 0
+    print $String (#Line,#Col)
+  else
+    display ''
+    display '***************************************'
+    display 'Print Line not defined for ' noline
+    display $Identifier
+    display 'in Tax Form Print Parameters Table.'
+    display 'Program Stopped.'
+    display '***************************************'
+    display ''
+    stop
+  end-if
+end-procedure
+
+
+begin-procedure Read-EEs
+let $FirstEE = 'Y'
+
+begin-SELECT
+C.W2C_ADD_EMPLID
+C.W2C_BATCH_NBR
+C.W2C_RECENT_BATCH
+
+  move &C.W2C_ADD_EMPLID  to $SelectedEmplID
+  move &C.W2C_BATCH_NBR to #W2c_Batch_Nbr
+  move &C.W2C_BATCH_NBR to $W2c_Batch_Nbr
+  move &C.W2C_ADD_EMPLID  to $ReprintCheck
+  let $ReprintCheck = rtrim(&C.W2C_ADD_EMPLID ,' ')
+
+  if isnull(rtrim($ReprintCheck,'')) and $FirstEE = 'Y'
+    do Get-Reprint-Info
+  else
+    let $E.SelectedEEs = 'AND E.W2C_ADD_EMPLID = '''
+    let $E.SelectedEEs = $E.SelectedEEs || RTRIM($SelectedEmplID  , ' ') || ''''
+
+    if &C.W2C_RECENT_BATCH = 'N'
+      let $E.Batch_Nbr = 'AND E.W2C_BATCH_NBR = ' || $W2c_Batch_Nbr
+    else
+      let $E.Batch_Nbr = 'AND E.W2C_BATCH_NBR = (SELECT MAX(W2C_BATCH_NBR) FROM ' ||
+       'PS_YE_W2C_DATA WHERE E.COMPANY = COMPANY ' ||
+       'AND E.W2C_ADD_EMPLID = W2C_ADD_EMPLID AND E.W2C_STATUS = W2C_STATUS)'
+    end-if
+  end-if
+  do Read-Employee-Data
+
+  let $FirstEE = 'N'
+
+FROM  PS_RC_TAX920USTEE C
+WHERE C.OPRID         = $Prcs_OprID
+  AND C.RUN_CNTL_ID   = $Prcs_Run_Cntl_ID
+end-SELECT
+
+end-procedure
+
+begin-procedure Get-Reprint-Info
+
+
+  if &C.W2C_RECENT_BATCH  = 'Y'
+    do Get-Most-Recent-Batch
+  end-if
+
+  let $E.Batch_Nbr = 'AND E.W2C_BATCH_NBR = ' || $W2c_Batch_Nbr
+
+
+end-procedure
+
+
+begin-procedure Get-Most-Recent-Batch
+begin-SELECT
+
+COUNT(*)   &W2cCount
+
+FROM PS_YE_W2C_DATA CT
+WHERE CT.W2C_BATCH_NBR = &W2C_INSTALL.W2C_BATCH_NBR
+AND   CT.W2C_TAXFORM_ID = $Taxform_ID
+
+end-SELECT
+
+if &W2cCount > 0
+    let #W2c_Batch_Nbr = &W2C_INSTALL.W2C_BATCH_NBR
+else
+    let #W2c_Batch_Nbr = &W2C_INSTALL.W2C_BATCH_NBR  - 1
+end-if
+
+let $W2c_Batch_Nbr = #W2c_Batch_Nbr
+
+end-procedure
+
+
+begin-procedure Get-State-SWT
+
+begin-SELECT DISTINCT
+S.EMPLOYER_ID_SWT
+
+
+   PUT $State INTO STATESWT(#StateSWTCount) State
+   PUT &S.EMPLOYER_ID_SWT INTO STATESWT(#StateSWTCount) SWT
+   let $S.EMPLOYER_ID_SWT = SUBSTR(&S.EMPLOYER_ID_SWT,1,18)
+   add 1 to #StateSWTCount
+
+
+FROM  PS_CO_STATETAX_TBL S
+WHERE S.COMPANY        = &E.COMPANY
+  AND S.STATE          = $State
+  AND S.EFF_STATUS     = 'A'
+  AND S.EFFDT =
+      (SELECT MAX(EFFDT)
+       FROM   PS_CO_STATETAX_TBL
+       WHERE  COMPANY = &E.COMPANY
+         AND  STATE   = $State
+         AND  EFF_STATUS = 'A'
+         AND  EFFDT  <= $AsOfDate)
+end-SELECT
+
+
+end-procedure
+
+begin-procedure Get-W2C-Run-Controls
+
+begin-select
+
+W2C.W2C_REG_REPRINT
+W2C.ALIGN_COUNT
+W2C.FORM_ID
+W2C.EMPLOYEES_PER_PAGE
+W2C.W2C_TAXFORM_ID
+W2C.PY_W2_FINAL_PRINT
+W2C.PY_W2_COPY_TYPE
+W2C.TAXFORM_ID
+
+  move &W2C.Py_W2_Final_Print  to $W2C.Py_W2_Final_Print
+  move &W2C.Py_W2_Copy_Type    to $W2C.Py_W2_Copy_Type
+  move &W2C.TAXFORM_ID         to $W2C.TAXFORM_ID
+
+FROM  PS_RC_TAX920UST   W2C
+WHERE W2C.OPRID            = $Prcs_OprID
+AND   W2C.RUN_CNTL_ID      = $Prcs_Run_Cntl_ID
+
+end-select
+
+
+  move &W2C.W2C_TAXFORM_ID to $Taxform_ID
+
+  evaluate &W2C.W2C_TAXFORM_ID
+     when = 'W'
+          move 'X' to $W2c_Taxform_ID
+     when = 'I'
+          move 'J' to $W2c_Taxform_ID
+     when = 'M'
+          move 'N' to $W2c_Taxform_ID
+     when = 'S'
+          move 'U' to $W2c_Taxform_ID
+  end-evaluate
+
+end-procedure
+
+begin-procedure Get-XMLP-Definitions
+
+  do Get-XML-URLID
+  do Get-Report-Definitions
+
+  move 'N'  to $W2C.Py_Ye_Rpt_Burst
+  move 'N'  to $Py_Ye_Rpt_Burst
+  if $OPT_SS.PY_YE_RPT_SS = 'Y'
+     move $OPT_SS.REPORT_DEFN_ID to $Report_Defn_ID
+
+!     do Check-Burst-Value
+!     move $Py_Ye_Rpt_Burst  to $W2C.Py_Ye_Rpt_Burst
+
+!     if $Py_Ye_Rpt_Burst <> 'Y'
+!        move 'N' to $OPT_SS.PY_YE_RPT_SS
+!        display 'No burst fieldname given for self-service report definition ' noline
+!        display $OPT_SS.REPORT_DEFN_ID
+!     end-if
+  end-if
+
+  move 'N'  to $Py_Ye_Rpt_Burst
+
+  if #OPT_BLK.PY_RPT_BATCH_SIZE <> 0
+     move $OPT_BLK.REPORT_DEFN_ID to $Report_Defn_ID
+     do Check-Burst-Value
+
+     if $Py_Ye_Rpt_Burst <> 'Y'
+        display 'No burst fieldname given for batched report definition ' noline
+        display $OPT_BLK.REPORT_DEFN_ID
+     end-if
+  end-if
+
+end-procedure
+
+begin-procedure Get-XML-URLID
+
+! fetch XML data files URLID
+
+  move ' '  to $OPT_XML.PY_YE_XMLURLID
+
+begin-SELECT
+OPT_XML.PY_YE_XMLURLID
+
+  move &OPT_XML.PY_YE_XMLURLID      to $OPT_XML.PY_YE_XMLURLID
+
+  exit-SELECT
+
+FROM PS_PY_YE_OPT_TAX OPT_XML
+WHERE OPT_XML.PY_TAX_YEAR     = #XMLP_Tax_Year
+  AND OPT_XML.TAXFORM_ID      = $W2c_Taxform_ID
+end-SELECT
+
+  if $OPT_XML.PY_YE_XMLURLID = ' '
+     display 'XML data file URLID is missing.'
+  end-if
+
+end-procedure
+
+begin-procedure Get-Report-Definitions
+
+! fetch definitions for self-service
+
+  move 'N'  to $OPT_SS.PY_YE_RPT_SS
+  move ' '  to $OPT_SS.REPORT_DEFN_ID
+  move ' '  to $OPT_SS.TMPLDEFN_ID
+
+begin-SELECT
+OPT_SS.PY_YE_RPT_SS
+OPT_SS.REPORT_DEFN_ID
+OPT_SS.TMPLDEFN_ID
+OPT_SS.PY_RPT_BATCH_SIZE
+
+  move &OPT_SS.PY_YE_RPT_SS      to $OPT_SS.PY_YE_RPT_SS
+  move &OPT_SS.REPORT_DEFN_ID    to $OPT_SS.REPORT_DEFN_ID
+  move &OPT_SS.TMPLDEFN_ID       to $OPT_SS.TMPLDEFN_ID
+!  move &OPT_SS.PY_RPT_BATCH_SIZE to #OPT_SS.PY_RPT_BATCH_SIZE
+
+  exit-SELECT
+
+FROM PS_PY_YE_OPT_RPT OPT_SS
+WHERE OPT_SS.PY_TAX_YEAR     = #XMLP_Tax_Year
+  AND OPT_SS.TAXFORM_ID      = $W2c_Taxform_ID
+  AND OPT_SS.PY_W2_COPY_TYPE = $W2C.Py_W2_Copy_Type
+  AND OPT_SS.PY_YE_RPT_SS    = 'Y'
+end-SELECT
+
+! fetch definitions for bulk report
+
+  move ' '  to $OPT_BLK.REPORT_DEFN_ID
+  move ' '  to $OPT_BLK.TMPLDEFN_ID
+  move 0    to #OPT_BLK.PY_RPT_BATCH_SIZE
+
+begin-SELECT
+OPT_BLK.REPORT_DEFN_ID
+OPT_BLK.TMPLDEFN_ID
+OPT_BLK.PY_RPT_BATCH_SIZE
+
+  move &OPT_BLK.REPORT_DEFN_ID    to $OPT_BLK.REPORT_DEFN_ID
+  move &OPT_BLK.TMPLDEFN_ID       to $OPT_BLK.TMPLDEFN_ID
+  move &OPT_BLK.PY_RPT_BATCH_SIZE to #OPT_BLK.PY_RPT_BATCH_SIZE
+
+  exit-SELECT
+
+FROM PS_PY_YE_OPT_RPT OPT_BLK
+WHERE OPT_BLK.PY_TAX_YEAR     = #XMLP_Tax_Year
+  AND OPT_BLK.TAXFORM_ID      = $W2c_Taxform_ID
+  AND OPT_BLK.PY_W2_COPY_TYPE = $W2C.Py_W2_Copy_Type
+  AND OPT_BLK.PY_YE_RPT_SS    <> 'Y'
+end-SELECT
+
+end-procedure
+
+begin-procedure Check-Burst-Value
+  let $Py_Ye_Rpt_Burst = 'N'
+begin-SELECT
+burst.BURST_FIELDNAME
+
+  if rtrim(&burst.BURST_FIELDNAME, ' ') = ''
+     let $Py_Ye_Rpt_Burst = 'N'
+  else
+     let $Py_Ye_Rpt_Burst = 'Y'
+  end-if
+
+  exit-SELECT
+
+from PSXPRPTDEFN burst
+WHERE burst.REPORT_DEFN_ID = $Report_Defn_ID
+end-SELECT
+end-procedure
+
+begin-procedure Get-W2C-Parameters
+
+begin-select
+W2C_INSTALL.W2C_BATCH_NBR
+W2C_INSTALL.W2C_BATCH_YR
+W2C_INSTALL.W2C_DEF_CAL_YR
+
+
+FROM  PS_YE_W2C_INSTALL W2C_INSTALL
+WHERE W2C_INSTALL.W2C_TAXFORM_ID = $Taxform_ID
+end-SELECT
+
+
+move &W2C_INSTALL.W2C_DEF_CAL_YR to #W2c_Def_Cal_Yr
+move &W2C_INSTALL.W2C_BATCH_NBR to #W2c_Batch_Nbr
+move &W2C_INSTALL.W2C_BATCH_NBR to $W2c_Batch_Nbr
+
+move &W2C_INSTALL.W2C_BATCH_YR   to $W2C_Batch_Yr 9999
+move &W2C_INSTALL.W2C_BATCH_YR   to #W2C_Batch_Yr
+let $E.Batch_Nbr = 'AND E.W2C_BATCH_NBR = ' || $W2c_Batch_Nbr
+
+end-procedure
+
+
+begin-procedure Update-W2-History
+
+ let $W2c_Error = 'Update-W2-History '
+
+ begin-SQL on-error=Error-W2c-Processing
+  UPDATE PS_YE_EE
+    SET PROCESS_FLAG = 'X'
+   WHERE EMPLID = &E.W2C_ADD_EMPLID
+    AND CALENDAR_YEAR = &E.CALENDAR_YEAR
+    AND TAXFORM_ID = $Taxform_ID
+    AND COMPANY IN (SELECT W2C.COMPANY
+       FROM PS_W2_COMPANY W2C
+       WHERE W2C.W2_REPORTING_CO = &E.COMPANY
+       AND W2C.CALENDAR_YEAR = &E.CALENDAR_YEAR);
+ end-SQL
+end-procedure
+
+
+
+begin-procedure Update-W2C-Parameters
+
+ let $W2c_Error = 'Update-W2C-Parameters  '
+
+ begin-SQL on-error=Error-W2c-Processing
+  UPDATE PS_YE_W2C_DATA
+   SET W2C_STATUS = 'C'
+  WHERE W2C_BATCH_NBR = &W2C_INSTALL.W2C_BATCH_NBR
+  AND W2C_TAXFORM_ID = $Taxform_ID
+  AND W2C_STATUS <> 'V';
+end-SQL
+
+  do Delete-W2c-Install
+  do Insert-W2c-Install
+end-procedure
+
+begin-procedure Update-Reg-Reprint-Status
+
+ let $W2c_Error = 'Update-Reg-Reprint-Status '
+
+ begin-SQL on-error=Error-W2c-Processing
+  UPDATE PS_RC_TAX920UST
+   SET W2C_REG_REPRINT  = 'C';
+ end-SQL
+
+ let $W2c_Error = 'Delete-W2c-EE  '
+
+ begin-SQL on-error=Error-W2c-Processing
+  DELETE FROM  PS_RC_TAX920USTEE
+  WHERE OPRID         = $Prcs_OprID
+  AND RUN_CNTL_ID   = $Prcs_Run_Cntl_ID
+ end-SQL
+
+end-procedure
+
+
+begin-procedure Delete-W2c-Install
+
+ let $W2c_Error = 'Delete-W2c-Install   '
+
+ begin-SQL on-error=Error-W2c-Processing
+  DELETE FROM PS_YE_W2C_INSTALL
+  WHERE W2C_TAXFORM_ID = $Taxform_ID;
+ end-SQL
+end-procedure
+
+begin-procedure Insert-W2c-Install
+ add 1 to #W2c_Batch_Nbr
+ let $W2c_Error = 'Insert-W2c-Install   '
+
+ begin-SQL on-error=Error-W2c-Processing
+  INSERT INTO PS_YE_W2C_INSTALL (W2C_BATCH_NBR,
+                            W2C_TAXFORM_ID,
+                            W2C_NEW_BATCH,
+                            W2C_DEF_CAL_YR,
+                            W2C_BATCH_YR)
+                    VALUES (#W2c_Batch_Nbr,
+                            $Taxform_ID,
+                            'Y',
+                            #W2c_Def_Cal_Yr,
+                            #W2c_Batch_Yr);
+ end-SQL
+end-procedure
+
+begin-procedure Error-W2c-Processing
+  display 'W2c Processing Error ' noline
+  display $W2c_Error
+end-procedure
+
+
+begin-procedure Next-Form
+
+  if $XMLPublisher <> 'Y'
+     if $first_time = 'N'
+        new-page
+     end-if
+     next-column
+     do Print-Value(' ',#Top_Margin,1,'Top Margin')
+     next-listing
+     do Print-Value(' ',#Last_Print_Line,1,'Last Print Line')
+  end-if
+
+  if $XMLPublisher = 'Y' and $TagOpened = 'Y'
+
+     do XML-Close-Tag('W2C_Data', $closeTag)
+     if $W2C.Py_W2_Copy_Type = '2' and #FNum <> 0
+        do Write-XML-Line(#Fnum, $closeTag)
+        let $TagOpened = 'N'
+     end-if
+
+     if ($W2C.Py_W2_Copy_Type = '2' and $Consent <> 'C') or
+         $W2C.Py_W2_Copy_Type <> '2'
+        do Write-XML-Line(#Fnum2, $closeTag)
+        let $TagOpened = 'N'
+     end-if
+  end-if
+
+  let #Locality_wages_count = 1
+  let #Locality_tax_count = 1
+
+  let $First_time = 'N'
+
+end-procedure
+
+
+begin-procedure Format-W2c-Number(#in, :$out, $mask)
+
+  if #in <> 0
+    move #in to $out :$mask
+    let $out = translate($out,',.',$_Delimiters)
+  else
+      let $out = '           0'
+  end-if
+
+
+end-procedure
+
+
+begin-procedure Clear-Guide-Temp
+  let $err-statement = 'Clear-Guide-Temp, DELETE PS_PY_SS_USA_TMP'
+begin-SQL on-error=Sql-Statement-Error
+DELETE FROM PS_PY_SS_USA_TMP
+end-SQL
+end-procedure
+
+begin-procedure Insert-Guide-Data
+
+  let $updateAction = 'I'
+  let $NotifyFlag = 'N'
+  do Get-Guide-Seqnum
+
+  let $err-statement = 'Insert-Guide-Data, INSERT PS_PY_SS_USA_TMP'
+begin-SQL on-error=Sql-Statement-Error
+INSERT INTO PS_PY_SS_USA_TMP
+(OPRID
+,RUN_CNTL_ID
+,PRCSINSTANCE
+,PRCSNAME
+,JOBINSTANCE
+,EMPLID
+,PY_TAX_YEAR
+,W2_REPORTING_CO
+,TAXFORM_ID
+,SEQUENCE_NUMBER
+,W2C_BATCH_NBR
+,W2C_BATCH_YR
+,PY_YE_FORM_SEQNUM
+,PY_W2_PROCESS_TYPE
+,YE_FORM_ISSUE_DT
+,YE_FORM_VIEWING_DT
+,ATTACHSYSFILENAME
+,ATTACHUSERFILE
+,PY_YE_FILEURLID
+,PY_YE_REPORT_URL
+,PY_YE_BURST_ID
+,PROCESS_INSTANCE
+,REPORT_DEFN_ID
+,BURST_FIELDNAME
+,PY_YE_NOTIFY_FLG
+,PY_W2_FINAL_PRINT
+,PY_YE_UPD_ACTION)
+Values
+($Prcs_OprID
+,$Prcs_Run_Cntl_ID
+,#prcs_process_instance
+,'TAX920US'
+,#prcs_job_instance
+,$E.EMPLID
+,&E.Calendar_Year
+,$A.W2_Reporting_Co
+,$W2c_Taxform_ID      ! taxform id
+,0
+,#E.W2C_BATCH_NBR     ! w2c batch nbr
+,&E.Calendar_Year     ! w2c batch yr
+,#gde.PY_YE_FORM_SEQNUM
+,'4'                  ! py_w2_process_type (4 - no specific reason)
+,$IssueDate
+,$ViewingDate1                 ! viewing date
+,$FName                        ! attachsysfilename
+,$FName                        ! attachuserfile
+,$OPT_XML.PY_YE_XMLURLID       ! xml data file urlid
+,' '                           ! report url
+,$BurstValue
+,0
+,$OPT_SS.REPORT_DEFN_ID
+,'BURST_VALUE'
+,$NotifyFlag
+,$W2C.Py_W2_Final_Print
+,$updateAction)
+end-SQL
+
+end-procedure
+
+begin-procedure Insert-YE-Runcontrol
+  let $err-statement = 'Insert-YE-Runcontrol, INSERT PS_PY_YE_FORM_RCTL'
+begin-SQL on-error=Sql-Statement-Error
+INSERT INTO PS_PY_YE_FORM_RCTL
+(OPRID
+,RUN_CNTL_ID
+,PRCSINSTANCE
+,PRCSNAME
+,JOBINSTANCE
+,REPORT_DEFN_ID
+,TMPLDEFN_ID
+,PY_YE_SOURCEFILE
+,PY_YE_SOURCELOC
+,PY_YE_SRC_FILENAME
+,PY_YE_OSPLATFORM
+,FORM_ID
+,PY_W2_FINAL_PRINT
+,PY_W2_COPY_TYPE
+,PY_YE_RPT_BURST
+,PY_YE_RPT_SS
+,PY_RPT_DEFN_ID_SS
+,PY_RPT_TMPL_ID_SS
+,TAXFORM_ID
+,PY_YE_SOURCEFILE2
+,PY_YE_SRC_FILENAM2
+,PY_YE_FILE_COUNT
+,PY_YE_XMLURLID
+,PY_TAX_YEAR
+)
+Values
+($Prcs_OprID
+,$Prcs_Run_Cntl_ID
+,#prcs_process_instance
+,'TAX920US'
+,#prcs_job_instance
+,$OPT_BLK.REPORT_DEFN_ID
+,$OPT_BLK.TMPLDEFN_ID
+,$sourceFile2
+,$sourceLocation2
+,$sourceFileName2
+,$yeOS
+,$Form_ID
+,$W2C.Py_W2_Final_Print
+,$W2C.Py_W2_Copy_Type
+,$W2C.Py_Ye_Rpt_Burst
+,$OPT_SS.PY_YE_RPT_SS
+,$OPT_SS.REPORT_DEFN_ID
+,$OPT_SS.TMPLDEFN_ID
+,$W2c_Taxform_ID
+,$sourceFile2
+,$sourceFileName2
+,0
+,$OPT_XML.PY_YE_XMLURLID
+,&E.Calendar_Year
+)
+end-SQL
+end-procedure
+
+begin-procedure Get-Setup-Viewing-Date
+  let $yeopt.YE_FORM_VIEWING_DT = ''
+  let $yeopt.PY_YE_SS_NOTE_DT   = ''
+
+  let $Year4 = '1'
+  do Format-DateTime('20491231', $ViewingDate, {DEFCMP},'','native')
+
+begin-SELECT
+yeopt.YE_FORM_VIEWING_DT
+yeopt.PY_YE_SS_NOTE_DT
+
+  let $yeopt.YE_FORM_VIEWING_DT = &yeopt.YE_FORM_VIEWING_DT
+  let $yeopt.PY_YE_SS_NOTE_DT   = &yeopt.PY_YE_SS_NOTE_DT
+
+  if $yeopt.YE_FORM_VIEWING_DT <> '' and
+     $yeopt.YE_FORM_VIEWING_DT >= $IssueDate
+
+     let $ViewingDate = $yeopt.YE_FORM_VIEWING_DT
+
+  else
+     if $yeopt.YE_FORM_VIEWING_DT <> '' and
+        $yeopt.YE_FORM_VIEWING_DT < $IssueDate
+
+        let $ViewingDate = $IssueDate
+
+     end-if
+  end-if
+
+from PS_PY_YEOPT_TX_USA yeopt
+WHERE yeopt.W2_REPORTING_CO = &A.W2_Reporting_Co
+  AND yeopt.PY_TAX_YEAR = &E.CALENDAR_YEAR
+  AND yeopt.TAXFORM_ID = $W2c_Taxform_ID
+end-SELECT
+end-procedure
+
+begin-procedure Get-Guide-Seqnum
+  let #gde.PY_YE_FORM_SEQNUM =  0
+  let $ViewingDate1 = $ViewingDate
+
+begin-SELECT
+gde.PY_YE_FORM_SEQNUM
+gde.YE_FORM_VIEWING_DT
+gde.PY_YE_NOTIFY_FLG
+
+  let #gde.PY_YE_FORM_SEQNUM = &gde.PY_YE_FORM_SEQNUM
+  let $ViewingDate1 = &gde.YE_FORM_VIEWING_DT
+  let $NotifyFlag = &gde.PY_YE_NOTIFY_FLG
+  let $updateAction = 'C'
+
+  exit-SELECT
+
+from PS_PY_SS_USA_GDE gde
+WHERE gde.EMPLID = $E.EMPLID
+  AND gde.PY_TAX_YEAR = &E.Calendar_Year
+  AND gde.W2_REPORTING_CO = $A.W2_Reporting_Co
+  AND gde.TAXFORM_ID = $W2c_Taxform_ID
+  AND gde.SEQUENCE_NUMBER = #E.SEQUENCE_NUMBER
+  AND gde.W2C_BATCH_NBR   = #E.W2C_BATCH_NBR
+  AND gde.W2C_BATCH_YR    = &E.Calendar_Year
+ORDER BY gde.PY_YE_FORM_SEQNUM DESC
+end-SELECT
+
+  if $updateAction <> 'C'
+     let #gde.PY_YE_FORM_SEQNUM = #gde.PY_YE_FORM_SEQNUM + 1
+  end-if
+
+! Although unlikely, a Current batch may be run more than once. Therefore,
+! the forms must not be viewable until released.
+  if $updateAction = 'C' and $NotifyFlag = 'N'
+
+     let $ViewingDate1 = $ViewingDate
+  end-if
+
+end-procedure
+
+begin-procedure Capture-OS
+  let $yeOS = ' '
+
+  #ifdef NT
+     let $yeOS = 'NT'
+  #end-if
+
+  #ifdef MVS
+     let $yeOS = 'MVS'
+  #end-if
+
+  #ifdef UNIX
+     let $yeOS = 'UNIX'
+  #end-if
+end-procedure
+
+begin-procedure Get-SS-Consent
+  let $Consent = 'N'
+begin-SELECT
+CONS.YE_CONSENT_CURRENT
+
+  move &CONS.YE_CONSENT_CURRENT to $Consent
+
+FROM PS_PY_YE_CONS_USA CONS
+WHERE CONS.EMPLID = $E.EmplID
+  AND CONS.LASTUPDDTTM =
+      (SELECT MAX(CONS1.LASTUPDDTTM)
+       FROM PS_PY_YE_CONS_USA CONS1
+       WHERE CONS1.EMPLID = CONS.EMPLID)
+end-SELECT
+
+  if $Consent = 'C' and $W2C.Py_W2_Copy_Type = '2'
+     let $UserFlag = 'N'
+  else
+     let $UserFlag = 'Y'
+  end-if
+end-procedure
+
+!----------------------------------
+begin-procedure Sql-Statement-Error
+!----------------------------------
+  show $err-statement
+  show ' Error : ' $sql-error
+end-procedure
+
+
+
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+
+#Include 'stdapi.sqc'    !Update Process API
+#Include 'w2c.sqc'       !Routine for W2 Year End Box variables
+#Include 'w2box.sqc'     !Evaluate-Box
+#Include 'pyxmlbld.sqc'  !Creates xml tags/elements

@@ -1,0 +1,524 @@
+! ***************************************************************!
+!  This software and related documentation are provided under a!
+!  license agreement containing restrictions on use and!
+!  disclosure and are protected by intellectual property!
+!  laws. Except as expressly permitted in your license agreement!
+!  or allowed by law, you may not use, copy, reproduce,!
+!  translate, broadcast, modify, license, transmit, distribute,!
+!  exhibit, perform, publish or display any part, in any form or!
+!  by any means. Reverse engineering, disassembly, or!
+!  decompilation of this software, unless required by law for!
+!  interoperability, is prohibited.!
+!  The information contained herein is subject to change without!
+!  notice and is not warranted to be error-free. If you find any!
+!  errors, please report them to us in writing.!
+!  !
+!  Copyright (C) 1988, 2011, Oracle and/or its affiliates.!
+!  All Rights Reserved.!
+! ***************************************************************!
+ 
+ 
+!                                                                    !
+!***********************************************************************
+!                                                                      *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+!                                                                      *
+!                                                                      *
+!                                                                      *
+!                                                                      *
+!***********************************************************************
+! ECIN999.SQC
+!
+! Change History -
+! 06/20/96 - Added new function Detect-Rowid_Value to loop through the record
+! definitions to match row ID against current data row. If it cannot find
+! the byte values in the data, it will error out severely with the
+! Process-999-Error function.
+! 07/03/96 - Converted Work List processing to support V6 Business Process
+! definitions. This required a changed to call 'Log-WL-Entry' and call
+! to 'Worklist-gen'.
+! 07/09/96 - Added support to for data conversion profiles. Added
+! "Cvt_Profile_ID" global variable.
+! 07/25/96 - Changed the select in the proc Validate-EC_EXT_TP_ID to handle
+! parent level trading partner profiles. It now selects either the profile
+! info from the current TPID or the related TPID.
+! 08/20/96 - Added call to "Update-Prcs-Run-Status" to update the run
+! control status in process scheduler.
+! 09/23/96 - Changed correlation table names so that they don't match
+! actual table names. This fix is for DB2 support. In most cases dropped
+! correlation usage.
+! 09/30/96 - Fixed global variable assignment and Q instance calculation
+! in the 'Process-999-Error' routine. Also deleted the
+! 'Validate-EC_EXT_TP_ID' function and now call the 'Get-ECPROFILEIDS'
+! to get the profile info.
+! 10/17/96 - Due to DB2 returning trailing blanks, needed to use 'rtrim'
+! function for all selected character columns.
+! 03/17/97 - Implemented Changes necessary for Forced Agent Mapping
+!
+!***********************************************************************
+
+
+!----------------------------------------------------------------------!
+!  Process-999-Row
+!  This proc parses the 999 control record in the flat file. It then
+!  validates the control information to make sure further data can be
+!  processed. It saves the actual flat file row in global memory. This
+!  will be saved to the DB in case an error occurs at the LUW level later on.
+!----------------------------------------------------------------------!
+begin-procedure Process-999-Row
+   #debugh do debug-msg('Process-999-Row')
+
+   let $Active_999_Row_Data = $Input_Record
+   do Parse-999-Row($Input_Record, $ECTRANSID, $EC_Entitycd_Ext,
+      $Ec_Ext_TP_ID, $EC_Entitycd_BU, $Ec_Alias_TP_ID)
+
+   do Validate-999-Row
+
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+!  Process-Force-999
+!  This procedure is called if the user is forcing a flat file to be
+!  Processed with specified partner information.
+!----------------------------------------------------------------------!
+begin-procedure Process-Force-999
+   #debugh do debug-msg('Process-Force-999')
+
+   let $ectransid = $Force_trans
+   let $ec_Entitycd_ext = $Force_eec
+   let $ec_Ext_TP_ID = $Force_etpi
+   let $ec_Entitycd_BU = $Force_iaec
+   let $ec_Alias_TP_ID = $Force_itpi
+
+   do Validate-999-Row
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+!  Parse-999-Row
+!----------------------------------------------------------------------!
+begin-procedure Parse-999-Row($input_record, :$trans_id, :$entitycd_ext,
+    :$ext_tp_id, :$entitycd_bu, :$alias_tp_id)
+   #debugh do debug-msg('Parse-999-Row')
+
+   let #start_transid    = #_File_Rowid_Size + 1
+   let #start_ext_cd     = #start_transid + #_ectransid_size
+   let #start_ext_tpid   = #start_ext_cd + #_ec_entitycd_size
+   let #start_bu_cd      = #start_ext_tpid +#_ec_tp_id_size
+   let #start_alias_tpid = #start_bu_cd + #_ec_entitycd_size
+
+   let $trans_id     = rtrim({PS-substr}($input_record,#start_transid, #_ectransid_size),' ')
+   let $entitycd_ext = rtrim({PS-substr}($input_record,#start_ext_cd, #_ec_entitycd_size),' ')
+   let $ext_tp_id    = rtrim({PS-substr}($input_record, #start_ext_tpid, #_ec_tp_id_size),' ')
+   let $entitycd_bu  = rtrim({PS-substr}($input_record,#start_bu_cd, #_ec_entitycd_size),' ')
+   let $alias_tp_id  = rtrim({PS-substr}($input_record, #start_alias_tpid, #_ec_tp_id_size),' ')
+
+   #debugv display '$transid=' noline
+   #debugv display $trans_id
+   #debugv display '$entitycd_ext=' noline
+   #debugv display $entitycd_ext
+   #debugv display '$ext_tp_id=' noline
+   #debugv display $ext_tp_id
+   #debugv display '$entitycd_bu=' noline
+   #debugv display $entitycd_bu
+   #debugv display '$alias_tp_id=' noline
+   #debugv display $alias_tp_id
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+!  Validate-999-Row
+!----------------------------------------------------------------------!
+begin-procedure Validate-999-Row
+   #debugh do debug-msg('Validate-999-Row')
+
+   let #Message_Nbr = 0
+
+   do Validate-ECTRANSID
+
+   if #Message_Nbr = 0
+      let $ecmapprofileid = ''
+      do Get-ECPROFILEIDS($Ec_Ext_Tp_Id, $ecmapprofileid, $Tp_Profile_ID, $Cvt_Profile_ID)
+      if isblank($ecmapprofileid)
+         let #Message_Nbr = 205
+      end-if
+   end-if
+
+   if #Message_Nbr = 0
+      do Validate-EC_ALIAS_TP_ID($Ec_Ext_Tp_Id, $Ec_Alias_Tp_Id, $int_tp_id)
+      if isblank($int_tp_id)
+         let #Message_Nbr = 206
+      end-if
+   end-if
+
+   if #Message_Nbr = 0
+      do Convert-EC_ALIAS_TP_ID($int_tp_id, $EC_Entitycd_BU, $Q_Business_Unit)
+      if isblank($Q_Business_Unit)
+         let #Message_Nbr = 204
+      else
+         let $Active_Business_Unit = $Q_Business_Unit
+      end-if
+   end-if
+
+   if #Message_Nbr = 0
+      do Get-ECENTITYCD_Type($Ec_Entitycd_Ext, $temp, $entitycd_recname)
+      do Convert-External_TP_ID($Active_Business_Unit,
+          $Ec_Ext_Tp_Id, $Ec_Entitycd_Ext, $entitycd_recname, $Q_Cust_Vndr)
+      if isblank($Q_Cust_Vndr)
+         let #Message_Nbr = 207
+         let $Error_Misc = 'Active Business Unit=('
+            || $Active_Business_Unit || '), External TPID=('
+            || $Ec_Ext_Tp_Id || '), Entity Code=(' || $Ec_Entity_Code || ')'
+      end-if
+   end-if
+
+   if #Message_Nbr = 0
+      do Get-ECMAPID($ecmapprofileid, $ECTRANSID, $Bus_Doc_In_Out_Sw, $ECMAPID)
+      if isblank($ECMAPID)
+         let #Message_Nbr = 209
+         let $Error_Misc = 'EC Inbound Process Map ID (' || $ECMAPID
+         || ') External TPID (' || $Ec_Ext_TP_ID || ').'
+      end-if
+   end-if
+
+   if #Message_Nbr > 0
+      do Process-999-Error
+   end-if
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+!  Validate-ECTRANSID
+!----------------------------------------------------------------------!
+begin-procedure Validate-ECTRANSID
+   #debugh do debug-msg('Validate-ECTRANSID')
+
+   let $temp = ''
+
+begin-select on-error=SQLError
+
+PS_ECTRANS1.ECTRANSID
+
+   let $temp = &PS_ECTRANS1.ECTRANSID
+
+FROM PS_ECTRANS PS_ECTRANS1
+WHERE PS_ECTRANS1.ECTRANSID = $ectransid
+
+end-select
+
+   if isblank($temp)
+      let #Message_Nbr = 203
+   end-if
+
+end-procedure
+
+!----------------------------------------------------------------------!
+!  Validate-EC_ALIAS_TP_ID
+!----------------------------------------------------------------------!
+begin-procedure Validate-EC_ALIAS_TP_ID($ext_tp_id, $alias_tp_id, :$int_tp_id)
+   #debugh do debug-msg('Validate-EC_ALIAS_TP_ID')
+
+   let $int_tp_id = ''
+
+begin-select on-error=SQLError
+
+PS_ECTPALIAS1.EC_INT_TP_ID
+
+   let $int_tp_id = rtrim(&PS_ECTPALIAS1.EC_INT_TP_ID, ' ')
+
+FROM PS_ECTPALIAS PS_ECTPALIAS1
+WHERE PS_ECTPALIAS1.EC_EXT_TP_ID = $ext_tp_id
+AND   PS_ECTPALIAS1.EC_ALIAS_TP_ID = $alias_tp_id
+
+end-select
+
+   #debugv display '$Int_TP_ID=' noline
+   #debugv display $int_tp_id
+
+end-procedure
+
+!----------------------------------------------------------------------!
+!  Process-999-Error
+!----------------------------------------------------------------------!
+begin-procedure Process-999-Error
+   #debugh do debug-msg('Process-999-Error')
+
+   evaluate #Message_Nbr
+      when = 203
+         let $error_999_msg = 'Invalid EC Trans ID'
+      when = 204
+         let $error_999_msg = 'Unable to convert Internal TP ID to Business Unit'
+      when = 205
+         let $error_999_msg = 'Invalid External TP ID'
+      when = 206
+         let $error_999_msg = 'Invalid Internal Alias TP ID'
+      when = 207
+         let $error_999_msg = 'Unable to convert External TP ID to Cust/Vendor'
+      when = 209
+         let $error_999_msg = 'Unable to Select Map ID'
+      when = 210
+         let $error_999_msg = 'Unable to resolve File Row ID'
+      when = 211
+         let $error_999_msg = 'Unable to resolve Trading Partner Profile ID'
+      when = 212
+         let $error_999_msg = 'Unable to resolve Data Conversion Profile ID'
+      when-other
+         let $error_999_msg = 'Unknown Error'
+   end-evaluate
+
+   do Commit-Transaction
+
+   do Get-ECQUEUEINSTANCE($ECTRANSID, 'I' , #ECQUEUEINSTANCE)
+
+   let #luw_error_total = #luw_error_total + 1
+   do Update-ECBUSDOCHDR(#ECBUSDOCID, 'N', #luw_load_total, #luw_error_total)
+
+   let $ecdatavalue = $Input_Record
+   let #ECqueueinstance_err = #ECQUEUEINSTANCE
+   let #LUWlinenum  = 0
+   let $ecfilerowid_filedata0 = $Active_Rowid_99X
+   let $ECBUSDOCDTL_Status = $Load_Error_Status
+   let $Temp_Space = '          '
+   let $Error_Misc = $Error_Misc || ' ECTRANSID = ' || $Ectransid || $Temp_Space
+                     || 'EC_EXT_TP_ID = ' || $Ec_Ext_TP_ID  || $Temp_Space
+                     || 'EC_ALIAS_TP_ID = ' || $Ec_Alias_TP_ID
+
+   do Process-ECBUSDOCLN(#ECBUSDOCID, $ECTRANSID, #ECQUEUEINSTANCE, $Bus_Doc_In_Out_Sw)
+
+   do Process-ECBUSDOCDTL
+
+   do Process-ECBUSDOCERR
+
+   do Log-WL-Entry('Manage EDI',
+                   'Manage Inbound EDI Agent',
+                   'Run Inbound Agent',
+                   'Work Inbound Agent Errors',
+                   'ECBUSDOCLN_WL',
+                   'ECIN0001',
+                   #ECBUSDOCID, $ECTRANSID,
+                   #ECQUEUEINSTANCE, $Bus_Doc_In_Out_Sw)
+
+
+   do Update-ECQUEUEINSTANCE($ECTRANSID, 'I' , #ECQUEUEINSTANCE)
+   let #prcs_run_status = #prcs_run_status_error
+   do Update-Prcs-Run-Status
+   do Commit-Transaction
+
+   display '---------------------------------------------------'
+   display '---------------------------------------------------'
+   display 'Error encountered in the business document 999/998 row.'
+   display 'Check your worklist.'
+   display $error_999_msg
+   display $Error_Misc
+   display '---------------------------------------------------'
+   display '---------------------------------------------------'
+STOP
+
+end-procedure
+
+!----------------------------------------------------------------------!
+!   Process-998-Row
+!   This procedure selects the ectransid from the ECMAPDEFN record based
+!   on input mapid. Mapid is unique and 998 assumes that TPID info is not
+!   known at this point. It returns the parsed map id, TP profile ID, and
+!   data conversion profile ID. It also returns the transaction ID from the DB.
+!
+!----------------------------------------------------------------------!
+
+begin-procedure Process-998-Row($input_record, :$mapid, :$transid,
+                                :$profile_id, :$cvt_pro_id,$force_flag,$force_map,$force_tpi,$force_cpi)
+
+   #debugh do debug-msg('Process-998-Row')
+
+   let $transid = ' '
+! added for force
+   if $force_flag = '8'
+    let $mapid = $force_map
+    let $profile_id = $force_tpi
+    let $cvt_pro_id = $force_cpi
+   else
+   let #start_mapid = #_Rowid_999_Size + 1
+   let #start_pro = #start_mapid + #_Ec_Mapid_Size
+   let #start_cvt = #start_pro + #_Profile_Size
+   let $mapid = rtrim({PS-substr}($input_record, #start_mapid, #_Ec_Mapid_Size), ' ')
+   let $profile_id = rtrim({PS-substr}($input_record, #start_pro, #_Profile_Size), ' ')
+   let $cvt_pro_id = rtrim({PS-substr}($input_record, #start_cvt, #_Profile_Size), ' ')
+   end-if
+
+   #debugv display 'Input map=' noline
+   #debugv display $mapid
+   #debugv display 'Input Profile id=' noline
+   #debugv display $profile_id
+   #debugv display 'Input Convert Profile id=' noline
+   #debugv display $cvt_pro_id
+
+begin-select on-error=SQLError
+
+PS_ECMAPDEFN2.ECTRANSID
+
+   let $transid = &PS_ECMAPDEFN2.ECTRANSID
+
+FROM   PS_ECMAPDEFN PS_ECMAPDEFN2
+       WHERE  PS_ECMAPDEFN2.ECMAPID = $mapid
+
+end-select
+
+   if isblank($transid)
+   ! Since no transid exists, can not create ecqueueinstance and log error in DB
+      let #prcs_run_status = #prcs_run_status_error
+      do Update-Prcs-Run-Status
+      do Commit-Transaction
+      let #_Message_Nbr = 209
+      display '---------------------------------------------------'
+      display '---------------------------------------------------'
+      display 'Error encountered in the business document 998 row.'
+      display 'Could not find Map Definition specified in the 998 Row. File Map ID=' noline
+      display $mapid
+      display '---------------------------------------------------'
+      display '---------------------------------------------------'
+      STOP
+   end-if
+
+   let $found = ''
+begin-select on-error=SQLError
+
+PS_ECTPPROFILE.TP_PROFILE_ID
+
+   let $found = 'Y'
+
+FROM PS_ECTPPROFILE
+WHERE PS_ECTPPROFILE.TP_PROFILE_ID = $profile_id
+
+end-select
+
+   if isblank($found)
+      let #_Message_nbr = 211
+      let $_Error_Misc = '998 TP Profile = (' || $profile_id || ').'
+      let $_ECTRANSID = $transid
+      do Process-999-Error
+   end-if
+
+   let $found = ''
+begin-select on-error=SQLError
+
+PS_ECCVTPROFILE.CVT_PROFILE_ID
+
+   let $found = 'Y'
+
+FROM PS_ECCVTPROFILE
+WHERE PS_ECCVTPROFILE.CVT_PROFILE_ID = $cvt_pro_id
+
+end-select
+
+!  if isblank($found)
+!     let #_Message_nbr = 212
+!     let $_Error_Misc = '998 Data Conversion Profile = (' || $cvt_pro_id || ').'
+!     let $_ECTRANSID = $transid
+!     do Process-999-Error
+!  end-if
+   let $_Active_999_Row_Data = $input_record
+   let $_Q_Cust_Vndr = ' '          ! These values will NOT be available with 998 mapping
+   let $_EC_Entitycd_Ext = ' '
+   let $_Q_Business_Unit = ' '
+   let $_EC_Entitycd_Bu = ' '
+
+end-procedure
+
+!----------------------------------------------------------------------!
+!   Detect-Rowid_Value
+! This proc determines what the row id is for the current data record read
+! from the file. If it detects a 999 row, it returns this immediately.
+! Else it loops through the PS_ECINMAPFILE array to match against the default
+! data value. The row ID, start postion, and length have been previously
+! saved when reading in the map definition.
+!----------------------------------------------------------------------!
+begin-procedure Detect-Rowid_Value($input_record, :$rowid)
+   #debugh do debug-msg('Detect-Rowid_Value')
+   #debugv display 'Input record :'
+   #debugv display $input_record
+
+
+   if $_csv_flag = 'N'
+     let $rowid = {PS-substr}($input_record, 1, #_Rowid_999_Size)
+
+     if $rowid <> $_Rowid_999 and $rowid <> $_Rowid_998
+       let #i = 0
+
+       if $_suppress_rowid = 'N'
+         while #i <= #_ECmapid_Count        ! remember #_ECmapid_Count was not post incremented
+           get
+              $rowid
+              $value
+              #startpos
+              #length
+           from PS_ECINMAPFILE(0)
+              ecfilerowid(#i)
+              rowidvalue(#i)
+              rowidstartpos(#i)
+              rowidlength(#i)
+
+           if $value = {PS-substr}($input_record, #startpos, #length)
+              break
+           end-if
+           add 1 to #i
+         end-while
+
+         if #i > #_ECmapid_Count
+           let #_Message_Nbr = 210
+           let $_Error_Misc = 'Input Data Row (' || $input_record || ')  '
+           do Process-999-Error      ! Kill this program NOW
+         end-if
+
+        else   ! not csv BUT flat file does not contain ROWID
+           let $rowid = '000'
+        end-if
+
+     end-if
+
+   else
+
+! this is a CSV file, we will assume that the first element in the CSV file
+! is the rowid.   If the suppress flag is on, we force a rowid of 000
+
+    if $_suppress_rowid = 'N'
+      let #sep_start = instr($input_record,$_csv_separator,1)
+      let $csv_element = {PS-substr}($input_record,1,#sep_start)
+      let $csv_element = rtrim(ltrim($csv_element,' '),' ')
+      let $csv_element = rtrim($csv_element,$_csv_separator)
+      let $csv_element = rtrim($csv_element,$_csv_delimiter)
+      let $rowid = ltrim($csv_element,$_csv_delimiter)
+    else
+      let $rowid = '000'
+    end-if
+
+   end-if
+
+
+   #debugv display 'Detected rowid=' noline
+   #debugv display $rowid
+end-procedure
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

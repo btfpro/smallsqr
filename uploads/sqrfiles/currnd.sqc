@@ -1,0 +1,1063 @@
+! ***************************************************************!
+!  This software and related documentation are provided under a!
+!  license agreement containing restrictions on use and!
+!  disclosure and are protected by intellectual property!
+!  laws. Except as expressly permitted in your license agreement!
+!  or allowed by law, you may not use, copy, reproduce,!
+!  translate, broadcast, modify, license, transmit, distribute,!
+!  exhibit, perform, publish or display any part, in any form or!
+!  by any means. Reverse engineering, disassembly, or!
+!  decompilation of this software, unless required by law for!
+!  interoperability, is prohibited.!
+!  The information contained herein is subject to change without!
+!  notice and is not warranted to be error-free. If you find any!
+!  errors, please report them to us in writing.!
+!  !
+!  Copyright (C) 1988, 2011, Oracle and/or its affiliates.!
+!  All Rights Reserved.!
+! ***************************************************************!
+ 
+ 
+!                                                                    !
+!----------------------------------------------------------------------!
+! Report Name: CURRND.SQC -- Currency Rounding Common Module           !
+!----------------------------------------------------------------------!
+!----------------------------------------------------------------------!
+
+!----------------------------------------------------------------------!
+! Variable Definitions
+! Descr:      !
+!----------------------------------------------------------------------!
+
+#define WhereClause  'V'
+#define ProcInstance 'P'
+#define ACTIVE       'A'
+#define NULL         ''
+!----------------------------------------------------------------------!
+! Procedure:  Init-Round-Fields                                        !
+! Descr:      This procedure is called directly from other SQRs.       !
+!             It initializes all areas where data will be passed from  !
+!             the calling SQR to the Round-Currency routine.           !
+!----------------------------------------------------------------------!
+
+begin-PROCEDURE Init-Round-Fields
+
+#debug display 'Entering Init-Round-Fields'
+
+move ' ' to $cur_recname
+move ' ' to $cur_rqst_opt
+move ' ' to $cur_where_clause
+let $cur_effdt = {NO}
+let #cur_prcs_instance = 0
+
+if $Currnd_Init_Done = ''       ! First time init called
+  create-array name=CurRndFlds Size=200
+       field=cur_fieldname:char
+  let $Currnd_Init_Done = 'Y'
+else
+  clear-array name=CurRndFlds
+end-if
+
+let #Cur_Rnd_Idx = 0
+
+#debug display 'Leaving Init-Round-Fields'
+
+end-procedure
+
+
+
+!----------------------------------------------------------------------!
+! Procedure:  Round-Currency                                           !
+! Descr:      This main loop is called from other SQRs and calls       !                 !
+!             other procdueres in the SQC                              !
+!----------------------------------------------------------------------!
+
+begin-PROCEDURE Round-Currency
+#debug display 'Entering Round-Currency'
+#debug display $cur_recname
+#debug display $cur_rqst_opt
+#debug display $cur_where_clause
+#debug display $cur_effdt
+do Get-Multicurrency-Flag
+if &multicurrency = 'Y'
+  do Validate-Input
+  do Uppercase-Recname
+  do Build-Where-Clause
+  do Determine-Round-Type
+  do Loop-Thru-Subrecords
+  do Loop-Thru-Fields
+end-if
+#debug display 'Leaving Round-Currency'
+end-PROCEDURE
+
+
+!----------------------------------------------------------------------!
+! Procedure:  Get-Multicurrency-Flag                                   !
+! Descr:      Only proceed to round currency if the database           !
+!             MultiCurrency flag is set to 'Y'                         !
+!----------------------------------------------------------------------!
+
+begin-procedure Get-Multicurrency-Flag
+
+#debug display 'Entering Get-Multicurrency-Flag'
+
+begin-Select
+
+MULTICURRENCY        &multicurrency
+
+  from PSOPTIONS
+
+end-Select
+
+#debug display 'Leaving Get-Multicurrency-Flag'
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+! Procedure:  Validate-Input                                           !
+! Descr:      This procedure validates that the calling SQR has passed !
+!             valid values into the variables used by this SQC.        !
+!----------------------------------------------------------------------!
+
+begin-procedure Validate-Input
+#debug display 'Entering Validate-Input'
+
+! Option must be either P or V
+! If option is P there must be value for Process Instance
+! If option is V there must be value for Where clause
+evaluate $cur_rqst_opt
+when = {ProcInstance}
+  if #cur_prcs_instance = 0
+    display 'You must pass a Process Instance in #cur_prcs_instance'
+    stop
+  end-if
+when = {WhereClause}
+  if $cur_where_clause = {Null}
+    display 'You must pass a where clause in $cur_where_clause'
+    stop
+  end-if
+break
+when-other
+    display 'Currency Round Request Option must be P or V - Terminating'
+    stop
+end-evaluate
+#debug display '  finished evaluate'
+
+
+
+! Recname must be valid record name
+
+let $recname_found = {NO}
+Begin-Select
+RECNAME
+  let $recname_found = {YES}
+from
+PSRECDEFN
+where
+RECNAME = $cur_recname
+
+End-Select
+
+if $recname_found = {NO}
+display 'Recname passed to rounding routine is not valid' NOLINE
+display $cur_recname
+stop
+end-if
+
+! There must be an effective date
+
+if $cur_effdt = {NO}
+display 'You must pass an effective date to the Rounding routine'
+stop
+end-if
+
+
+#debug display 'Leaving Validate-Input'
+end-procedure
+
+!----------------------------------------------------------------------!
+! Procedure:  Uppercase-Recname                                        !
+! Descr:      Recname must be uppercase for dynamic SQL later          !
+!----------------------------------------------------------------------!
+
+begin-procedure Uppercase-Recname
+
+uppercase $cur_recname
+
+#debug display 'Leaving Uppercase-Recname'
+
+end-procedure
+
+!----------------------------------------------------------------------!
+! Procedure:  Build-Where-Clause                                       !
+! Descr:      This procedure builds a where clause based on user call  !
+!----------------------------------------------------------------------!
+
+
+begin-procedure Build-Where-Clause
+
+#debug display 'Entering Build-Where-Clause'
+
+! create where clause to be added into SQL as needed.
+! if user specifies where clause in call leave as is. Otherwise
+! build one using process instance.
+
+if $cur_rqst_opt = 'P'
+let $cur_prcs_inst = to_char(#cur_prcs_instance)
+let $cur_where_clause = 'PROCESS_INSTANCE = '||$cur_prcs_inst
+end-if
+
+#debug display 'Leaving Build-Where-Clause'
+
+end-procedure
+
+!----------------------------------------------------------------------!
+! Procedure:  Determine-Round-Type                                     !
+! Descr:      Based on the database figure out round algorithim to use !
+!----------------------------------------------------------------------!
+
+begin-procedure Determine-Round-Type
+
+#debug display 'Entering Determine-Round-Type'
+
+move ' ' to $round-type
+
+#ifdef MICROSOFT
+move 'Round-Type-1' to $round-type
+#end-if
+
+#ifdef ORACLE
+move 'Round-Type-1' to $round-type
+#end-if
+
+#ifdef INFORMIX
+move 'Round-Type-1' to $round-type
+#end-if
+
+#ifdef DB2ALL
+move 'Round-Type-2' to $round-type
+#end-if
+
+#ifdef SYBASE
+move 'Round-Type-2' to $round-type
+#end-if
+
+!#ifdef MICROSOFT
+!Left in case problems with new round type 1
+!move 'Round-Type-3' to $round-type
+!#end-if
+
+!#ifdef ORACLE
+!Left in case problems with new round type 1
+!move 'Round-Type-3' to $round-type
+!#end-if
+
+!#ifdef INFORMIX
+!Left in case problems with new round type 1
+!move 'Round-Type-3' to $round-type
+!#end-if
+
+if $round-type = ' '
+ display 'Database Currency Rounding Type not defined in Currency Rounding routine'
+ stop
+end-if
+
+
+
+
+
+
+#debug display 'Leaving Determine-Round-Type'
+
+end-procedure
+
+!----------------------------------------------------------------------!
+! Procedure:  Loop-Thru-Fields                                         !
+! Descr:      This procedure starts the process of rounding each field !
+!             specified in the user-passed array                       !
+!----------------------------------------------------------------------!
+
+begin-procedure Loop-Thru-Fields
+#debug display 'Entering Loop-Thru-Fields'
+
+!Loop through the array and process each field
+let #Cur_Rnd_Idx = 0
+let $rec_found = {YES}
+while $rec_found = {YES}
+add 1 to #Cur_Rnd_Idx
+move {NO} to $defn_row_found
+get $cur_fieldname from CurRndFlds (#Cur_Rnd_Idx) cur_fieldname
+#debug display 'record:' NOLINE
+#debug display $cur_recname
+#debug display 'field:' NOLINE
+#debug display $cur_fieldname
+!#debug display 'Processing Field ' $cur_fieldname
+
+if $cur_fieldname = {NULL}  !done with array
+ let $rec_found = {NO}
+else
+
+ do Get-Field-Defn-Info
+
+ if $defn_row_found ={NO}
+#debug       display 'Field or RecField definition not found for'
+#debug       show 'Record (' $Cur_recname   ') Field (' $Cur_fieldname ')'
+
+
+
+ end-if
+
+ do Select-Currency-Info
+
+end-if
+end-while
+#debug display 'Leaving Loop-Thru-Fields'
+
+end-procedure
+
+!----------------------------------------------------------------------!
+! Procedure:  Loop-Thru-Subrecords                                     !
+! Descr:      Get all the subrecords which are a part of the record    !
+!             which we are considering.                                !
+!----------------------------------------------------------------------!
+
+begin-procedure Loop-Thru-Subrecords
+
+#debug display 'Entering Loop-Thru-Subrecords'
+
+CREATE-ARRAY NAME=currRndRecs Size=200 FIELD=recname:char
+let #lastCleared = 0
+let #lastRec = 1
+
+!put the initial record in the record list
+#debug display 'Value of Cur_recname : ' NOLINE
+#debug display $cur_recname
+PUT $cur_recname INTO currRndRecs(#lastRec) recname
+
+!loop through the record list expanding it as we go until we run out
+WHILE #lastRec > #lastCleared
+
+  !get the record name we are working with currently
+  add 1 to #lastCleared
+
+  #debug display 'LastCleared num is : ' NOLINE
+  #debug display #lastCleared
+
+  get $currEntryName from currRndRecs(#lastCleared) recname
+
+  #debug display 'A pertinent record : ' NOLINE
+  #debug display $currEntryName
+
+  do Select-Subrec-Names
+
+  !we've found every subrecord of our current entry, so we can say it's cleared
+
+end-WHILE
+
+#debug display 'Leaving Loop-thru-subrecords'
+end-procedure
+
+
+!----------------------------------------------------------------------!
+! Procedure:  Select-Subrec-Names                                      !
+! Descr:      Puts into the array all subrecords defined for the       !
+!             record name that we are processing.  The record name that!
+!             we are processing is either the recname passed by the    !
+!             calling program or a subrecord of a recname (or a        !
+!             subrecord) passed by the calling program.                !
+!----------------------------------------------------------------------!
+
+
+
+begin-procedure Select-Subrec-Names
+
+let $currEntryName = rtrim($currEntryName,' ')
+
+#debug display 'Entering Select-Subrec-Names'
+
+begin-SELECT
+
+RECFIELD.FIELDNAME
+
+        !for Every subrecord found in this record add it to the record list
+
+        move &recfield.fieldname to $subrecord
+#debug        display 'Subrecord is : ' NOLINE
+#debug        display $subrecord
+        add 1 to #lastRec
+        put &recfield.fieldname into currRndRecs(#lastrec) recname
+
+
+FROM
+PSRECFIELD RECFIELD
+
+WHERE
+RECFIELD.RECNAME = $currEntryName and
+RECFIELD.SUBRECORD = 'Y'
+
+end-SELECT
+
+#debug display 'Leaving Select-Subrec-Names'
+
+
+end-procedure
+
+!----------------------------------------------------------------------!
+! Procedure:  Get-Field-Defn-Info                                      !
+! Descr:      Get field definition information for later processing    !
+!----------------------------------------------------------------------!
+
+begin-procedure Get-Field-Defn-Info
+#debug display 'Entering Get-Field-Defn-Info'
+
+let #currentRecNum = 1
+move ' ' to $curctlfieldname
+#debug show 'lastrec = ' #lastrec
+#debug show  $curctlfieldname
+while (#currentRecNum <= #lastRec) and ($curctlfieldname = ' ')
+
+        get $currentRecName from currRndRecs(#currentRecNum) recname
+
+        #debug show '#currentRecNum = ' #currentRecNum
+        #debug display '$currentRecName = 'NOLINE
+        #debug display $currentRecName
+        #debug display '$cur_fieldname = 'NOLINE
+        #debug display $cur_fieldname
+
+        do Select-Currencies
+
+        add 1 to #currentRecNum
+end-while
+
+if $curctlfieldname = ' '
+#debug  display 'Record.Field does not have a currency control field'
+#debug         show 'Record (' $Cur_recname   ') Field (' $Cur_fieldname ')'
+stop
+end-if
+
+#debug display 'Leaving Get-Field-Defn-Info'
+
+end-procedure
+
+!----------------------------------------------------------------------!
+! Procedure:  Select-Currencies                                        !
+! Descr:      Get field definition information for later processing    !
+!----------------------------------------------------------------------!
+
+begin-procedure Select-Currencies
+
+let $currentRecName = rtrim($currentRecName,' ')
+let $cur_fieldname = rtrim($cur_fieldname,' ')
+
+#debug display 'Entering Select-Currencies'
+
+begin-SELECT
+
+DBFIELD.DECIMALPOS        &decimalpos
+DBFIELD.LENGTH            &length
+RECFIELD.CURCTLFIELDNAME  &curctlfieldname
+
+        move {YES} to $defn_row_found
+        let #fld_decimal_pos = &decimalpos
+        let #fld_length = &length
+
+        #debug DISPLAY 'Field Decimal Positions: ' NOLINE
+        #debug DISPLAY #fld_decimal_pos
+        #debug DISPLAY 'Field Length: '  NOLINE
+        #debug DISPLAY #fld_length
+
+        let $curctlfieldname = &curctlfieldname
+        UPPERCASE $curctlfieldname
+        #debug DISPLAY 'Currency Control Field: ' NOLINE
+        #debug DISPLAY $curctlfieldname
+
+from    PSDBFIELD DBFIELD,
+        PSRECFIELDDB RECFIELD
+where
+        DBFIELD.FIELDNAME = RECFIELD.FIELDNAME
+        and
+        RECFIELD.RECNAME = $currentRecName
+        and
+        DBFIELD.FIELDNAME = $cur_fieldname
+
+end-SELECT
+
+if substr($curctlfieldname,1,1) = ' '
+   display 'Record.Field does not have a currency control field'
+   show 'Record (' $Cur_recname   ') Field (' $Cur_fieldname ')'
+   stop
+end-if
+
+#debug display 'Leaving Select-Currencies'
+
+end-procedure
+
+!----------------------------------------------------------------------!
+! Procedure:  Build-Update-Where-Clause                                !
+! Descr:      This procedure builds a where clause used in             !
+!             update statements                                         !
+!----------------------------------------------------------------------!
+
+
+begin-procedure Build-Update-Where-Clause
+
+#debug display 'Entering Build-Update-Where-Clause'
+
+move 'A' to $active
+
+let $cur_update_where_clause =
+
+$curctlfieldname ||' in ('||$currencies||')'
+
+!now concatenate the value passed in by calling program
+
+let $cur_update_where_clause =
+$cur_update_where_clause ||' and '||$cur_where_clause
+
+#debug display 'Leaving Build-Update-Where-Clause'
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+! Procedure:  Select-Currency-Info                                     !
+! Descr:      This procedure selects information from the Currency Code!
+!             table.                                                   !
+!----------------------------------------------------------------------!
+
+begin-procedure Select-Currency-Info
+
+#debug display 'Entering Select-Currency-Info'
+#debug display $cur_effdt
+
+let $currencies=''
+let $all_currencies=''
+let #cur_decimal_pos_prior = 99
+#debug let $col1 = 'A.'||$curctlfieldname
+#debug DISPLAY 'Select currency control field is: ' NOLINE
+#debug DISPLAY $col1
+let $ps_cur_recname = 'PS_'||$cur_recname
+
+#debug DISPLAY 'Select currency recname is: ' NOLINE
+#debug DISPLAY $ps_cur_recname
+
+
+begin-SELECT DISTINCT
+
+[$curctlfieldname] &active_cur_cd=char
+
+  let $currency_cd = &active_cur_cd
+
+  if $all_currencies <> ''
+     CONCAT ',' with $all_currencies
+  end-if
+
+  CONCAT '''' with $all_currencies
+  CONCAT $currency_cd with $all_currencies
+  CONCAT '''' with $all_currencies
+
+FROM
+[$PS_CUR_RECNAME]
+WHERE
+[$cur_where_clause]
+
+end-SELECT
+
+if $all_currencies = ''
+
+   DISPLAY 'No rows found to round in ' NOLINE
+   DISPLAY $ps_cur_recname
+   DISPLAY 'WHERE'
+   DISPLAY $cur_where_clause
+
+else
+
+#debug DISPLAY 'Currency codes used: ' NOLINE
+#debug DISPLAY $all_currencies
+
+begin-SELECT
+
+CURCD1.CURRENCY_CD        &currency_cd,
+CURCD1.DECIMAL_POSITIONS  &decimal_positions,
+CURCD1.EFFDT              &hold_effdt,
+MAX(CURCD2.EFFDT)         &hold_maxeffdt
+
+  let #cur_decimal_pos = &decimal_positions
+  let $currency_cd = &currency_cd
+
+#debug DISPLAY 'Currency code is: ' NOLINE
+#debug DISPLAY &currency_cd
+#debug DISPLAY 'Decimal position is: ' NOLINE
+#debug DISPLAY &decimal_positions
+
+  if #cur_decimal_pos <> #cur_decimal_pos_prior
+    let #cur_decimal_pos_prior = #cur_decimal_pos
+
+    if $currencies <> ''
+
+       do Process-Currency-Info
+       let $currencies = ''
+
+    end-if
+
+
+  else
+
+     CONCAT ',' with $currencies
+
+  end-if
+
+  let  #hold_decimal_pos = &decimal_positions
+  move #hold_decimal_pos to $cur_dec   !used for stringing into SQL
+  CONCAT '''' with $currencies
+  CONCAT $currency_cd with $currencies
+  CONCAT '''' with $currencies
+
+FROM
+PS_CURRENCY_CD_TBL CURCD1, PS_CURRENCY_CD_TBL CURCD2
+WHERE
+CURCD2.CURRENCY_CD = CURCD1.CURRENCY_CD AND
+CURCD2.EFF_STATUS = 'A' AND
+CURCD2.EFFDT <= $cur_effdt AND
+CURCD2.CURRENCY_CD IN
+([$all_currencies])
+GROUP BY CURCD1.DECIMAL_POSITIONS, CURCD1.CURRENCY_CD, CURCD1.EFFDT
+HAVING CURCD1.EFFDT = MAX(CURCD2.EFFDT)
+ORDER BY CURCD1.DECIMAL_POSITIONS
+
+end-SELECT
+
+   if $currencies <> ''
+      do Process-Currency-Info
+   else
+      DISPLAY 'No currency found in PS_CURRENCY_CD_TBL'
+      stop
+   end-if
+
+end-if
+
+#debug display 'Leaving Select-Currency-Info'
+
+end-procedure
+
+!----------------------------------------------------------------------!
+! Procedure:  Process-Currency-Info                                    !
+! Descr:      This procedure processes Currency Codes                  !
+!----------------------------------------------------------------------!
+
+begin-procedure Process-Currency-Info
+
+#debug display 'Entering Process-Currency-Info'
+#debug DISPLAY 'Processing currencies : ' NOLINE
+#debug DISPLAY $currencies
+#debug DISPLAY 'Rounding to : ' NOLINE
+#debug DISPLAY $cur_dec
+
+
+do Build-Update-Where-Clause
+
+
+evaluate $round-type
+
+   when = 'Round-Type-1'
+      do Round-Type-1
+   when = 'Round-Type-2'
+      do Det-Round
+      do Det-Factor
+      do Round-Type-2
+   when = 'Round-Type-3'
+      do Det-Factor
+      do Round-Type-3
+
+end-evaluate
+
+#debug display 'Leaving Process-Currency-Info'
+
+end-procedure
+
+!----------------------------------------------------------------------!
+! Procedure:  Round-Type-1                                             !
+! Descr:      Use native db ROUND(col, factor) to round                !
+!----------------------------------------------------------------------!
+
+begin-procedure Round-Type-1
+
+#debug display 'Entering Round-Type-1'
+
+#debug DISPLAY 'Fld decimal pos : ' NOLINE
+#debug DISPLAY #fld_decimal_pos
+#debug DISPLAY 'Hold decimal pos : ' NOLINE
+#debug DISPLAY #hold_decimal_pos
+!only round if decimal size of field is greater than or equal to currency
+!decimal precision
+
+if #fld_decimal_pos > #hold_decimal_pos
+
+
+  let $SqlCmd = ' UPDATE PS_' ||
+                 $cur_recname ||
+                ' SET ' ||
+                 $cur_fieldname ||
+                ' = ROUND(' ||
+                 $cur_fieldname ||
+                ',' ||
+                 $cur_dec ||
+                ') WHERE '
+                ||$cur_update_where_clause
+                || ''
+
+
+UPPERCASE $SqlCmd
+
+  #ifdef debug
+         display $SqlCmd
+  #endif
+
+ begin-SQL  on-error=Skip
+        [$SQLCMD]
+ end-SQL
+
+end-if
+
+#debug display 'Leaving Round-Type-1'
+
+
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+! Procedure:  Round-Type-2                                             !
+! Descr:      Second in a series of rounding algorithims. It rounds    !
+!             by truncation.                                           !
+!----------------------------------------------------------------------!
+
+begin-procedure Round-Type-2
+
+#debug display 'Entering Round-Type-2'
+
+#debug DISPLAY 'Fld decimal pos : ' NOLINE
+#debug DISPLAY #fld_decimal_pos
+#debug DISPLAY 'Hold decimal pos : ' NOLINE
+#debug DISPLAY #hold_decimal_pos
+!only round if decimal size of field is greater than currency
+!decimal precision
+
+if #fld_decimal_pos > #hold_decimal_pos
+
+
+  do Round-Type-2-Update-1
+  do Round-Type-2-Update-2
+  do Round-Type-2-Update-3
+
+end-if
+
+#debug display 'Leaving Round-Type-2'
+
+
+
+end-procedure
+
+!----------------------------------------------------------------------!
+! Procedure:  Round-Type-2-Update-Build                                !
+! Descr:      This procedure creates a generic update statement        !
+!----------------------------------------------------------------------!
+
+begin-procedure Round-Type-2-Update-Build
+
+#debug display 'Entering Round-Type-2-Update-Build'
+
+
+#debug display 'Standard where clause: ' NOLINE
+#debug display $cur_update_where_clause
+
+
+#ifdef DB2ALL
+let $alpha_round_amt = rtrim($alpha_round_amt,'0')
+let $alpha_factor = rtrim($alpha_factor,'0')
+#debug display 'Trimmed alpha factor is: ' NOLINE
+#debug display $alpha_factor
+
+let $SqlCmd = 'UPDATE PS_' || $cur_recname ||
+            ' SET ' || $cur_fieldname || ' = (' || $cur_fieldname || '
+ /'|| $alpha_factor||') '|| $cur_sign|| $alpha_round_amt || ' WHERE
+ ' ||$cur_update_where_clause|| ''
+
+#ELSE
+
+
+let $SqlCmd = 'UPDATE PS_' || $cur_recname ||
+            ' SET ' || $cur_fieldname || ' = (' || $cur_fieldname || '
+ /'|| $alpha_factor||') '|| $cur_sign|| $alpha_round_amt || ' WHERE
+ ' ||$cur_update_where_clause|| ''
+
+#ENDIF
+
+let $SqlCmd = rtrim($SqlCmd, ' ') || ' and '|| $cur_fieldname|| $cur_compare ||''
+
+
+
+UPPERCASE $SqlCmd
+
+#ifdef debug
+display $SqlCmd
+#endif
+
+#debug display 'Leaving Round-Type-2-Update-Build'
+
+end-procedure
+
+!----------------------------------------------------------------------!
+! Procedure:  Round-Type-2-Update-1                                    !
+! Descr:      This procedure creates and executes the first update     !
+!             statement.                                               !
+!----------------------------------------------------------------------!
+
+begin-procedure Round-Type-2-Update-1
+
+#debug display 'Entering Round-Type-2-Update-1'
+
+
+let $cur_sign = ' + '
+let $cur_compare = ' > 0'
+
+do Round-Type-2-Update-Build
+
+UPPERCASE $SqlCmd
+
+    #ifdef debug
+        display $SqlCmd
+    #endif
+
+begin-SQL  on-error=Skip
+        [$SqlCmd]
+end-SQL
+
+#debug display 'Leaving Round-Type-2-Update-1'
+
+end-procedure
+
+!----------------------------------------------------------------------!
+! Procedure:  Round-Type-2-Update-2                                    !
+! Descr:      This procedure creates and executes an update            !
+!             statement.                                               !
+!----------------------------------------------------------------------!
+
+begin-procedure Round-Type-2-Update-2
+
+#debug display 'Entering Round-Type-2-Update-2'
+
+
+let $cur_sign = ' - '
+let $cur_compare = ' < 0'
+
+do Round-Type-2-Update-Build
+
+    #ifdef debug
+        display $SqlCmd
+    #endif
+
+begin-SQL  on-error=Skip
+        [$SqlCmd]
+end-SQL
+
+#debug display 'Leaving Round-Type-2-Update-2'
+
+end-procedure
+
+!----------------------------------------------------------------------!
+! Procedure:  Round-Type-2-Update-3                                    !
+! Descr:      This procedure creates and executes an update            !
+!             statement.                                               !
+!----------------------------------------------------------------------!
+
+begin-procedure Round-Type-2-Update-3
+
+#debug display 'Entering Round-Type-2-Update-3'
+
+
+let $SqlCmd = 'UPDATE PS_' || $cur_recname ||
+            ' SET ' || $cur_fieldname || ' = (' || $cur_fieldname || '
+ *'|| $alpha_factor||')'|| ' WHERE
+ ' ||$cur_update_where_clause||''
+
+UPPERCASE $SqlCmd
+
+    #ifdef debug
+        display $SqlCmd
+    #endif
+
+begin-SQL  on-error=Skip
+        [$SQLCMD]
+end-SQL
+
+#debug display 'Leaving Round-Type-2-Update-3'
+
+end-procedure
+
+!----------------------------------------------------------------------!
+! Procedure:  Round-Type-3                                             !
+! Descr:      Third in a series of rounding algorithims.  It is used   !
+!             for databases that round automatically.                  !
+!----------------------------------------------------------------------!
+
+begin-procedure Round-Type-3
+
+#debug display 'Entering Round-Type-3'
+#debug DISPLAY 'Fld decimal pos : ' NOLINE
+#debug DISPLAY #fld_decimal_pos
+#debug DISPLAY 'Hold decimal pos : ' NOLINE
+#debug DISPLAY #hold_decimal_pos
+
+!only round if decimal size of field is greater than currency
+!decimal precision
+
+if #fld_decimal_pos > #hold_decimal_pos
+
+  do Round-Type-3-Update-1
+  do Round-Type-3-Update-2
+
+end-if
+
+#debug display 'Leaving Round-Type-3'
+
+
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+! Procedure:  Det-Round                                                !
+! Descr:      This procedure determines a round amount based on        !
+!             Database in use.                                         !
+!----------------------------------------------------------------------!
+
+begin-procedure Det-Round
+
+#debug display 'Entering Det-Round'
+
+let #power = #fld_decimal_pos * -1
+let #cur_round_amt = 0.5 * e10(#power)
+
+#debug display 'Round is: ' NOLINE
+#debug display #cur_round_amt
+
+let $alpha_round_amt = #cur_round_amt
+
+#debug display 'Alpha Round is: ' NOLINE
+#debug display $alpha_round_amt
+
+
+#debug display 'Leaving Det-Round'
+
+end-procedure
+
+!----------------------------------------------------------------------!
+! Procedure:  Det-Factor                                               !
+! Descr:      This procedure determines a rounding factor to be used in!
+!             the updates                                              !
+!----------------------------------------------------------------------!
+
+begin-procedure Det-Factor
+
+#debug display 'Entering Det-Factor'
+
+#debug display 'Field Decimal positions equal: ' NOLINE
+#debug display #fld_decimal_pos
+#debug display 'Currency Decimal positions equal: ' NOLINE
+#debug display #hold_decimal_pos
+
+
+let #factor = e10(#fld_decimal_pos - #hold_decimal_pos)
+#debug display 'Factor is: ' NOLINE
+#debug display #factor
+
+let $alpha_factor = #factor
+
+#debug display 'Alpha Factor is: ' NOLINE
+#debug display $alpha_factor
+
+#debug display 'Leaving Det-Factor'
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+! Procedure:  Round-Type-3-Update-1                                    !
+! Descr:      This procedure creates and executes the first update     !
+!             statement.                                               !
+!----------------------------------------------------------------------!
+
+begin-procedure Round-Type-3-Update-1
+
+#debug display 'Entering Round-Type-3-Update-1'
+
+ let $SqlCmd = 'UPDATE PS_' || $cur_recname ||
+            ' SET ' || $cur_fieldname || ' = (' || $cur_fieldname || '/'
+ || $alpha_factor ||
+            ') WHERE ' ||$cur_update_where_clause|| ''
+
+
+UPPERCASE $SqlCmd
+
+    #ifdef debug
+        display $SqlCmd
+    #endif
+
+begin-SQL  on-error=Skip
+        [$SQLCMD]
+end-SQL
+
+#debug display 'Leaving Round-Type-3-Update-1'
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+! Procedure:  Round-Type-3-Update-2                                    !
+! Descr:      This procedure creates and executes the second update    !
+!             statement.                                               !
+!----------------------------------------------------------------------!
+
+begin-procedure Round-Type-3-Update-2
+
+#debug display 'Entering Round-Type-3-Update-2'
+
+
+
+ let $SqlCmd = 'UPDATE PS_' || $cur_recname ||
+            ' SET ' || $cur_fieldname || ' = (' || $cur_fieldname || '
+* ' || $alpha_factor ||
+            ') WHERE '
+||$cur_update_where_clause|| ''
+
+
+UPPERCASE $SqlCmd
+
+    #ifdef debug
+        display $SqlCmd
+    #endif
+
+ begin-SQL  on-error=Skip
+        [$SQLCMD]
+ end-SQL
+
+#debug display 'Leaving Round-Type-3-Update-2'
+
+end-procedure
+
+!----------------------------------------------------------------------!
+! Procedure:  Skip                                                     !
+! Descr:      This procedure skips the SQL error that may be caused    !
+!             when no rows exist to update.                            !
+!----------------------------------------------------------------------!
+
+begin-procedure Skip
+  ! skip SQL update errors
+end-procedure
+
+!----------------------------------------------------------------------!
+! Called SQC Procedures                                                !
+!----------------------------------------------------------------------!
+

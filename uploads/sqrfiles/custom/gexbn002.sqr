@@ -1,0 +1,590 @@
+!***********************************************************************
+!  GEXBN002:  Weekly Benefit Contributions Register                    *
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module is the confidential and proprietary information of       *
+! Giant Eagle, Inc.; it is not to be copied, reproduced,or transmitted *
+! in any form, by any means, in whole or in part, nor is it to be used *
+! for any purpose other than that for which it is expressly provided   *
+! without the written permission of Giant Eagle.                       *
+!                                                                      *
+! Copyright (c) 1997-1998 Giant Eagle,Inc. All Rights Reserved         *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+! GEXBN002 :            Weekly Benefit Contributions Register          *
+!                                                                      *
+! Narrative:            This program is a clone of BEN003.  Reg_temp   *
+!                         is added.  Run control parameters include    *
+!                         multiple benefit programs, and multiple plan *
+!                         type/benefit plans.  Current deduction has   *
+!                         also been added.                             * 
+!                                                                      *
+! #Debugx Used:         #debug9 paragraph trace                        *
+!                       #debug8 key variable values                    *
+!                       #debug7 data returned from sql calls           *
+!                                                                      *
+! SQL Tables:           personal_data                                  *
+!                       job                                            *
+!                       dept_tbl                                       *
+!                       deduction_bal                                  *
+!                       ben_prog_partic                                *
+!                       pay_check                                      *
+!                       pay_deduction                                  *
+!                                                                      *
+! Written by:           Jim Hutchison                                  *
+!                                                                      *
+! Normally Run:         Weekly                                         *
+!                                                                      *
+! Control Parms:        FOR WHERE CLAUSE:                              *
+!                         As Of Date                                   *
+!                         Benefit Program(s)                           *
+!                         Plan Type(s)/Benefit Plan(s)                 *
+!                                                                      *
+!***********************************************************************
+!                         MODIFICATION HISTORY                         *
+!***********************************************************************
+! INITIALS  DATE        DESCRIPTION OF THE CHANGE                      *
+!***********************************************************************
+! JDH       06/17/98    Initial Creation (Cloned BEN003)               *
+!                                                                      *
+! JDH       11/20/98    Added SQRW run control logic.                  *
+!                       Changed run controls to include multiple       *
+!                          benefit programs and multiple plan type/    *
+!                          benefit plans.  Sort and break order have   *
+!                          been changed to plan type, benefit plan,    *
+!                          benefit program, emplid.                    *
+!                                                                      *
+! JDH       12/08/98    Modified logic that gets current deductions.   *
+!                       Modified logic to pull balances for the last   *
+!                          confirmed pay end date.                     *
+!                       Switched to rule-based optimizer due to poor   *
+!                          performance under cost-based optimization.  *
+!                                                                      *
+! JDH       12/30/98    Performance Tuning.                            *
+!                                                                      *
+! JDH       01/11/99    Added logic to perform Get-Deduction-Balance   *
+!                          procedure from each on-break procedure.     *
+!                                                                      *
+! SXK       06/22/99    Modified to solve split month problem by       *
+!			using pay cal bal id balance information       *
+!			rather than using check_dt                     *
+!                                                                      *
+! JDH       07/28/99    Removed company and paygroup from join between *
+!                          job and pay_check.                          *
+!                                                                      *
+! PSR       07/24/02    Modified EMPL_RCD# to EMPL_RCD                 *
+!                       LINE# to LINE_NUM                              *
+!                       PAGE# to PAGE_NUM and PAGE#_THRU to            *
+!                       PAGE_NUM_THRU                                  * 
+!                                                                      *
+! CWB      06/15/2004   Changed the variables used in the procedure    *
+!                       Get-Deduction-Balance.                         * 
+!                                                                      *
+! ISDVNPK 08/23/2007 Added PS_PER_ORG_ASGN as part of 9.0 upgrade
+! VENDKXY 08/27/2009 Done changes for ITG 63228			       *
+!***********************************************************************
+
+#include 'setenv.sqc'  !Set environment
+#include 'setup02.sqc' !Printer and page-size initialization
+#Include 'prcsapi.sqc'   !Get $oprid
+#Include 'getrplng.sqc'  !Get $language_cd
+
+begin-setup
+!#Include 'ldplntyp.sqc'  !Load-Lookup Table with Plan Types
+end-setup
+
+begin-report
+  !do Set-Optimizer-Goal ! ISDVNPK 08/23/2007 
+  do Init-Report
+  do Process-Main
+  do StdAPI-Term
+  date-time () HH:MI:SS &timeEnded
+  date-time () MM/DD/YYYY &dateEnded
+  show 'Report Ended at ' &timeEnded ' on ' &dateEnded
+end-report
+
+! ISDVNPK 08/23/2007 
+!begin-procedure Set-Optimizer-Goal
+!  Begin-SQL
+!    Alter Session Set OPTIMIZER_GOAL=RULE;
+!  End-SQL
+!end-procedure
+
+begin-procedure Init-Report
+  do Init-DateTime
+  do Init-Number
+  move 'GEXBN002' to $ReportID
+  move 'Weekly Benefit Contributions Register' to $ReportTitle
+  do Get-Current-DateTime
+  do StdAPI-Init
+
+  Let $GEXXX911_Benefit_Program_Alias = 'b.benefit_program'
+  Let $GEXXX911_Plan_Type_Alias       = 'pd.plan_type'
+  Let $GEXXX911_Benefit_Plan_Alias    = 'pd.benefit_plan'
+
+  Let $GEXXX912_Plan_Type_Alias       = 'pd.plan_type'
+  Let $GEXXX912_Benefit_Plan_Alias    = 'pd.benefit_plan'
+
+  if $prcs_process_instance = ''
+    do Ask-As-Of-Date
+   
+    Let $BenefitProgramString = ''''
+    Display 'Enter Benefit Program or leave blank to exit.'
+    While 1=1
+      Input $In-Benefit-Program Maxlen=3 'Benefit Program'
+      Uppercase $In-Benefit-Program
+      If Rtrim($In-Benefit-Program, ' ') = ''
+        Concat '''' With $BenefitProgramString
+        Break
+      End-If
+      If $BenefitProgramString <> ''''
+        Concat ''',''' With $BenefitProgramString
+      End-If
+      Concat $In-Benefit-Program With $BenefitProgramString
+    End-While
+
+    If $BenefitProgramString = ''''''
+      Let $GEXXX911_INCLUDE_BENEFIT_PROGRAM_CRITERIA = '1=1'
+      Let $GEXXX911_INCLUDE_BENEFIT_PROGRAM_DISPLAY_CRITERIA = 'ALL'
+    Else
+      Let $GEXXX911_INCLUDE_BENEFIT_PROGRAM_CRITERIA = $GEXXX911_Benefit_Program_Alias || ' In (' || $BenefitProgramString || ')'
+      Let $GEXXX911_INCLUDE_BENEFIT_PROGRAM_DISPLAY_CRITERIA = $GEXXX911_INCLUDE_BENEFIT_PROGRAM_CRITERIA
+    End-If
+
+    Display 'Enter Plan Type/Benefit Plan or leave blank to exit.'
+    While 1=1
+      Input $In-Plan-Type Maxlen=2 'Plan Type'
+      Uppercase $In-Plan-Type
+      If Rtrim($In-Plan-Type, ' ') = ''
+        Break
+      Else
+        Input $In-Benefit-Plan Maxlen=6 'Benefit Plan'
+        Uppercase $In-Benefit-Plan
+        If Rtrim($In-Benefit-Plan, ' ') = ''
+          Let $Include_Condition = '(' || $GEXXX912_Plan_Type_Alias || ' = '''  || $In-Plan-Type || ''')'
+        Else
+          Let $Include_Condition = '(' || $GEXXX912_Plan_Type_Alias || ' = '''  || $In-Plan-Type || ''' And ' || $GEXXX912_Benefit_Plan_Alias || ' = '''  || $In-Benefit-Plan || ''')'
+        End-If
+        Add 1 To #GEX_RC_BEN_PLAN_ROWS
+        If #GEX_RC_BEN_PLAN_ROWS = 1
+          Let $GEXXX912_INCLUDE_BENEFIT_PLAN_CRITERIA = '(' || $Include_Condition
+        Else
+          Let $GEXXX912_INCLUDE_BENEFIT_PLAN_CRITERIA = $GEXXX912_INCLUDE_BENEFIT_PLAN_CRITERIA || ' Or '  || $Include_Condition
+        End-If
+      End-If
+    End-While
+
+    If #GEX_RC_BEN_PLAN_ROWS = 0
+      Let $GEXXX912_INCLUDE_BENEFIT_PLAN_CRITERIA = '1=1'
+      Let $GEXXX912_INCLUDE_BENEFIT_PLAN_DISPLAY_CRITERIA = 'ALL'
+    Else
+      Let $GEXXX912_INCLUDE_BENEFIT_PLAN_CRITERIA = $GEXXX912_INCLUDE_BENEFIT_PLAN_CRITERIA || ')'
+      Let $GEXXX912_INCLUDE_BENEFIT_PLAN_DISPLAY_CRITERIA = $GEXXX912_INCLUDE_BENEFIT_PLAN_CRITERIA
+    End-If
+
+  else
+
+    Do GEXRCBN1-SELECT-PARAMETERS
+
+    Let $AsOfDate = &GEX_RC_BEN.AsOfDate
+    If Rtrim (&GEX_RC_BEN.AsOfDate, ' ') = ''
+      Let $AsOfDate = $AsOfToday
+    End-If
+
+    Do GEXXX911-Select-Benefit-Program-Parameters
+    Do GEXXX912-Select-Benefit-Plan-Parameters
+
+  end-if
+
+
+ #Include 'ldplntyp.sqc'  !Load-Lookup Table with Plan Types
+
+ do Initialization
+
+  display $ReportTitle
+
+  Do Format-DateTime($AsOfDate, $X000_Report_Heading_AsOfDate, {DEFDATE}, '', '')
+  Let $X000_Order_By = 'Plan Type, Benefit Plan, Benefit Program, Name, EmplID'
+
+  Show '$GEXXX911_Include_Benefit_Program_Display_Criteria  = ' $GEXXX911_Include_Benefit_Program_Display_Criteria
+  Show '$GEXXX912_Include_Benefit_Plan_Display_Criteria  = ' $GEXXX912_Include_Benefit_Plan_Display_Criteria
+  Show 'AsOfDate = ' $AsOfDate
+
+  do Get-Last-Confirmed-Pay
+  do P130-Print-Cover-Page
+end-procedure
+
+begin-procedure P130-Print-Cover-Page
+#debug9 Show 'P130-Print-Cover-Page'
+  Print 'RUN CONTROL INFORMATION FOR THIS REPORT RUN:'            (+5,1)
+  Print '$Prcs_OprID          ='                                  (+2,5)
+  Print $Prcs_OprID                                               (0,+2)
+  Print '$Prcs_Run_Cntl_ID    ='                                  (+1,5)
+  Print $Prcs_Run_Cntl_ID                                         (0,+2)
+
+  Print 'SELECTION CRITERIA FOR THIS REPORT RUN:'                 (+5,2)
+  Print '$GEXXX911_Include_Benefit_Program_Display_Criteria = '   (+2,5)
+  Print $GEXXX911_Include_Benefit_Program_Display_Criteria        (0,+2)
+  Print '$GEXXX912_Include_Benefit_Plan_Display_Criteria  = '     (+2,5)
+  Print $GEXXX912_Include_Benefit_Plan_Display_Criteria           (0,+2)
+  Print 'As Of Date :'                                            (+2,5)
+  Print $X000_Report_Heading_AsOfDate                             (0,+2)
+  Print 'Last confirmed pay end date:'                            (+2,5)
+  Print $pay_end_dt                                               (0,+2)
+
+  Print 'SORT ORDER FOR THIS REPORT RUN:'                         (+5,2)
+  Print $X000_Order_By                                            (+2,5)
+
+  Let #PAGE-COUNT = 0
+  NEW-PAGE
+  Let #PAGE-COUNT = 1
+End-Procedure
+
+begin-procedure Initialization
+  date-time () HH:MI:SS &timeBegan
+  date-time () MM/DD/YYYY &dateBegan
+  show 'Report Began at ' &timeBegan ' on ' &dateBegan
+  do Get-Date-Codes
+  create-array name=Totals size=7 -
+    field=TotalName:char field=total:number:6 field=startCol:number:6
+  put 'Grand Total'       into Totals(1) TotalName
+  put 'Plan Type Total'   into Totals(2) TotalName
+  put 'Ben Plan Total'    into Totals(3) TotalName
+  put 'Ben Program Total' into Totals(4) TotalName
+  put  80 96 112 129 145 161 into Totals(0) -
+    startCol(0) startCol(1) startCol(2) startCol(3) startCol(4) startCol(5)
+end-procedure
+
+
+begin-heading 10
+  #Include 'stdhdg01.sqc'
+  print 'As Of Date: '    (-1,1)
+  do Format-DateTime($AsOfDate, $out, {DEFDATE}, '', '')
+  print $out ()
+
+#ifdef DB2ALL
+  move $PlanID to $PlanID xxxx
+#endif
+#ifdef MICROSOFT
+  move $PlanID to $PlanID xxxx
+#endif
+  LookUp Plan-Types $PlanID $PlanType
+  print 'Plan Type'    (+1,1)
+  print $PlanType      (0,13)
+
+  print 'Ben Plan'     (+1,1)
+  print $Benefit_Plan  (0,13)
+  
+
+  do Get-Benefit-Program-Name
+  print 'Ben Program'         (+1,1)
+  print $BenProgram    (0,13)	!Vendkxy done changes for ITG 63228	
+  !print $BenefitProgramName   (0,13)  !Vendkxy done changes for ITG 63228
+  print $BenefitProgramName  (0,+1)!Vendkxy done changes for ITG 63228
+  
+  if #MultiCurr
+    print 'Currency:'         (0,45)
+    print $BenefitProgramCurr (0,+1)
+  end-if
+
+  print 'Empl    Reg/'                                           (+2,41)
+  print '-------------Employee Deductions--------------'         (0,80)
+  print '------------Company Contributions-------------'         (0,129)
+
+  print 'Employee Name'                                          (+1,1)
+  print 'Employee ID'                                            (0,28)
+  print 'Status  Temp  Dept. ID    Dept. Name'                   (0,41)
+  print 'CUR'                                                    (0,91)
+  print 'MTD'                                                    (0,107)
+  print 'YTD'                                                    (0,123)
+  print 'CUR'                                                    (0,140)
+  print 'MTD'                                                    (0,156)
+  print 'YTD'                                                    (0,172)
+
+end-heading
+
+Begin-Procedure Get-Last-Confirmed-Pay
+#debug9 Show 'Get-Last-Confirmed-Pay'
+
+Begin-Select Loops=1
+pay_end_dt
+
+  Let $pay_end_dt       = &pay_end_dt
+  Show 'Last confirmed pay end date:  ' $pay_end_dt
+
+From   ps_pay_cal_bal_id
+
+Where  pay_end_dt         =
+      (Select Max(pay_end_dt)
+       From   ps_pay_cal_bal_id
+       Where  pay_end_dt <= $AsOfDate
+       And    balance_id  = 'CY')
+End-Select
+End-Procedure
+
+
+begin-procedure Process-Main
+#debug9 Show 'Process-Main'
+  do Get-Calendar-Year-Id
+begin-SELECT
+PD.PLAN_TYPE      ()      on-break print=never level=1 procedure=PlanType-Change
+PD.BENEFIT_PLAN   ()      on-break print=never level=2 procedure=BenPlan-change
+B.BENEFIT_PROGRAM ()      on-break print=never level=3 procedure=BenProgram-Change
+J.EMPLID          (0,28)  on-break skiplines=1 level=4 procedure=Employee-Change
+P.NAME            (0,1,25)
+J.EMPL_STATUS     (0,41)
+J.REG_TEMP        (0,49)
+D.DEPTID          (0,55)
+D.DESCRSHORT      (0,67)
+PC.COMPANY
+PC.PAYGROUP
+PC.CHECK_DT
+PD.DED_CLASS
+PD.DED_CUR
+!SXK 06/22/1999 begin
+BL.BALANCE_PERIOD
+BL.BALANCE_YEAR
+BL.BALANCE_QTR
+!SXK 06/22/1999 End
+
+  Let $Emplid     = &J.EMPLID
+  Let $Company    = &PC.COMPANY
+  Let $Paygroup   = &PC.PAYGROUP
+  Let $Check_Dt   = &PC.CHECK_DT
+
+  let #BALANCE_PERIOD = &BL.BALANCE_PERIOD      ! CWB 06/15/2004
+  let #BALANCE_YEAR = &BL.BALANCE_YEAR          ! CWB 06/15/2004
+  let #BALANCE_QTR = &BL.BALANCE_QTR            ! CWB 06/15/2004
+
+  move &B.Benefit_Program  to $BenProgram
+  move &PD.Plan_Type       to $PlanID
+  move &PD.Benefit_Plan    to $Benefit_Plan
+
+  if &PD.DED_CLASS <= 'K' !Employee Deduction
+    ARRAY-ADD &PD.DED_CUR to TOTALS(5) TOTAL(0)
+  else                    !Company Contribution
+    ARRAY-ADD &PD.DED_CUR to TOTALS(5) TOTAL(3)
+  end-if
+
+FROM  PS_DEPT_TBL         D,
+      PS_PERSONAL_DATA    P,
+      PS_JOB              J,
+      PS_BEN_PROG_PARTIC  B,
+      PS_PAY_CHECK        PC,
+      PS_PAY_DEDUCTION    PD,
+      PS_PAY_CAL_BAL_ID   BL,
+      PS_PER_ORG_ASGN PER               ! ISDVNPK 08/23/2007 Added as part of 9.0 upgrade
+
+WHERE PD.PLAN_TYPE       <> '00'  !General Deduction
+
+AND   PC.COMPANY          = PD.COMPANY
+AND   PC.PAYGROUP         = PD.PAYGROUP
+AND   PC.PAY_END_DT       = PD.PAY_END_DT
+AND   PC.OFF_CYCLE        = PD.OFF_CYCLE
+AND   PC.PAGE_NUM            = PD.PAGE_NUM
+AND   PC.LINE_NUM            = PD.LINE_NUM
+AND   PC.SEPCHK           = PD.SEPCHK
+
+!SXK 06/22/1999 Begin
+AND   BL.COMPANY          = PC.COMPANY
+AND   BL.PAYGROUP         = PC.PAYGROUP
+AND   BL.PAY_END_DT       = PC.PAY_END_DT
+AND   BL.BALANCE_ID       = 'CY'
+!SXK 06/22/1999 End
+
+AND   PC.PAY_END_DT       = $Pay_End_Dt
+
+AND   J.EMPLID            = PC.EMPLID
+AND   J.EMPL_RCD         = PC.EMPL_RCD
+
+AND   J.EFFDT             =
+     (SELECT MAX(EFFDT)
+      FROM   PS_JOB
+      WHERE  EMPLID       = PC.EMPLID
+      AND    EMPL_RCD    = PC.EMPL_RCD
+      AND    EFFDT       <= $Pay_End_Dt)
+
+AND   J.EFFSEQ            =
+     (SELECT MAX(EFFSEQ)
+      FROM   PS_JOB
+      WHERE  EMPLID       = J.EMPLID
+      AND    EMPL_RCD    = J.EMPL_RCD
+      AND    EFFDT        = J.EFFDT)
+
+AND   B.EMPLID            = PC.EMPLID
+AND   B.EMPL_RCD         = PC.EMPL_RCD
+
+AND   B.EFFDT             =
+      (SELECT MAX(EFFDT)
+       FROM   PS_BEN_PROG_PARTIC
+       WHERE  EMPLID      = PC.EMPLID
+       AND    EMPL_RCD   = PC.EMPL_RCD
+       AND    EFFDT      <= $Pay_End_Dt)
+
+AND    P.EMPLID           = PC.EMPLID
+! ISDVNPK 08/23/2007 Added as part of 9.0 upgrade
+!AND    P.PER_STATUS       = 'E'
+  AND J.EMPLID = PER.EMPLID
+  AND J.EMPL_RCD = PER.EMPL_RCD
+  AND PER.PER_ORG = 'EMP'
+! ISDVNPK 08/23/2007 Added as part of 9.0 upgrade
+
+AND    D.DEPTID           = J.DEPTID
+
+AND    D.EFFDT            =
+      (SELECT MAX(EFFDT)
+       FROM   PS_DEPT_TBL
+       WHERE  DEPTID      = J.DEPTID
+       AND    EFFDT      <= J.EFFDT)
+
+AND   [$GEXXX911_INCLUDE_BENEFIT_PROGRAM_CRITERIA]
+AND   [$GEXXX912_INCLUDE_BENEFIT_PLAN_CRITERIA]
+
+ORDER BY PD.PLAN_TYPE,PD.BENEFIT_PLAN,B.BENEFIT_PROGRAM,P.NAME,J.EMPLID
+end-SELECT
+
+  move 'Y' to $End
+  if RTRIM($BenProgram, ' ') <> '' !implies some data selected
+    do Get-Deduction-Balance
+    move 1 to #changeLevel
+    do Print-Totals
+  end-if
+end-procedure
+
+
+begin-procedure Get-Deduction-Balance
+#debug9 Show 'Get-Deduction-Balance'
+!SXK 06/22/1999 Begin
+!  do convert-to-dtu-date($Check_Dt,$check_dt_dtu)
+!  let #balance_period = substr($check_dt_dtu,6,2)
+!  evaluate #balance_period
+!      when <= 3
+!         let #balance_qtr = 1
+!         break
+!      when <= 6
+!         let #balance_qtr = 2
+!         break
+!      when <= 9
+!         let #balance_qtr = 3
+!         break
+!      when <= 12
+!         let #balance_qtr = 4
+!  end-evaluate
+!  let #balance_year = substr($check_dt_dtu,1,4)
+!SXK 06/22/1999 End
+
+begin-SELECT
+A.DED_CLASS
+A.DED_MTD
+A.DED_YTD
+
+  if &A.Ded_Class <= 'K'  !Employee Deduction
+    ARRAY-ADD &A.Ded_MTD &A.Ded_YTD to TOTALS(5) TOTAL(1) TOTAL(2)
+  else                    !Company Contribution
+    ARRAY-ADD &A.Ded_MTD &A.Ded_YTD to TOTALS(5) TOTAL(4) TOTAL(5)
+  end-if
+
+FROM  PS_DEDUCTION_BAL    A
+
+WHERE A.EMPLID            = $Emplid
+  AND A.COMPANY           = $Company
+  AND A.BALANCE_ID        = $Calendar_Year_Id
+
+! CWB 06/15/2004 BEGIN
+!  AND A.BALANCE_YEAR      = &bl.balance_year !06/22/99 Used to be $balance_year
+!  AND A.BALANCE_QTR       = &bl.balance_qtr  !06/22/99 Used to be #balance_qtr
+!  AND A.BALANCE_PERIOD    = &bl.balance_period !06/22/99 used to be #balance_period
+  AND A.BALANCE_YEAR      = #balance_year      ! CWB 06/15/2004
+  AND A.BALANCE_QTR       = #balance_qtr       ! CWB 06/15/2004 
+  AND A.BALANCE_PERIOD    = #balance_period    ! CWB 06/15/2004
+! CWB 06/15/2004 END
+
+  AND A.PLAN_TYPE         = $PlanID
+  AND A.BENEFIT_PLAN      = $Benefit_Plan
+end-SELECT
+end-procedure
+
+
+begin-procedure PlanType-Change
+#debug Show 'PlanType-Change'
+  do Get-Deduction-Balance
+  move 2 to #changeLevel
+  do Print-Totals
+  new-page
+end-procedure
+
+begin-procedure BenPlan-Change
+#debug9 Show 'BenPlan-Change'
+  do Get-Deduction-Balance
+  move 3 to #changeLevel
+  do Print-Totals
+  new-page
+end-procedure
+
+begin-procedure BenProgram-Change
+#debug9 Show 'BenProgram-Change'
+  do Get-Deduction-Balance
+  move 4 to #changeLevel
+  do Print-Totals
+  new-page
+end-procedure
+
+begin-procedure Employee-Change
+#debug9 Show 'Employee-Change'
+  do Get-Deduction-Balance
+  move 5 to #changeLevel
+  do Print-Totals
+end-procedure
+
+begin-procedure Print-Totals
+#debug9 Show 'Print-Totals'
+  move 5 to #totalRow
+  while #totalRow >= #changeLevel
+    move #totalRow to #rollRow
+    subtract 1 from #rollRow
+    if #totalRow < 5  !if not the Employee's totals
+      get $TotalName from Totals(#totalRow) TotalName
+      print $TotalName (+2,61)
+    end-if
+    move 0 to #i
+    while #i <= 5
+      get #total from Totals(#totalRow) total(#i)
+      get #startCol from Totals(0) startCol(#i)
+      do Format-Number(#total, $out, '999,999,999.99mi')
+      print $out (0,#startCol)
+      array-add #total to Totals(#rollRow) total(#i)
+      put 0 into Totals(#totalRow) total(#i)
+      add 1 to #i
+    end-while
+    subtract 1 from #totalRow
+  end-while
+  if $End = 'Y'
+    do Reset
+  end-if
+end-procedure
+
+!**********************************
+! This procedure is used to read language-dependent text from the database.
+!**********************************
+Begin-Procedure Report-Translation
+End-Procedure
+!**********************************
+
+#Include 'gexxx911.sqc'  !Get Benefit Program Multiples Run Controls
+#Include 'gexxx912.sqc'  !Get Plan Type/Benefit Plan Multiples Run Controls
+#include 'gexxx920.sqc'  !Get ben single row run control
+#Include 'getcodta.sqc'  !Get-Company-Data procedure
+#Include 'getpgmnm.sqc'  !Get-Benefit-Program-Name procedure
+#Include 'getdatcd.sqc'  !Get-Date-Codes procedure
+#Include 'getrptpd.sqc'  !Get-Reporting-Period procedure
+#Include 'reset.sqc'     !Reset printer procedure
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'datemath.sqc'  !Routines for date math
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'askaod.sqc'    !Ask-As-Of-Date procedure
+#Include 'stdapi.sqc'    !Update Process API
+#Include 'getbalid.sqc'  !Get-Calendar-Year-Id

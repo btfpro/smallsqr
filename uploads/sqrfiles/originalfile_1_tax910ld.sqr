@@ -1,0 +1,2717 @@
+!***********************************************************************
+!  TAX910LD:  Load W-2 Data Records                                    *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+!                                                                      *
+! This module contains confidential and proprietary information        *
+! of Oracle; it is not to be copied, reproduced, or transmitted        *
+! in any form, by any means, in whole or in part, nor is it to         *
+! be used for any purpose other than that for which it is              *
+! expressly provided under the applicable license agreement.           *
+!                                                                      *
+! Copyright (C) 2006 Oracle. All Rights Reserved.                      *
+!                                                                      *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!          $Date:  2006/10/23:13:05:45                                 !
+!       $Release:  HR9                                                 !
+!      $Revision:  104                                                 !
+!                                                                      *
+!***********************************************************************
+!
+!***********************************************************************
+! Modified for Education & Government                                  *
+! HP99999       Release 8 Technical Merge                              *
+! HP00001       Add $PublicSector indicator                            *
+! FED0001       Add $FederalProduct indicator                          *
+!***********************************************************************
+
+#include 'setenv.sqc' !Set environment
+#Include 'setup31.sqc'   !Printer and page-size initialization
+#Include 'usarpt.sqc' !USA-specific variables
+
+begin-report
+  do Init-Report
+  do Process-Companies
+
+  if $RC_YE.Reg_Select_Proc = 'C'           !Load W-2 data for selected W-2 cos. only
+     do Finish-Processing-Selected-Cos
+  else
+     do Finish-Processing
+  end-if
+
+  if $PublicSector = 'Y' or $FederalProduct = 'Y'                       !HP00001 FED0001
+    do Process-MQGE-Companies                                           !HP99999
+  end-if                                                                !HP99999
+
+  if $Processed-Territory = 'Y'
+     do Finish-Processing-Territories
+  end-if
+
+  if $RC_YE.Reg_Select_Proc = 'C'           !Load W-2 data for selected W-2 cos. only
+     do Reset-NY-Gross-Selected-Cos
+  else
+     do Reset-NY-Gross
+  end-if
+
+  do Process-TSB
+
+  do Update-W2-Company-Values                  !Reset Puerto W-2 Company taxform
+                                               ! i.d.s to 'W' to allow for rollup federal reporting.
+
+  if $ZeroFlag = 'Y'
+    if $RC_YE.Reg_Select_Proc = 'S'           !Selected EEs only
+    or $RC_YE.Reg_Select_Proc = 'R'           !All W-2 data
+      do Remove-Zero-Rows
+    else
+      do Remove-Zero-Rows-Selected-Companies   !Selected W-2 cos. only
+    end-if
+  end-if
+  if $EE_Selected = 'Y'
+    do Delete-Sel-Employees-Table
+  end-if
+
+  if  $Company_Selected = 'Y'
+    do  Delete-Sel-Company-Table
+  end-if
+  do Stdapi-Term
+end-report
+
+begin-procedure Init-Report
+  display ''
+  display 'Loading Year-end Data Records'
+  do Get-EandG                                                          !HP00001
+  do Get-FederalProduct                                                 !FED0001
+  do Init-DateTime
+  do Init-Number
+  do Get-Calendar-Year-Id
+  do Stdapi-Init
+  do Initialization
+  do Create-Track-Company-Array
+  do Initialize-Track-Company-Array
+  do Read-KY
+
+  let $TAXFORM_ID = 'W'
+  let $Processed-Territory = 'N'
+  let $ZeroFlag = 'N'
+  do Assign-Year-End-Variables
+  do Assign-Common-Box-Variables
+
+end-procedure
+
+begin-procedure Initialization
+  do Get-Current-DateTime
+  move '1' to $MMLZero
+  move '1' to $Year4
+  do Format-DateTime($AsOfToday, $910Date, {DEFYMD},'','')
+
+  move $910Date to $AsOfYear xxxx   !extract the current year
+  move $AsOfYear  to #AsOfYear
+  move #AsOfYear  to #saveAsOfYear
+  subtract 1    from #AsOfYear
+  do Get-Tax-Reporting-Run-Controls
+  if &TX.Balance_Year <> #AsOfYear and $Prcs_Process_Instance = ''
+    display ''
+    display 'Current Year is not one greater than Tax Reporting Year.'
+    display 'Current Year is    ' noline
+    display  #saveAsOfYear  9999
+    display 'Tax Reporting Year ' noline
+    display &TX.Balance_Year
+    input $Answer maxlen=1 'Do you want to continue? (Y/N)'
+    uppercase $Answer
+    if $Answer <> 'Y'
+      stop
+    end-if
+  end-if
+
+  create-array name=KYLocals size=11
+    field=KYLocality:char
+
+  do Select-Year-End-Parameters
+
+end-procedure
+
+begin-procedure Process-Companies
+  move &TX.Company       to $Company  !TX.Company is the Transmitter
+  move &TX.Balance_Year to $CalYear 9999
+  let $AsOfDate = $CalYear || '1231'
+  do Format-DateTime($AsOfDate, $AsOfDate, {DEFCMP}, '', 'native')
+
+Begin-SELECT
+MAX(EFFDT)  &Max_effdt
+   Move &Max_effdt to $Max_Effdt
+FROM   PS_TAXFORM_TBL
+WHERE  TAXFORM_ID = $TAXFORM_ID
+  AND  EFFDT  <= $AsOfDate
+End-SELECT
+
+
+  if $RC_YE.Reg_Select_Proc = 'S'           !Selected EEs only
+  or $RC_YE.Reg_Select_Proc = 'R'           !All W-2 data
+    do Delete-W2-Company-Data
+  else
+    do Delete-W2-Company-Data-Selected-Companies   !Selected W-2 cos. only
+  end-if
+
+
+begin-SELECT
+A.W2_REPORTING_CO
+A.FEDERAL_EIN
+
+    do Process-Tax-Balances
+    do Process-Earnings-Balances
+    do Process-Deduction-Balances
+    do Process-Territories-Balances
+
+FROM  PS_W2_COMPANY A
+WHERE A.CALENDAR_YEAR = &TX.Balance_Year
+  AND A.W2_REPORTING_CO = A.COMPANY
+  [$A.SelectedCos]             !NULL string if SELECT W-2 Companies option not used
+  AND A.W2_REPORTING_CO <> ' '
+ORDER BY A.W2_REPORTING_CO
+end-SELECT
+end-procedure
+
+begin-procedure Process-Tax-Balances
+
+begin-SELECT
+TB1.COMPANY
+TB1.EMPLID         () on-break print=never before=Before-EmplID-Tax-Balance
+TB1.STATE
+TB1.LOCALITY
+TB1.TAX_CLASS
+TB1.TXGRS_YTD
+TB1.NLGRS_YTD
+TB1.TAX_YTD
+T1.BOX
+T1.AMOUNT_TYPE
+
+    let  $State     = rtrim(&TB1.State, ' ')
+    let  $Company   = rtrim(&TB1.Company, ' ')
+    let  $EmplID    = rtrim(&TB1.EmplID, ' ')
+    let  $Locality  = rtrim(&TB1.Locality, ' ')
+
+    let $T1.Box = &T1.Box
+    move $T1.Box to $Box xx
+    let $Pos3 = substr($T1.Box, 3,1)
+
+    if $Box = $YE_Other
+      and $Pos3 > ' '
+      let $Box = &T1.Box
+    else
+      let $Box = RTRIM(&T1.Box,' ')
+    end-if
+
+    if $Locality  = ''
+      let  $Locality  = ' '
+    end-if
+
+    evaluate $State
+
+    when = 'AS'
+      let $Issue-W2AS = 'Y'
+      let $Process-W2AS = 'Y'
+      let $Track-TaxformID = 'S'
+      do Check-Track-Company-Array
+    break
+
+    when = 'GU'
+      let $Issue-W2GU = 'Y'
+      let $Process-W2GU = 'Y'
+      let $Track-TaxformID = 'M'
+      do Check-Track-Company-Array
+    break
+
+    when = 'PR'
+      let $Issue-W2PR = 'Y'
+      let $Process-W2PR = 'Y'
+      let $Track-TaxformID = 'P'
+      do Check-Track-Company-Array
+    break
+
+    when = 'VI'
+      let $Issue-W2VI = 'Y'
+      let $Process-W2VI = 'Y'
+      let $Track-TaxformID = 'I'
+      do Check-Track-Company-Array
+    break
+
+    when-other
+
+    if &T1.Amount_Type = 'G'
+       if $State = 'KY' and $Locality = '03628' and $Box = $YE_Local_Wages
+          move &TB1.NlGrs_YTD to #Amount
+       else
+          move &TB1.TxGrs_YTD to #Amount
+       end-if
+    end-if
+
+    if $State = 'IN' and &TB1.Tax_Class = 'C'
+      move '99990' to $Locality
+    end-if
+
+    if $State = 'KY' and $KY-Code = 'Y' and ($Box = '18' or $Box = '19')
+       do Check-KY-Locality
+       if $KY-KEDFA-Local = 'Y'
+           if $Box = '18'
+             move 0 to #Amount
+           else
+             if $Box = '19'
+               move '17' to $Box
+             end-if
+           end-if
+       end-if
+    end-if
+
+    if &T1.Amount_Type = 'T' or &T1.Amount_Type = 'M'
+      move &TB1.Tax_YTD to #Amount
+      if $Box = $YE_Local_Tax and $State = 'MD'   !Combine MD state and local tax amounts
+        let $Box = $YE_State_Tax
+        let $Locality = ' '
+      else
+        if $Box  = $YE_State_Tax and $State = 'MD'
+          let $Locality = ' '
+        end-if
+      end-if
+
+      if &TB1.Tax_Class = 'C'                         !Reverse sign on EIC
+      or &T1.Amount_Type = 'M'                       !Less Taxes reverses sign
+        let #Amount = #Amount * (-1)
+      end-if
+
+    end-if
+
+    if $State = 'NJ' and
+      $Locality = 'MMLIPAF-EE' and
+      $Box = $YE_Local_Wages
+        let #Amount = 0
+    end-if
+
+    if $State = 'NM' and
+      $Locality = 'NM0001'
+        let #Amount = 0
+    end-if
+
+    if $State <> 'PA'  and                    !Box 14YN, 14YT and 14ZN valid for PA only
+       ($Box = '14YN'  or
+        $Box = '14YT'  or
+        $Box = '14ZN')
+        let #Amount = 0
+    end-if
+
+    if $State = 'WV' and                      !Service fee not to be included in W-2
+         ($Locality = '14600'
+       or $Locality = '39460'
+       or $Locality = '85156')
+        let #Amount = 0
+    end-if
+    if $State  = '$UAS'                       !Reduce US amount by territories balance
+      let $Issue-W2AS = 'Y'
+      let $Process-W2AS = 'Y'
+      let #Amount = #Amount * (-1)
+      let $State  = '$U'
+      let $Track-TaxformID = 'S'
+      do Check-Track-Company-Array
+    else
+      if $State = '$UGU'
+        let $Issue-W2GU = 'Y'
+        let $Process-W2GU = 'Y'
+        let #Amount = #Amount * (-1)
+        let $State  = '$U'
+        let $Track-TaxformID = 'M'
+        do Check-Track-Company-Array
+      else
+        if $State = '$UPR'
+          let $Issue-W2PR = 'Y'
+          let $Process-W2PR = 'Y'
+          let #Amount = #Amount * (-1)
+          let $State  = '$U'
+          let $Track-TaxformID = 'P'
+          do Check-Track-Company-Array
+        else
+          if $State = '$UVI'
+          let $Issue-W2VI = 'Y'
+          let $Process-W2VI = 'Y'
+          let #Amount = #Amount * (-1)
+          let $State  = '$U'
+          let $Track-TaxformID = 'I'
+          do Check-Track-Company-Array
+          end-if
+        end-if
+      end-if
+    end-if
+
+
+    if $State <> $priorState
+      if $priorState <> '$U' and $priorState <> '$E' and $priorState <> ''
+        add 1 to #Sequence_Number
+      end-if
+      let $priorState = $State
+    end-if
+
+    if $Box  <> $YE_Local_Wages or $State <> 'MD'           !Combine MD state and local tax amounts
+
+                                                                !Report MD state wages
+      if #Amount <> 0
+
+         if $State = 'NY' and $Box = $YE_Local_Wages
+             and $Locality = 'P0001'
+                 let #Amount = 0
+                 let $ZeroFlag = 'Y'
+         end-if
+
+         if rtrim($Locality, ' ') = '80892' and  &TX.Balance_Year = 2001  !For 2001 the Warren locality requires
+         and  $State = 'OH'                                               !the separate reporting of first and
+         and ($Box = $YE_Local_Wages                                      !second half tax balances
+         or  $Box = $YE_Local_Tax)
+             do Process-Warren-Locality
+         else
+           if INSTR($BoxesUsed,($Box || $State || $Locality || $Company || '*'),1) = 0
+             let $BoxesUsed = $BoxesUsed || $Box || $State || $Locality || $Company || '*'
+             do Insert-W2-Amount
+           else
+             do Update-W2-Amount
+           end-if
+         end-if
+      end-if
+    end-if
+
+    break
+  end-evaluate
+
+
+FROM  PS_TAX_BALANCE TB1, PS_TAXFORM_TAX T1,
+      PS_W2_COMPANY C1
+WHERE C1.W2_REPORTING_CO = &A.W2_Reporting_Co
+  AND C1.CALENDAR_YEAR   = &TX.Balance_Year
+  AND T1.TAXFORM_ID      = $TAXFORM_ID
+  AND T1.EFFDT           =  $Max_Effdt
+  AND T1.TAX_CLASS IN ('H','D','E','F','G','J','Q','T','Z','C','K','V','L','M','N','W')
+  [$TB1.SelectedEEs]                     !NULL string if SELECT EEs option not used
+  AND TB1.COMPANY         = C1.COMPANY
+  AND TB1.BALANCE_ID      = $Calendar_Year_Id
+  AND TB1.BALANCE_YEAR    = &TX.Balance_Year
+  AND T1.TAX_CLASS       = TB1.TAX_CLASS
+  AND ( (T1.JURISDICTION_TYPE = 'F' AND TB1.STATE  LIKE '$U%')
+    OR  (  (T1.JURISDICTION_TYPE = 'S'
+            AND TB1.STATE <> '$U'
+            AND TB1.LOCALITY  = ' ')
+      AND  (TB1.STATE = T1.STATE OR T1.STATE = ' ') )
+    OR  (  (T1.JURISDICTION_TYPE = 'L'
+            AND TB1.STATE <> '$U'
+            AND TB1.LOCALITY <> ' ')
+      AND  (TB1.STATE = T1.STATE OR T1.STATE = ' ')
+      AND  (TB1.LOCALITY = T1.LOCALITY or T1.LOCALITY = ' ') ) )
+  AND TB1.BALANCE_PERIOD =
+      (SELECT MAX(BALANCE_PERIOD)
+       FROM   PS_TAX_BALANCE
+       WHERE  EMPLID        = TB1.EMPLID
+         AND  COMPANY       = TB1.COMPANY
+         AND  BALANCE_YEAR = TB1.BALANCE_YEAR
+         AND  BALANCE_ID = TB1.BALANCE_ID
+         AND  STATE         = TB1.STATE
+         AND  LOCALITY      = TB1.LOCALITY
+         AND  TAX_CLASS     = TB1.TAX_CLASS)
+  AND (TB1.TXGRS_YTD <> 0  OR  TB1.TAX_YTD <> 0)
+ ORDER BY TB1.EMPLID, TB1.STATE, TB1.LOCALITY, TB1.TAX_CLASS,TB1.COMPANY
+end-SELECT
+
+  do Before-EmplID-Tax-Balance
+
+end-procedure
+
+begin-procedure Process-Warren-Locality
+
+begin-SELECT
+WOH.TXGRS_YTD
+WOH.TAX_YTD
+
+  if $Box = $YE_Local_Tax and &WOH.TAX_YTD > 0
+
+    let #SecondHalf = (#Amount - &WOH.TAX_YTD)
+    let $SecondHalfLocality = $Locality
+
+    let #Amount =  &WOH.TAX_YTD
+    let $Locality ='80892A'
+
+    do Insert-Update-W2-Amount
+
+    let #Amount = #SecondHalf
+    let $Locality  = $SecondHalfLocality
+
+  else
+    if $Box = $YE_Local_Wages and &WOH.TXGRS_YTD > 0
+
+      let #SecondHalf = (#Amount - &WOH.TXGRS_YTD)
+      let $SecondHalfLocality = $Locality
+
+      let #Amount =  &WOH.TXGRS_YTD
+      let $Locality ='80892A'
+
+      do Insert-Update-W2-Amount
+
+      let #Amount = #SecondHalf
+      let $Locality  = $SecondHalfLocality
+
+
+    end-if
+  end-if
+
+FROM PS_TAX_BALANCE WOH
+WHERE WOH.EMPLID = &TB1.EMPLID
+AND WOH.COMPANY = &TB1.COMPANY
+AND WOH.BALANCE_ID      = $Calendar_Year_Id
+AND WOH.BALANCE_YEAR    = &TX.Balance_Year
+AND WOH.STATE = 'OH'
+AND WOH.LOCALITY = '80892'
+AND WOH.BALANCE_PERIOD =
+(SELECT MAX(BALANCE_PERIOD)
+FROM PS_TAX_BALANCE
+WHERE EMPLID = WOH.EMPLID
+AND COMPANY = WOH.COMPANY
+AND BALANCE_ID = WOH.BALANCE_ID
+AND BALANCE_YEAR = WOH.BALANCE_YEAR
+AND BALANCE_QTR < 3
+AND STATE = WOH.STATE
+AND LOCALITY = WOH.LOCALITY
+AND TAX_CLASS = 'H')
+end-SELECT
+
+
+  if #Amount > 0
+    do Insert-Update-W2-Amount
+  end-if
+
+end-procedure
+
+begin-procedure Check-KY-Locality
+
+  move 0 to #NextKYLocal
+  move 'N' to $KY-KEDFA-Local
+
+  while #NextKYLocal <= #MaxKYLocal
+    get $KYLocality from KYLocals(#NextKYLocal)
+    if $Locality = $KYLocality
+       move 'Y' to $KY-KEDFA-Local
+       move #MaxKYLocal  to #NextKYLocal
+    end-if
+    add 1 to #NextKYLocal
+  end-while
+
+end-procedure
+begin-procedure Insert-Update-W2-Amount
+
+    if INSTR($BoxesUsed,($Box || $State || $Locality || $Company || '*'),1) = 0
+       let $BoxesUsed = $BoxesUsed || $Box || $State || $Locality || $Company || '*'
+       do Insert-W2-Amount
+    else
+       do Update-W2-Amount
+    end-if
+
+end-procedure
+
+
+begin-procedure Process-Territories-Balances
+
+    if $Process-W2AS = 'Y'
+      let $TAXFORM_ID = 'S'
+      do Assign-Year-End-Variables
+      do Process-Territories-Tax-Balances
+      do Process-Territories-Earnings-Balances
+      do Process-Territories-Deduction-Balances
+      let $Processed-Territory = 'Y'
+    end-if
+
+    if $Process-W2GU = 'Y'
+      let $TAXFORM_ID = 'M'
+      do Assign-Year-End-Variables
+      do Process-Territories-Tax-Balances
+      do Process-Territories-Earnings-Balances
+      do Process-Territories-Deduction-Balances
+      let $Processed-Territory = 'Y'
+    end-if
+
+    if $Process-W2VI = 'Y'
+      let $TAXFORM_ID = 'I'
+      do Assign-Year-End-Variables
+      do Process-Territories-Tax-Balances
+      do Process-Territories-Earnings-Balances
+      do Process-Territories-Deduction-Balances
+      let $Processed-Territory = 'Y'
+    end-if
+
+    if $Process-W2PR = 'Y'
+      let $TAXFORM_ID = 'P'
+      do Assign-Year-End-Variables
+      do Process-Territories-Tax-Balances
+      do Process-Territories-Earnings-Balances
+      do Process-Territories-Deduction-Balances
+      let $Processed-Territory = 'Y'
+    end-if
+
+    let $Process-W2AS = 'N'
+    let $Process-W2GU = 'N'
+    let $Process-W2PR = 'N'
+    let $Process-W2VI = 'N'
+    let $TAXFORM_ID = 'W'
+    do Assign-Year-End-Variables
+
+end-procedure
+
+
+begin-procedure Process-Territories-Tax-Balances
+
+begin-SELECT
+TB2.COMPANY
+TB2.EMPLID         () on-break print=never before=Before-EmplID-Territories
+TB2.STATE
+TB2.LOCALITY
+TB2.TAX_CLASS
+TB2.TXGRS_YTD
+TB2.TAX_YTD
+T2.BOX
+T2.AMOUNT_TYPE
+
+  let $State = rtrim(&TB2.State, ' ')
+  let  $Box   = rtrim(&T2.Box, ' ')
+
+  let  $Company   = rtrim(&TB2.Company, ' ')
+  let  $EmplID    = rtrim(&TB2.EmplID, ' ')
+  move &TB2.Locality to $Locality
+
+  if &T2.Amount_Type = 'G'
+    move &TB2.TxGrs_YTD to #Amount
+  end-if
+
+  if &T2.Amount_Type = 'T'
+    move &TB2.Tax_YTD to #Amount
+
+    if &TB2.Tax_Class = 'C'                         !Reverse sign on EIC
+      let #Amount = #Amount * (-1)
+    end-if
+
+  end-if
+
+  if &T2.Amount_Type = 'M'
+    move &TB2.Tax_YTD to #Amount
+    let #Amount = #Amount * (-1)
+  end-if
+
+  if #Amount <> 0
+
+      if INSTR($BoxesUsed,($Box || $State || $Locality || $Company || '*'),1) = 0
+        let $BoxesUsed = $BoxesUsed || $Box || $State || $Locality || $Company || '*'
+        do Insert-W2-Amount
+      else
+        do Update-W2-Amount
+      end-if
+  end-if
+
+FROM  PS_TAX_BALANCE TB2, PS_TAXFORM_TAX T2, PS_YE_EE EE2,
+      PS_W2_COMPANY C2
+WHERE C2.W2_REPORTING_CO = &A.W2_Reporting_Co
+  AND C2.CALENDAR_YEAR   = &TX.Balance_Year
+  AND T2.TAXFORM_ID      = $TAXFORM_ID
+  AND EE2.EMPLID          = TB2.EMPLID
+  AND EE2.COMPANY         = TB2.COMPANY
+  AND EE2.CALENDAR_YEAR   = TB2.BALANCE_YEAR
+  AND EE2.TAXFORM_ID      = $TAXFORM_ID
+  [$TB2.SelectedEEs]            !NULL string if SELECT EEs option not used
+  AND T2.EFFDT           =  $Max_Effdt
+  AND T2.TAX_CLASS IN ('H','D','E','F','G','J','L','Q','T','Z','C','K','V','M','N','W')
+  AND TB2.COMPANY         = C2.COMPANY
+  AND TB2.BALANCE_ID      = $Calendar_Year_Id
+  AND TB2.BALANCE_YEAR    = &TX.Balance_Year
+  AND TB2.STATE          <> '$U'
+  AND T2.TAX_CLASS       = TB2.TAX_CLASS
+  AND T2.STATE           = TB2.STATE
+  AND ( (T2.JURISDICTION_TYPE = 'F' AND TB2.STATE  LIKE '$U%')
+    OR  (  (T2.JURISDICTION_TYPE = 'S'
+            AND TB2.STATE <> '$U'
+            AND TB2.LOCALITY  = ' ')
+      AND  (TB2.STATE = T2.STATE OR T2.STATE = ' ') )
+    OR  (  (T2.JURISDICTION_TYPE = 'L'
+            AND TB2.STATE <> '$U'
+            AND TB2.LOCALITY <> ' ')
+      AND  (TB2.STATE = T2.STATE OR T2.STATE = ' ')
+      AND  (TB2.LOCALITY = T2.LOCALITY or T2.LOCALITY = ' ') ) )
+  AND TB2.BALANCE_PERIOD =
+      (SELECT MAX(BALANCE_PERIOD)
+       FROM   PS_TAX_BALANCE
+       WHERE  EMPLID        = TB2.EMPLID
+         AND  COMPANY       = TB2.COMPANY
+         AND  BALANCE_YEAR = TB2.BALANCE_YEAR
+         AND  BALANCE_ID = TB2.BALANCE_ID
+         AND  STATE         = TB2.STATE
+         AND  LOCALITY      = TB2.LOCALITY
+         AND  TAX_CLASS     = TB2.TAX_CLASS)
+  AND (TB2.TXGRS_YTD > 0  OR  TB2.TAX_YTD > 0)
+ORDER BY TB2.EMPLID, TB2.STATE, TB2.LOCALITY, TB2.TAX_CLASS, TB2.COMPANY
+end-SELECT
+
+
+do Before-EmplID-Territories
+
+end-procedure
+
+
+
+begin-procedure Before-EmplID-Tax-Balance
+
+    if #TrackCo_i > 0
+
+       let #j = 0
+
+       while #j < #TrackCo_i
+         get $GetCompany $GetTaxformID from Track-Company(#j)
+             Company TaxformID
+
+         let  $Company    =  $GetCompany
+         let  $TAXFORM_ID =  $GetTaxformID
+         do Insert-W2-EE-Record
+
+         add 1 to #j
+
+         end-while
+
+         do Initialize-Track-Company-Array
+
+     end-if
+
+    let $Issue-W2AS = 'N'
+    let $Issue-W2GU = 'N'
+    let $Issue-W2PR = 'N'
+    let $Issue-W2VI = 'N'
+    let $TAXFORM_ID =    'W'
+
+  move 1 to #Sequence_Number
+  move '' to $priorState
+  move '' to $State
+  move '' to $BoxesUsed
+  move ' ' to $Mar_Status
+  move ' ' to $Spouse_SSN
+
+end-procedure
+
+
+begin-procedure Before-EmplID
+
+  move 1 to #Sequence_Number
+  move '' to $priorState
+  move '' to $State
+  move '' to $BoxesUsed
+
+end-procedure
+
+
+begin-procedure Before-EmplID-Territories
+
+  move 1 to #Sequence_Number
+  move '' to $priorState
+  move '' to $State
+  move '' to $BoxesUsed
+  move ' ' to $Mar_Status
+  move ' ' to $Spouse_SSN
+
+  move 1 to #Sequence_Number
+  move '' to $priorState
+  move '' to $State
+  move '' to $BoxesUsed
+  move ' ' to $Mar_Status
+  move ' ' to $Spouse_SSN
+
+  do Before-Company-Territories
+
+end-procedure
+
+
+begin-procedure Before-Company-Territories
+
+begin-SQL  on-error=Ignore
+
+  DELETE FROM PS_YE_AMOUNTS
+        WHERE COMPANY = $Company
+          AND EMPLID  = $EmplID
+          AND CALENDAR_YEAR = &TX.Balance_Year
+          AND TAXFORM_ID = 'W'
+          AND W2_AMOUNT = 0;
+end-SQL
+
+end-procedure
+
+begin-procedure Process-Earnings-Balances
+begin-SELECT
+EB3.COMPANY
+EB3.BALANCE_YEAR
+EB3.EMPLID          () on-break print=never before=Before-EmplID
+
+#ifdef DB2ALL
+DECIMAL(SUM(EB3.GRS_YTD),15,3)   &EB3.Grs_YTD
+#else
+SUM(EB3.GRS_YTD)         &EB3.Grs_YTD
+#endif
+
+E3.BOX
+
+  let $Box   = rtrim(&E3.Box, ' ')
+  let $Company   = rtrim(&EB3.Company, ' ')
+  let $EmplID   = rtrim(&EB3.EmplID, ' ')
+
+  if $Box = $YE_OtherYN  or
+     $Box = $YE_OtherYT or
+     $Box = $YE_OtherZN
+     do PA-Only
+  else
+
+    move '$U'        to $State
+    move &EB3.Grs_YTD to #Amount
+  end-if
+
+    move ' '         to $Locality
+
+    if #Amount <> 0
+      if INSTR($BoxesUsed,($Box || $Company || '*'),1) = 0
+        let $BoxesUsed = $BoxesUsed || $Box || $Company || '*'
+        do Insert-W2-Amount
+      else
+        do Update-W2-Amount
+      end-if
+    end-if
+
+   if #Amount <> 0 and
+      $Box = $YE_OtherYN  or
+      $Box = $YE_OtherYT or
+      $Box = $YE_OtherZN
+      let #Sequence_Number =  #hold-seq-num
+   end-if
+
+
+FROM  PS_EARNINGS_BAL EB3, PS_TAXFORM_ERN E3,
+      PS_W2_COMPANY C3
+WHERE C3.W2_REPORTING_CO   = &A.W2_Reporting_Co
+  AND C3.CALENDAR_YEAR     = &TX.Balance_Year
+  AND E3.TAXFORM_ID        = $TAXFORM_ID
+  AND E3.EFFDT             = $Max_Effdt
+  [$EB3.SelectedEEs]              !NULL string if SELECT EEs option not used
+  AND EB3.COMPANY           = C3.COMPANY
+  AND EB3.BALANCE_ID        = $Calendar_Year_Id
+  AND EB3.BALANCE_YEAR      = &TX.Balance_Year
+  AND EB3.ERNCD             = E3.ERNCD
+  AND EB3.SPCL_BALANCE      = 'N'
+  AND EB3.BALANCE_PERIOD    =
+      (SELECT MAX(BALANCE_PERIOD)
+       FROM   PS_EARNINGS_BAL
+       WHERE  EMPLID            = EB3.EMPLID
+         AND  COMPANY           = EB3.COMPANY
+         AND  BALANCE_YEAR      = EB3.BALANCE_YEAR
+         AND  BALANCE_ID        = EB3.BALANCE_ID
+         AND  EMPL_RCD          = EB3.EMPL_RCD
+         AND  SPCL_BALANCE      = EB3.SPCL_BALANCE
+         AND  ERNCD             = EB3.ERNCD)
+  AND EB3.GRS_YTD           <> 0
+GROUP BY EB3.COMPANY, EB3.BALANCE_YEAR, EB3.EMPLID, E3.BOX
+ORDER BY EB3.COMPANY, EB3.BALANCE_YEAR, EB3.EMPLID
+end-SELECT
+end-procedure
+
+begin-procedure PA-Only
+
+  move 0 to #Amount
+  let #hold-seq-num = #Sequence_Number
+
+begin-SELECT
+TB9.STATE
+C9.COMPANY
+
+    do Get-PA-Sequence
+    let $State    = rtrim(&TB9.STATE, ' ')
+    move &EB3.Grs_YTD to #Amount
+
+FROM  PS_TAX_BALANCE TB9, PS_TAXFORM_TAX T9,
+      PS_W2_COMPANY C9
+WHERE C9.W2_REPORTING_CO = &A.W2_Reporting_Co
+  AND C9.CALENDAR_YEAR   = &TX.Balance_Year
+  AND T9.TAXFORM_ID      = $TAXFORM_ID
+  AND T9.EFFDT           =  $Max_Effdt
+  AND T9.TAX_CLASS       = 'H'
+  AND T9.BOX             = '16'
+  AND TB9.EMPLID         = &EB3.EmplID
+  AND TB9.COMPANY        = C9.COMPANY
+  AND TB9.BALANCE_ID     = $Calendar_Year_Id
+  AND TB9.BALANCE_YEAR   = &TX.Balance_Year
+  AND TB9.STATE = 'PA'
+  AND T9.TAX_CLASS       = TB9.TAX_CLASS
+  AND  ( (T9.JURISDICTION_TYPE = 'S'
+            AND TB9.STATE <> '$U'
+            AND TB9.LOCALITY  = ' ')
+      AND  (TB9.STATE = T9.STATE OR T9.STATE = ' ') )
+  AND TB9.BALANCE_PERIOD =
+      (SELECT MAX(BALANCE_PERIOD)
+       FROM   PS_TAX_BALANCE
+       WHERE  EMPLID        = TB9.EMPLID
+         AND  COMPANY       = TB9.COMPANY
+         AND  BALANCE_YEAR  = TB9.BALANCE_YEAR
+         AND  BALANCE_ID    = TB9.BALANCE_ID
+         AND  STATE         = TB9.STATE
+         AND  LOCALITY      = TB9.LOCALITY
+         AND  TAX_CLASS     = TB9.TAX_CLASS)
+  AND (TB9.TXGRS_YTD <> 0  OR  TB9.TAX_YTD <> 0)
+
+end-SELECT
+end-procedure
+
+begin-procedure Get-PA-Sequence
+begin-SELECT
+YE9.SEQUENCE_NUMBER
+
+  let #Sequence_Number = &YE9.SEQUENCE_NUMBER
+
+FROM PS_YE_AMOUNTS YE9
+WHERE YE9.COMPANY = &C9.COMPANY
+  AND YE9.EMPLID = &EB3.EmplID
+  AND YE9.CALENDAR_YEAR = &TX.Balance_Year
+  AND YE9.TAXFORM_ID    = $TAXFORM_ID
+  AND YE9.STATE         = &TB9.STATE
+  AND YE9.BOX           = '16'
+
+end-SELECT
+
+
+end-procedure
+
+begin-procedure Process-Territories-Earnings-Balances
+
+
+begin-SELECT
+EB4.COMPANY
+EB4.BALANCE_YEAR
+EB4.EMPLID          () on-break print=never before=Before-EmplID
+
+#ifdef DB2ALL
+DECIMAL(SUM(EB4.GRS_YTD),15,3)   &EB4.Grs_YTD
+#else
+SUM(EB4.GRS_YTD)         &EB4.Grs_YTD
+#endif
+
+E4.BOX
+
+  let  $Box   = rtrim(&E4.Box, ' ')
+
+  let $Company   = rtrim(&EB4.Company, ' ')
+  let $EmplID   = rtrim(&EB4.EmplID, ' ')
+
+  move '$U'        to $State
+  move ' '         to $Locality
+  move &EB4.Grs_YTD to #Amount
+
+
+      if $TAXFORM_ID = 'P'           !For Puerto Rico, reduce Wages box by amount
+        if $Box = $YE_Commissions    !reported in Commissions box
+        or $Box = $YE_Allowance      !or reported in Allowance box
+        or $Box = $YE_Tips           !or reported in Tips box
+           do Adjust-PR-Wages
+        end-if
+      end-if
+
+      if INSTR($BoxesUsed,($Box || $Company || '*'),1) = 0
+        let $BoxesUsed = $BoxesUsed || $Box || $Company || '*'
+
+
+        if $TAXFORM_ID = 'P'
+           if $Box = $YE_Tips
+           or $Box = $YE_Reimbursed_Expense
+              do Delete-Common-Deduction-Earnings
+           end-if
+        else
+          if $Box = $YE_Alloc_Tips
+          or $Box = $YE_Dep_Care
+          or $Box = $YE_Non_Qual_457_Y
+          or $Box = $YE_Non_Qual_457_N
+          or $Box = $YE_Sick_Pay
+          or $Box = $YE_Business_Exp
+          or $Box = $YE_Excl_Moving_Exp
+          or $Box = $YE_Adoption_Exp
+
+             do Delete-Common-Deduction-Earnings
+          end-if
+        end-if
+
+
+        do Insert-W2-Amount
+      else
+        do Update-W2-Amount
+      end-if
+
+FROM  PS_EARNINGS_BAL EB4, PS_TAXFORM_ERN E4, PS_YE_EE EE4,
+      PS_W2_COMPANY C4
+WHERE C4.W2_REPORTING_CO   = &A.W2_Reporting_Co
+  AND C4.CALENDAR_YEAR     = &TX.Balance_Year
+  AND E4.TAXFORM_ID        = $TAXFORM_ID
+  AND E4.EFFDT             = $Max_Effdt
+  AND EB4.EMPLID           = EE4.EMPLID
+  AND EB4.COMPANY          = EE4.COMPANY
+  AND EB4.BALANCE_YEAR     = EE4.CALENDAR_YEAR
+  [$EB4.SelectedEEs]               !NULL string if SELECT EEs option not used
+  AND EB4.COMPANY           = C4.COMPANY
+  AND EE4.TAXFORM_ID       = $TAXFORM_ID
+  AND EB4.BALANCE_ID        = $Calendar_Year_Id
+  AND EB4.BALANCE_YEAR      = &TX.Balance_Year
+  AND EB4.ERNCD             = E4.ERNCD
+  AND EB4.SPCL_BALANCE      = 'N'
+  AND EB4.BALANCE_PERIOD    =
+      (SELECT MAX(BALANCE_PERIOD)
+       FROM   PS_EARNINGS_BAL
+       WHERE  EMPLID            = EB4.EMPLID
+         AND  COMPANY           = EB4.COMPANY
+         AND  BALANCE_YEAR      = EB4.BALANCE_YEAR
+         AND  BALANCE_ID        = EB4.BALANCE_ID
+         AND  EMPL_RCD          = EB4.EMPL_RCD
+         AND  SPCL_BALANCE      = EB4.SPCL_BALANCE
+         AND  ERNCD             = EB4.ERNCD)
+  AND EB4.GRS_YTD           <> 0
+GROUP BY EB4.COMPANY, EB4.BALANCE_YEAR, EB4.EMPLID, E4.BOX
+ORDER BY EB4.COMPANY, EB4.BALANCE_YEAR, EB4.EMPLID
+end-SELECT
+end-procedure
+
+begin-procedure Process-Deduction-Balances
+begin-SELECT
+DB5.COMPANY
+DB5.BALANCE_YEAR
+DB5.EMPLID          () on-break print=never before=Before-EmplID
+
+#ifdef DB2ALL
+DECIMAL(SUM(DB5.DED_YTD),15,3)   &DB5.Ded_YTD
+#else
+SUM(DB5.DED_YTD)         &DB5.Ded_YTD
+#endif
+
+
+D5.BOX
+
+    move &DB5.Company to $Company
+    move &DB5.EmplID  to $EmplID
+    let $Box   = rtrim(&D5.Box, ' ')
+    move '$U'        to $State
+    move ' '         to $Locality
+    move &DB5.Ded_YTD to #Amount
+
+    if INSTR($BoxesUsed,($Box || $Company || '*'),1) = 0
+      let $BoxesUsed = $BoxesUsed || $Box || $Company || '*'
+
+
+      do Insert-W2-Amount
+    else
+      do Update-W2-Amount
+    end-if
+
+FROM  PS_DEDUCTION_BAL DB5, PS_TAXFORM_DED D5,
+      PS_W2_COMPANY C5
+WHERE C5.W2_REPORTING_CO   = &A.W2_Reporting_Co
+  AND C5.CALENDAR_YEAR     = &TX.Balance_Year
+  AND D5.TAXFORM_ID        = $TAXFORM_ID
+  AND D5.EFFDT             = $Max_Effdt
+  [$DB5.SelectedEEs]              !NULL string if SELECT EEs option not used
+  AND D5.DED_SLSTX_CLASS   = 'B'
+  AND DB5.COMPANY           = C5.COMPANY
+  AND DB5.BALANCE_ID        = $Calendar_Year_Id
+  AND DB5.BALANCE_YEAR      = &TX.Balance_Year
+  AND DB5.PLAN_TYPE         = D5.PLAN_TYPE
+  AND DB5.DEDCD             = D5.DEDCD
+  AND DB5.DED_CLASS         = D5.DED_CLASS
+  AND DB5.BALANCE_PERIOD           =
+      (SELECT MAX(BALANCE_PERIOD)
+       FROM   PS_DEDUCTION_BAL
+       WHERE  EMPLID            = DB5.EMPLID
+         AND  COMPANY           = DB5.COMPANY
+         AND  BALANCE_YEAR     = DB5.BALANCE_YEAR
+         AND  BALANCE_ID     = DB5.BALANCE_ID
+         AND  BENEFIT_PLAN      = DB5.BENEFIT_PLAN
+         AND  BENEFIT_RCD_NBR   = DB5.BENEFIT_RCD_NBR
+         AND  PLAN_TYPE         = DB5.PLAN_TYPE
+         AND  DEDCD             = DB5.DEDCD
+         AND  DED_CLASS         = DB5.DED_CLASS)
+  AND DB5.DED_YTD           <> 0
+GROUP BY DB5.COMPANY, DB5.BALANCE_YEAR, DB5.EMPLID, D5.BOX
+ORDER BY DB5.COMPANY, DB5.BALANCE_YEAR, DB5.EMPLID
+end-SELECT
+end-procedure
+
+begin-procedure Process-Territories-Deduction-Balances
+
+begin-SELECT
+DB6.COMPANY
+DB6.BALANCE_YEAR
+DB6.EMPLID          () on-break print=never before=Before-EmplID
+
+#ifdef DB2ALL
+DECIMAL(SUM(DB6.DED_YTD),15,3)   &DB6.Ded_YTD
+#else
+SUM(DB6.DED_YTD)         &DB6.Ded_YTD
+#endif
+
+D6.BOX
+
+
+    let $Company   = rtrim(&DB6.Company, ' ')
+    let $EmplID   = rtrim(&DB6.EmplID, ' ')
+    let $Box   = rtrim(&D6.Box, ' ')
+    move '$U'        to $State
+    move ' '         to $Locality
+    move &DB6.Ded_YTD to #Amount
+
+    if INSTR($BoxesUsed,($Box || $Company || '*'),1) = 0
+      let $BoxesUsed = $BoxesUsed || $Box || $Company || '*'
+
+      if $TAXFORM_ID = 'P'
+         if $Box = $YE_CODA_Plans
+            do Delete-Common-Deduction-Earnings
+         end-if
+      else
+        if $Box = $YE_Dep_Care
+        or $Box = $YE_Group_Term_Life
+        or $Box = $YE_401K
+        or $Box = $YE_403B
+        or $Box = $YE_408K6
+        or $Box = $YE_457B
+        or $Box = $YE_501C18D
+        or $Box = $YE_Uncoll_SS_Tax_GTL
+        or $Box = $YE_Uncoll_Med_Tax_GTL
+        or $Box = $YE_Med_Svgs_Acct
+        or $Box = $YE_408P_Simple_Retirement
+        or $Box = $YE_Adoption_Exp
+           do Delete-Common-Deduction-Earnings
+        end-if
+      end-if
+
+      do Insert-W2-Amount
+    else
+      do Update-W2-Amount
+    end-if
+
+FROM  PS_DEDUCTION_BAL DB6, PS_TAXFORM_DED D6, PS_YE_EE EE6,
+      PS_W2_COMPANY C6
+WHERE C6.W2_REPORTING_CO   = &A.W2_Reporting_Co
+  AND C6.CALENDAR_YEAR     = &TX.Balance_Year
+  AND D6.TAXFORM_ID        = $TAXFORM_ID
+  AND D6.EFFDT             = $Max_Effdt
+  AND D6.DED_SLSTX_CLASS   = 'B'
+  AND DB6.COMPANY          = C6.COMPANY
+  AND DB6.EMPLID           = EE6.EMPLID
+  AND DB6.COMPANY          = EE6.COMPANY
+  AND DB6.BALANCE_YEAR     = EE6.CALENDAR_YEAR
+  AND EE6.TAXFORM_ID       = $TAXFORM_ID
+  [$DB6.SelectedEEs]              !NULL string if SELECT EEs option not used
+  AND DB6.BALANCE_ID       = $Calendar_Year_Id
+  AND DB6.BALANCE_YEAR     = &TX.Balance_Year
+  AND DB6.PLAN_TYPE        = D6.PLAN_TYPE
+  AND DB6.DEDCD            = D6.DEDCD
+  AND DB6.DED_CLASS        = D6.DED_CLASS
+  AND DB6.BALANCE_PERIOD           =
+      (SELECT MAX(BALANCE_PERIOD)
+       FROM   PS_DEDUCTION_BAL
+       WHERE  EMPLID            = DB6.EMPLID
+         AND  COMPANY           = DB6.COMPANY
+         AND  BALANCE_YEAR     = DB6.BALANCE_YEAR
+         AND  BALANCE_ID     = DB6.BALANCE_ID
+         AND  BENEFIT_PLAN      = DB6.BENEFIT_PLAN
+         AND  PLAN_TYPE         = DB6.PLAN_TYPE
+         AND  BENEFIT_RCD_NBR   = DB6.BENEFIT_RCD_NBR
+         AND  DEDCD             = DB6.DEDCD
+         AND  DED_CLASS         = DB6.DED_CLASS)
+  AND DB6.DED_YTD           <> 0
+GROUP BY DB6.COMPANY, DB6.BALANCE_YEAR, DB6.EMPLID, D6.BOX
+ORDER BY DB6.COMPANY, DB6.BALANCE_YEAR, DB6.EMPLID
+end-SELECT
+end-procedure
+
+begin-procedure Finish-Processing
+
+  move '' to $priorState
+begin-SELECT DISTINCT
+W.EMPLID          () on-break print=never level=1 after=After-EmplID-Company
+W.COMPANY         () on-break print=never level=2 after=After-EmplID-Company
+W.TAXFORM_ID      () on-break print=never level=3 after=After-EmplID-Company
+W.SEQUENCE_NUMBER () on-break print=never level=4 before=Before-Seq-Num
+W.STATE           () on-break print=never level=5 after=After-State
+P5.LAST_NAME
+P5.FIRST_NAME
+P5.MIDDLE_NAME
+P5.NAME_SUFFIX
+P41.NATIONAL_ID
+
+P4.MAR_STATUS
+
+  let  $EmplID            = rtrim(&W.EmplID, ' ')
+  let  $Company             = rtrim(&W.Company, ' ')
+  move &W.Taxform_ID      to $TAXFORM_ID
+  move &W.Sequence_Number to #Sequence_Number
+
+  let $YE_LName        = &P5.LAST_NAME
+  let $YE_Middle_Name  = translate(&P5.MIDDLE_NAME, '.', '')
+  let $YE_FName        = translate(&P5.FIRST_NAME, '.', '')
+  let $YE_Suffix       = substr(&P5.NAME_SUFFIX ,1,5)
+
+  uppercase $YE_LName
+  uppercase $YE_Middle_Name
+  uppercase $YE_FName
+  uppercase $YE_Suffix
+
+  let $W.State = rtrim(&W.State, ' ')
+
+  let $SSN = rtrim(&P41.NATIONAL_ID,' ')
+  if  $SSN = ''
+     move ' '          to $SSN
+  end-if
+
+
+  let $AddressType = 'MAIL'
+  do Get-Employee-Address
+
+  if $AddressFound = 'N'
+     let $AddressType = 'HOME'
+     do Get-Employee-Address
+  end-if
+
+
+  let $AddrState = rtrim($State, ' ')
+  if $AddrState = '' and
+     ($PublicSector <> 'Y' or $FederalProduct <> 'Y')                   !HP00001 FED0001
+     move ' '             to $AddrState
+  end-if
+  if $AddrState = '' and                                                !HP99999
+     $PublicSector = 'Y'                    !HP00001 FED0001
+     let $AddrState = '-'                                               !HP99999
+  end-if
+  move $Postal         to $Zip
+  move $Zip               to $ZipExtsn ~~~~~~xxxx
+
+  if $Country = 'USA'
+    if instr($Zip,'-',6) = 0
+    and $ZipExtsn <> '    '
+      let $Zip = substr($Zip,1,5) || '-' || substr($Zip,6,4)
+    end-if
+  end-if
+
+  move ' '       to $Spouse_SSN
+  move ' '               to $Mar_Status
+  if $TAXFORM_ID = 'P'                          !get spouse SSN for Puerto Rico
+    if &P4.Mar_Status = 'M'
+      move &P4.Mar_Status   to $Mar_Status
+      do Get-Spouse-SSN
+    else
+      move 'S'             to $Mar_Status
+    end-if
+  end-if
+
+  do Get-Fed-Tax-Data
+
+FROM  PS_YE_AMOUNTS W, PS_PERS_DATA_EFFDT P4, PS_PERS_NID P41, PS_PERSON_NAME P5
+WHERE P41.COUNTRY = {NID_Country}
+  AND P41.NATIONAL_ID_TYPE = $PAYROLL_NID_TYPE
+  AND P41.EMPLID           = P4.EMPLID
+  [$W.SelectedEEs]            !NULL string if SELECT EEs option not used
+  AND P4.EMPLID            = W.EMPLID
+  AND W.CALENDAR_YEAR      = &TX.Balance_Year
+  AND P4.EFFDT =
+  (SELECT MAX(EFFDT)
+       FROM   PS_PERS_DATA_EFFDT
+       WHERE  EMPLID = P4.EMPLID
+         AND  EFFDT  <= $AsOfDate)
+  AND P41.EMPLID           = P5.EMPLID
+ORDER BY W.EMPLID, W.COMPANY, W.TAXFORM_ID, W.SEQUENCE_NUMBER, W.STATE DESC
+end-SELECT
+
+
+  do Get-State-Tax-Data
+
+end-procedure
+
+begin-procedure Finish-Processing-Selected-Cos
+
+  move '' to $priorState
+begin-SELECT DISTINCT
+WC.EMPLID          () on-break print=never level=1 after=After-EmplID-Company
+WC.COMPANY         () on-break print=never level=2 after=After-EmplID-Company
+WC.TAXFORM_ID      () on-break print=never level=3 after=After-EmplID-Company
+WC.SEQUENCE_NUMBER () on-break print=never level=4 before=Before-Seq-Num
+WC.STATE           () on-break print=never level=5 after=After-State
+P6.LAST_NAME
+P6.FIRST_NAME
+P6.MIDDLE_NAME
+P6.NAME_SUFFIX
+P41C.NATIONAL_ID
+P4C.MAR_STATUS
+
+
+  let  $EmplID            = rtrim(&WC.EmplID, ' ')
+  let  $Company             = rtrim(&WC.Company, ' ')
+  move &WC.Taxform_ID      to $TAXFORM_ID
+  move &WC.Sequence_Number to #Sequence_Number
+
+  let $YE_LName        = &P6.LAST_NAME
+  let $YE_Middle_Name  = translate(&P6.MIDDLE_NAME, '.', '')
+  let $YE_FName        = translate(&P6.FIRST_NAME, '.', '')
+  let $YE_Suffix       = substr(&P6.NAME_SUFFIX ,1,5)
+
+
+  uppercase $YE_LName
+  uppercase $YE_Middle_Name
+  uppercase $YE_FName
+  uppercase $YE_Suffix
+
+  let $W.State = rtrim(&WC.State, ' ')
+
+
+  let $SSN = rtrim(&P41C.NATIONAL_ID,' ')
+  if  $SSN = ''
+     move ' '          to $SSN
+  end-if
+
+
+  let $AddressType = 'MAIL'
+  do Get-Employee-Address
+
+  if $AddressFound = 'N'
+     let $AddressType = 'HOME'
+     do Get-Employee-Address
+  end-if
+
+
+  let $AddrState = rtrim($State, ' ')
+  if $AddrState = ''
+     move ' '             to $AddrState
+  end-if
+  move $Postal         to $Zip
+  move $Zip               to $ZipExtsn ~~~~~~xxxx
+  if $Country = 'USA'
+    if instr($Zip,'-',6) = 0
+      and $ZipExtsn <> '    '
+      let $Zip = substr($Zip,1,5) || '-' || substr($Zip,6,4)
+    end-if
+  end-if
+
+  move ' '       to $Spouse_SSN
+  move ' '               to $Mar_Status
+  if $TAXFORM_ID = 'P'                          !get spouse SSN for Puerto Rico
+    if &P4C.Mar_Status = 'M'
+      move &P4C.Mar_Status   to $Mar_Status
+      do Get-Spouse-SSN
+    else
+      move 'S'             to $Mar_Status
+    end-if
+  end-if
+
+  do Get-Fed-Tax-Data
+
+
+FROM  PS_YE_AMOUNTS WC, PS_PERS_DATA_EFFDT P4C, PS_PERS_NID P41C, PS_PERSON_NAME P6,
+      PS_W2_COMPANY C7
+WHERE P41C.COUNTRY = {NID_Country}
+  AND P41C.NATIONAL_ID_TYPE = $PAYROLL_NID_TYPE
+  AND P41C.EMPLID           = P4C.EMPLID
+  AND P4C.EMPLID            = WC.EMPLID
+  [$C7.SelectedCos]            !NULL string if SELECT W-2 company not used
+  AND C7.COMPANY           = WC.COMPANY
+  AND C7.CALENDAR_YEAR     = &TX.Balance_Year
+  AND WC.CALENDAR_YEAR      = &TX.Balance_Year
+  AND P4C.EFFDT =
+  (SELECT MAX(EFFDT)
+       FROM   PS_PERS_DATA_EFFDT
+       WHERE  EMPLID = P4C.EMPLID
+         AND  EFFDT  <= $AsOfDate)
+  AND P41C.EMPLID            = P6.EMPLID
+ORDER BY WC.EMPLID, WC.COMPANY, WC.TAXFORM_ID, WC.SEQUENCE_NUMBER, WC.STATE DESC
+end-SELECT
+
+
+  do Get-State-Tax-Data
+
+end-procedure
+
+
+begin-procedure Get-Spouse-SSN
+
+
+begin-SELECT
+BN.NATIONAL_ID
+
+FROM  PS_DEPENDENT_BENEF B, PS_DEP_BENEF_NID BN
+WHERE B.EMPLID           = $EmplID
+  AND B.RELATIONSHIP     = 'SP'
+  AND BN.EMPLID          = B.EMPLID
+  AND BN.DEPENDENT_BENEF = B.DEPENDENT_BENEF
+end-SELECT
+
+if RTRIM(&BN.NATIONAL_ID, ' ') = ''
+   move '000000000'          to $Spouse_SSN
+else
+  move &BN.NATIONAL_ID       to $Spouse_SSN
+end-if
+
+end-procedure
+
+
+begin-procedure Get-Fed-Tax-Data
+  move 'N' to $Statutory_EE
+  move 'N' to $Deceased
+  move 'N' to $Pension_Plan
+  move 'N' to $ThirdParty_SickPay
+begin-SELECT
+F.STATUTORY_EE
+F.DECEASED
+F.PENSION_PLAN
+F.THIRDPARTY_SICKPAY
+
+  move &F.Statutory_EE         to $Statutory_EE
+  move &F.Deceased             to $Deceased
+  move &F.Pension_Plan         to $Pension_Plan
+  move &F.ThirdParty_SickPay   to $ThirdParty_SickPay
+
+FROM  PS_FED_TAX_DATA F
+WHERE F.EMPLID        = $EmplID
+  AND F.COMPANY       = $Company
+  AND F.EFFDT =
+      (SELECT MAX(EFFDT)
+       FROM   PS_FED_TAX_DATA
+       WHERE  EMPLID  = $EmplID
+         AND  COMPANY = $Company
+         AND  EFFDT  <= $AsOfDate)
+end-SELECT
+end-procedure
+
+begin-procedure Get-State-Tax-Data
+
+if rtrim($W1.SelectedEEs, ' ') <> ''
+and rtrim($W3.SelectedCOs, ' ') <> ''
+    move '' to $W1.SelectedEEs
+    move '' to $State.SelectedEEs
+end-if
+
+begin-SELECT DISTINCT
+W1.COMPANY
+W1.STATE
+S.EMPLOYER_ID_SWT
+
+  do Update-State-EIN
+
+FROM  PS_CO_STATETAX_TBL S, PS_YE_AMOUNTS W1, PS_W2_COMPANY W3
+WHERE W1.CALENDAR_YEAR = &TX.Balance_Year
+  AND W1.TAXFORM_ID    = $TAXFORM_ID
+  AND W1.STATE        <> '$U'
+  [$W1.SelectedEEs]
+  AND W3.COMPANY       = W1.COMPANY
+  [$W3.SelectedCos]
+  AND W3.CALENDAR_YEAR = W1.CALENDAR_YEAR
+  AND W3.TAXFORM_ID    = W1.TAXFORM_ID
+  AND S.COMPANY        = W3.W2_REPORTING_CO
+  AND S.STATE          = W1.STATE
+  AND S.EFFDT =
+      (SELECT MAX(EFFDT)
+       FROM   PS_CO_STATETAX_TBL
+       WHERE  COMPANY = W3.W2_REPORTING_CO
+         AND  STATE   = W1.STATE
+         AND  EFFDT  <= $AsOfDate)
+end-SELECT
+
+end-procedure
+
+begin-procedure After-EmplID-Company
+
+  if $EmplID <> $priorEmplID or $Company <> $priorCompany or $TAXFORM_ID <> $priorForm_ID
+    if $TAXFORM_ID = 'W'
+       do Insert-W2-EE-Record
+    end-if
+  end-if
+  move $EmplID  to $priorEmplID
+  move $Company to $priorCompany
+  move $TAXFORM_ID to $priorForm_ID
+
+end-procedure
+
+begin-procedure Before-Seq-Num
+    move 'N' to $DataRecordInserted
+end-procedure
+
+begin-procedure After-State
+  if #Sequence_Number > 1
+    do Insert-W2-Data-Record
+    move 'Y' to $DataRecordInserted
+  else
+    if  $W.State <> '$U'
+    and $W.State <> '$UPR'
+    and $W.State <> '$UGU'
+    and $W.State <> '$UVI'
+    and $W.State <> '$UAS'
+
+      do Insert-W2-Data-Record
+      move 'Y' to $DataRecordInserted
+    else
+      if $DataRecordInserted = 'N'
+        move ' ' to $W.State
+        do Insert-W2-Data-Record
+        move 'Y' to $DataRecordInserted
+      end-if
+    end-if
+  end-if
+end-procedure
+
+begin-procedure Adjust-PR-Wages
+
+begin-SQL on-error=Error-W2-Amounts
+    UPDATE PS_YE_AMOUNTS
+       SET W2_AMOUNT = W2_AMOUNT - #Amount
+     WHERE COMPANY           = $Company
+       AND EMPLID            = $EmplID
+       AND CALENDAR_YEAR     = &TX.Balance_Year
+       AND TAXFORM_ID        = 'P'
+       AND SEQUENCE_NUMBER   = #Sequence_Number
+       AND BOX               = $YE_Wages
+       AND STATE             = 'PR'
+       AND LOCALITY          = $Locality;
+  end-SQL
+
+
+end-procedure
+
+begin-procedure Delete-Common-Deduction-Earnings
+
+  if $TAXFORM_ID = 'P'
+     if $Box = $YE_Tips
+        let $DelCommonBox = $Common_Tips
+     else
+       if $Box = $YE_Reimbursed_Expense
+          let $DelCommonBox = $Common_Reimbursed_Expense
+       else
+         if $Box = $YE_CODA_Plans
+            let $DelCommonBox = $Common_CODA_Plans
+         end-if
+       end-if
+     end-if
+  else
+     let $DelCommonBox = 'AND BOX     = '''  || $Box   || ''''
+  end-if
+
+
+begin-SQL  on-error=Ignore
+
+  DELETE FROM PS_YE_AMOUNTS
+        WHERE COMPANY = $Company
+          AND EMPLID  = $EmplID
+          AND CALENDAR_YEAR = &TX.Balance_Year
+          AND TAXFORM_ID <> $TAXFORM_ID
+         [$DelCommonBox];
+end-SQL
+
+
+end-procedure
+
+begin-procedure Insert-W2-EE-Record
+
+begin-SQL
+  INSERT INTO PS_YE_EE (COMPANY,
+                        EMPLID,
+                        CALENDAR_YEAR,
+                        TAXFORM_ID,
+                        PROCESS_FLAG)
+                VALUES ($Company,
+                        $EmplID,
+                        &TX.Balance_Year,
+                        $TAXFORM_ID,
+                        'C')
+end-SQL
+end-procedure
+
+begin-procedure Insert-W2-Data-Record
+
+begin-SQL  on-error=Error-W2-Data
+  INSERT INTO PS_YE_DATA (COMPANY,
+                          EMPLID,
+                          CALENDAR_YEAR,
+                          TAXFORM_ID,
+                          SEQUENCE_NUMBER,
+                          SSN,
+                          YE_FNAME,
+                          YE_MIDDLE_NAME,
+                          YE_LNAME,
+                          YE_SUFFIX,
+                          ADDRESS1,
+                          ADDRESS2,
+                          CITY,
+                          STATE,
+                          COUNTRY,
+                          POSTAL,
+                          STATUTORY_EE,
+                          PENSION_PLAN,
+                          DECEASED,
+                          THIRDPARTY_SICKPAY,
+                          W2_STATE,
+                          EMPLOYER_ID_SWT,
+                          CONTROL_NUMBER,
+                          MEDICARE_ONLY,                                !HP99999
+                          MAR_STATUS,
+                          SPOUSE_SSN)
+                  VALUES ($Company,
+                          $EmplID,
+                          &TX.Balance_Year,
+                          $TAXFORM_ID,
+                          #Sequence_Number,
+                          $SSN,
+                          $YE_FName,
+                          $YE_Middle_Name,
+                          $YE_LName,
+                          $YE_Suffix,
+                          $Address1,
+                          $Address2,
+                          $City,
+                          $AddrState,
+                          $Country,
+                          $Zip,
+                          $Statutory_EE,
+                          $Pension_Plan,
+                          $Deceased,
+                          $ThirdParty_SickPay,
+                          $W.State,
+                          ' ',
+                          ' ',
+                          'N',                                          !HP99999
+                          $Mar_Status,
+                          $Spouse_SSN);
+end-SQL
+end-procedure
+
+begin-procedure Error-W2-Data
+  display 'W2 Data Error ' noline
+  display $Company noline
+  display ' '      noline
+  display $EmplID                     noline
+  display ' '      noline
+  display &TX.Balance_Year     noline
+  display ' '      noline
+  display #Sequence_Number
+
+end-procedure
+
+begin-procedure Delete-W2-Company-Data
+
+begin-SQL  on-error=Ignore
+  DELETE FROM PS_YE_EE
+        WHERE CALENDAR_YEAR = &TX.Balance_Year
+          [$Delete_SelectedEEs];             !NULL string if SELECT EEs option not used
+
+  DELETE FROM PS_YE_DATA
+        WHERE CALENDAR_YEAR = &TX.Balance_Year
+          [$Delete_SelectedEEs];             !NULL string if SELECT EEs option not used
+
+  DELETE FROM PS_YE_AMOUNTS
+        WHERE CALENDAR_YEAR = &TX.Balance_Year
+          [$Delete_SelectedEEs];             !NULL string if SELECT EEs option not used
+end-SQL
+end-procedure
+
+begin-procedure Delete-W2-Company-Data-Selected-Companies
+
+move 'AND PT.COMPANY IN (''' to $PT.SelectedCos
+
+begin-SELECT
+
+C8.COMPANY
+
+     do Delete-Selected-Companies
+     let $PT.SelectedCos   = $PT.SelectedCos  || &C8.COMPANY  || ''','''
+
+FROM  PS_W2_COMPANY C8
+WHERE C8.CALENDAR_YEAR = &TX.Balance_Year
+  [$C8.SelectedCos]            !Selected W-2 companies
+
+end-SELECT
+
+let $PT.SelectedCos  = SUBSTR($PT.SelectedCos,1,LENGTH($PT.SelectedCos) - 2)
+let $PT.SelectedCos  = $PT.SelectedCos || ')'
+
+end-procedure
+
+begin-procedure Delete-Selected-Companies
+
+begin-SQL  on-error=Ignore
+  DELETE FROM PS_YE_EE
+         WHERE CALENDAR_YEAR = &TX.Balance_Year
+         AND COMPANY = &C8.COMPANY;
+
+
+  DELETE FROM PS_YE_DATA
+         WHERE CALENDAR_YEAR = &TX.Balance_Year
+         AND COMPANY = &C8.COMPANY;
+
+  DELETE FROM PS_YE_AMOUNTS
+         WHERE CALENDAR_YEAR = &TX.Balance_Year
+         AND COMPANY = &C8.COMPANY;
+end-SQL
+end-procedure
+
+begin-procedure Remove-Zero-Rows
+
+begin-SQL  on-error=Ignore
+  DELETE FROM PS_YE_AMOUNTS
+        WHERE CALENDAR_YEAR = &TX.Balance_Year
+          AND W2_AMOUNT = 0
+          [$Delete_SelectedEEs];             !NULL string if SELECT EEs option not used
+end-SQL
+end-procedure
+
+begin-procedure Remove-Zero-Rows-Selected-Companies
+
+let $SelectedCos  = 'AND ' || SUBSTR($PT.SelectedCos,8,LENGTH($PT.SelectedCos))
+
+begin-SQL  on-error=Ignore
+  DELETE FROM PS_YE_AMOUNTS
+        WHERE CALENDAR_YEAR = &TX.Balance_Year
+          AND W2_AMOUNT = 0
+          [$SelectedCos];
+end-SQL
+end-procedure
+
+
+begin-procedure Insert-W2-Amount
+
+  if #Amount <= 0
+    let $ZeroFlag = 'Y'
+  end-if
+
+begin-SQL on-error=Update-W2-Amount
+
+  INSERT INTO PS_YE_AMOUNTS (COMPANY,
+                             EMPLID,
+                             CALENDAR_YEAR,
+                             TAXFORM_ID,
+                             SEQUENCE_NUMBER,
+                             BOX,
+                             STATE,
+                             LOCALITY,
+                             W2_AMOUNT)
+                     VALUES ($Company,
+                             $EmplID,
+                             &TX.Balance_Year,
+                             $TAXFORM_ID,
+                             #Sequence_Number,
+                             $Box,
+                             $State,
+                             $Locality,
+                             #Amount);
+end-SQL
+end-procedure
+
+begin-procedure Update-W2-Amount
+
+  if #Amount <= 0
+    let $ZeroFlag = 'Y'
+  end-if
+
+! Error Message from procedure Insert-W2-Amount
+  move $sql-error  to $Ins_error
+
+  begin-SQL on-error=Error-W2-Amounts
+    UPDATE PS_YE_AMOUNTS
+       SET W2_AMOUNT = W2_AMOUNT + #Amount
+     WHERE COMPANY           = $Company
+       AND EMPLID            = $EmplID
+       AND CALENDAR_YEAR     = &TX.Balance_Year
+       AND TAXFORM_ID        = $TAXFORM_ID
+       AND SEQUENCE_NUMBER   = #Sequence_Number
+       AND BOX               = $Box
+       AND STATE             = $State
+       AND LOCALITY          = $Locality;
+  end-SQL
+
+   If #Sql-Count = 0
+     Show 'Error : ' $Ins_error
+     do Rollback-Transaction
+     stop
+  End-if
+
+end-procedure
+
+begin-procedure Process-MQGE-Companies                                  !HP99999
+begin-SELECT                                                            !HP99999
+M.W2_REPORTING_CO                                                       !HP99999
+                                                                        !HP99999
+    do Check-for-Medicare-Only                                          !HP99999
+                                                                        !HP99999
+FROM  PS_W2_COMPANY M                                                   !HP99999
+WHERE M.CALENDAR_YEAR    = &TX.Balance_Year                             !HP99999
+  AND M.W2_REPORTING_CO  = M.COMPANY                                    !HP99999
+  AND M.W2_REPORTING_CO <> ' '                                          !HP99999
+  AND M.MQGE_EMPLOYEES   = 'Y'                                          !HP99999
+  [$M.SelectedCos]             !NULL string if SELECT W-2 Companies option not used  HP99999
+ORDER BY M.W2_REPORTING_CO                                              !HP99999
+end-SELECT                                                              !HP99999
+end-procedure                                                           !HP99999
+
+begin-procedure Check-for-Medicare-Only                                 !HP99999
+begin-SELECT                                                            !HP99999
+W2D.COMPANY                                                             !HP99999
+W2D.EMPLID                                                              !HP99999
+W2D.SEQUENCE_NUMBER                                                     !HP99999
+W2D.TAXFORM_ID                                                          !HP99999
+                                                                        !HP99999
+  move &W2D.COMPANY         to $Company                                 !HP99999
+  move &W2D.EMPLID          to $EmplID                                  !HP99999
+  move &W2D.SEQUENCE_NUMBER to #Sequence_Number                         !HP99999
+  move &W2D.TAXFORM_ID      to $HP_TaxForm_ID                           !HP99999
+  do Update-W2-Medicare-Ind                                             !HP99999
+                                                                        !HP99999
+FROM PS_YE_DATA W2D, PS_W2_COMPANY M2                                   !HP99999
+WHERE M2.W2_REPORTING_CO = &M.W2_Reporting_Co                           !HP99999
+  AND M2.CALENDAR_YEAR   = &TX.Balance_Year                             !HP99999
+  AND W2D.COMPANY        = M2.COMPANY                                   !HP99999
+  AND W2D.CALENDAR_YEAR  = M2.CALENDAR_YEAR                             !HP99999
+  AND W2D.TAXFORM_ID in ('W','P')                                       !HP99999
+  AND (                                                                 !HP99999
+        (   W2D.TAXFORM_ID   = 'W'                                      !HP99999
+         AND EXISTS                                                     !HP99999
+            (SELECT 'X' FROM PS_YE_AMOUNTS W2A1                         !HP99999
+             WHERE W2A1.COMPANY         = W2D.COMPANY                   !HP99999
+               AND W2A1.EMPLID          = W2D.EMPLID                    !HP99999
+               AND W2A1.CALENDAR_YEAR   = W2D.CALENDAR_YEAR             !HP99999
+               AND W2A1.TAXFORM_ID      = W2D.TAXFORM_ID                !HP99999
+               AND W2A1.STATE           = '$U'                          !HP99999
+               AND W2A1.SEQUENCE_NUMBER = W2D.SEQUENCE_NUMBER           !HP99999
+               AND W2A1.BOX             = '05'                          !HP99999
+               AND W2A1.W2_AMOUNT       <> 0)                           !HP99999
+         AND NOT EXISTS                                                 !HP99999
+            (SELECT 'X' FROM PS_YE_AMOUNTS W2A2                         !HP99999
+             WHERE W2A2.COMPANY         = W2D.COMPANY                   !HP99999
+               AND W2A2.EMPLID          = W2D.EMPLID                    !HP99999
+               AND W2A2.CALENDAR_YEAR   = W2D.CALENDAR_YEAR             !HP99999
+               AND W2A2.TAXFORM_ID      = W2D.TAXFORM_ID                !HP99999
+               AND W2A2.STATE           = '$U'                          !HP99999
+               AND W2A2.SEQUENCE_NUMBER = W2D.SEQUENCE_NUMBER           !HP99999
+               AND W2A2.BOX             = '03'                          !HP99999
+               AND W2A2.W2_AMOUNT       <> 0)                           !HP99999
+        )                                                               !HP99999
+     OR (   W2D.TAXFORM_ID   = 'P'                                      !HP99999
+         AND EXISTS                                                     !HP99999
+            (SELECT 'X' FROM PS_YE_AMOUNTS W2A3                         !HP99999
+             WHERE W2A3.COMPANY         = W2D.COMPANY                   !HP99999
+               AND W2A3.EMPLID          = W2D.EMPLID                    !HP99999
+               AND W2A3.CALENDAR_YEAR   = W2D.CALENDAR_YEAR             !HP99999
+               AND W2A3.TAXFORM_ID      = W2D.TAXFORM_ID                !HP99999
+               AND W2A3.STATE           = '$UPR'                        !HP99999
+               AND W2A3.SEQUENCE_NUMBER = W2D.SEQUENCE_NUMBER           !HP99999
+               AND W2A3.BOX             = '20'                          !HP99999
+               AND W2A3.W2_AMOUNT       <> 0)                           !HP99999
+         AND NOT EXISTS                                                 !HP99999
+            (SELECT 'X' FROM PS_YE_AMOUNTS W2A4                         !HP99999
+             WHERE W2A4.COMPANY         = W2D.COMPANY                   !HP99999
+               AND W2A4.EMPLID          = W2D.EMPLID                    !HP99999
+               AND W2A4.CALENDAR_YEAR   = W2D.CALENDAR_YEAR             !HP99999
+               AND W2A4.TAXFORM_ID      = W2D.TAXFORM_ID                !HP99999
+               AND W2A4.STATE           = '$UPR'                        !HP99999
+               AND W2A4.SEQUENCE_NUMBER = W2D.SEQUENCE_NUMBER           !HP99999
+               AND W2A4.BOX             = '18'                          !HP99999
+               AND W2A4.W2_AMOUNT       <> 0)                           !HP99999
+        )                                                               !HP99999
+      )                                                                 !HP99999
+end-SELECT                                                              !HP99999
+end-procedure                                                           !HP99999
+                                                                        !HP99999
+begin-procedure Update-W2-Medicare-Ind                                  !HP99999
+  begin-SQL on-error=Error-W2-Medicare-Ind                              !HP99999
+    UPDATE PS_YE_DATA                                                   !HP99999
+       SET MEDICARE_ONLY = 'Y'                                          !HP99999
+     WHERE COMPANY           = $Company                                 !HP99999
+       AND EMPLID            = $EmplID                                  !HP99999
+       AND CALENDAR_YEAR     = &TX.Balance_Year                         !HP99999
+       AND TAXFORM_ID        = $HP_TaxForm_ID                           !HP99999
+       AND SEQUENCE_NUMBER   = #Sequence_Number                         !HP99999
+  end-SQL                                                               !HP99999
+end-procedure                                                           !HP99999
+                                                                        !HP99999
+begin-procedure Error-W2-Medicare-Ind                                   !HP99999
+  display 'W2 Medicare Indicator Error ' noline                         !HP99999
+  display $Company noline                                               !HP99999
+  display ' '      noline                                               !HP99999
+  display $EmplID                     noline                            !HP99999
+  display ' '      noline                                               !HP99999
+  display &TX.Balance_Year     noline                                   !HP99999
+  display ' '      noline                                               !HP99999
+  display #Sequence_Number                                              !HP99999
+end-procedure                                                           !HP99999
+
+begin-procedure Error-W2-Amounts
+  display 'W2 Amount Error '  noline
+  display $Company noline
+  display ' '      noline
+  display $EmplID  noline
+  display ' '      noline
+  display &TX.Balance_Year     noline
+  display ' '      noline
+  display #Sequence_Number      noline
+  display ' '      noline
+  display $Box                  noline
+  display ' '      noline
+  display $State                noline
+  display ' '      noline
+  display $Locality             noline
+  display ' '      noline
+  display #Amount
+end-procedure
+
+begin-procedure Update-State-EIN        !add to where clause
+
+  let $W1.State = rtrim(&W1.State, ' ')
+begin-SQL on-error=Error-State-EIN
+  UPDATE PS_YE_DATA
+     SET EMPLOYER_ID_SWT = &S.Employer_ID_SWT
+   WHERE COMPANY         = &W1.Company
+     AND W2_STATE        = $W1.State
+     AND CALENDAR_YEAR   = &TX.Balance_Year
+     [$State.SelectedEEs]
+end-SQL
+end-procedure
+
+begin-procedure Error-State-EIN
+  display 'Error updating state EIN'
+  display &S.Employer_ID_SWT
+  display &W1.Company
+  display $W1.State
+end-procedure
+
+begin-procedure Reset-NY-Gross
+begin-SELECT
+SA.COMPANY
+SA.EMPLID
+SA.LOCALITY
+SA.SEQUENCE_NUMBER
+
+    let $NYC.Company = rtrim(&SA.COMPANY, ' ')
+    let $NYC.Emplid = rtrim(&SA.EMPLID, ' ')
+    let #NYC.SequenceNumber = &SA.SEQUENCE_NUMBER
+
+    do Get-Federal-Amount
+
+FROM  PS_YE_AMOUNTS SA
+WHERE SA.STATE          =  'NY'
+  AND SA.CALENDAR_YEAR  =  &TX.Balance_Year
+  AND SA.TAXFORM_ID     =  'W'
+  [$SA.SelectedEEs]                    !NULL string if SELECT EEs option not used
+  AND SA.BOX            =  $YE_State_Wages
+end-SELECT
+end-procedure
+
+begin-procedure Reset-NY-Gross-Selected-Cos
+begin-SELECT
+SAC.COMPANY
+SAC.EMPLID
+SAC.LOCALITY
+SAC.SEQUENCE_NUMBER
+
+
+    let $NYC.Company = rtrim(&SAC.COMPANY, ' ')
+    let $NYC.Emplid = rtrim(&SAC.EMPLID, ' ')
+    let #NYC.SequenceNumber = &SAC.SEQUENCE_NUMBER
+
+    do Get-Federal-Amount
+
+FROM  PS_YE_AMOUNTS SAC, PS_W2_COMPANY C9
+WHERE SAC.STATE          =  'NY'
+  AND SAC.CALENDAR_YEAR  =  &TX.Balance_Year
+  AND SAC.TAXFORM_ID     =  'W'
+  [$C9.SelectedCos]            !NULL string if SELECT W-2 company not used
+  AND SAC.BOX            =  $YE_State_Wages
+  AND C9.COMPANY           = SAC.COMPANY
+  AND C9.CALENDAR_YEAR     = SAC.CALENDAR_YEAR
+end-SELECT
+end-procedure
+
+
+begin-procedure Get-Federal-Amount
+begin-SELECT
+FA.W2_AMOUNT
+  move &FA.W2_Amount to #NYAmt
+
+  do Update-State-Amount
+  do Update-Local-Amount
+
+FROM PS_YE_AMOUNTS FA
+WHERE FA.COMPANY         =  $NYC.Company
+  AND FA.EMPLID          =  $NYC.Emplid
+  AND FA.CALENDAR_YEAR   =  &TX.Balance_Year
+  AND FA.TAXFORM_ID      =  'W'
+  AND FA.SEQUENCE_NUMBER =  1
+  AND FA.BOX             =  $YE_Fed_Wages
+  AND FA.STATE           =  '$U'
+end-SELECT
+end-procedure
+
+
+begin-procedure Update-State-Amount
+
+  begin-SQL on-error=Error-NY-Amounts
+    UPDATE PS_YE_AMOUNTS
+       SET W2_AMOUNT       = #NYAmt
+     WHERE COMPANY         = $NYC.Company
+     AND   EMPLID          = $NYC.Emplid
+     AND   CALENDAR_YEAR   = &TX.Balance_Year
+     AND   TAXFORM_ID      = 'W'
+     AND   SEQUENCE_NUMBER = #NYC.SequenceNumber
+     AND   BOX             = $YE_State_Wages
+     AND   STATE           = 'NY'
+  end-SQL
+  end-procedure
+
+begin-procedure Error-NY-Amounts
+  display 'NY Amount Error '  noline
+  display &SA.Company noline
+  display ' '      noline
+  display &SA.EmplID  noline
+  display ' '      noline
+  display &TX.Balance_Year     noline
+  display ' '      noline
+  display &SA.Sequence_Number      noline
+  display ' '      noline
+  display $YE_State_Wages         noline
+  display ' '      noline
+  display 'NY'                  noline
+  display ' '      noline
+  display #NYAmt
+end-procedure
+
+begin-procedure Update-Local-Amount
+
+  begin-SQL on-error=Error-NY-Local
+    UPDATE PS_YE_AMOUNTS
+       SET W2_AMOUNT       = #NYAmt
+     WHERE COMPANY         = $NYC.Company
+     AND   EMPLID          = $NYC.Emplid
+     AND   CALENDAR_YEAR   = &TX.Balance_Year
+     AND   TAXFORM_ID      = 'W'
+     AND   SEQUENCE_NUMBER = #NYC.SequenceNumber
+     AND   BOX             = $YE_Local_Wages
+     AND   STATE           = 'NY'
+     AND   LOCALITY        = '84000'
+  end-SQL
+end-procedure
+
+
+begin-procedure Error-NY-Local
+  display 'NY Local Error '  noline
+  display &SA.Company noline
+  display ' '      noline
+  display &SA.EmplID  noline
+  display ' '      noline
+  display &TX.Balance_Year     noline
+  display ' '      noline
+  display &SA.Sequence_Number      noline
+  display ' '      noline
+  display &SA.LOCALITY                noline
+  display ' '      noline
+  display $YE_Local_Wages
+  display ' '      noline
+  display 'NY'                  noline
+  display ' '      noline
+  display #NYAmt
+end-procedure
+
+
+begin-procedure Process-TSB
+begin-SELECT
+TM.EMPLID
+TM.COMPANY
+TM.AMT1
+
+  do TSB-UPDATE
+
+FROM PS_R_TAX909NY TM
+end-SELECT
+end-procedure
+
+
+begin-procedure TSB-UPDATE
+  begin-SQL on-error=Error-TSB-Amounts
+    UPDATE PS_YE_AMOUNTS
+       SET W2_AMOUNT       =  &TM.AMT1
+     WHERE COMPANY         =  &TM.Company
+     AND   EMPLID          =  &TM.EmplID
+     AND   CALENDAR_YEAR   =  &TX.Balance_Year
+     AND   TAXFORM_ID      =  'W'
+     AND   BOX             =  $YE_Local_Wages
+     AND   STATE           =  'NY'
+     AND   LOCALITY        =  'P0001'
+  end-SQL
+  end-procedure
+
+
+begin-procedure Error-TSB-Amounts
+  display 'TSB Amount Error '  noline
+  display &TM.Company          noline
+  display ' '      noline
+  display &TM.EmplID           noline
+  display ' '      noline
+  display &TX.Balance_Year     noline
+  display ' '      noline
+  display $YE_Local_Wages      noline
+  display ' '      noline
+  display 'NY'                 noline
+  display ' '      noline
+  display 'P0001'              noline
+  display ' '      noline
+  display &TM.AMT1
+end-procedure
+
+
+begin-procedure Ignore
+  !Dummy procedure to avoid error if no records to delete
+end-procedure
+
+begin-procedure Create-Track-Company-Array
+
+  create-array name=Track-Company size=40   -
+    field=Company:char
+    field=TaxformID:char
+
+end-procedure
+
+begin-procedure Initialize-Track-Company-Array
+
+  move 0 to #load
+  move ' ' to $loadCo
+  move ' ' to $loadID
+  while #load < 40
+
+    put $loadCo $LoadID into Track-Company(#load)
+        Company TaxformID
+
+    add 1 to #load
+
+  end-while
+
+  move 0 to #TrackCo_i
+
+end-procedure
+
+begin-procedure Check-Track-Company-Array
+
+  let $Found_In_Company_Array = 'N'
+  let #j = 0
+
+  while #j < #TrackCo_i and $Found_In_Company_Array = 'N'
+    get $GetCompany $GetTaxformID from Track-Company(#j)
+        Company TaxformID
+
+    if  $Company         =  $GetCompany
+    and $Track-TaxformID =  $GetTaxformID
+       let $Found_In_Company_Array = 'Y'
+    end-if
+
+   add 1 to #j
+
+  end-while
+
+  if $Found_In_Company_Array = 'N'
+
+     put $Company $Track-TaxformID into Track-Company(#TrackCo_i)
+          Company TaxformID
+
+     add 1 to #TrackCo_i
+
+  end-if
+
+end-procedure
+
+begin-procedure Finish-Processing-Territories
+
+  let $TAXFORM_ID = 'W'
+  do Assign-Year-End-Variables
+
+  let $Core_W2_Fed_Wages      =  $YE_Fed_Wages
+  let $Core_W2_Fed_Tax        =  $YE_Fed_Tax
+  let $Core_W2_SS_Wages       =  $YE_SS_Wages
+  let $Core_W2_SS_Tax         =  $YE_SS_Tax
+  let $Core_W2_Med_Wages      =  $YE_Med_Wages
+  let $Core_W2_Med_Tax        =  $YE_Med_Tax
+  let $Core_W2_SS_Tips        =  $YE_SS_Tips
+  let $Core_W2_Adv_EIC        =  $YE_Adv_EIC
+  let $Core_W2_Non_Qual_457_Y =  $YE_Non_Qual_457_Y
+  let $Core_W2_Non_Qual_457_N =  $YE_Non_Qual_457_N
+
+
+  let $TAXFORM_ID = 'I'
+  do Assign-Year-End-Variables
+
+  let $Core_W2VI_Fed_Wages        =   $YE_Fed_Wages
+  let $Core_W2VI_Fed_Tax          =   $YE_Fed_Tax
+  let $Core_W2VI_SS_Wages         =   $YE_SS_Wages
+  let $Core_W2VI_SS_Tax           =   $YE_SS_Tax
+  let $Core_W2VI_Med_Wages        =   $YE_Med_Wages
+  let $Core_W2VI_Med_Tax          =   $YE_Med_Tax
+  let $Core_W2VI_SS_Tips          =   $YE_SS_Tips
+  let $Core_W2VI_Adv_EIC          =   $YE_Adv_EIC
+  let $Core_W2VI_Non_Qual_457_Y   =   $YE_Non_Qual_457_Y
+  let $Core_W2VI_Non_Qual_457_N   =   $YE_Non_Qual_457_N
+
+  let $TAXFORM_ID = 'M'
+  do Assign-Year-End-Variables
+
+  let $Core_W2GU_Fed_Wages        =   $YE_Fed_Wages
+  let $Core_W2GU_Fed_Tax          =   $YE_Fed_Tax
+  let $Core_W2GU_SS_Wages         =   $YE_SS_Wages
+  let $Core_W2GU_SS_Tax           =   $YE_SS_Tax
+  let $Core_W2GU_Med_Wages        =   $YE_Med_Wages
+  let $Core_W2GU_Med_Tax          =   $YE_Med_Tax
+  let $Core_W2GU_SS_Tips          =   $YE_SS_Tips
+  let $Core_W2GU_Adv_EIC          =   $YE_Adv_EIC
+  let $Core_W2GU_Non_Qual_457_Y   =   $YE_Non_Qual_457_Y
+  let $Core_W2GU_Non_Qual_457_N   =   $YE_Non_Qual_457_N
+
+  let $TAXFORM_ID = 'P'
+  do Assign-Year-End-Variables
+
+  let $Core_W2PR_Wages            =   $YE_Wages
+  let $Core_W2PR_Commissions      =   $YE_Commissions
+  let $Core_W2PR_Allowance        =   $YE_Allowance
+  let $Core_W2PR_Tips             =   $YE_Tips
+  let $Core_W2PR_Tax_Withheld     =   $YE_Tax_Withheld
+  let $Core_W2PR_SS_Tax           =   $YE_SS_Tax
+  let $Core_W2PR_SS_Tax           =   $YE_SS_Tax
+  let $Core_W2PR_Med_Wages        =   $YE_Med_Wages
+  let $Core_W2PR_Med_Tax          =   $YE_Med_Tax
+
+  let $TAXFORM_ID = 'S'
+  do Assign-Year-End-Variables
+
+  let $Core_W2AS_Fed_Wages        =   $YE_Fed_Wages
+  let $Core_W2AS_Fed_Tax          =   $YE_Fed_Tax
+  let $Core_W2AS_SS_Wages         =   $YE_SS_Wages
+  let $Core_W2AS_SS_Tax           =   $YE_SS_Tax
+  let $Core_W2AS_Med_Wages        =   $YE_Med_Wages
+  let $Core_W2AS_Med_Tax          =   $YE_Med_Tax
+  let $Core_W2AS_SS_Tips          =   $YE_SS_Tips
+  let $Core_W2AS_Non_Qual_457_Y   =   $YE_Non_Qual_457_Y
+  let $Core_W2AS_Non_Qual_457_N   =   $YE_Non_Qual_457_N
+
+begin-SELECT
+PT.COMPANY
+PT.EMPLID
+PT.CALENDAR_YEAR
+
+  do Check-For-Core-Boxes
+
+FROM PS_YE_EE PT
+WHERE PT.CALENDAR_YEAR   = &TX.Balance_Year
+[$PT.SelectedCos]
+[$PT.SelectedEEs]
+GROUP BY PT.COMPANY,PT.EMPLID,PT.CALENDAR_YEAR
+HAVING COUNT(*) > 1
+
+
+end-SELECT
+
+end-procedure
+
+
+begin-procedure Check-For-Core-Boxes
+
+  let $Found-Core-W2   = 'N'
+  let $Found-W2        = 'N'
+  let $Found-Core-W2VI = 'N'
+  let $Found-W2VI      = 'N'
+  let $Found-Core-W2GU = 'N'
+  let $Found-W2GU      = 'N'
+  let $Found-Core-W2PR = 'N'
+  let $Found-W2PR      = 'N'
+  let $Found-Core-W2AS = 'N'
+  let $Found-W2AS      = 'N'
+
+begin-SELECT
+
+CB.TAXFORM_ID
+CB.BOX
+
+    let $CheckBox = rtrim(&CB.BOX, ' ')                !Each type of W-2 must contain at least one core box
+                                                       !in order to have a W-2 generated.
+    if &CB.TAXFORM_ID = 'W'
+
+       evaluate $CheckBox
+
+       when = $Core_W2_Fed_Wages
+       when = $Core_W2_Fed_Tax
+       when = $Core_W2_SS_Wages
+       when = $Core_W2_SS_Tax
+       when = $Core_W2_Med_Wages
+       when = $Core_W2_Med_Tax
+       when = $Core_W2_SS_Tips
+       when = $Core_W2_Adv_EIC
+       when = $Core_W2_Non_Qual_457_Y
+       when = $Core_W2_Non_Qual_457_N
+
+          let $Found-Core-W2 = 'Y'
+          let $Found-W2      = 'Y'
+       break
+
+       when-other
+          let $Found-W2 = 'Y'
+       break
+
+       end-evaluate
+    else
+       if &CB.TAXFORM_ID = 'I'
+
+          evaluate $CheckBox
+
+          when = $Core_W2VI_Fed_Wages
+          when = $Core_W2VI_Fed_Tax
+          when = $Core_W2VI_SS_Wages
+          when = $Core_W2VI_SS_Tax
+          when = $Core_W2VI_Med_Wages
+          when = $Core_W2VI_Med_Tax
+          when = $Core_W2VI_SS_Tips
+          when = $Core_W2VI_Adv_EIC
+          when = $Core_W2VI_Non_Qual_457_Y
+          when = $Core_W2VI_Non_Qual_457_N
+
+          let $Found-Core-W2VI = 'Y'
+          let $Found-W2VI      = 'Y'
+          break
+
+          when-other
+             let $Found-W2VI = 'Y'
+          break
+
+          end-evaluate
+
+
+       else
+         if &CB.TAXFORM_ID = 'M'
+
+            evaluate $CheckBox
+
+            when = $Core_W2GU_Fed_Wages
+            when = $Core_W2GU_Fed_Tax
+            when = $Core_W2GU_SS_Wages
+            when = $Core_W2GU_SS_Tax
+            when = $Core_W2GU_Med_Wages
+            when = $Core_W2GU_Med_Tax
+            when = $Core_W2GU_SS_Tips
+            when = $Core_W2GU_Adv_EIC
+            when = $Core_W2GU_Non_Qual_457_Y
+            when = $Core_W2GU_Non_Qual_457_N
+
+            let $Found-Core-W2GU = 'Y'
+            let $Found-W2GU      = 'Y'
+            break
+
+            when-other
+               let $Found-W2GU = 'Y'
+            break
+
+            end-evaluate
+
+         else
+           if &CB.TAXFORM_ID = 'P'
+
+              evaluate $CheckBox
+
+              when = $Core_W2PR_Wages
+              when = $Core_W2PR_Commissions
+              when = $Core_W2PR_Allowance
+              when = $Core_W2PR_Tips
+              when = $Core_W2PR_Tax_Withheld
+              when = $Core_W2PR_SS_Tax
+              when = $Core_W2PR_SS_Tax
+              when = $Core_W2PR_Med_Wages
+              when = $Core_W2PR_Med_Tax
+
+                let $Found-Core-W2PR = 'Y'
+                let $Found-W2PR      = 'Y'
+              break
+
+              when-other
+                 let $Found-W2PR = 'Y'
+              break
+
+            end-evaluate
+
+           else
+             if &CB.TAXFORM_ID = 'S'
+
+                evaluate $CheckBox
+
+                when = $Core_W2AS_Fed_Wages
+                when = $Core_W2AS_Fed_Tax
+                when = $Core_W2AS_SS_Wages
+                when = $Core_W2AS_SS_Tax
+                when = $Core_W2AS_Med_Wages
+                when = $Core_W2AS_Med_Tax
+                when = $Core_W2AS_SS_Tips
+                when = $Core_W2AS_Non_Qual_457_Y
+                when = $Core_W2AS_Non_Qual_457_N
+
+                let $Found-Core-W2AS = 'Y'
+                let $Found-W2AS      = 'Y'
+                break
+
+                when-other
+                   let $Found-W2AS = 'Y'
+                break
+
+              end-evaluate
+
+             end-if
+           end-if
+         end-if
+       end-if
+    end-if
+
+
+FROM PS_YE_AMOUNTS CB
+WHERE CB.COMPANY = &PT.COMPANY
+AND CB.EMPLID = &PT.EMPLID
+AND CB.CALENDAR_YEAR   = &PT.CALENDAR_YEAR
+ORDER BY CB.TAXFORM_ID
+
+
+end-SELECT
+
+  if $Found-W2  = 'Y' and $Found-Core-W2   = 'N'
+      let $Taxform_ID = 'W'
+      do Delete-Invalid-W2-Rows
+  end-if
+
+  if  $Found-W2VI = 'Y' and $Found-Core-W2VI  = 'N'
+      let $Taxform_ID = 'I'
+      do Delete-Invalid-W2-Rows
+  end-if
+
+  if  $Found-W2GU = 'Y' and $Found-Core-W2GU  = 'N'
+      let $Taxform_ID = 'M'
+      do Delete-Invalid-W2-Rows
+  end-if
+
+  if  $Found-W2PR = 'Y' and $Found-Core-W2PR  = 'N'
+      let $Taxform_ID = 'P'
+      do Delete-Invalid-W2-Rows
+  end-if
+
+  if  $Found-W2AS = 'Y' and $Found-Core-W2AS  = 'N'
+      let $Taxform_ID = 'S'
+      do Delete-Invalid-W2-Rows
+  end-if
+
+
+end-procedure
+
+begin-procedure Delete-Invalid-W2-Rows
+
+      !display 'Invalid W-2 rows   ' noline
+      !display 'COMPANY ' noline
+      !display &PT.COMPANY      noline
+      !display '   EMPLID ' noline
+      !display &PT.EMPLID       noline
+      !display  ' '
+
+
+begin-SQL  on-error=Ignore
+
+  DELETE FROM PS_YE_EE
+        WHERE COMPANY = &PT.COMPANY
+          AND EMPLID  = &PT.EMPLID
+          AND CALENDAR_YEAR = &PT.CALENDAR_YEAR
+          AND TAXFORM_ID = $Taxform_ID;
+end-SQL
+
+
+begin-SQL  on-error=Ignore
+
+  DELETE FROM PS_YE_DATA
+        WHERE COMPANY = &PT.COMPANY
+          AND EMPLID  = &PT.EMPLID
+          AND CALENDAR_YEAR = &PT.CALENDAR_YEAR
+          AND TAXFORM_ID = $Taxform_ID;
+end-SQL
+
+begin-SQL  on-error=Ignore
+
+  DELETE FROM PS_YE_AMOUNTS
+        WHERE COMPANY = &PT.COMPANY
+          AND EMPLID  = &PT.EMPLID
+          AND CALENDAR_YEAR = &PT.CALENDAR_YEAR
+          AND TAXFORM_ID = $Taxform_ID;
+end-SQL
+
+
+end-procedure
+
+
+
+begin-procedure Select-Year-End-Parameters
+
+begin-SELECT
+
+RC_YE.REG_SELECT_PROC
+
+FROM  PS_RC_TAX910LD   RC_YE
+WHERE RC_YE.OPRID               = $Prcs_OprID
+AND   RC_YE.RUN_CNTL_ID         = $Prcs_Run_Cntl_ID
+
+end-SELECT
+
+  let $RC_YE.Reg_Select_Proc     = RTRIM(&RC_YE.Reg_Select_Proc, ' ')
+
+  if $RC_YE.Reg_Select_Proc = 'S'                                     !Load W-2 data for selected employees
+    do Read-EEs
+  else
+    if $RC_YE.Reg_Select_Proc = 'C'
+       do Read-W2-Companies                               !Load W-2 data for selected W-2 reporting cos.
+    end-if
+  end-if
+
+
+end-procedure
+
+begin-procedure Assign-Common-Box-Variables
+
+ let $Common_Tips = 'AND BOX = ''' || $YE_Alloc_Tips  || ''''
+ let $Common_Reimbursed_Expense = 'AND BOX = ' || $YE_Business_Exp
+
+ let $Common_CODA_Plans = 'AND BOX IN (''' || $YE_401K || ''',''' || $YE_403B || ''',''' || $YE_408K6  || ''','''
+ let $Common_CODA_Plans = $Common_CODA_Plans || $YE_457B || ''',''' || $YE_501C18D || ''')'
+
+end-procedure
+
+begin-procedure Update-W2-Company-Values
+
+begin-SQL on-error=Ignore
+    UPDATE PS_W2_COMPANY
+       SET TAXFORM_ID = 'W'
+     WHERE TAXFORM_ID = 'P'
+       AND CALENDAR_YEAR   >= &TX.Balance_Year;
+  end-SQL
+
+
+end-procedure
+
+begin-procedure Read-KY
+
+  let $KY-Code = 'N'
+
+begin-SELECT
+K.LOCALITY
+
+  let $KY-Locality = rtrim(&K.LOCALITY,' ')
+  PUT $KY-Locality INTO KYLocals (#NextKYLocal)  KYLocality
+  add 1 to #NextKYLocal
+  let $KY-Code = 'Y'
+
+FROM PS_RC_TAX960KY K
+end-SELECT
+
+  move #NextKYLocal to #MaxKYLocal
+
+end-procedure
+
+begin-procedure Read-EEs
+
+move 'AND TB1.EMPLID in (''' to $TB1.SelectedEEs
+move 'AND TB2.EMPLID in (''' to $TB2.SelectedEEs
+move 'AND EB3.EMPLID in (''' to $EB3.SelectedEEs
+move 'AND EB4.EMPLID in (''' to $EB4.SelectedEEs
+move 'AND DB5.EMPLID in (''' to $DB5.SelectedEEs
+move 'AND DB6.EMPLID in (''' to $DB6.SelectedEEs
+move 'AND SA.EMPLID in  (''' to $SA.SelectedEEs
+move 'AND W.EMPLID   in (''' to $W.SelectedEEs
+move 'AND PT.EMPLID   in (''' to $PT.SelectedEEs
+move 'AND EMPLID   in (''' to $Delete_SelectedEEs
+move 'AND W1.EMPLID   in (''' to $W1.SelectedEEs
+move 'AND EMPLID      in (''' to $State.SelectedEEs
+move ' ' to $SelectedEmplID
+
+begin-SELECT
+C.SELECTED_EE
+
+  let  $SelectedEmplID = rtrim(&C.Selected_EE, ' ')
+
+  let $TB1.SelectedEEs  = $TB1.SelectedEEs || $SelectedEmplID || ''','''
+  let $TB2.SelectedEEs  = $TB2.SelectedEEs || $SelectedEmplID || ''','''
+  let $EB3.SelectedEEs  = $EB3.SelectedEEs || $SelectedEmplID || ''','''
+  let $EB4.SelectedEEs  = $EB4.SelectedEEs || $SelectedEmplID || ''','''
+  let $DB5.SelectedEEs  = $DB5.SelectedEEs || $SelectedEmplID || ''','''
+  let $DB6.SelectedEEs  = $DB6.SelectedEEs || $SelectedEmplID || ''','''
+  let $SA.SelectedEEs    = $SA.SelectedEEs || $SelectedEmplID || ''','''
+  let $W.SelectedEEs    = $W.SelectedEEs   || $SelectedEmplID || ''','''
+  let $PT.SelectedEEs    = $PT.SelectedEEs   || $SelectedEmplID || ''','''
+  let $Delete_SelectedEEs   = $Delete_SelectedEEs  || $SelectedEmplID || ''','''
+  let $W1.SelectedEEs   = $W1.SelectedEEs  || $SelectedEmplID || ''','''
+  let $State.SelectedEEs = $State.SelectedEEs || $SelectedEmplID || ''','''
+  move 'Y' to $EE_Selected
+
+FROM  PS_RC_TAX910LD_EE C
+WHERE C.OPRID         = $Prcs_OprID
+  AND C.RUN_CNTL_ID   = $Prcs_Run_Cntl_ID
+end-SELECT
+
+
+let $TB1.SelectedEEs = SUBSTR($TB1.SelectedEEs,1,LENGTH($TB1.SelectedEEs) - 2)
+let $TB1.SelectedEEs = $TB1.SelectedEEs || ')'
+
+let $TB2.SelectedEEs = SUBSTR($TB2.SelectedEEs,1,LENGTH($TB2.SelectedEEs) - 2)
+let $TB2.SelectedEEs = $TB2.SelectedEEs || ')'
+
+let $EB3.SelectedEEs = SUBSTR($EB3.SelectedEEs,1,LENGTH($EB3.SelectedEEs) - 2)
+let $EB3.SelectedEEs = $EB3.SelectedEEs || ')'
+
+
+let $EB4.SelectedEEs = SUBSTR($EB4.SelectedEEs,1,LENGTH($EB4.SelectedEEs) - 2)
+let $EB4.SelectedEEs = $EB4.SelectedEEs || ')'
+
+
+let $DB5.SelectedEEs = SUBSTR($DB5.SelectedEEs,1,LENGTH($DB5.SelectedEEs) - 2)
+let $DB5.SelectedEEs = $DB5.SelectedEEs || ')'
+
+let $DB6.SelectedEEs = SUBSTR($DB6.SelectedEEs,1,LENGTH($DB6.SelectedEEs) - 2)
+let $DB6.SelectedEEs = $DB6.SelectedEEs || ')'
+
+let $SA.SelectedEEs = SUBSTR($SA.SelectedEEs,1,LENGTH($SA.SelectedEEs) - 2)
+let $SA.SelectedEEs = $SA.SelectedEEs || ')'
+
+let $W.SelectedEEs = SUBSTR($W.SelectedEEs,1,LENGTH($W.SelectedEEs) - 2)
+let $W.SelectedEEs = $W.SelectedEEs || ')'
+
+let $PT.SelectedEEs = SUBSTR($PT.SelectedEEs,1,LENGTH($PT.SelectedEEs) - 2)
+let $PT.SelectedEEs = $PT.SelectedEEs || ')'
+
+let $Delete_SelectedEEs  = SUBSTR($Delete_SelectedEEs,1,LENGTH($Delete_SelectedEEs) - 2)
+let $Delete_SelectedEEs  = $Delete_SelectedEEs || ')'
+
+let $W1.SelectedEEs = SUBSTR($W1.SelectedEEs,1,LENGTH($W1.SelectedEEs) - 2)
+let $W1.SelectedEEs = $W1.SelectedEEs || ')'
+
+let $State.SelectedEEs = SUBSTR($State.SelectedEEs,1,LENGTH($State.SelectedEEs) - 2)
+let $State.SelectedEEs = $State.SelectedEEs || ')'
+
+
+end-procedure
+
+begin-procedure Delete-Sel-Employees-Table
+begin-SQL on-error=Ignore
+  DELETE FROM PS_RC_TAX910LD_EE
+  WHERE OPRID       = $Prcs_OprID
+    AND RUN_CNTL_ID = $Prcs_Run_Cntl_ID
+
+end-SQL
+end-procedure
+
+begin-procedure Read-W2-Companies
+
+move 'AND A.W2_REPORTING_CO in (''' to $A.SelectedCos
+move 'AND C7.W2_REPORTING_CO in (''' to $C7.SelectedCos
+move 'AND C8.W2_REPORTING_CO in (''' to $C8.SelectedCos
+move 'AND C9.W2_REPORTING_CO in (''' to $C9.SelectedCos
+move 'AND M.W2_REPORTING_CO in (''' to $M.SelectedCos                          !HP99999
+move 'AND W3.COMPANY in (''' to $W3.SelectedCos
+move ' ' to $SelectedCos
+
+begin-SELECT
+D.W2_REPORTING_CO
+
+  let $SelectedCos   = rtrim(&D.W2_Reporting_Co, ' ')
+  let $A.SelectedCos   = $A.SelectedCos || $SelectedCos || ''','''
+  let $C7.SelectedCos   = $C7.SelectedCos || $SelectedCos || ''','''
+  let $C8.SelectedCos   = $C8.SelectedCos || $SelectedCos || ''','''
+  let $C9.SelectedCos   = $C9.SelectedCos || $SelectedCos || ''','''
+  let $M.SelectedCos   = $M.SelectedCos || $SelectedCos || ''','''             !HP99999
+  let $W3.SelectedCos   = $W3.SelectedCos || $SelectedCos || ''','''
+  move 'Y' to $Company_Selected
+
+FROM  PS_RC_TAX910LD_CO D
+WHERE D.OPRID         = $Prcs_OprID
+  AND D.RUN_CNTL_ID   = $Prcs_Run_Cntl_ID
+end-SELECT
+
+
+let $A.SelectedCos = SUBSTR($A.SelectedCos,1,LENGTH($A.SelectedCos) - 2)
+let $A.SelectedCos = $A.SelectedCos || ')'
+let $C7.SelectedCos = SUBSTR($C7.SelectedCos,1,LENGTH($C7.SelectedCos) - 2)
+let $C7.SelectedCos = $C7.SelectedCos || ')'
+let $C8.SelectedCos = SUBSTR($C8.SelectedCos,1,LENGTH($C8.SelectedCos) - 2)
+let $C8.SelectedCos = $C8.SelectedCos || ')'
+let $C9.SelectedCos = SUBSTR($C9.SelectedCos,1,LENGTH($C9.SelectedCos) - 2)
+let $C9.SelectedCos = $C9.SelectedCos || ')'
+let $M.SelectedCos = SUBSTR($M.SelectedCos,1,LENGTH($M.SelectedCos) - 2)       !HP99999
+let $M.SelectedCos = $M.SelectedCos || ')'                                     !HP99999
+let $W3.SelectedCos = SUBSTR($W3.SelectedCos,1,LENGTH($W3.SelectedCos) - 2)
+let $W3.SelectedCos = $W3.SelectedCos || ')'
+
+
+end-procedure
+
+
+begin-procedure Delete-Sel-Company-Table
+begin-SQL on-error=Ignore
+  DELETE FROM PS_RC_TAX910LD_CO
+  WHERE OPRID       = $Prcs_OprID
+    AND RUN_CNTL_ID = $Prcs_Run_Cntl_ID
+
+end-SQL
+end-procedure
+
+
+begin-procedure Get-Employee-Address
+
+  let $AddressFound = 'N'
+  let $Address1     = ' '
+  let $Address2     = ' '
+  let $City         = ' '
+  let $State        = ' '
+  let $Country      = ' '
+  let $Postal       = ' '
+
+begin-SELECT
+PA.ADDRESS1
+PA.ADDRESS2
+PA.CITY
+PA.STATE
+PA.COUNTRY
+PA.POSTAL
+
+  let $AddressFound = 'Y'
+  let $Address1     = &PA.Address1
+  let $Address2     = &PA.Address2
+  let $City         = &PA.City
+  let $State        = &PA.State
+  let $Country      = &PA.Country
+  let $Postal       = &PA.Postal
+
+FROM  PS_ADDRESSES  PA
+WHERE PA.EMPLID       = $Emplid
+AND   PA.ADDRESS_TYPE = $AddressType
+AND   PA.EFF_STATUS   = 'A'
+AND   PA.EFFDT = (SELECT MAX (PA1.EFFDT) FROM PS_ADDRESSES PA1
+                        WHERE PA1.EMPLID = $Emplid
+                          AND PA1.ADDRESS_TYPE = $AddressType
+                          AND PA1.EFFDT <= {DATEIN-PREFIX}$AsOfToday{DATEIN-SUFFIX})
+
+end-SELECT
+
+  if $AddressFound = 'N'
+      let $Country = 'USA'
+  end-if
+
+end-procedure
+
+
+#include 'tranctrl.sqc'  !Transaction Control
+#Include 'taxrnctl.sqc'  !Get-Tax-Reporting-Run-Controls procedure
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'getcodta.sqc'  !Get-Company-Data procedure
+#Include 'geteandg.sqc'  !Get-EandG procedure                           !HP00001
+#Include 'getfed.sqc'    !Get-FederalProduct procedure                  !FED0001
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'getbalid.sqc'  !Get-Calendar-Year-Id
+#Include 'stdapi.sqc'    !Update Process API
+#Include 'w2.sqc'        !Common Box Descriptions

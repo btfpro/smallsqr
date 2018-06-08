@@ -1,0 +1,948 @@
+!************************************************
+!  NDT003:  401(m) Nondiscrimination Testing    *
+!************************************************
+
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+!                                                                      *
+! This module contains confidential and proprietary information        *
+! of Oracle; it is not to be copied, reproduced, or transmitted        *
+! in any form, by any means, in whole or in part, nor is it to         *
+! be used for any purpose other than that for which it is              *
+! expressly provided under the applicable license agreement.           *
+!                                                                      *
+! Copyright (C) 2006 Oracle. All Rights Reserved.                      *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+!          $Date:  2006/07/19:09:14:57                                 !
+!       $Release:  HR9                                                 !
+!      $Revision:  101                                                 !
+!                                                                      *
+!***********************************************************************
+!
+!This program uses the file created by program NDT001.SQR to analyze
+!the eligible compensation and actual deferral percentages (ADP) for the
+!highly and non-highly compensated employees.  The following
+!abbreviations will be used in the comments in this program:
+!   ADP -- Average Deferral Percentage
+!   HCE -- Highly Compensated Employee
+!   LCE -- Non-Highly Compensated Employee ("Lowly" Compensated)
+!***********************************************************************
+
+#include 'setenv.sqc'    !Set environment
+
+begin-setup
+#Include 'ptpsp125.sqc'   !Printer and page-size initialization
+end-setup
+
+!#define debugD  YES
+
+!***********************************************************************
+! NOTE: Programs NDT002 and NDT003 are virtual clones and must be kept
+! absolutely in synch with each other.  The only differences between the
+! two programs are the program titles and the following #DEFINEs.
+!***********************************************************************
+
+!#define 401K    !Uncomment for NDT002
+#define 401M    !Uncomment for NDT003
+
+#define CURRENT_YEAR   C
+#define PRIOR_YEAR     P
+
+
+!***************************************************************************
+begin-program
+!***************************************************************************
+
+  do Init-Report
+
+  display 'Program Began at: ' NoLine
+  do Display-Time
+
+  do Main-Report
+
+  display 'Program Ended at: ' noline
+  do display-time
+
+  do StdAPI-Term
+
+end-program
+
+
+!***************************************************************************
+begin-procedure Init-Report
+!***************************************************************************
+
+  #ifdef 401K
+    let $ReportID    = 'NDT002'
+    let $NDTProgType = '401(k)'
+    let $K_M_Flag    = 'K'
+    let $Ded_Class_List = '(''B'')'
+  #end-if
+
+  #ifdef 401M
+    let $ReportID    = 'NDT003'
+    let $NDTProgType = '401(m)'
+    let $K_M_Flag    = 'M'
+    let $Ded_Class_List = '(''A'',''N'',''P'')'
+  #end-if
+
+  let $ReportTitle = $NDTProgType || ' Discrimination Testing'
+  display $ReportTitle
+  display ''
+
+  do Init-DateTime
+  do Get-Current-DateTime
+  do Init-Number
+  do StdAPI-Init
+  do Get-Calendar-Year-Id
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Main-Report
+!***************************************************************************
+
+  do Initialization
+  do Gather-Contribution-Data
+  do Deduction-Projections
+  do Comp-And-Contrib-Rollup
+#ifdef 401K
+  if (&RC.Projection_Percent > 0)
+    do Limit-Forecasted-Contribs
+  end-if
+#end-if
+  do Calculate-ADP
+  do ADP-Testing
+
+  display ''
+  display '***** Testing Complete - Run NDT004 for results *****'
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Initialization
+!***************************************************************************
+
+let $sql-statement = $ReportID || '.SQR,Initialization,Delete/Update'
+begin-SQL on-error=SQL-Error
+
+DELETE FROM PS_R_NDT_EMPL_YTD
+WHERE  DED_YTD <> 0
+  AND  YTD_401_K_M = $K_M_Flag;
+
+DELETE FROM PS_R_NDT_EMPL_ADP
+WHERE  YTD_401_K_M = $K_M_Flag;
+
+#ifdef 401K
+UPDATE PS_NDT_RUNCTL
+  SET RESULTS_ACTUAL_K = 'N',
+      RESULTS_FORECAST_K = 'N'
+#end-if
+
+#ifdef 401M
+UPDATE PS_NDT_RUNCTL
+  SET RESULTS_ACTUAL_M = 'N',
+      RESULTS_FORECAST_M = 'N'
+#end-if
+
+end-SQL
+
+begin-SELECT
+RC.PLAN_YEAR_BEGIN_DT,
+RC.MONTH_END_DT,
+RC.PROJECTION_PERCENT
+
+FROM  PS_NDT_RUNCTL RC
+end-SELECT
+
+begin-SELECT
+NDT.MIN_TIMES_FACTOR,
+NDT.MIN_ADD_FACTOR,
+NDT.MAX_TIMES_FACTOR,
+NDT.ADP_CALC_YEAR,
+NDT.ADP_COMP_LIMIT,
+NDT.ADP_CONTRIB_LIMIT
+
+FROM  PS_NDT_HCE_TBL NDT
+WHERE EFFDT =
+      (SELECT MAX(EFFDT)
+       FROM   PS_NDT_HCE_TBL
+       WHERE  EFFDT <= &RC.Plan_Year_Begin_Dt)
+end-SELECT
+
+#ifdef debugD
+  display 'DEBUG: Data:'                     Noline
+  display ' PlanYr='                         Noline
+  display &RC.PLAN_YEAR_BEGIN_DT  YYYY-MM-DD Noline
+  display ' MonthEnd='                       Noline
+  display &RC.MONTH_END_DT        YYYY-MM-DD Noline
+  display ' Project%='                       Noline
+  display &RC.PROJECTION_PERCENT        99.9 Noline
+  display ' ADP_DataYr='                     Noline
+  display &NDT.ADP_CALC_YEAR                 Noline
+  display ' Comp_Lmt='                       Noline
+  display &NDT.ADP_COMP_LIMIT       $999,999 Noline
+  display ' Contrib_Lmt='                    Noline
+  display &NDT.ADP_CONTRIB_LIMIT     $99,999
+#end-if
+
+  let $ADP_Calc_Choice        = &NDT.ADP_CALC_YEAR
+  let #ADP_Comp_Limit         = &NDT.ADP_COMP_LIMIT
+
+  if ($ADP_Calc_Choice = 'P')
+     do Get-Prior-Comp-Limit (#Prior_Comp_Limit,&RC.Plan_Year_Begin_Dt)
+  end-if
+
+  do Format-DateTime(&RC.Plan_Year_Begin_Dt, $out, {DEFCMP}, '', '')
+  let #PlanYear = To_Number(SubStr($out, 1, 4))
+  let $BeginMonth = SubStr($out, 5, 2)
+
+  do Format-DateTime(&RC.Month_End_Dt, $out, {DEFCMP}, '', '')
+  let $EndMonth = SubStr($out, 5, 2)
+
+  let #ThisYear = #PlanYear
+  let #NextYear = #PlanYear + 1
+  let #LastYear = #PlanYear - 1
+
+  do Convert-To-DTU-Date(&RC.Plan_Year_Begin_Dt, $dtu_work)
+  do DTU-Add-Days($dtu_work, -1, $dtu_work)
+  do Convert-From-DTU-Date($dtu_work, $Prior_PlanYear_EndDt)
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Gather-Contribution-Data
+!***************************************************************************
+
+  if ($BeginMonth = '01')
+    do Calendar-Plan-Actuals
+  else
+    do Fiscal-Plan-Actuals
+  end-if
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Calendar-Plan-Actuals
+!***************************************************************************
+
+  display 'Status: Beginning Calendar Year Calculations ...'
+
+  let $ADP_Plan_Year = '{CURRENT_YEAR}'
+  let $BenPlan_EffDt = &RC.Month_End_Dt
+  let #ViewYear      = #ThisYear
+  let #ViewMonth     = To_Number($EndMonth)
+  let #SignValue     = 1
+
+  do Insert-Employee-Deductions
+
+  if ($ADP_Calc_Choice = 'P')
+     let $ADP_Plan_Year = '{PRIOR_YEAR}'
+     let $BenPlan_EffDt = $Prior_PlanYear_EndDt
+     let #ViewYear      = #LastYear
+     let #ViewMonth     = 12
+     let #SignValue     = 1
+
+     do Insert-Employee-Deductions
+  end-if
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Fiscal-Plan-Actuals
+!***************************************************************************
+
+  display 'Status: Beginning Fiscal Year Calculations ....'
+
+  let #MonthEnd = To_Number($BeginMonth) - 1
+  move #MonthEnd to $MonthEnd 09
+  if ($EndMonth > $MonthEnd)
+    move $EndMonth to $PeriodEnd
+  else
+    move '12'      to $PeriodEnd
+  end-if
+
+  let $ADP_Plan_Year = '{CURRENT_YEAR}'
+  let $BenPlan_EffDt = &RC.Month_End_Dt
+
+  let #ViewYear  = #ThisYear
+  let #ViewMonth = To_Number($PeriodEnd)
+  let #SignValue = 1
+  do Insert-Employee-Deductions
+
+  let #ViewYear  = #ThisYear
+  let #ViewMonth = To_Number($MonthEnd)
+  let #SignValue = -1
+  do Insert-Employee-Deductions
+
+  if ($EndMonth <= $MonthEnd)
+    let #ViewYear  = #NextYear
+    let #ViewMonth = To_Number($EndMonth)
+    let #SignValue = 1
+    do Insert-Employee-Deductions
+  end-if
+
+  if ($ADP_Calc_Choice = 'P')
+     let $ADP_Plan_Year = '{PRIOR_YEAR}'
+     let $BenPlan_EffDt = $Prior_PlanYear_EndDt
+
+     let #ViewYear  = #LastYear
+     let #ViewMonth = 12
+     let #SignValue = 1
+     do Insert-Employee-Deductions
+
+     let #ViewYear  = #LastYear
+     let #ViewMonth = #MonthEnd
+     let #SignValue = -1
+     do Insert-Employee-Deductions
+
+     let #ViewYear  = #ThisYear
+     let #ViewMonth = #MonthEnd
+     let #SignValue = 1
+     do Insert-Employee-Deductions
+  end-if
+
+end-procedure
+
+!***************************************************************************
+begin-procedure Insert-Employee-Deductions
+
+!This procedure retrieves Deduction Balance records for all
+!plan-eligible employees having gross deductions in one or more of the
+!companies which are aggregated together for nondiscrimination testing.
+!The SELECT also references PS_R_NDT_Control which is a temporary, one-row table
+!which must first be loaded with three elements:  the appropriate Calendar Year,
+!the appropriate MonthCd, and, for fiscal plan years only, a value of either
+!+1 or -1 to be multiplied times the Ded_YTD (where -1 means to reduce the
+!employee's total for the period in consideration).
+!Initial values for PS_R_NDT_Control were INSERTed in the Initialization
+!procedure of program NDT001.SQR.
+!***************************************************************************
+
+  display 'Status: Gathering Contribution Data ...'
+
+#ifdef debugD
+  display 'DEBUG: Data:'         Noline
+  display ' PlanYrCd='           Noline
+  display $ADP_Plan_Year         Noline
+  display ' BalID='              Noline
+  display $Calendar_Year_Id      Noline
+  display ' Bal_Yr/Mos='         Noline
+  display #ViewYear         9999 Noline
+  display '/'                    Noline
+  display #ViewMonth          09 Noline
+  display ' Sign='               Noline
+  display #SignValue           9 Noline
+  display ' DedClass='           Noline
+  display $Ded_Class_List
+#end-if
+
+let $sql-statement = $ReportID || '.SQR,Insert-Empl-Deduct,PS_R_NDT_Empl_YTD,insert'
+begin-SQL on-error=SQL-Error
+
+UPDATE PS_R_NDT_CONTROL
+SET BALANCE_ID     = $Calendar_Year_Id,
+    BALANCE_YEAR   = #ViewYear,
+    BALANCE_PERIOD = #ViewMonth,
+    YEAR_CD        = $ADP_Plan_Year,
+    SIGNVALUE      = #SignValue;
+
+INSERT INTO PS_R_NDT_EMPL_YTD
+(EMPLID,HCE_TYPE,GRS_YTD,YEAR_CD,DED_YTD,YTD_401_K_M)
+
+SELECT
+BN.EMPLID,' ',0,C.YEAR_CD,(C.SIGNVALUE*B.DED_YTD),
+#ifdef 401K
+'K'
+#else
+'M'
+#end-if
+
+FROM  PS_BN_PERSON BN,
+      PS_DEDUCTION_BAL B,
+      PS_R_NDT_CONTROL C
+WHERE ((C.YEAR_CD = 'C' AND BN.HIGHLY_COMP_EMPL_C <> 'N')
+    OR (C.YEAR_CD = 'P' AND BN.HIGHLY_COMP_EMPL_P <> 'N'))
+  AND EXISTS
+      (SELECT 'x' FROM PS_BENEF_PLAN_TBL D
+        WHERE D.PLAN_TYPE      = B.PLAN_TYPE
+          AND D.BENEFIT_PLAN   = B.BENEFIT_PLAN
+          AND D.EFFDT =
+             (SELECT MAX(D1.EFFDT)
+                FROM PS_BENEF_PLAN_TBL D1
+               WHERE D1.PLAN_TYPE    = D.PLAN_TYPE
+                 AND D1.BENEFIT_PLAN = D.BENEFIT_PLAN
+                 AND D1.EFFDT <= $BenPlan_EffDt)
+          AND D.INCLUDE_IN_NDT = 'Y')
+  AND B.EMPLID         = BN.EMPLID
+  AND B.COMPANY IN (SELECT COMPANY
+                    FROM   PS_NDT_CO_PAYGROUP)
+  AND B.DED_CLASS      IN [$Ded_Class_List]
+  AND B.DED_YTD        <> 0
+  AND B.BALANCE_ID     = C.BALANCE_ID
+  AND B.BALANCE_YEAR   = C.BALANCE_YEAR
+  AND B.BALANCE_PERIOD =
+      (SELECT MAX(BALANCE_PERIOD)
+       FROM   PS_DEDUCTION_BAL
+       WHERE  EMPLID          = B.EMPLID
+         AND  COMPANY         = B.COMPANY
+         AND  BENEFIT_RCD_NBR = B.BENEFIT_RCD_NBR
+         AND  PLAN_TYPE       = B.PLAN_TYPE
+         AND  BENEFIT_PLAN    = B.BENEFIT_PLAN
+         AND  DEDCD           = B.DEDCD
+         AND  DED_CLASS       = B.DED_CLASS
+         AND  BALANCE_ID      = B.BALANCE_ID
+         AND  BALANCE_YEAR    = B.BALANCE_YEAR
+         AND  BALANCE_PERIOD <= C.BALANCE_PERIOD);
+
+end-SQL
+
+#ifdef debugD
+
+Begin-SELECT
+COUNT(*)   &DebugCnt1
+FROM PS_R_NDT_EMPL_YTD
+WHERE DED_YTD<>0
+End-Select
+
+  display 'DEBUG: Data:'         Noline
+  display ' Contrib_Count='      Noline
+  display &DebugCnt1
+
+#end-if
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Deduction-Projections
+!***************************************************************************
+
+  display 'Status: Performing Deduction Projections ...'
+
+let $sql-statement = $ReportID || '.SQR,Deduct-Project,PS_R_NDT_Empl_YTD,Insert'
+begin-SQL on-error=SQL-Error
+
+UPDATE PSASOFDATE
+   SET ASOFDATE = &RC.Month_End_Dt;
+
+INSERT INTO PS_R_NDT_EMPL_YTD
+(EMPLID,HCE_TYPE,GRS_YTD,YEAR_CD,YTD_401_K_M,DED_YTD)
+
+SELECT
+A.EMPLID,' ',0,'F',
+#ifdef DB2ALL
+#ifdef 401K
+'K',(A.PAY_PDS_PER_YEAR * A.FLAT_DED_AMT * DECIMAL((R.PROJECTION_PERCENT / 100),15,5))
+#else
+'M',(A.PAY_PDS_PER_YEAR * A.FLAT_DED_AMT_ATAX * DECIMAL((R.PROJECTION_PERCENT / 100),15,5))
+#end-if
+#else
+#ifdef 401K
+'K',(A.PAY_PDS_PER_YEAR * A.FLAT_DED_AMT * R.PROJECTION_PERCENT / 100)
+#else
+'M',(A.PAY_PDS_PER_YEAR * A.FLAT_DED_AMT_ATAX * R.PROJECTION_PERCENT / 100)
+#end-if
+#end-if
+
+FROM  PS_NDT_FCST_SVGS A,
+      PS_NDT_RUNCTL    R
+WHERE R.PROJECTION_PERCENT > 0
+#ifdef 401K
+  AND A.SAVINGS_COVRG = '1'
+  AND A.FLAT_DED_AMT  > 0;
+#else
+  AND A.SAVINGS_COVRG_ATAX = '1'
+  AND A.FLAT_DED_AMT_ATAX  > 0;
+#end-if
+
+INSERT INTO PS_R_NDT_EMPL_YTD
+(EMPLID,HCE_TYPE,GRS_YTD,YEAR_CD,YTD_401_K_M,DED_YTD)
+
+SELECT
+A.EMPLID,' ',0,'F',
+#ifdef DB2ALL
+#ifdef 401K
+'K',(DECIMAL((A.PCT_GROSS / 100),15,5) * A.ANNUAL_RT * DECIMAL((R.PROJECTION_PERCENT / 100),15,5))
+#else
+'M',(DECIMAL((A.PCT_GROSS_ATAX / 100),15,5) * A.ANNUAL_RT * DECIMAL((R.PROJECTION_PERCENT / 100),15,5))
+#endif
+#else
+#ifdef 401K
+'K',(A.PCT_GROSS / 100 * A.ANNUAL_RT * R.PROJECTION_PERCENT / 100)
+#else
+'M',(A.PCT_GROSS_ATAX / 100 * A.ANNUAL_RT * R.PROJECTION_PERCENT / 100)
+#endif
+#endif
+
+FROM  PS_NDT_FCST_SVGS A,
+      PS_NDT_RUNCTL    R
+WHERE R.PROJECTION_PERCENT > 0
+#ifdef 401K
+  AND A.SAVINGS_COVRG = '2'
+  AND A.PCT_GROSS  > 0
+#else
+  AND A.SAVINGS_COVRG_ATAX = '2'
+  AND A.PCT_GROSS_ATAX  > 0
+#end-if
+  AND (R.BENEFITS_BASE = '1'
+   OR A.ANNL_BENEF_BASE_RT <= A.ANNUAL_RT);
+
+INSERT INTO PS_R_NDT_EMPL_YTD
+(EMPLID,HCE_TYPE,GRS_YTD,YEAR_CD,YTD_401_K_M,DED_YTD)
+
+SELECT
+A.EMPLID,' ',0,'F',
+#ifdef DB2ALL
+#ifdef 401K
+'K',(DECIMAL((A.PCT_GROSS / 100),15,5) * A.ANNL_BENEF_BASE_RT * DECIMAL((R.PROJECTION_PERCENT / 100),15,5))
+#else
+'M',(DECIMAL((A.PCT_GROSS_ATAX / 100),15,5) * A.ANNL_BENEF_BASE_RT * DECIMAL((R.PROJECTION_PERCENT / 100),15,5))
+#endif
+#else
+#ifdef 401K
+'K',(A.PCT_GROSS / 100 * A.ANNL_BENEF_BASE_RT * R.PROJECTION_PERCENT / 100)
+#else
+'M',(A.PCT_GROSS_ATAX / 100 * A.ANNL_BENEF_BASE_RT * R.PROJECTION_PERCENT / 100)
+#endif
+#endif
+
+FROM  PS_NDT_FCST_SVGS A,
+      PS_NDT_RUNCTL    R
+WHERE R.PROJECTION_PERCENT > 0
+#ifdef 401K
+  AND A.SAVINGS_COVRG = '2'
+  AND A.PCT_GROSS  > 0
+#else
+  AND A.SAVINGS_COVRG_ATAX = '2'
+  AND A.PCT_GROSS_ATAX  > 0
+#end-if
+  AND R.BENEFITS_BASE = '2'
+  AND A.ANNL_BENEF_BASE_RT > A.ANNUAL_RT;
+
+end-SQL
+
+#ifdef debugD
+
+Begin-SELECT
+COUNT(*)   &DebugCnt2
+FROM PS_R_NDT_EMPL_YTD
+WHERE DED_YTD<>0
+End-Select
+
+  display 'DEBUG: Data:'        Noline
+  display ' Project_Count='     Noline
+  display &DebugCnt2
+
+#end-if
+
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Comp-And-Contrib-Rollup
+!***************************************************************************
+
+  display 'Status: Compensation and Contribution Rollup ...'
+
+let $sql-statement = $ReportID || '.SQR,Comp-Contrib-Rollup,PS_R_NDT_Empl_ADP,Insert'
+begin-SQL on-error=SQL-Error
+
+!***** HCEs for the Current year *****
+
+INSERT INTO PS_R_NDT_EMPL_ADP
+(EMPLID,ADP_MODE,HCE_TYPE,ADP_HCE_ACTUAL,YTD_401_K_M,GRS_YTD,DED_YTD)
+
+SELECT
+BN.EMPLID,'A','H',0,
+#ifdef 401K
+'K',
+#else
+'M',
+#end-if
+#ifdef DB2ALL
+   DECIMAL(SUM(GRS_YTD),15,3), DECIMAL(SUM(DED_YTD),15,3)
+#else
+   SUM(GRS_YTD), SUM(DED_YTD)
+#endif
+
+FROM PS_BN_PERSON BN,
+     PS_R_NDT_EMPL_YTD B
+WHERE BN.HIGHLY_COMP_EMPL_C = 'H'
+  AND B.EMPLID  = BN.EMPLID
+  AND B.YEAR_CD = '{CURRENT_YEAR}'
+  AND B.YTD_401_K_M IN ($K_M_Flag,' ')
+GROUP BY BN.EMPLID;
+
+!***** HCEs for the Forecasted year *****
+
+INSERT INTO PS_R_NDT_EMPL_ADP
+(EMPLID,ADP_MODE,HCE_TYPE,ADP_HCE_ACTUAL,YTD_401_K_M,GRS_YTD,DED_YTD)
+
+SELECT
+BN.EMPLID,'F','H',0,
+#ifdef 401K
+'K',
+#else
+'M',
+#end-if
+#ifdef DB2ALL
+   DECIMAL(SUM(GRS_YTD),15,3),DECIMAL(SUM(DED_YTD),15,3)
+#else
+   SUM(GRS_YTD), SUM(DED_YTD)
+#endif
+
+FROM PS_BN_PERSON BN,
+     PS_R_NDT_EMPL_YTD B
+WHERE BN.HIGHLY_COMP_EMPL_C = 'H'
+  AND B.EMPLID  = BN.EMPLID
+  AND B.YEAR_CD IN ('{CURRENT_YEAR}','F')
+  AND B.YTD_401_K_M IN ($K_M_Flag,' ')
+GROUP BY BN.EMPLID;
+
+!***** NHCEs for the Current year *****
+
+INSERT INTO PS_R_NDT_EMPL_ADP
+(EMPLID,ADP_MODE,HCE_TYPE,ADP_HCE_ACTUAL,YTD_401_K_M,GRS_YTD,DED_YTD)
+
+SELECT
+BN.EMPLID,'A','L',0,
+#ifdef 401K
+'K',
+#else
+'M',
+#end-if
+#ifdef DB2ALL
+   DECIMAL(SUM(GRS_YTD),15,3),DECIMAL(SUM(DED_YTD),15,3)
+#else
+   SUM(GRS_YTD), SUM(DED_YTD)
+#endif
+
+FROM PS_BN_PERSON BN,
+     PS_R_NDT_EMPL_YTD B
+WHERE (($ADP_Calc_Choice = 'P' AND BN.HIGHLY_COMP_EMPL_P = 'E')
+    OR ($ADP_Calc_Choice = 'C' AND BN.HIGHLY_COMP_EMPL_C = 'E'))
+  AND B.EMPLID  = BN.EMPLID
+  AND (($ADP_Calc_Choice = 'P' AND B.YEAR_CD = '{PRIOR_YEAR}')
+    OR ($ADP_Calc_Choice = 'C' AND B.YEAR_CD = '{CURRENT_YEAR}'))
+  AND B.YTD_401_K_M IN ($K_M_Flag,' ')
+GROUP BY BN.EMPLID;
+
+!***** NHCEs for the Forecasted year *****
+
+INSERT INTO PS_R_NDT_EMPL_ADP
+(EMPLID,ADP_MODE,HCE_TYPE,ADP_HCE_ACTUAL,YTD_401_K_M,GRS_YTD,DED_YTD)
+
+SELECT
+BN.EMPLID,'F','L',0,
+#ifdef 401K
+'K',
+#else
+'M',
+#end-if
+#ifdef DB2ALL
+   DECIMAL(SUM(GRS_YTD),15,3),DECIMAL(SUM(DED_YTD),15,3)
+#else
+   SUM(GRS_YTD), SUM(DED_YTD)
+#endif
+
+FROM PS_BN_PERSON BN,
+     PS_R_NDT_EMPL_YTD B
+WHERE (($ADP_Calc_Choice = 'P' AND BN.HIGHLY_COMP_EMPL_P = 'E')
+    OR ($ADP_Calc_Choice = 'C' AND BN.HIGHLY_COMP_EMPL_C = 'E'))
+  AND B.EMPLID  = BN.EMPLID
+  AND (($ADP_Calc_Choice = 'P' AND B.YEAR_CD = '{PRIOR_YEAR}')
+    OR ($ADP_Calc_Choice = 'C' AND B.YEAR_CD IN ('{CURRENT_YEAR}','F')))
+  AND B.YTD_401_K_M IN ($K_M_Flag,' ')
+GROUP BY BN.EMPLID;
+
+end-SQL
+
+#ifdef debugD
+
+Begin-SELECT
+COUNT(*)   &DebugCnt3
+FROM PS_R_NDT_EMPL_ADP
+End-Select
+
+  display 'DEBUG: Data:'       Noline
+  display ' Rollup_Count='     Noline
+  display &DebugCnt3
+
+#end-if
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Limit-Forecasted-Contribs
+!***************************************************************************
+
+  display 'Status: Limiting Forecasted Contributions ...'
+
+begin-SELECT
+L.EMPLID
+L.HCE_TYPE
+L.DED_YTD
+
+  if (&L.DED_YTD >= &NDT.ADP_CONTRIB_LIMIT)
+    let #F_Contrib = &L.DED_YTD
+  else
+    let #F_Contrib = &NDT.ADP_CONTRIB_LIMIT
+  end-if
+  do PS_SQR_Round(#F_Contrib, 2, #F_Contrib)
+
+#ifdef debugD
+  display 'DEBUG: Data:'                    Noline
+  display ' EmplID='                        Noline
+  display &L.EMPLID                         Noline
+  display ' Limit='                         Noline
+  display &NDT.ADP_CONTRIB_LIMIT   $99,999  Noline
+  display ' Actual='                        Noline
+  display &L.DED_YTD               $99,999  Noline
+  display ' Ltd-Fcst='                      Noline
+  display #F_Contrib               $99,999
+#end-if
+
+    do Update-Contrib-Projection(&L.EMPLID, &L.HCE_TYPE, #F_Contrib)
+
+FROM PS_R_NDT_EMPL_ADP L
+WHERE L.YTD_401_K_M = 'K'
+  AND L.ADP_MODE    = 'A'
+  AND &NDT.ADP_CONTRIB_LIMIT <
+      (SELECT L1.DED_YTD
+         FROM PS_R_NDT_EMPL_ADP L1
+        WHERE L1.EMPLID      = L.EMPLID
+          AND L1.YTD_401_K_M = 'K'
+          AND L1.ADP_MODE    = 'F'
+          AND L1.HCE_TYPE    = L.HCE_TYPE)
+end-SELECT
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Update-Contrib-Projection ($UpdEmpl, $UpdType, #F_Contrib)
+!***************************************************************************
+
+let $sql-statement = $ReportID || '.SQR,Upd-Contrib-Project,PS_R_NDT_Empl_ADP,Update'
+begin-SQL on-error=SQL-Error
+UPDATE PS_R_NDT_EMPL_ADP
+   SET DED_YTD = #F_Contrib
+WHERE EMPLID      = $UpdEmpl
+  AND HCE_TYPE    = $UpdType
+  AND YTD_401_K_M = 'K'
+  AND ADP_MODE    = 'F';
+end-SQL
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Calculate-ADP
+!***************************************************************************
+
+  display 'Status: Calculating ADP ...'
+
+let $sql-statement = $ReportID || '.SQR,Calculate-ADP(HCE),PS_R_NDT_Empl_ADP,Update'
+begin-SQL on-error=SQL-Error
+
+UPDATE PS_R_NDT_EMPL_ADP
+   SET ADP_HCE_ACTUAL = 100 * (DED_YTD / GRS_YTD)
+WHERE HCE_TYPE    = 'H'
+  AND GRS_YTD    <> 0
+  AND GRS_YTD    <= #ADP_Comp_Limit
+  AND YTD_401_K_M = $K_M_Flag;
+
+UPDATE PS_R_NDT_EMPL_ADP
+   SET ADP_HCE_ACTUAL = 100 * (DED_YTD / #ADP_Comp_Limit)
+WHERE HCE_TYPE    = 'H'
+  AND GRS_YTD    <> 0
+  AND GRS_YTD     > #ADP_Comp_Limit
+  AND YTD_401_K_M = $K_M_Flag;
+end-SQL
+
+  if ($ADP_Calc_Choice = 'P')
+    let #ADP_Comp_Limit = #Prior_Comp_Limit
+  end-if
+
+let $sql-statement = $ReportID || '.SQR,Calculate-ADP(NHCE),PS_R_NDT_Empl_ADP,Update'
+begin-SQL on-error=SQL-Error
+
+UPDATE PS_R_NDT_EMPL_ADP
+   SET ADP_HCE_ACTUAL = 100 * (DED_YTD / GRS_YTD)
+WHERE HCE_TYPE    = 'L'
+  AND GRS_YTD    <> 0
+  AND GRS_YTD    <= #ADP_Comp_Limit
+  AND YTD_401_K_M = $K_M_Flag;
+
+UPDATE PS_R_NDT_EMPL_ADP
+   SET ADP_HCE_ACTUAL = 100 * (DED_YTD / #ADP_Comp_Limit)
+WHERE HCE_TYPE    = 'L'
+  AND GRS_YTD    <> 0
+  AND GRS_YTD     > #ADP_Comp_Limit
+  AND YTD_401_K_M = $K_M_Flag;
+
+end-SQL
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure ADP-Testing
+!***************************************************************************
+
+  display 'Status: Performing ADP Testing ...'
+
+begin-SELECT
+M.ADP_MODE,
+M.HCE_TYPE,
+COUNT(*)     &Cnt,
+#ifdef DB2ALL
+  DECIMAL(SUM(ADP_HCE_ACTUAL),15,3) / DECIMAL(COUNT(*),15,3) &ADP
+#else
+  SUM(ADP_HCE_ACTUAL) / COUNT(*) &ADP
+#endif
+
+  if (&M.ADP_Mode = 'A')
+    if (&M.HCE_Type = 'H')
+      move &ADP to #ADP_HCE_Actual
+      move &Cnt to #HCE_Count
+    else
+      move &ADP to #ADP_LCE_Actual
+      move &Cnt to #LCE_Count
+    end-if
+  else
+    if (&M.HCE_Type = 'H')
+      move &ADP to #ADP_HCE_Forecast
+    else
+      move &ADP to #ADP_LCE_Forecast
+    end-if
+  end-if
+
+FROM  PS_R_NDT_EMPL_ADP M
+WHERE YTD_401_K_M = $K_M_Flag
+GROUP BY ADP_MODE, HCE_TYPE
+HAVING SUM(GRS_YTD) <> 0
+end-SELECT
+
+  do ADP-Test(#ADP_HCE_Actual, #ADP_LCE_Actual, $PassFailActual, -
+              #Excess_Actual)
+  do ADP-Test(#ADP_HCE_Forecast, #ADP_LCE_Forecast, $PassFailForecast, -
+              #Excess_Forecast)
+
+let $sql-statement = $ReportID || '.SQR,ADP-Testing,PS_NDT_Runctl,update'
+begin-SQL on-error=SQL-Error
+
+#ifdef 401K
+UPDATE PS_NDT_RUNCTL
+  SET ADP_HCE_ACTUAL_K   = #ADP_HCE_Actual,
+      ADP_HCE_FORECAST_K = #ADP_HCE_Forecast,
+      TOTAL_HCE_COUNT    = #HCE_Count,
+      ADP_LCE_ACTUAL_K   = #ADP_LCE_Actual,
+      ADP_LCE_FORECAST_K = #ADP_LCE_Forecast,
+      TOTAL_NHCE_COUNT   = #LCE_Count,
+      RESULTS_ACTUAL_K   = $PassFailActual,
+      RESULTS_FORECAST_K = $PassFailForecast,
+      D_EXCESS_ACTUAL_K  = #Excess_Actual,
+      D_EXCESS_FCST_K    = #Excess_Forecast;
+#end-if
+#ifdef 401M
+UPDATE PS_NDT_RUNCTL
+  SET ADP_HCE_ACTUAL_M   = #ADP_HCE_Actual,
+      ADP_HCE_FORECAST_M = #ADP_HCE_Forecast,
+      TOTAL_HCE_COUNT    = #HCE_Count,
+      ADP_LCE_ACTUAL_M   = #ADP_LCE_Actual,
+      ADP_LCE_FORECAST_M = #ADP_LCE_Forecast,
+      TOTAL_NHCE_COUNT   = #LCE_Count,
+      RESULTS_ACTUAL_M   = $PassFailActual,
+      RESULTS_FORECAST_M = $PassFailForecast,
+      D_EXCESS_ACTUAL_M  = #Excess_Actual,
+      D_EXCESS_FCST_M    = #Excess_Forecast;
+#end-if
+
+end-SQL
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure ADP-Test (#HCE_ADP, #NHCE_ADP, :$Result, :#Excess)
+!***************************************************************************
+
+  let #Test1Amt = #NHCE_ADP * &_NDT.Max_Times_Factor
+  if (#HCE_ADP <= #Test1Amt)
+     let $Result = '1'
+  else
+     let #Mult_Amt = #NHCE_ADP * &_NDT.Min_Times_Factor
+     let #Add_Amt  = #NHCE_ADP + &_NDT.Min_Add_Factor
+     let #Test2Amt = cond((#Mult_Amt > #Add_Amt), #Add_Amt, #Mult_Amt)
+     if (#HCE_ADP <= #Test2Amt)
+        let $Result = '2'
+     else
+        let $Result = 'F'
+        let #Excess = #HCE_ADP - #Test2Amt
+     end-if
+  end-if
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Get-Prior-Comp-Limit (:#Comp, $Begin_Dt)
+!***************************************************************************
+
+  do Convert-To-DTU-Date($Begin_Dt, $DTU_Begin)
+  do DTU-Add-Years($DTU_Begin, -1, $DTU_Out)
+  do Convert-From-DTU-Date($DTU_Out, $Lookback_Begin_Dt)
+
+  let #Comp = #_ADP_Comp_Limit
+
+begin-SELECT
+Z.ADP_COMP_LIMIT
+
+  let #Comp = &Z.ADP_COMP_LIMIT
+
+FROM  PS_NDT_HCE_TBL Z
+WHERE EFFDT =
+      (SELECT MAX(EFFDT)
+       FROM   PS_NDT_HCE_TBL
+       WHERE  EFFDT <= $Lookback_Begin_Dt)
+end-SELECT
+
+end-procedure
+
+
+!*******************************
+begin-procedure Display-Time
+!*******************************
+
+  do Get-Current-Datetime
+  display $AsOfToday NoLine
+  display ', '       NoLine
+  display $AsOfNow
+  display ''
+
+end-procedure
+
+!***************************************************************************
+
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'datemath.sqc'  !Routines for date math
+#Include 'number.sqc'    !Numeric formatting and math
+#Include 'stdapi.sqc'    !Update Process API
+#Include 'getbalid.sqc'  !Get-Calendar-Year-Id
+
+!**************************** End of NDT002 ********************************
+

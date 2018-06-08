@@ -1,0 +1,812 @@
+!***********************************************************************
+! GEXBN832:                                                            *
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module is the confidential and proprietary information of       *
+! Giant Eagle, Inc.; it is not to be copied, reproduced,or transmitted *
+! in any form, by any means, in whole or in part, nor is it to be used *
+! for any purpose other than that for which it is expressly provided   *
+! without the written permission of Giant Eagle.                       *
+!                                                                      *
+! Copyright (c) 1997-1998 Giant Eagle,Inc. All Rights Reserved         *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+! GEXBN832 :                                                           *
+!                                                                      *
+! Narrative:            This program will check to see if the current  *
+!                       pay_end_dt is the 1st pay period of the month. *
+!                       If not, the SQR stops. If so, checks for EEs in*   
+!                       Benefit programs from the run control. If these*
+!                       EEs do not have a paysheet, it will create one *
+!                       if the specified criteria are met.             *
+!                                                                      *
+! #Debugx Used:         #debug9 paragraph trace                        *
+!                       #debug8 key variable values                    *
+!                       #debug7 data returned from sql calls           *
+!                                                                      *
+! SQL Tables:           personal_data                                  *
+!                       job                                            *
+!                       ben_prog_partic                                *
+!                       health_benefit                                 *
+!                       pay_earnings                                   *
+!                       pay_oth_earns                                  *
+!                                                                      *
+! Written by:           Carl Buckrop                                   *
+!                                                                      *
+! Normally Run:         Weekly                                         *
+!                                                                      *
+! Control Parms:        FOR WHERE CLAUSE:                              *
+!                         None                                         *
+!                                                                      *
+!***********************************************************************
+
+!***********************************************************************
+!                         MODIFICATION HISTORY                         *
+!***********************************************************************
+! INITIALS  DATE        DESCRIPTION OF THE CHANGE                      *
+!***********************************************************************
+!                                                                      *
+!          CWB          09/12/2001    Initial Creation                 *
+!                                                                      *
+!          CWB          08/29/2002    Added DEDUCT_STATUS field to the *
+!                                     insert into PS_PAY_EARNINGS. Set *
+!                                     the value to 'I'. This is because*
+!                                     the table was altered by Tax     *
+!                                     Update 02E.                      *
+!                                                                      *     
+!          CWB          01/09/2003    Modified insert into PAY_EARNINGS*
+!                                     due to the alter to the table    *
+!                                     from Tax Update 02D for v8.3     *    
+!                                                                      *
+!***********************************************************************
+
+
+#include 'setenv.sqc'    !Set environment
+#Include 'setup01.sqc'   !Printer and Page-Size Initialization (Portrait)
+
+
+#define #column1  001
+#define #column2  009
+#define #column3  018
+#define #column4  029
+#define #column5  081
+
+
+Begin-program
+#debug9 Show 'Begin-Program'
+
+  Do P100-Initialization
+  if $pay_period <> '1'
+    Show 'Pay period not the first period of the month, processing stopped'
+    Print 'Pay period not the first period of the month, processing stopped' (,10)
+    Do P300-Finalization
+  else
+    show '$GEXXX911_INCLUDE_BENEFIT_PROGRAM_CRITERIA: ' $GEXXX911_INCLUDE_BENEFIT_PROGRAM_CRITERIA
+    Do P200-Main-Process
+    Do P300-Finalization
+  end-if
+End-program
+
+
+Begin-Heading 7
+#debug9 Show 'Begin-Heading'
+  #Include 'stdhdg01.sqc'
+
+  Print 'As Of Date: '           (3,1)
+  Do Format-DateTime($AsOfDate, $out, {DEFDATE}, '', '')
+  Print $out ()
+
+  If #BP-recs-printed > 0
+    Print 'Benefit Program: '    (4,1)
+    Print $save_benefit_program  ()
+  End-If
+
+  Print $ReportTitle2            (3,) Center
+  Print $ReportTitle3            (4,) Center
+
+  Print 'COMPANY'                (+2,{#column1})
+  Print 'PAYGROUP'               (+0,{#column2})
+  Print 'EMPLID'                 (+0,{#column3})
+  Print 'NAME'                   (+0,{#column4})
+  Print 'BENEFIT PGM'            (+0,{#column5})
+
+  Print '-'                      (+1,{#column1},07)  Fill
+  Print '-'                      (+0,{#column2},08)  Fill
+  Print '-'                      (+0,{#column3},09)  Fill
+  Print '-'                      (+0,{#column4},50)  Fill
+  Print '-'                      (+0,{#column5},11)  Fill
+End-Heading
+
+
+Begin-Procedure P100-Initialization
+#debug9 Show 'P100-Initialization'
+  Do Init-DateTime           !datetime.sqc
+  Do Init-Number             !number.sqc
+  Do Get-Current-DateTime    !curdttim.sqc
+  Do Stdapi-Init             !stdapi.sqc
+
+  Let $GEXXX911_Benefit_Program_Alias  = 'bpp.benefit_program'
+  if $prcs_process_instance = ''
+      display 'Enter Run Control Date, or leave blank'
+      input $rnctl_date 'to default to today''s date({Prompt-Date}): ' type=char
+      if $rnctl_date = ''
+        Let $AsofDate = $AsOfToday
+      else
+        do format-datetime($rnctl_date,$rnctl_date_dbf,{prompt-mask},'','native')
+        Let $asofdate = $rnctl_date_dbf
+      end-if 
+    Let $BenefitProgramString = ''''
+    Display 'Enter Benefit Program or leave blank to exit.'
+    While 1=1
+      Input $In-Benefit-Program Maxlen=3 'Benefit Program'
+      Uppercase $In-Benefit-Program
+      If Rtrim($In-Benefit-Program, ' ') = ''
+        Concat '''' With $BenefitProgramString
+        Break
+      End-If
+      If $BenefitProgramString <> ''''
+        Concat ''',''' With $BenefitProgramString
+      End-If
+      Concat $In-Benefit-Program With $BenefitProgramString
+    End-While
+
+    If $BenefitProgramString = ''''''
+      Let $GEXXX911_INCLUDE_BENEFIT_PROGRAM_CRITERIA = '1=1'
+      Let $GEXXX911_INCLUDE_BENEFIT_PROGRAM_DISPLAY_CRITERIA = 'ALL'
+    Else
+      Let $GEXXX911_INCLUDE_BENEFIT_PROGRAM_CRITERIA = ' AND ' || $GEXXX911_Benefit_Program_Alias || ' In (' || $BenefitProgramString || ')'
+      Let $GEXXX911_INCLUDE_BENEFIT_PROGRAM_DISPLAY_CRITERIA = $GEXXX911_INCLUDE_BENEFIT_PROGRAM_CRITERIA
+    End-If
+  else
+    Do GEXRCBN1-SELECT-PARAMETERS
+    Let $X000_Where_Select_AsofDate = &GEX_RC_BEN.ASOFDATE
+    Let $AsofDate = $X000_Where_Select_AsofDate
+    If Rtrim(&GEX_RC_BEN.ASOFDATE,' ') = ''
+       Let $AsofDate = $AsOfToday
+    End-If
+
+    Do GEXXX911-Select-Benefit-Program-Parameters
+    If $GEXXX911_INCLUDE_BENEFIT_PROGRAM_CRITERIA != ''
+       Let $GEXXX911_INCLUDE_BENEFIT_PROGRAM_CRITERIA = ' AND ' || $GEXXX911_INCLUDE_BENEFIT_PROGRAM_CRITERIA
+    End-If
+
+!     if $found = 'N'
+!        goto report-exit
+!     end-if
+  End-if
+  show '$asofdate: ' $asofdate
+
+  Let $ReportID      = 'GEXBN832'
+  Let $ReportTitle   = 'Employees for whom paysheets were created'
+  Let $ReportTitle2  = ' '
+  Let $ReportTitle3  = ' '
+
+  Show '$ReportID    = ' $ReportID
+  Show '$ReportTitle = ' $ReportTitle
+  Show ' '
+  Show 'Report Began:'
+  Show '  Date = ' $ReportDate
+  Show '  Time = ' $ReportTime
+
+  do prepare-businessunit-lookup
+  Do Get-Pay-End-Dt
+
+End-Procedure
+begin-procedure Prepare-Businessunit-lookup
+
+Load-Lookup
+     Name=BULookup
+     Table='PS_BUS_UNIT_TBL_HR BU'
+     Key='BU.DEFAULT_SETID'
+     Return_Value='BU.BUSINESS_UNIT'
+     Where='BU.ACTIVE_INACTIVE  = ''A'''   
+end-procedure
+
+Begin-Procedure Get-Pay-End-Dt
+  Move 'N' To $found
+Begin-Select Loops=1 On-Error=P260-sql-error-found('Get-Pay-End-Dt')
+PAY.PAY_BEGIN_DT
+PAY.PAY_END_DT
+PAY.PAY_PERIOD
+
+  Move &PAY.PAY_BEGIN_DT to $pay_begin_dt 
+  Move &PAY.PAY_END_DT   To $pay_end_dt
+  MOVE &PAY.PAY_PERIOD   To $pay_period 
+  Show ' '
+  Show 'Pay Begin Date: '  $pay_begin_Dt
+  Show 'Pay End Date: '  $pay_end_Dt
+  Show 'Pay Period:   '  $pay_period
+  Move 'Y' To $found
+
+FROM   PS_PAY_CALENDAR PAY
+
+WHERE  PAY.PAY_END_DT         =
+      (SELECT MAX(PAY_END_DT)
+       FROM   PS_PAY_CALENDAR
+       WHERE  PAY_END_DT     <= $AsOfdate
+       AND    PAY_SHEETS_RUN  = 'Y'
+       AND PAY.PAY_CONFIRM_RUN = 'N' 
+       AND PAY_OFF_CYCLE_CAL = 'N')
+      AND PAY.PAY_OFF_CYCLE_CAL = 'N'
+End-Select
+
+  If $found = 'N'
+    Display 'No Previous Pay Cycle as of: ' noline
+    Display $AsOfToday
+    Stop
+  End-If
+
+End-Procedure  !get-pay-end-dt
+
+Begin-Procedure P200-Main-Process
+#debug9 Show 'P200-Main-Process'
+
+
+Begin-Select On-Error=P260-SQL-Error-Found('P200-Main-Process')
+/*+ RULE */
+j.company
+j.paygroup
+j.emplid
+j.empl_rcd
+j.empl_status
+j.empl_type
+j.location
+j.deptid
+j.gl_pay_type
+j.jobcode
+j.position_nbr
+j.shift
+j.hourly_rt
+e.benefit_rcd_nbr
+e.ded_taken
+e.ded_subset_id
+p.name
+bpp.benefit_program  
+bpp.emplid
+bpp.empl_rcd
+bpp.cobra_event_id
+
+  let $company      = &j.company
+  let $paygroup     = &j.paygroup
+  let $deptid       = &j.deptid
+  let $emplid       = &j.emplid
+  let $empl_type    = &j.empl_type
+  let $location     = &j.location
+  let $gl_pay_type  = &j.gl_pay_type
+  let $jobcode      = &j.jobcode  
+  let $position_nbr = &j.position_nbr
+  let $shift        = &j.shift
+  let $dedtaken     = &e.ded_taken
+  let $dedsubsetid  = &e.ded_subset_id
+  let $name         = &p.name
+  let $benefit_pgm  = &bpp.benefit_program
+  move &j.empl_rcd to #empl_rcd
+  move &j.hourly_rt to #hourly_rt
+  move &e.benefit_rcd_nbr to #benefit_rcd_nbr
+  add 1 to #emps_selected
+  Do P210-verify-paysheet
+
+From   ps_ben_prog_partic bpp,
+       ps_health_benefit  hb,
+       ps_employment      e,  
+       ps_personal_data   p,
+       ps_job             j
+
+Where  e.emplid               = j.emplid
+And    e.empl_rcd             = j.empl_rcd
+And    p.emplid               = j.emplid
+And    bpp.emplid             = j.emplid
+And    hb.emplid              = j.emplid
+And    hb.plan_type           = '1Y' 
+And    hb.coverage_elect      = 'E'
+And    hb.effdt               =
+      (Select Max(effdt)
+       From   ps_health_benefit
+       Where  emplid          = hb.emplid
+       And    empl_rcd        = hb.empl_rcd
+       And    cobra_event_id  = hb.cobra_event_id
+       And    plan_type       = '1Y' 
+       And    effdt          <= $pay_end_dt)
+And    j.effdt                =
+      (Select Max(effdt)
+       From   ps_job
+       Where  emplid          = j.emplid
+       And    empl_rcd        = j.empl_rcd
+       And    effdt          <= $pay_end_dt)
+
+And    j.effseq               =
+      (Select Max(effseq)
+       From   ps_job
+       Where  emplid          = j.emplid
+       And    empl_rcd        = j.empl_rcd
+       And    effdt           = j.effdt)
+And    bpp.effdt              =
+      (Select Max(effdt)
+       From   ps_ben_prog_partic
+       Where  emplid          = bpp.emplid
+       And    empl_rcd        = bpp.empl_rcd
+       And    cobra_event_id  = bpp.cobra_event_id
+       And    effdt          <= $pay_end_dt)
+!######################################################################
+! Put into run control panel !
+!And    bpp.benefit_program   In ('R07','R09','R11', 'R15','R33', 'R34')
+       [$GEXXX911_INCLUDE_BENEFIT_PROGRAM_CRITERIA]
+!######################################################################
+Order by j.paygroup,j.emplid
+End-Select
+End-Procedure
+
+
+Begin-Procedure P210-verify-paysheet
+#debug9 Show 'P210-verify-paysheet'
+  let $paysheet-found = 'N'
+Begin-Select On-Error=P260-SQL-Error-Found('P210-verify-paysheet')
+'x'
+
+  let $paysheet-found = 'Y'
+
+From   ps_pay_line     pl
+
+Where  pl.emplid              = $emplid
+And    pl.off_cycle           = 'N'
+And    pl.pay_end_dt          = $pay_end_dt
+End-Select
+
+  if $paysheet-found = 'N'
+!    Do P220-health-benefit
+     do P230-create-paysheet
+  end-if
+
+End-Procedure
+
+
+
+Begin-Procedure P230-create-paysheet
+#debug9 Show 'P230-Create-Paysheet'
+
+  if $paygroup = $save_paygroup
+    if #line_num = 7
+      add 1 to #page_num
+      do P232-Add-page
+      move 1 to #line_num
+      do P233-Add-line
+    else
+      add 1 to #line_num
+      do P233-Add-line
+    end-if
+  else 
+    do P231-get-last-page
+    add 1 to #page_num
+    do P232-Add-page
+    move 1 to #line_num
+    do P233-Add-line
+  end-if
+  move $paygroup to $save_paygroup
+
+   do P240-print-record
+   do P233-add-pay-earnings
+
+
+End-Procedure
+
+!*********************************************************************
+! Retrieves the last page in the pay_page table for current period
+! and paygroup. 
+!*********************************************************************
+
+begin-procedure P231-Get-Last-Page
+#debug9 Show 'P231-Get-Last-Page'
+
+ !display 'P231-Get-Last-Page'
+ !display 'Pay End date in last-page proc: ' noline
+ !display $Pay_End_Dt
+ !display 'Company in last-page proc: ' noline
+ !display $Company
+ !display 'Paygroup in last-page proc: ' noline
+ !display $Paygroup
+
+begin-select ON-ERROR=P260-SQL-Error-Found('P231-Get-Last-Page')
+/*+ RULE */
+MAX(PAGE_NUM) &Page
+
+  move &Page to #page_num
+  !display 'Max Page : ' noline 
+  !display &Page
+
+FROM PS_PAY_PAGE
+WHERE COMPANY = $Company
+  AND PAYGROUP = $PayGroup
+  AND PAY_END_DT = $Pay_End_Dt
+  AND OFF_CYCLE = 'N'
+end-select
+end-procedure
+
+!*********************************************************************
+!Inserts a new page in the paysheet
+!*********************************************************************
+Begin-Procedure P232-Add-page
+#debug9 Show 'P232-Add-page'
+
+ display 'add-page'
+
+ display $company
+ display $paygroup
+ display $pay_end_dt
+ display #page_num
+ 
+begin-SQL ON-ERROR=P260-SQL-Error-Found('P232-Add-page')
+/*+ RULE */
+INSERT INTO PS_PAY_PAGE ( COMPANY,
+			  PAYGROUP,
+			  PAY_END_DT,
+			  OFF_CYCLE,
+			  PAGE_NUM,
+			  CONFIRMED,
+			  BALNC_LINES,
+			  BALNC_LINES_OK,
+			  BALNC_REG_PAY_HRS,
+			  BALNC_OT_HRS,
+			  BALNC_OTH_HRS,
+			  BALNC_REG_PAY,
+			  BALNC_OTH_EARNS,
+			  BALNC_HOURLY_RT,
+			  SINGLE_CHECK_USE,
+			  PAY_SHEET_SRC)
+VALUES                  ( $Company,
+			  $paygroup,
+			  $pay_end_dt,
+			  'N',
+			  #page_num,
+			  'N',
+			  0,
+			  0,
+			  0,
+			  0,
+			  0,
+			  0,
+			  0,
+			  0,
+			'N',
+			'S')
+end-SQL
+
+End-Procedure   !P232-Add-Page
+
+!*********************************************************************
+!insets a new line in the pay sheet
+!*********************************************************************
+Begin-Procedure P233-Add-line
+#debug9 Show 'P233-Add-line'
+
+ let $bu_lkp = ' '
+ lookup bulookup 'COMMN' $bu_lkp  
+
+begin-SQL ON-ERROR=P260-SQL-Error-Found('P233-Add-Line')
+/*+ RULE */
+INSERT INTO PS_PAY_LINE ( COMPANY,
+			  PAYGROUP,
+			  PAY_END_DT,
+			  OFF_CYCLE,
+			  PAGE_NUM,
+			  LINE_NUM,
+			  EMPLID,
+			  EMPL_RCD,
+			  BENEFIT_RCD_NBR,
+			  NAME,
+			  JOB_CHANGE,
+			  PARTIAL_PERIOD,
+			  CONFIRMED,
+			  EMPL_TYPE,
+			  LOCATION,
+			  DEPTID,
+			  BENEFIT_PROGRAM,
+			  MANUAL_CHECK,
+			  FORM_ID,
+			  PAYCHECK_NBR,
+			  CHECK_DT,
+			  TOTAL_GROSS,
+			  NET_PAY,
+			  PAYCHECK_ADJUST,
+			  SINGLE_CHECK_USE,
+			  TL_SOURCE,
+			  PAY_SHEET_SRC,
+			  BUSINESS_UNIT,        
+			  LOCKED_FOR_CONF)	
+VALUES                  ( $company,
+			  $paygroup,
+			  $Pay_End_Dt,
+			  'N',
+			  #page_num,
+			  #line_num,
+			  $emplid,
+			  #Empl_Rcd,
+			  #benefit_rcd_nbr,
+			  $name,
+			  'N',
+			  'N',
+			  'N',
+			  $empl_type,
+			  $location,
+			  $deptid,
+			  $benefit_pgm,                   
+			  'N',
+			  '      ',
+			  0,
+			  NULL,
+			  0,
+			  0,
+			  'N',
+			  'N',
+			  'G',
+			  'S',
+			  $bu_lkp,
+			  'N')
+end-SQL
+
+End-Procedure  !P233-Add-Line
+
+!*********************************************************************
+!Adds information to Earnings table
+!*********************************************************************
+
+begin-procedure P233-Add-Pay-Earnings
+
+ let $bu_lkp = ' '
+
+ lookup bulookup 'COMMN' $bu_lkp  
+
+
+  do P234-get-state-locality
+
+  move 'N' to $Addl_Taxes        
+
+begin-SQL ON-ERROR=P260-SQL-Error-Found('P233-Add-Pay-Earnings')
+INSERT /*+ RULE */ INTO PS_PAY_EARNINGS ( COMPANY,
+			      PAYGROUP,
+			      PAY_END_DT,
+			      OFF_CYCLE,
+			      PAGE_NUM,
+			      LINE_NUM,
+			      ADDL_NBR,
+			      SEPCHK,
+			      EMPLID,
+			      EMPL_RCD,
+			      BENEFIT_RCD_NBR,
+			      EARNS_END_DT,
+			      EARNS_BEGIN_DT,
+			      ADDLPAY_REASON,
+			      DISABLE_DIR_DEP,
+			      GROSSUP,
+			      PAY_LINE_STATUS,
+			      OK_TO_PAY,
+			      JOB_PAY,
+			      SINGLE_CHECK_USE,
+			      ACCT_CD,
+			      GL_PAY_TYPE,
+			      DEPTID,
+			      JOBCODE,
+			      POSITION_NBR,
+			      SHIFT,
+			      SHIFT_RT,
+			      HOURLY_RT,
+			      FLSA_RT,
+			      RATE_USED,
+			      FLSA_REQUIRED,
+			      ERNCD_REG_HRS,
+			      ERNCD_OT_HRS,
+			      REG_PAY_HRS,
+			      REG_HRS,
+			      OT_HRS,
+			      REG_HRLY_EARNS,
+			      OT_HRLY_EARNS,
+			      ERNCD_REG_EARNS,
+			      REG_PAY,
+			      REG_EARNS,
+			      REG_EARN_HRS,
+			      DED_TAKEN,
+			      DED_SUBSET_ID,
+                              DED_TAKEN_GENL,           !CWB 01/09/2003
+                              DED_SUBSET_GENL,          !CWB 01/09/2003 
+		              STATE,
+			      LOCALITY,
+			      PAY_FREQUENCY,
+			      TAX_PERIODS,
+			      TAX_METHOD,
+			      ADDL_TAXES,
+			      OVERRIDE_HOURLY_RT,
+			      TL_SOURCE,
+			      PAY_SHEET_SRC,
+			      BUSINESS_UNIT,  		
+			      EI_PRIOR_PD_CORR,
+			      COMP_RATECD_REG,	
+          		      COMP_RATECD_OT,		
+			      COMPRATE_USED_REG,	
+			      COMPRATE_USED_OT,
+                              FICA_STATUS_EE,
+                              PAID_PRDS_PER_YEAR,
+                              FLSA_END_DT,
+                              ORIG_PAYGROUP,
+                              FLSA_STATUS,
+                              XREF_NUM,
+                              UNION_CD,		
+                              BEN_DED_STATUS,      !CWB 01/09/2003
+                              GENL_DED_STATUS)     !CWB 01/09/2003		
+VALUES                  (     $Company,
+			      $paygroup,
+			      $pay_End_dt,
+			      'N',
+			      #page_num,
+			      #line_num,
+			      0,
+			      0,
+			      $emplid,
+			      #Empl_Rcd,
+			      #benefit_rcd_nbr,
+                              $Pay_End_Dt,
+                              $Pay_Begin_Dt,
+			      'N',
+			      'N',
+			      'N',
+			      'I',
+			      'Y',
+			      'N',
+			      'N',
+			      ' ',
+			      $gl_pay_type,
+			      $deptid,
+			      $jobcode,
+			      $position_nbr,
+			      $shift,
+			      0,
+			      0,
+			      0,
+			      'H',
+			      'N',
+			      'REG',
+			      'OTP',
+			      0,
+			      0,
+			      0,
+			      0,
+			      0,
+			      'REG',
+			      0,
+			      0,
+			      0,
+			      $DedTaken,
+			      $DedSubsetId,
+                              'D',              !CWB 01/09/2003
+                              ' ',              !CWB 01/09/2003
+			      $state,
+			      $locality, 
+			      'W',
+			      1,
+			      'A',
+			      'N',
+             		      'Y',
+			      'G',
+			      'S',
+			      $bu_lkp, 		
+			      'N',	
+			      ' ',		
+			      ' ',		
+			      0,	! new fields in HRMS 8.3	
+			      0,
+                              'N',
+                              0,
+                              '',
+                              $paygroup,
+                              'X',
+                              0,
+                              ' ',		
+                              'I',             !CWB 01/09/2003
+                              'I')             !CWB 01/09/2003		
+end-sql
+End-procedure  !P233-add-pay-earnings
+
+!***************************************************************
+begin-procedure P234-get-state-locality
+!**************************************************************
+
+! display 'P234-get-state-locality'
+
+  move '**' to $State
+  move ' ' to $Locality
+
+begin-select
+/*+ RULE */
+TD.STATE
+TD.LOCALITY
+TD.DIST_PCT
+
+  let $State = rtrim(&TD.State, ' ')
+
+  if isnull(&TD.Locality) = 1
+    let $Locality = '  '
+  else
+    let $Locality = &TD.Locality
+  end-if
+  exit-select
+
+ FROM PS_TAX_DISTRIB TD
+ where TD.EMPLID = $Emplid
+  and TD.EMPL_RCD = #Empl_Rcd
+  and TD.EFFDT =
+	    (SELECT MAX(TD1.EFFDT)
+	     from PS_TAX_DISTRIB TD1
+	     where TD1.EMPLID = $emplid
+	       and TD1.EMPL_RCD = #EMPL_RCD
+	       and TD1.EFFDT <= $Pay_End_Dt)
+end-select
+
+  if $state = '**'
+    show 'EE ' $emplid ' has no state in PS_TAX_DISTRIB'
+  end-if
+
+end-procedure  !P234-Get_State-Locality
+
+!*****************************************************************
+Begin-Procedure P240-Print-Record
+#debug9 Show 'P240-Print-Record'
+  Print $company                 (+1,3)
+  Print $paygroup                (+0,12) 
+  Print &bpp.emplid              (+0,{#column3})      
+  Print $name                    (+0,{#column4},50)
+  Print &bpp.benefit_program     (+0,85)
+
+  Add 1 To #BP-recs-printed
+End-Procedure
+
+Begin-Procedure P260-SQL-Error-Found($Proc_Name) 
+#debug9 Show 'P260-SQL-Error-Found'
+  Display 'SQL Error in ' 
+  Display $Proc_Name 
+  Display $_sql-error
+  Display 'sql-status:' 
+  Display #_sql-status 
+  Do P270-BP-Emplid-in-Error
+  STOP
+End-Procedure
+
+
+Begin-Procedure P270-BP-Emplid-in-Error
+#debug9 Show 'P270-BP-Emplid-in-Error'
+  Display ''
+  Display 'Error occurred while processing BP (' Noline
+  Display &bpp.benefit_program Noline
+  Display '), emplid ' Noline
+  Display &bpp.emplid
+  Display ''
+End-Procedure
+
+
+Begin-Procedure P300-Finalization
+#debug9 Show 'P300-Finalization'
+  If #BP-recs-printed < 1
+    Print 'NO DATA SELECTED FOR THIS REPORT RUN'	(25,) Center
+  End-If
+
+  Do Reset                   !reset.sqc
+  Do Stdapi-Term             !stdapi.sqc
+  Do Get-Current-DateTime    !curdttim.sqc
+
+  Show ' '
+  Show 'Program Ended:'
+  Show '  Date = ' $ReportDate
+  Show '  Time = ' $ReportTime
+  Show ' '
+  Show 'Successful end of program'
+End-Procedure
+
+
+#Include 'stdapi.sqc'    !Process Scheduler Interface
+#Include 'reset.sqc'     !Reset Printer Procedure
+#Include 'curdttim.sqc'  !Get-Current-DateTime Procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'datemath.sqc'  !Routines for date math
+#Include 'gexxx911.sqc'  !Multiple Benefits Run Controls
+#Include 'gexxx920.sqc'  !Benefits AsOfDate Run Control

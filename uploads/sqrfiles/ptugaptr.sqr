@@ -1,0 +1,1015 @@
+! ***************************************************************!
+!  This software and related documentation are provided under a!
+!  license agreement containing restrictions on use and!
+!  disclosure and are protected by intellectual property!
+!  laws. Except as expressly permitted in your license agreement!
+!  or allowed by law, you may not use, copy, reproduce,!
+!  translate, broadcast, modify, license, transmit, distribute,!
+!  exhibit, perform, publish or display any part, in any form or!
+!  by any means. Reverse engineering, disassembly, or!
+!  decompilation of this software, unless required by law for!
+!  interoperability, is prohibited.!
+!  The information contained herein is subject to change without!
+!  notice and is not warranted to be error-free. If you find any!
+!  errors, please report them to us in writing.!
+!  !
+!  Copyright (C) 1988, 2011, Oracle and/or its affiliates.!
+!  All Rights Reserved.!
+! ***************************************************************!
+ 
+ 
+!                                                                    !
+!----------------------------------------------------------------------
+! Report Name: PTUGAPTR.SQR -- Asssign tree node numbers with gaps.   
+!----------------------------------------------------------------------
+!                                                                      
+!                                                                      
+!**********************************************************************
+!                                                                      
+!                                                                      
+!                                                                      
+!                                                                 !
+!                                                                      
+!----------------------------------------------------------------------
+! Program Descr: This program determines the maximum possible gap      
+!                between node numbers, and re-numbers the nodes using  
+!                that multiplier.   
+! Program makes use of an in memory array which must be large enough to
+! hold all nodes of tree being processed.
+!----------------------------------------------------------------------
+! Prompts:       SetID, Tree Name and Effective Date                   
+!----------------------------------------------------------------------
+! Tables Referenced:  PSTREELEAF                                       
+!                     PSTREENODE                                       
+!                     PSTREEDEFN   
+!                     PSTREEBRANCH
+!                     PSX_TREENODEGAP
+!                     PSLOCK                                           
+!----------------------------------------------------------------------
+
+#include 'setenv.sqc'                   !Set environment procedure
+#include 'setup02.sqc'                  ! Init printer and page size
+!------------------------------------------------------------------------
+!
+!------------------------------------------------------------------------
+begin-setup
+#define MAXNODENUM 2000000000
+! Note : Array must be sized at COMPILE time. Hard coding to 250,000 nodes. 
+!        If you require a larger array than that this size can be increased as 
+!        needed
+#define MAXTREENODES 250000
+#define FALSE 0
+#define TRUE -1
+declare-variable 
+INTEGER #gap
+end-declare
+end-setup
+!------------------------------------------------------------------------
+!
+!------------------------------------------------------------------------
+begin-report
+  do Init-DateTime
+  do Init-Number
+  do Get-Current-DateTime
+  do Define-Prcs-Vars
+  do Get-Run-Control-Parms
+  do Create-Node-Array
+  move 'PTUGAPTR' to $ReportID
+  move 'RE-NUMBER TREE NODES' to $ReportTitle
+  
+  while 1 = 1
+  
+    do Prog-Initialization
+
+    if $SetID = 'ALL'
+      do Gap-All-Trees
+      move 'Y' to $All
+      do Wrap-Up
+      break
+    end-if
+
+    if $SetID = 'QUIT'
+      move 'N' to $All
+      do Wrap-Up
+      break
+    end-if
+
+    move 0 to #ErrorCount
+    do Gap-A-Tree
+
+  end-while
+
+  do Terminate
+  
+end-report
+
+!----------------------------------------------------------------------!
+
+begin-heading 8
+   #include 'stdhdg01.sqc'
+end-heading
+
+!----------------------------------------------------------------------!
+! Procedure: Prog-Initialization                                       !
+! Descr:     Prompt for SetID, Tree Name, and Effective Date.  Verify  !
+!            that the specified tree exists.                           !
+!----------------------------------------------------------------------!
+
+begin-procedure Prog-Initialization
+
+while 1 = 1
+  input $Setid 'Enter specific key value for tree, ALL, or QUIT' type=char maxlen=20
+  let $SetID = upper($SetID)
+  let $SetCntrlValue = ' '
+
+  if $SetID = 'ALL'
+    break
+  end-if
+  if $SetID = 'QUIT'
+    break
+  end-if
+  if $SetID = ''
+    let $SetID = ' '
+    let $SetCntrlValue = ' '
+    let $TreeKeyType = 'N'
+  else
+    while 1 = 1
+      input $TreeKeyType 'Enter type of tree key field (S=SetID, B=Business Unit, U=User-defined)' type=char maxlen=1
+      let $TreeKeyType = upper($TreeKeyType)
+      IF $TreeKeyType = 'S' or $TreeKeyType = 'B' or $TreeKeyType = 'U'
+        break
+      else
+        input $invalidEntry 'Incorrect tree key type.  Please press ENTER'
+      end-if
+    end-while
+  end-if
+
+  input $TreeName 'Enter Tree Name' type=char maxlen=18
+  let $TreeName = upper($TreeName)
+  do Ask-Eff-Date
+  do Verify-Tree
+  if $Found = 'Y'
+    break
+  else
+    input $Found 'Tree not found.  Please try again.  Please press ENTER'
+  end-if
+end-while
+
+
+
+end-procedure
+
+!----------------------------------------------------------------------!
+! Procedure: Verify-Tree                                               !
+! Desc:      Determine if the tree specified by the user exists.  Also,!
+!            get the node count from PSTREEDEFN.                       !
+!----------------------------------------------------------------------!
+
+begin-procedure Verify-Tree
+  move 'N' to $Found
+
+  Evaluate $TreeKeyType
+    WHEN = 'S'
+      let $SetCntrlValue = ' '
+    WHEN = 'B'
+      let $SetCntrlValue = $Setid
+      let $Setid = ' '
+    WHEN = 'U'
+      let $SetCntrlValue = $Setid
+      let $Setid = ' '
+    WHEN = 'N'
+      let $SetCntrlValue = ' '
+      let $Setid = ' '
+  END-Evaluate
+
+begin-SELECT On-error=SQL-error
+TD.NODE_COUNT
+  move &TD.Node_Count to #NodeCount
+  move 'Y' to $Found
+FROM PSTREEDEFN TD
+WHERE SETID = $SetID
+  AND SETCNTRLVALUE = $SetCntrlValue
+  AND TREE_NAME = $TreeName
+  AND EFFDT = $Effdt
+end-SELECT
+end-procedure
+
+!----------------------------------------------------------------------!
+! Procedure: Gap-All-Trees                                             !
+! Desc:      Re-number every tree in the database.  Also, get the node !
+!            count from PSTREEDEFN.                                    !
+!----------------------------------------------------------------------!
+
+begin-procedure Gap-All-Trees
+  move 0 to #ErrorCount
+begin-SELECT
+TD2.SETID
+TD2.SETCNTRLVALUE
+TD2.TREE_NAME
+TD2.EFFDT
+TD2.NODE_COUNT
+  move &TD2.SetID to $SetID
+  move &TD2.SetCntrlValue to $SetCntrlValue
+  move &TD2.Tree_Name to $TreeName
+  move &TD2.Effdt to $Effdt
+  move &TD2.Node_Count to #NodeCount
+  print 'Re-numbering ' (+1,1)
+  print $SetID ()
+  print ' ' ()
+  print $SetCntrlValue ()
+  print ' ' ()
+  print $TreeName ()
+  print ' ' ()
+  print $Effdt ()
+  print '.' ()  
+  do Gap-A-Tree   
+FROM PSTREEDEFN TD2
+ORDER BY SETID,
+  SETCNTRLVALUE,
+  TREE_NAME,
+  EFFDT DESC
+end-SELECT
+end-procedure
+
+!----------------------------------------------------------------------!
+! Procedure: Gap-A-Tree                                                    !
+! Desc:      This is the main procedure.                               !
+!----------------------------------------------------------------------!
+
+begin-procedure Gap-A-Tree
+
+  let #ValidTree = {TRUE}
+  do Check-All-Parent-Nodes  
+  
+  if #NodeCount = 0
+      do Sum-NodeCount
+  end-if
+  
+  if #NodeCount = 0
+    let #ValidTree = {FALSE}
+  else
+    let #gap = floor({MAXNODENUM} / #NodeCount)
+  end-if
+  
+  if #NodeCount > {MAXTREENODES}    
+    display 'Node Array Not Large enough to hold all tree nodes. Increase size of MAXTREENODES to at least ' noline
+    display #NodeCount      
+    let #ValidTree = {FALSE}
+  end-if
+  
+  if #validtree <> {TRUE}   
+     ! add 1 to #ErrorCount
+  else 
+
+      do Delete-PSXTreeNodeGap     
+      do Clear-Node-Array
+      do Load-Node-Array
+      do Process-Node-Array  
+      #ifdef debug
+        do Dump-Node-Array
+      #endif
+      if #ErrorCount = 0   
+        ! Lock everybody out while we do our updates. 
+        ! do Commit-Transaction
+        ! do Begin-Transaction 
+        do Update-Version 
+        do Update-TreeNodes
+        do Update-TreeLeaves
+        do Update-TreeBranches
+        do Update-VersionTree
+        do Update-TreeDefnBranch
+      end-if
+      
+   end-if
+end-procedure
+!**********************************************************************
+!*      Create-Node-Array                                     *
+!**********************************************************************
+
+begin-procedure Create-Node-Array  
+
+ display 'Creating Node Array of Size = ' noline
+ display {MAXTREENODES}
+
+
+create-array name=NodeArray size={MAXTREENODES}                                    
+                                    field=Node_Num:integer:2  -
+                                    field=Node_Num_End:integer:2  -
+                                    field=Parent_Node_Num:integer:2
+
+
+end-procedure
+
+!**********************************************************************
+!*      Clear-Node-Array                                         *
+!**********************************************************************
+
+begin-procedure Clear-Node-Array  
+
+
+display 'Clearing Node Array ' 
+clear-array name=NodeArray 
+
+end-procedure
+
+!**********************************************************************
+!*       Load-Node-Array                             *
+!**********************************************************************
+
+begin-procedure Load-Node-Array
+
+let #NodeCounter = 0
+let #OldValues = 0
+let #NewValues = 1
+
+
+display 'Loading Node Array ' 
+
+
+begin-select
+
+TREE_NODE_NUM
+TREE_NODE_NUM_END
+PARENT_NODE_NUM
+
+   !   Load Tree Array
+   let NodeArray.Node_Num  (#NodeCounter, #OldValues) = &TREE_NODE_NUM
+   let NodeArray.Node_Num_End  (#NodeCounter, #OldValues) = &TREE_NODE_NUM_END
+   let NodeArray.Parent_Node_Num  (#NodeCounter, #OldValues) = &PARENT_NODE_NUM
+
+   let #NodeCounter = #NodeCounter + 1
+
+ from PSTREENODE    
+where SETID    = $SetID
+  and SETCNTRLVALUE = $SetCntrlValue
+  and TREE_NAME = $TreeName
+  and EFFDT    = $Effdt
+order by TREE_NODE_NUM
+
+end-select
+
+
+display 'Node Array Populated with ' noline
+display #NodeCounter noline
+display ' nodes.'   
+
+end-procedure
+
+!-----------------------------------------------------
+! Procedure : Process-Node-Array
+!------------------------------------------------------
+begin-procedure Process-Node-Array
+
+display 'Processing Node Array '
+
+let #nodes = #NodeCounter
+let #gap   = floor({MAXNODENUM}/(#nodes + 1))
+let #ctr   = 0
+
+let #NewNodeNum = 1
+let #NewNodeNumEnd = {MAXNODENUM}  
+let #NewParentNum = 0
+let #OldNodeNum = NodeArray.Node_Num (#ctr, #OldValues)
+let NodeArray.Node_Num (#ctr, #NewValues) = #NewNodeNum
+let NodeArray.Node_Num_End (#ctr, #NewValues) = #NewNodeNumEnd
+let NodeArray.Parent_Node_Num (#ctr, #NewValues) = #NewParentNum
+
+Do Insert-PSXTreeNodeGap
+
+let #OldParentNum = NodeArray.Node_Num (0, #OldValues)
+let #ctr = 1
+
+while #ctr <= #nodes
+
+  Let #OldNodeNum = NodeArray.Node_Num(#ctr, #OldValues)
+  Let #OldNodeNumEnd = NodeArray.Node_Num_End(#ctr, #OldValues)
+  Let #OldParentNum = NodeArray.Parent_Node_Num(#ctr, #OldValues)
+  
+  #ifdef debuga
+    print 'Process Node (Old) '               ( +1,  1, 0) 
+    print #OldNodeNum                         (  0, 30, 0) edit 9,999,999,999
+ #end-if
+  
+  do Find-Parent-Entry    
+  
+  if #ParentEntry = -1
+    display 'Unable to Find Parent Node for Node  ' noline
+    display #OldNodeNum 
+    add 1 to #ErrorCount
+    break
+  end-if
+  
+  let #NewParentNum = NodeArray.Node_Num(#ParentEntry, #NewValues)
+  let #NewParentNumEnd = NodeArray.Node_Num_End(#ParentEntry, #NewValues)   
+  Let #NewNodeNum = #NewParentNum + ((#ctr - #ParentEntry) * #gap) - 1
+  
+  do Count-NbrKids
+  Let #NewNodeNumEnd = #NewNodeNum + (#gap * (#NbrKids + 1)) - 1
+
+  if #NewNodeNumEnd > #NewParentNumEnd
+    #ifdef debuga
+        display 'child node end number greater than its parent end number for node ' noline
+        display #NewNodeNum
+    #end-if
+  end-if  
+  
+  Let NodeArray.Node_Num(#ctr, #NewValues) = #NewNodeNum
+  Let NodeArray.Node_Num_End(#ctr, #NewValues) = #NewNodeNumEnd
+  Let NodeArray.Parent_Node_Num(#ctr, #NewValues) = #NewParentNum
+  
+  Do Insert-PSXTreeNodeGap
+  
+  let #ctr  = #ctr + 1
+
+end-while
+
+end-procedure 
+!-----------------------------------------------------
+! Procedure : Find-Parent-Entry
+!------------------------------------------------------
+begin-procedure Find-Parent-Entry
+
+#ifdef debuga
+ print 'Looking for Parent Node (OLD) :'      ( +1,  1,  0 )
+ print #OldParentNum                          (  0, 32,  0 ) edit 9,999,999,999
+#end-if
+
+let #Entry = #ctr 
+let #ParentEntry = -1
+while #Entry >= 0
+  if #OldParentNum = NodeArray.Node_Num(#Entry, #OldValues)
+    let #ParentEntry = #Entry
+    #ifdef debuga
+      let #NewParentNum = NodeArray.Node_Num(#ParentEntry, #NewValues) 
+      print 'Found Parent Entry #'              ( +1,  1,  0 )
+      print #ParentEntry                        (  0, 28,  0 ) edit 999,999
+      print 'Parent Node(New)'                  (  0, 36,  0 )      
+      print #NewParentNum                       (  0, 58,  0 ) edit 9,999,999,999
+    #end-if
+    break
+  end-if
+  let #Entry = #Entry - 1
+end-while
+
+end-procedure
+
+!---------------------------------------------------------------
+! Procedure : Count-NbrKids
+! Description : Counts number of nodes that fall into range of
+!               current node being processed
+! Inputs :  #ctr is current node counter
+!           
+!----------------------------------------------------------------
+begin-procedure Count-NbrKids
+
+let #NbrKids = 0
+let #KidCtr = #ctr + 1
+let #OldEndNum = NodeArray.Node_Num_End(#Ctr,#OldValues)
+
+#ifdef debuga
+  let #NewParentNum = NodeArray.Node_Num(#Entry, #NewValues) 
+  print 'Counting Kids for Node (old) '     ( +1,  1, 0) 
+  print #OldNodeNum                         (  0, 30,  0 ) edit 9,999,999,999
+#end-if
+
+while #KidCtr <= #Nodes
+  let #KidNodeNum = NodeArray.Node_Num(#KidCtr,#OldValues)
+  if #KidNodeNum <= #OldEndNum
+    Add 1 to #NbrKids
+    Add 1 to #KidCtr  
+  else
+    break
+  end-if
+  
+end-while
+
+#ifdef debuga 
+  print '#Kids Found for Node '             (  +1,  1,  0 )
+  print #NbrKids                            (   0, 24, 0) edit 9,999,999,999
+#end-if
+
+end-procedure
+
+!---------------------------------------------
+! Procedure : Dump-Node-Array
+!---------------------------------------------
+begin-procedure Dump-Node-Array
+
+  let #i = 0
+  print 'Node Array Entries '       ( +1,  1,  0 )
+  print 'Old Node Num '             ( +1,  2,  0 )
+  print 'New Node Num '             (  0, 25,  0 )
+  print 'New Node End Num '         (  0, 45,  0 )
+  print 'New Parent Num'            (  0, 65,  0 )
+  while #i < #nodes    
+    let #OldNodeNum                  = NodeArray.Node_Num (#i, #OldValues)
+    let #NewNodeNum                  = NodeArray.Node_Num (#i, #NewValues)
+    let #NewNodeNumEnd               = NodeArray.Node_Num_End (#i, #NewValues)
+    let #NewParentNum                = NodeArray.Parent_Node_num (#i, #NewValues)
+    print #OldNodeNum             ( +1,  2,  0 ) edit 9,999,999,999
+    print #NewNodeNum             (  0, 25,  0 ) edit 9,999,999,999
+    print #NewNodeNumEnd          (  0, 45,  0 ) edit 9,999,999,999
+    print #NewParentNum           (  0, 65,  0 ) edit 9,999,999,999
+    let #i  = #i + 1
+  end-while
+
+end-procedure
+
+!----------------------------------------------------------------------!
+! Procedure: Sum-NodeCount                                             !
+! Desc: Tree is branched so get node count from branches               !
+!----------------------------------------------------------------------!
+
+begin-procedure Sum-NodeCount
+begin-SELECT On-error=SQL-error
+SUM(NODE_COUNT) &NodeCount
+FROM PSTREEBRANCH
+WHERE SETID = $SetID
+  AND SETCNTRLVALUE = $SetCntrlValue
+  AND TREE_NAME = $TreeName
+  AND EFFDT = $Effdt
+end-SELECT
+  move &NodeCount to #NodeCount
+end-procedure
+
+!----------------------------------------------------------------------
+! Procedure: Check-All-Parent-Nodes                                             
+! Desc: Check if all nodes have a valid Parent Node Number            
+!----------------------------------------------------------------------
+
+begin-procedure Check-All-Parent-Nodes  
+  move 'Check-All-Parent-Nodes.' to $Sql-Msg  
+begin-SELECT
+A1.TREE_NODE
+A1.TREE_NODE_NUM
+A1.PARENT_NODE_NUM
+A1.PARENT_NODE_NAME
+ move &A1.TREE_NODE to $TreeNodeName
+ move &A1.TREE_NODE_NUM to #TreeNodeNum  
+ move &A1.PARENT_NODE_NUM to #ParentNodeNum
+ move &A1.PARENT_NODE_NAME to $ParentNodeName
+ print 'Parent Node Not Found for Node : ' (+1,1)
+ print $TreeNodeName ()
+ print ',NodeNum : ' ()
+ print #TreeNodeNum   ()
+ print ',ParentNodeNum : ' ()
+ print #ParentNodeNum ()
+ print '.' ()  
+ let #ValidTree = {FALSE}
+FROM PSTREENODE A1 
+WHERE  
+A1.SETID = $SetId
+AND A1.SETCNTRLVALUE = $SETCNTRLVALUE
+AND A1.TREE_NAME = $TreeName
+AND A1.EFFDT = $Effdt  
+AND A1.TREE_NODE_NUM <> 1
+AND NOT EXISTS 
+(
+SELECT 'Y' 
+FROM PSTREENODE A2
+WHERE 
+A1.SETID = A2.SETID
+AND A1.SETCNTRLVALUE = A2.SETCNTRLVALUE
+AND A1.TREE_NAME = A2.TREE_NAME
+AND A1.EFFDT = A2.EFFDT
+AND A1.PARENT_NODE_NUM = A2.TREE_NODE_NUM
+)
+
+end-SELECT
+    
+end-procedure
+
+!----------------------------------------------------------------------!
+! Procedure: Insert-PSXTreeNodeGap                                     !
+! Descr:     Insert into PSX_TREENODEGap                                !
+!------------------------------------------------------------------------
+
+begin-procedure Insert-PSXTreeNodeGap
+
+begin-SQL On-error=SQL-error
+INSERT INTO PSX_TREENODEGAP (
+  SETID,
+  SETCNTRLVALUE,
+  TREE_NAME,
+  EFFDT,
+  TREE_NODE_NUM_OLD,
+  TREE_NODE_NUM_NEW,
+  TREE_NODE_END_NEW,
+  TREE_NODE_PAR_NEW)
+VALUES (
+  $SetID,
+  $SetCntrlValue,
+  $TreeName,
+  $Effdt,
+  #OldNodeNum,
+  #NewNodeNum,
+  #NewNodeNumEnd,
+  #NewParentNum)
+end-SQL
+end-procedure
+
+!----------------------------------------------------------------------!
+! Procedure: Delete-PSXTreeNodeGap                                    !
+! Descr:     Delete from PSX_TREENODEGAP.                              !
+!----------------------------------------------------------------------!
+
+begin-procedure Delete-PSXTreeNodeGap
+  move 'Deleting from PSX_TREENODEGAP.' to $Sql-Msg
+begin-SQL On-error=SQL-error
+
+DELETE FROM PSX_TREENODEGAP
+WHERE
+PSX_TREENODEGAP.SETID = $SetId
+AND PSX_TREENODEGAP.SETCNTRLVALUE = $SETCNTRLVALUE
+AND PSX_TREENODEGAP.TREE_NAME = $TreeName
+AND PSX_TREENODEGAP.EFFDT = $Effdt  
+
+end-SQL
+end-procedure
+
+!-----------------------------------------------------------------------
+! Procedure: Update-TreeNodes  
+! Descr : Uses Set Based SQL Operation to update node numbers
+!-----------------------------------------------------------------------
+begin-procedure Update-TreeNodes
+
+  display 'Update-TreeNodes '
+  
+  do Update-TreeNode-ParentNum
+  do Update-TreeNodes-EndNum
+  do Update-TreeNodes-NodeNum 
+
+end-procedure
+!-----------------------------------------------------------------------
+! Procedure: Update-TreeNodes-NodeNum 
+! Descr : Uses Set Based SQL Operation to update node numbers
+!-----------------------------------------------------------------------
+begin-procedure Update-TreeNodes-NodeNum 
+move 'Updating TREE_NODE_NUM on PSTREENODE.' to $Sql-Msg
+
+display 'Update-TreeNodes-NodeNum  ' 
+
+begin-SQL On-error=SQL-error
+
+  UPDATE PSTREENODE
+    SET OLD_TREE_NODE_NUM = 'N'
+    , TREE_NODE_NUM = 
+      (SELECT GAP.TREE_NODE_NUM_NEW 
+        FROM PSX_TREENODEGAP GAP
+        WHERE GAP.SETID = PSTREENODE.SETID
+        AND GAP.SETCNTRLVALUE = PSTREENODE.SETCNTRLVALUE
+        AND GAP.TREE_NAME = PSTREENODE.TREE_NAME
+        AND GAP.EFFDT = PSTREENODE.EFFDT
+        AND GAP.TREE_NODE_NUM_OLD = PSTREENODE.TREE_NODE_NUM)   
+  WHERE SETID = $SetID
+  AND SETCNTRLVALUE = $SetCntrlValue
+  AND TREE_NAME = $TreeName
+  AND EFFDT = $Effdt;
+
+end-SQL
+end-procedure
+
+!-----------------------------------------------------------------------
+! Procedure: Update-TreeNodes-EndNum
+! Descr : Uses Set Based SQL Operation to update node numbers
+!-----------------------------------------------------------------------
+begin-procedure Update-TreeNodes-EndNum
+move 'Updating TREE_NODE_NUM_END of PSTREENODE.' to $Sql-Msg
+
+display 'Update-TreeNodes-EndNum ' 
+
+begin-SQL On-error=SQL-error
+
+UPDATE PSTREENODE
+  SET TREE_NODE_NUM_END = 
+    (SELECT GAP.TREE_NODE_END_NEW 
+        FROM PSX_TREENODEGAP GAP
+        WHERE GAP.SETID = PSTREENODE.SETID
+        AND GAP.SETCNTRLVALUE = PSTREENODE.SETCNTRLVALUE
+        AND GAP.TREE_NAME = PSTREENODE.TREE_NAME
+        AND GAP.EFFDT = PSTREENODE.EFFDT
+        AND GAP.TREE_NODE_NUM_OLD  = PSTREENODE.TREE_NODE_NUM)    
+WHERE SETID = $SetID
+AND SETCNTRLVALUE = $SetCntrlValue
+AND TREE_NAME = $TreeName
+AND EFFDT = $Effdt;
+
+end-SQL
+end-procedure
+
+!-----------------------------------------------------------------------
+! Procedure: Update-TreeNode-ParentNum  
+! Descr : Uses Set Based SQL Operation to update node numbers
+!-----------------------------------------------------------------------
+begin-procedure Update-TreeNode-ParentNum  
+  move 'Updating PARENT_NODE_NUM of PSTREENODE.' to $Sql-Msg
+  
+  display 'Update-TreeNode-ParentNum ' 
+ 
+  begin-SQL On-error=SQL-error
+
+    UPDATE PSTREENODE
+      SET OLD_TREE_NODE_NUM = 'Y'
+      , PARENT_NODE_NUM = 
+        (SELECT GAP.TREE_NODE_PAR_NEW 
+          FROM PSX_TREENODEGAP GAP
+          WHERE GAP.SETID = PSTREENODE.SETID
+          AND GAP.SETCNTRLVALUE = PSTREENODE.SETCNTRLVALUE
+          AND GAP.TREE_NAME = PSTREENODE.TREE_NAME
+          AND GAP.EFFDT = PSTREENODE.EFFDT
+          AND GAP.TREE_NODE_NUM_OLD  = PSTREENODE.TREE_NODE_NUM)  
+    WHERE SETID = $SetID
+    AND SETCNTRLVALUE = $SetCntrlValue
+    AND TREE_NAME = $TreeName
+    AND EFFDT = $Effdt;
+
+  end-SQL
+end-procedure
+
+!-----------------------------------------------------------------------
+! Procedure: Update-TreeLeaves  
+! Descr : Uses Set Based SQL Operation to update node numbers
+!-----------------------------------------------------------------------
+begin-procedure Update-TreeLeaves
+  move 'Updating PSTREELEAF.' to $Sql-Msg
+
+  display 'Update-TreeLeaves ' 
+ 
+  begin-SQL On-error=SQL-error
+
+    UPDATE PSTREELEAF
+      SET OLD_TREE_NODE_NUM = 'N',
+      TREE_NODE_NUM = 
+        (SELECT GAP.TREE_NODE_NUM_NEW 
+          FROM PSX_TREENODEGAP GAP
+          WHERE GAP.SETID = PSTREELEAF.SETID
+          AND GAP.SETCNTRLVALUE = PSTREELEAF.SETCNTRLVALUE
+          AND GAP.TREE_NAME = PSTREELEAF.TREE_NAME
+          AND GAP.EFFDT = PSTREELEAF.EFFDT
+          AND GAP.TREE_NODE_NUM_OLD = PSTREELEAF.TREE_NODE_NUM)    
+    WHERE SETID = $SetID
+      AND SETCNTRLVALUE = $SetCntrlValue
+      AND TREE_NAME = $TreeName
+      AND EFFDT = $Effdt;
+
+  end-SQL
+end-procedure
+!-----------------------------------------------------------------------
+! Procedure: Update-TreeBranches 
+! Descr : Uses Set Based SQL Operation to update node numbers
+!-----------------------------------------------------------------------
+begin-procedure Update-TreeBranches
+  
+  display 'Update-TreeBranches ' 
+ 
+  do Update-TreeBranches-ParentNodeNum
+  do Update-TreeBranches-NodeNumEnd   
+  do Update-TreeBranches-NodeNum
+  
+end-procedure
+
+!-----------------------------------------------------------------------
+! Procedure: Update-TreeBranches-NodeNum
+! Descr : Uses Set Based SQL Operation to update node numbers
+!-----------------------------------------------------------------------
+begin-procedure Update-TreeBranches-NodeNum
+  move 'Updating TREE_NODE_NUM on PSTREEBRANCH.' to $Sql-Msg
+ 
+  display 'Update-TreeBranches-NodeNum ' 
+ 
+  begin-SQL On-error=SQL-error
+    UPDATE PSTREEBRANCH
+    SET TREE_NODE_NUM = 
+      (SELECT GAP.TREE_NODE_NUM_NEW 
+        FROM PSX_TREENODEGAP GAP
+        WHERE GAP.SETID = PSTREEBRANCH.SETID
+        AND GAP.SETCNTRLVALUE = PSTREEBRANCH.SETCNTRLVALUE
+        AND GAP.TREE_NAME = PSTREEBRANCH.TREE_NAME
+        AND GAP.EFFDT = PSTREEBRANCH.EFFDT
+        AND GAP.TREE_NODE_NUM_OLD = PSTREEBRANCH.TREE_NODE_NUM)   
+    WHERE SETID = $SetID
+    AND SETCNTRLVALUE = $SetCntrlValue
+    AND TREE_NAME = $TreeName
+    AND EFFDT = $Effdt;
+  end-SQL
+end-procedure
+
+!-----------------------------------------------------------------------
+! Procedure: Update-TreeBranches-NodeNumEnd 
+! Descr : Uses Set Based SQL Operation to update node numbers
+!-----------------------------------------------------------------------
+begin-procedure Update-TreeBranches-NodeNumEnd 
+
+  move 'Updating NODE_NUM_END ON PSTREEBRANCH.' to $Sql-Msg
+  
+  display 'Update-TreeBranches-NodeNumEnd  ' 
+  
+  begin-SQL On-error=SQL-error
+  
+    UPDATE PSTREEBRANCH 
+    SET TREE_NODE_NUM_END = 
+      (SELECT GAP.TREE_NODE_END_NEW 
+        FROM PSX_TREENODEGAP GAP
+        WHERE GAP.SETID = PSTREEBRANCH.SETID
+        AND GAP.SETCNTRLVALUE = PSTREEBRANCH.SETCNTRLVALUE
+        AND GAP.TREE_NAME = PSTREEBRANCH.TREE_NAME
+        AND GAP.EFFDT = PSTREEBRANCH.EFFDT
+        AND GAP.TREE_NODE_NUM_OLD = PSTREEBRANCH.TREE_NODE_NUM)   
+    WHERE SETID = $SetID
+      AND SETCNTRLVALUE = $SetCntrlValue
+      AND TREE_NAME = $TreeName
+      AND EFFDT = $Effdt;
+      
+  end-SQL
+  
+end-procedure
+
+!-----------------------------------------------------------------------
+! Procedure: Update-TreeBranches-ParentNodeNum
+! Descr : Uses Set Based SQL Operation to update node numbers
+!-----------------------------------------------------------------------
+begin-procedure Update-TreeBranches-ParentNodeNum
+
+  move 'Updating PARENT_NODE_NUM on PSTREEBRANCH.' to $Sql-Msg    
+  
+  display 'Update-TreeBranches-ParentNodeNum  '  
+  
+  begin-SQL On-error=SQL-error
+  
+    UPDATE PSTREEBRANCH
+    SET PARENT_NODE_NUM = 
+      (SELECT GAP.TREE_NODE_PAR_NEW 
+        FROM PSX_TREENODEGAP GAP
+        WHERE GAP.SETID = PSTREEBRANCH.SETID
+        AND GAP.SETCNTRLVALUE = PSTREEBRANCH.SETCNTRLVALUE
+        AND GAP.TREE_NAME = PSTREEBRANCH.TREE_NAME
+        AND GAP.EFFDT = PSTREEBRANCH.EFFDT
+        AND GAP.TREE_NODE_NUM_OLD = PSTREEBRANCH.TREE_NODE_NUM) 
+    WHERE SETID = $SetID
+    AND SETCNTRLVALUE = $SetCntrlValue
+    AND TREE_NAME = $TreeName
+    AND EFFDT = $Effdt;
+  
+  end-SQL
+end-procedure
+
+!----------------------------------------------------------------------!
+! Procedure: Update-Version                                            !
+! Descr:     Update the version number in PSLOCK.                      !
+!----------------------------------------------------------------------!
+
+begin-procedure Update-Version
+  move 'Updating the version number in PSLOCK.' to $Sql-Msg
+  
+  display 'Update-Version  ' 
+  
+  begin-SQL On-error=SQL-error
+    UPDATE PSLOCK
+      SET VERSION = VERSION + 1
+      WHERE OBJECTTYPENAME IN ('TDM', 'TAM')
+    #IFDEF DB2UNIX
+      AND 1=1
+    #ENDIF
+      ;
+  end-SQL
+end-procedure
+
+!----------------------------------------------------------------------!
+! Procedure: Update-VersionTree                                        !
+! Descr:     Update the tree version numbers in PSVERSION.             !
+!----------------------------------------------------------------------!
+
+begin-procedure Update-VersionTree
+  move 'Updating the tree version numbers in PSVERSION.' to $Sql-Msg
+begin-SQL On-error=SQL-error
+UPDATE PSVERSION
+  SET VERSION = VERSION + 1
+  WHERE OBJECTTYPENAME IN ('SYS')
+#IFDEF DB2UNIX
+  AND 1=1
+#ENDIF
+  ;
+end-SQL
+
+end-procedure
+
+!----------------------------------------------------------------------!
+! Procedure: Update-TreeDefnBranch                                     !
+! Descr:     Update VERSION in PSTREEDEFN and PSTREEBRANCH.  The TDM   !
+!            version number determined in the Update-VersionTree       !
+!            procedure is used.                                        !
+!----------------------------------------------------------------------!
+
+begin-procedure Update-TreeDefnBranch
+begin-SELECT
+PS.OBJECTTYPENAME
+PS.VERSION
+  if rtrim(&PS.OBJECTTYPENAME,' ') = 'TDM'
+    do Update-TreeVersion
+  end-if
+
+  do Update-PSVERSION
+
+FROM PSLOCK PS
+WHERE OBJECTTYPENAME in ('TDM', 'TAM')
+end-SELECT
+end-procedure
+
+!----------------------------------------------------------------------!
+! Procedure: Update-TreeVersion                                        !
+! Descr:     Update VERSION in PSTREEDEFN and PSTREEBRANCH.            !
+!----------------------------------------------------------------------!
+
+begin-procedure Update-TreeVersion
+  move 'Updating VERSION in PSTREEDEFN and PSTREEBRANCH.' to $Sql-Msg
+begin-SQL On-error=SQL-error
+UPDATE PSTREEDEFN
+  SET VERSION = &PS.Version,
+      LASTUPDOPRID = 'PTUGAPTR',
+      LASTUPDDTTM = {DateTimeIn-Prefix}$Sysdatetime{DateTimeIn-Suffix}
+WHERE SETID = $SetID
+  AND SETCNTRLVALUE = $SetCntrlValue
+  AND TREE_NAME = $TreeName
+  AND EFFDT = $Effdt;
+
+UPDATE PSTREEBRANCH
+  SET VERSION = &PS.Version
+WHERE SETID = $SetID
+  AND SETCNTRLVALUE = $SetCntrlValue
+  AND TREE_NAME = $TreeName
+  AND EFFDT = $Effdt;
+end-SQL
+end-procedure
+
+!----------------------------------------------------------------------!
+! Procedure: Update-PSVERSION                                          !
+! Descr:     Update VERSION in PSVERSION to keep in synch with PSLOCK  !
+!----------------------------------------------------------------------!
+
+begin-procedure Update-PSVERSION
+  move 'Updating VERSION in PSVERSION for TAM and TDM.' to $Sql-Msg
+begin-SQL On-error=SQL-error
+UPDATE PSVERSION
+  SET VERSION = &PS.Version
+WHERE OBJECTTYPENAME = &PS.Objecttypename;
+end-SQL
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+! Procedure: Wrap-Up                                                   !
+! Descr:     If there were errors, do a rollback, otherwise do a       !
+!            commit.                                                   !
+!----------------------------------------------------------------------!
+
+begin-procedure Wrap-Up
+  if #ErrorCount > 0
+    do Rollback-Transaction
+    if $All = 'N'
+      print 'Errors were found for ' (+1,1)
+      print $SetID ()
+      print ' ' ()
+      print $SetCntrlValue ()
+      print ' ' ()
+      print $TreeName ()
+      print ' ' ()
+      print $Effdt ()
+      print '.  All work on this tree was rolled back.' ()
+    else
+      print 'Errors were found.  All work was rolled back.' (+1,1)
+    end-if
+  else
+    do Commit-Transaction
+    if $All = 'N'
+      print $SetID (+1,1)
+      print ' ' ()
+      print $SetCntrlValue ()
+      print ' ' ()
+      print $TreeName ()
+      print ' ' ()
+      print $Effdt ()
+      print ' was successfully re-numbered.' ()
+    else
+      print 'All trees were successfully re-numbered.' (+1,1)
+    end-if
+  end-if
+end-procedure
+
+!----------------------------------------------------------------------!
+
+begin-procedure Terminate
+  if #prcs_process_instance > 0
+    do Update-Prcs-Run-Status
+  end-if
+  do Reset
+end-procedure
+
+!----------------------------------------------------------------------!
+
+#include 'reset.sqc'        !Reset printer
+#include 'askeffdt.sqc'     !Ask Effective Date
+#include 'datetime.sqc'     !Routines for date and time formatting
+#include 'number.sqc'       !Routines to format numbers
+#include 'prcsapi.sqc'      !Update Process Request API
+#include 'curdttim.sqc'     ! Current Date and Time

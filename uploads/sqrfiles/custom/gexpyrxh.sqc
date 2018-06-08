@@ -1,0 +1,1176 @@
+!*********************************************************************
+!This procedure adjusts pharmacy full time and pharmacy manager''s
+!hours to be their standard hours. If employee receives more than
+!their standard hours through Time&Attendance, hours will be taken off
+!from their REG hours for the amount of difference. If there are not
+!many number of hours exist on REG, other earnings hours will be used.
+!If the employee receives hours less than their standard hours, hours
+!will be added to their REG hours.
+!*********************************************************************
+! 04/09/1999 - SXK - change Rx logic to see if Pharmacist is
+!                    active all pay period prior to syncing
+!                    hours
+!---------------------------------------------------------------------
+! 04/12/1999 - CJH - Pharmacy hours should only be adjusted for
+!                    On-Cycle paysheets.  Added logic to select
+!                    OFF_CYCLE='N' paysheets
+!---------------------------------------------------------------------
+! 05/04/1999 - CJH - Ignore paysheet rows with Earnings Begin & Earnings
+!                    end dates outside of current pay period.  Log all
+!                    Rx hours adjustment conditions.
+!---------------------------------------------------------------------
+! 08/13/1999 - CJH - Correct "ORA-0041 Not Null column missing or NULL
+!                    during insert" in insert-hours procedure.
+! 09/15/1999 - SXK - Modified tablespace to TE7TOOLS001
+!---------------------------------------------------------------------
+! 11/27/2000 - CJH - correct add/subract hours procedures
+!---------------------------------------------------------------------
+! 11/19/2002 - GBD - v8.3 upgrade: added fields to PS_PAY_OTH_EARNS
+!---------------------------------------------------------------------
+! 04/10/2003 - AXL - Account for situations where no home store hours
+!                    are reported but time needs to be added.
+!---------------------------------------------------------------------
+! 11/18/2004 - AXL - Exclude earnings code for Meeting Time: Earnings
+!                    code 177 per user request.
+!                    New Check-Non-PHM-167-rows procedure which audits
+!                    non-pharmacy employees with 167 ERNCD''s
+!                    New steps to handle unique constraints
+!---------------------------------------------------------------------
+! 08/22/2006 - CXA - Add full-time floaters (job code 30299)
+!---------------------------------------------------------------------
+!06/26/2007 - isdvrxd - Excluded 502 ern code from sync down process
+!06/26/2007 - isdvmxr - added new logic  502 ern code from substract process
+!09/14/2007-  GEX-MXT - HCM 9.0 Upgrade
+!08/05/2009-  GEX-RKK - Added History table GEX_R_GEXPYHST
+!----------------------------------------------------------------------*
+!11/19/2012 - ISDVMZA - ITG#123946 -- GEXPY_848_ITG123946_01           *
+!                       Exclude '540' erncode from sum of REG hours    *
+!----------------------------------------------------------------------*
+!05/13/2014 - ISDVAWD - ITG#1043 -- GEXPY_848_ITG1043_01               *
+!                       Added new Pharmacist job code '31052'Pharmacist*
+!----------------------------------------------------------------------*
+!08/18/2014 - TCSXSSS - ITG#1642 --                                    *
+!                       Added new Pharmacist job code '31183' and      *
+!			'31208'Pharmacist                              *
+!----------------------------------------------------------------------*
+
+begin-procedure adjust-pharmacy-hours
+
+move 'N' to $found
+display 'Adjusting Pharmacy Hours - begin: ' noline
+date-time () hh:mi:ss &timeEnded
+display &timeEnded
+
+begin-select ON-ERROR=SQL-Error-Found('adjust-pharmacy-hours')
+
+SUM(YY.OTH_HRS) &sum_hrs_phm
+XX.EMPLID
+XX.EMPL_RCD
+XX.COMPANY
+XX.PAYGROUP
+ZZ.STD_HOURS
+
+  do find-empl-active-all-period
+
+  !show ' $active_all_period '  $active_all_period
+
+   !SHOW '#sum_hrs_phm ' &sum_hrs_phm
+   !SHOW '&ZZ.STD_HOURS ' &ZZ.STD_HOURS
+  if $active_all_period = 'Y'
+    do get-home-deptid
+    do sum-167-earns
+    do sum-502-hours
+    do sum-reg-hours
+    let #sum_hrs_phm_REG_502 =  #502_total + #REG_total
+   ! SHOW '      #sum_hrs_phm_REG_502 =  #502_total + #REG_total   ' #sum_hrs_phm_REG_502
+
+    let #sum_hrs_phm = &sum_hrs_phm - #167_total
+    let $rx_action = ' '
+    let #diff = 0
+    let $erncd_phm = 'REG'
+    let $subtract_from_all = 'N'
+    let $std_reg = 'N'
+    let $update_eligible = 'N'
+
+  ! show #sum_hrs_phm '/' &ZZ.STD_HOURS '/' #sum_hrs_phm_REG_502
+
+    if (#sum_hrs_phm < &ZZ.STD_HOURS )  AND( #sum_hrs_phm_REG_502 < &ZZ.STD_HOURS )
+       #debug9 show 'add hours'
+      ! show 'add hours'
+      ! show '****************** EMPLID: ' &XX.EMPLID ' *********************'
+       do Add-Hours
+    else
+      if ( #sum_hrs_phm > &zz.std_hours ) AND ( #REG_total > &ZZ.STD_HOURS )
+         #debug9  show 'subract hours'
+         !show 'subract hours'
+        ! show '****************** EMPLID: ' &XX.EMPLID ' *********************'
+         do Subtract-Hours
+      end-if
+    end-if
+  end-if
+
+FROM PS_PAY_EARNINGS XX, PS_PAY_OTH_EARNS YY, PS_JOB ZZ
+WHERE XX.PAY_END_DT = $pay_end_dt
+  and XX.OFF_CYCLE  = 'N'
+  and XX.COMPANY    = YY.COMPANY
+  and XX.PAYGROUP   = YY.PAYGROUP
+  and XX.PAY_END_DT = YY.PAY_END_DT
+  and XX.OFF_CYCLE  = YY.OFF_CYCLE
+  and XX.PAGE_NUM      = YY.PAGE_NUM
+  and XX.LINE_NUM      = YY.LINE_NUM
+  and XX.ADDL_NBR      = YY.ADDL_NBR
+!  and ZZ.JOBCODE  in ('30170','20138','30299')  !Pharmacy Managers, Licensed Pharmacists, Floaters
+  and ZZ.JOBCODE  in ('30170','20138','30299','31052' ,'31183','31208')  !ISDVAWD ITG# 1043 - 4/22/2014 - Begin - New jobcode-'31052'  added  !TCSXSSS ITG - #1642 added New jobcode-'31183'
+  and ZZ.FULL_PART_TIME = 'F'             !Full Time
+  and ZZ.EMPL_TYPE = 'S'
+  and XX.EMPLID = ZZ.EMPLID
+  and XX.EMPL_RCD = ZZ.EMPL_RCD
+  and XX.EARNS_BEGIN_DT >= $pay_Begin_dt
+  and XX.EARNS_END_DT <= $pay_end_dt
+  and ZZ.EFFDT = (SELECT MAX(EFFDT)
+		     FROM PS_JOB
+		    WHERE EMPLID = ZZ.EMPLID
+		      AND EMPL_RCD = ZZ.EMPL_RCD
+		      AND EFFDT <= $pay_end_Dt)
+  and ZZ.EFFSEQ = (SELECT MAX(EFFSEQ)
+		     FROM PS_JOB
+		    WHERE EMPLID = ZZ.EMPLID
+		      AND EMPL_RCD = ZZ.EMPL_RCD
+		      AND EFFDT = ZZ.EFFDT)
+  and YY.ERNCD NOT IN ('177', '540')			!AXL 11/18/2004
+ ! and XX.EMPLID in ( '050388361','373861235','647167314','079623777','163647505','296586554') !TESTING
+  !  and XX.EMPLID   = '373861235'
+GROUP BY XX.COMPANY,XX.PAYGROUP,XX.EMPLID, XX.EMPL_RCD, ZZ.STD_HOURS
+end-select
+
+display 'Adjusting Pharmacy Hours - end: ' noline
+date-time () hh:mi:ss &timeEnded
+display &timeEnded
+
+end-procedure
+!*********************************************************************
+begin-procedure Add-Hours
+!*********************************************************************
+
+#debug8 show 'std hrs:     ' &zz.std_hours
+#debug8 show 'Sum Hrs phm: ' &sum_hrs_phm
+#debug8 show '167 total:   ' #167_total
+#debug8 show '$erncd_phm:  ' $erncd_phm
+#debug8 show '$home_dpt:   ' $home_deptid
+
+let #diff = &zz.std_hours - #sum_hrs_phm
+let $reg_found = 'N'
+let #reg_hours_phm = 0
+
+#debug9 show '$std_reg: ' $std_reg
+#debug9 show '#diff: ' #diff
+
+begin-select
+PE.DEPTID
+PE.PAGE_NUM
+PE.LINE_NUM
+PE.ADDL_NBR
+PE.OFF_CYCLE
+PO.OTH_HRS
+PO.ERNCD
+
+    #debug9 show '&PE.DEPTID '   &PE.DEPTID
+    #debug9 show '$home_deptid ' $home_deptid
+    #debug9 show '&PO.ERNCD '    &PO.ERNCD
+    #debug9 show '$erncd_phm '   $erncd_phm
+
+    if &PE.DEPTID = $home_deptid and &PO.ERNCD = $erncd_phm
+       move &PO.OTH_HRS   to #reg_hours_phm
+       move &PE.DEPTID    to $rx_deptid
+       move &PE.PAGE_NUM     to #page_num_phm
+       move &PE.LINE_NUM     to #line_num_phm
+       move &PE.ADDL_NBR     to #addl_nbr_phm
+       move &PE.OFF_CYCLE to $off_cycle_phm
+       let $reg_found = 'Y'
+       exit-select
+    end-if
+
+FROM PS_PAY_EARNINGS PE,
+     PS_PAY_OTH_EARNS PO
+WHERE PE.PAY_END_DT = $pay_end_dt
+  and PE.OFF_CYCLE  = 'N'
+  and PE.COMPANY    = &XX.COMPANY
+  and PE.PAYGROUP   = &XX.PAYGROUP
+  and PE.EMPLID     = &XX.EMPLID
+  and PE.EARNS_BEGIN_DT >= $pay_Begin_dt
+  and PE.EARNS_END_DT <= $pay_end_dt
+  and PE.COMPANY    = PO.COMPANY
+  and PE.PAYGROUP   = PO.PAYGROUP
+  and PE.PAY_END_DT = PO.PAY_END_DT
+  and PE.OFF_CYCLE  = PO.OFF_CYCLE
+  and PE.PAGE_NUM      = PO.PAGE_NUM
+  and PE.LINE_NUM      = PO.LINE_NUM
+  and PE.ADDL_NBR      = PO.ADDL_NBR
+  and PE.DEPTID     = $home_deptid		!AXL 4/10/2003
+  and PO.ERNCD NOT IN ('177', '540')			!AXL 11/18/2004
+order by PE.PAGE_NUM, PE.LINE_NUM, PE.ADDL_NBR
+end-select
+
+#debug8 show 'reg_found: ' $reg_found
+if $reg_found = 'N'
+  !find home pay earnings line
+  do get-line-details
+  !AXL 11/18/2004 New steps to handle unique constraints - Begin
+  #debug8 show '$gld_found: ' $gld_found
+  if $gld_found='Y'
+     move $home_deptid   to $rx_deptid
+     move &GLD.PAGE_NUM  to #page_num_phm
+     move &GLD.LINE_NUM  to #line_num_phm
+     move &GLD.ADDL_NBR  to #addl_nbr_phm
+     move &GLD.OFF_CYCLE to $off_cycle_phm
+     let $gld_found='N'
+  else
+     do get-line-details-other
+     move &GLDo.deptid    to $rx_deptid
+     move #gld_oth_hrs    to #reg_hours_phm
+    move &GLDo.PAGE_NUM  to #page_num_phm
+     move &GLDo.LINE_NUM  to #line_num_phm
+     move &GLDo.ADDL_NBR  to #addl_nbr_phm
+     move &GLDo.OFF_CYCLE to $off_cycle_phm
+  end-if
+end-if
+
+!AXL 11/18/2004 New steps to handle unique constraints - End
+#debug8 show 'Oth Hrs:  ' #reg_hours_phm
+#debug8 show 'deptid:   ' $rx_deptid
+#debug8 show 'Page_Num: ' #page_num_phm
+#debug8 show 'Line_Num: ' #line_num_phm
+#debug8 show 'Addl_Nbr: ' #addl_nbr_phm
+
+#debug9 show '#reg_hours_phm BEFORE: ' #reg_hours_phm
+let #reg_hours_phm = #reg_hours_phm + #diff
+#debug9 show '#reg_hours_phm AFTER: ' #reg_hours_phm
+move 'A' to $rx_action
+
+#debug9 show 'Update pay oth earns line with ' #reg_hours_phm ' hours'
+do update-hours
+
+move &XX.EMPLID to $emplid
+add 1 to #ErrorCount
+do error-found
+print 'Pharmacy Hours are modified; ' (,43)
+print #diff ()
+print ' Hours are added to their ' ()
+print $erncd_phm ()
+print ' hours' ()
+
+end-procedure
+!*********************************************************************
+begin-procedure Subtract-Hours
+!*********************************************************************
+
+#debug9 show 'standard_hrs: ' &zz.std_hours
+#debug9 show '&sum_hrs_phm: ' &sum_hrs_phm
+#debug9 show '167 total: ' #167_total
+#debug9 show '#sum_hrs_phm: ' #sum_hrs_phm
+#debug9 show '#502_total: ' #502_total
+#debug9 show '&zz.std_hours: ' &zz.std_hours
+
+let #diff = #sum_hrs_phm - &zz.std_hours -  #502_total  !isdvmxr 07/10/2007 added 502 logic
+let $std_reg = 'G'
+#debug9 show  '#diff: ' #diff
+do subtract-reg-hours
+
+if #diff > 0
+  let $erncd_phm = 'and reg2.ERNCD ='''||&reg2.ERNCD||''''
+  display $erncd_phm
+  move &XX.EMPLID to $emplid
+  do find-right-erncd-hours
+end-if
+
+end-procedure
+!*********************************************************************
+!Retrieves sum of 167 earnings for Rx
+!*********************************************************************
+begin-procedure sum-167-earns
+
+let #167_total = 0
+
+begin-SELECT
+sum(Y3.OTH_HRS) &167_total
+
+   move &167_total to #167_total
+
+  ! show '  #167_total ===========  ' #167_total
+
+from ps_pay_earnings X3, ps_pay_oth_earns Y3
+where X3.COMPANY    = Y3.COMPANY
+  and X3.PAYGROUP   = Y3.PAYGROUP
+  and X3.PAY_END_DT = Y3.PAY_END_DT
+  and X3.OFF_CYCLE  = Y3.OFF_CYCLE
+  and X3.PAGE_NUM      = Y3.PAGE_NUM
+  and X3.LINE_NUM      = Y3.LINE_NUM
+  and X3.ADDL_NBR      = Y3.ADDL_NBR
+  and X3.COMPANY = &XX.COMPANY
+  and X3.PAYGROUP = &XX.PAYGROUP
+  and X3.PAY_END_DT = $pay_end_dt
+  and X3.OFF_CYCLE  = 'N'
+  and X3.EARNS_BEGIN_DT >= $pay_Begin_dt
+  and X3.EARNS_END_DT <= $pay_end_dt
+  and X3.EMPLID = &XX.EMPLID
+  and Y3.ERNCD = '167'
+
+end-select
+
+end-procedure
+!*********************************************************************
+!Retrieves sum of 502 earnings for Rx
+!*********************************************************************
+begin-procedure sum-502-hours
+
+ let #502_total = 0
+
+begin-SELECT
+sum(Y3.OTH_HRS) &502_total
+
+   move &502_total to #502_total
+
+  ! show ' #502_total ================================================'  #502_total
+
+from ps_pay_earnings X3, ps_pay_oth_earns Y3
+where X3.COMPANY    = Y3.COMPANY
+  and X3.PAYGROUP   = Y3.PAYGROUP
+  and X3.PAY_END_DT = Y3.PAY_END_DT
+  and X3.OFF_CYCLE  = Y3.OFF_CYCLE
+  and X3.PAGE_NUM      = Y3.PAGE_NUM
+  and X3.LINE_NUM      = Y3.LINE_NUM
+  and X3.ADDL_NBR      = Y3.ADDL_NBR
+  and X3.COMPANY = &XX.COMPANY
+  and X3.PAYGROUP = &XX.PAYGROUP
+  and X3.PAY_END_DT = $pay_end_dt
+  and X3.OFF_CYCLE  = 'N'
+  and X3.EARNS_BEGIN_DT >= $pay_Begin_dt
+  and X3.EARNS_END_DT <= $pay_end_dt
+  and X3.EMPLID = &XX.EMPLID
+  and Y3.ERNCD = '502'
+
+end-select
+
+end-procedure
+!*********************************************************************
+!Retrieves sum of REG earnings for Rx
+!*********************************************************************
+begin-procedure sum-reg-hours
+
+let #REG_total = 0
+let $erncd_phm = 'REG'
+
+begin-SELECT
+sum(Y3.OTH_HRS) &REG_total
+
+   move &REG_total to #REG_total
+
+ !  show ' #REG_total ================================================'  #REG_total
+
+from ps_pay_earnings X3, ps_pay_oth_earns Y3
+where X3.COMPANY    = Y3.COMPANY
+  and X3.PAYGROUP   = Y3.PAYGROUP
+  and X3.PAY_END_DT = Y3.PAY_END_DT
+  and X3.OFF_CYCLE  = Y3.OFF_CYCLE
+  and X3.PAGE_NUM      = Y3.PAGE_NUM
+  and X3.LINE_NUM      = Y3.LINE_NUM
+  and X3.ADDL_NBR      = Y3.ADDL_NBR
+  and X3.COMPANY = &XX.COMPANY
+  and X3.PAYGROUP = &XX.PAYGROUP
+  and X3.PAY_END_DT = $pay_end_dt
+  and X3.OFF_CYCLE  = 'N'
+  and X3.EARNS_BEGIN_DT >= $pay_Begin_dt
+  and X3.EARNS_END_DT <= $pay_end_dt
+  and X3.EMPLID = &XX.EMPLID
+  and Y3.ERNCD not in ('167','177','502','540')	!AXL 11/18/2004
+  !and Y3.ERNCD <> $erncd_phm
+
+end-select
+
+end-procedure
+!*********************************************************************
+!Get Home department for adding Pharmacy hours
+!*********************************************************************
+begin-procedure get-home-deptid
+
+ let $deptid-found = 'N'
+
+begin-SELECT
+GHD.DEPTID
+
+  move &ghd.deptid to $home_deptid
+  move 'Y' to $deptid-found
+
+  #debug8 show 'emplid and home store ' &XX.EMPLID ' ' $home_deptid
+
+from ps_job GHD
+where GHD.EMPLID = &XX.EMPLID
+  and GHD.EFFDT = (SELECT MAX(EFFDT)
+		     FROM PS_JOB
+		    WHERE EMPLID = &XX.EMPLID
+		      AND EFFDT <= $pay_end_Dt)
+  and GHD.EFFSEQ = (SELECT MAX(EFFSEQ)
+		     FROM PS_JOB
+		    WHERE EMPLID = &XX.EMPLID
+		      AND EFFDT = GHD.EFFDT)
+
+end-select
+
+end-procedure
+!*********************************************************************
+!Selects REG hours for this pay period
+!*********************************************************************
+begin-procedure subtract-reg-hours
+
+let #reg_hours_phm = 0
+let #mod_hrs = 0
+
+begin-select ON-ERROR=SQL-Error-Found('Select-reg-hours')
+XX1.DEPTID
+XX1.PAGE_NUM
+XX1.LINE_NUM
+XX1.ADDL_NBR
+XX1.OFF_CYCLE
+YY1.OTH_HRS
+YY1.ERNCD
+
+    move &XX1.DEPTID    to $rx_deptid
+    move &XX1.PAGE_NUM     to #page_num_phm
+    move &XX1.LINE_NUM     to #line_num_phm
+    move &XX1.ADDL_NBR     to #addl_nbr_phm
+    move &XX1.OFF_CYCLE to $off_cycle_phm
+
+    #debug9 show 'Oth Hrs: ' &YY1.OTH_HRS
+    #debug9 show 'Page#: ' &XX1.PAGE_NUM
+    #debug9 show 'Line#: ' &XX1.LINE_NUM
+    #debug9 show 'Addl#: ' &XX1.ADDL_NBR
+
+    if &YY1.ERNCD = $erncd_phm
+        if #diff >= &YY1.OTH_HRS
+           #debug9 show '#diff > line hrs' #diff ' > ' &YY1.OTH_HRS
+	         let #reg_hours_phm = 0
+	         let #diff = #diff - &YY1.OTH_HRS
+           let #mod_hrs = &YY1.OTH_HRS
+           #debug9 show '#diff: ' #diff
+           #debug9 show '#mod_hrs: ' #mod_hrs
+	      else
+	         let #reg_hours_phm = &YY1.OTH_HRS - #diff
+           let #mod_hrs = #diff
+	         let #diff = 0
+	      end-if
+        #debug9 show 'Update pay oth earns line with ' #reg_hours_phm ' hours'
+	      move 'S' to $rx_action
+	      do update-hours
+      	move &XX.EMPLID to $emplid
+	      add 1 to #ErrorCount
+	      do error-found
+      	print 'Pharmacy Hours are modified; ' (,43)
+	      print #mod_hrs ()
+	      print ' Hours are subtracted from their ' ()
+	      print $erncd_phm ()
+	      print ' hours' ()
+    end-if
+
+   if #diff = 0
+      exit-select
+   end-if
+
+FROM PS_PAY_EARNINGS XX1, PS_PAY_OTH_EARNS YY1
+
+!WHERE YY1.ERNCD <> '177'  !AXL 11/18/2004 New
+WHERE YY1.ERNCD not in ( '177', '502')  !isdvmxr 06/26/2007
+  and XX1.PAY_END_DT = $pay_end_dt
+  and XX1.OFF_CYCLE  = 'N'
+  and XX1.COMPANY    = &XX.COMPANY
+  and XX1.PAYGROUP   = &XX.PAYGROUP
+  and XX1.EMPLID     = &XX.EMPLID
+  and XX1.EARNS_BEGIN_DT >= $pay_Begin_dt
+  and XX1.EARNS_END_DT <= $pay_end_dt
+  and XX1.COMPANY    = YY1.COMPANY
+  and XX1.PAYGROUP   = YY1.PAYGROUP
+  and XX1.PAY_END_DT = YY1.PAY_END_DT
+  and XX1.OFF_CYCLE  = YY1.OFF_CYCLE
+  and XX1.PAGE_NUM   = YY1.PAGE_NUM
+  and XX1.LINE_NUM   = YY1.LINE_NUM
+  and XX1.ADDL_NBR   = YY1.ADDL_NBR
+order by XX1.PAGE_NUM, XX1.LINE_NUM, XX1.ADDL_NBR
+
+end-select
+
+end-procedure
+!*********************************************************************
+!Selects which erncd has hours greater than #diff hours calculated above
+!*********************************************************************
+begin-procedure find-right-erncd-hours
+
+!show 'begin-procedure find-right-erncd-hours'
+
+let #mod_hrs = 0
+let #reg_hours_phm = 0
+let $erncd_phm = 'REG'
+
+begin-select ON-ERROR=SQL-Error-Found('find-right-erncd-hours')
+reg3.deptid
+reg3.PAGE_NUM
+reg3.LINE_NUM
+reg3.ADDL_NBR
+reg2.OFF_CYCLE
+reg2.OTH_HRS
+reg2.ERNCD
+
+    move &reg3.deptid  to $rx_deptid
+    move &reg3.PAGE_NUM   to #page_num_phm
+    move &reg3.LINE_NUM   to #line_num_phm
+    move &reg3.ADDL_NBR   to #addl_nbr_phm
+    move &reg2.OFF_CYCLE to $off_cycle_phm
+
+   if #diff >= &reg2.OTH_HRS
+  	 let #reg_hours_phm = 0
+  	 let #diff = #diff - &reg2.OTH_HRS
+     let #mod_hrs = &reg2.OTH_HRS
+     #debug9 show '#diff >= sheet hrs ' #diff ' >= ' &reg2.OTH_HRS
+   else
+	   let #reg_hours_phm = &reg2.OTH_HRS - #diff
+	   let #mod_hrs = #diff
+     #debug9 show '#diff <= sheet hrs ' #diff ' <= ' &reg2.OTH_HRS
+	   let #diff = 0
+   end-if
+
+   let $erncd_phm = &reg2.ERNCD
+
+   #debug9 show 'Update pay oth earns line with ' #reg_hours_phm ' hours'
+
+   do update-hours         !uncommented this after testing isdvmxr
+
+   add 1 to #ErrorCount
+   do error-found
+   print 'Pharmacy Hours are modified; ' (,43)
+   print #mod_hrs ()
+   print ' Hours are subtracted from their ' ()
+   print $erncd_phm ()
+   print ' hours' ()
+
+   if #diff = 0
+	  exit-select
+   end-if
+
+FROM PS_PAY_EARNINGS reg3, PS_PAY_OTH_EARNS reg2
+
+WHERE reg3.PAY_END_DT = $pay_end_dt
+  and reg3.OFF_CYCLE  = 'N'
+  and reg3.COMPANY    = &XX.COMPANY
+  and reg3.PAYGROUP   = &XX.PAYGROUP
+  and reg3.EMPLID     = &XX.EMPLID
+  and reg3.EARNS_BEGIN_DT >= $pay_Begin_dt
+  and reg3.EARNS_END_DT <= $pay_end_dt
+  and reg3.COMPANY    = reg2.COMPANY
+  and reg3.PAYGROUP   = reg2.PAYGROUP
+  and reg3.PAY_END_DT = reg2.PAY_END_DT
+  and reg3.OFF_CYCLE  = reg2.OFF_CYCLE
+  and reg3.PAGE_NUM      = reg2.PAGE_NUM
+  and reg3.LINE_NUM      = reg2.LINE_NUM
+  and reg3.ADDL_NBR      = reg2.ADDL_NBR
+  !and reg2.ERNCD <> '167'		 AXL 11/18/2004
+!  and reg2.ERNCD not in ('167','177','502')	!AXL 11/18/2004 !isdvrxd 06/22/2007
+  and reg2.ERNCD not in ('167','177','502','540')	!ISDVMZA  -- GEXPY_848_ITG123946_01
+  and reg2.ERNCD <> $erncd_phm
+!  [$erncd_phm]
+ORDER BY reg2.ERNCD
+
+end-select
+
+end-procedure
+
+!*********************************************************************
+!Updates PAY_OTH_EARNS with adjusted pharmacy hours
+!*********************************************************************
+begin-procedure update-hours
+
+! show ' '
+! show 'begin-procedure update-hours'
+! show '$erncd_phm: ' $erncd_phm
+! show ' '
+! show 'Update Rx hours: ' &xx.emplid '/' &xx.company '/' &xx.paygroup '/' #page_num_phm '/' #line_num_phm '/' #addl_nbr_phm '/' #diff '/' #reg_hours_phm
+
+if $rx_action = 'A'
+   move #diff to #rx_hrs_add
+   move 0 to #rx_hrs_sub
+else
+   if $rx_action = 'S'
+      move 0 to #rx_hrs_add
+      move #diff to #rx_hrs_sub
+   else
+      move 0 to #rx_hrs_add
+      move 0 to #rx_hrs_sub
+   end-if
+end-if
+move 0 to #rx_hrs_covrt
+move &xx.company to $company_upd
+move &xx.paygroup to $paygroup_upd
+move $rx_deptid to $store_upd
+do process-temp-table
+
+begin-sql ON-ERROR=SQL-Error-Found('update-hours')
+UPDATE PS_PAY_OTH_EARNS reg
+SET reg.OTH_HRS = #reg_hours_phm
+WHERE reg.PAY_END_DT = $pay_end_dt
+  and reg.COMPANY    = &XX.COMPANY
+  and reg.PAYGROUP   = &XX.PAYGROUP
+  and reg.ERNCD      = $erncd_phm
+  and reg.OFF_CYCLE  = $OFF_CYCLE_phm
+  and reg.PAGE_NUM      = #PAGE_NUM_phm
+  and reg.LINE_NUM      = #line_num_phm
+  and reg.ADDL_NBR      = #ADDL_NBR_phm
+end-sql
+
+if #sql-count =0
+  do get-line-details
+
+  begin-sql ON-ERROR=SQL-Error-Found('insert-hours')
+  INSERT INTO PS_PAY_OTH_EARNS
+  (COMPANY,
+  PAYGROUP,
+  PAY_END_DT,
+  OFF_CYCLE,
+  PAGE_NUM,
+  LINE_NUM,
+  ADDL_NBR,
+  ERNCD,
+  SEPCHK,
+  JOB_PAY,
+  OTH_HRS,
+  OTH_PAY,
+  OTH_EARNS,
+  ADD_GROSS,
+  TAX_METHOD,
+  ADDL_SEQ,
+  TL_SOURCE,
+  RATE_USED,
+  BAS_CREDIT_SW,
+  COMP_RATECD,
+  COMPRATE,
+  COMPRATE_USED,
+  HRS_DIST_SW,
+  XREF_NUM,
+  EX_DOC_ID,
+  EX_DOC_TYPE,
+  EX_LINE_NBR,
+  CURRENCY_CD,
+  VC_PLAN_ID,
+  VC_PAYOUT_PRD_ID,
+  GB_GROUP_ID,
+  APPLID,
+  AWARD_DATE,
+  !GEX-MXT added on 09/14/2007 for Upgrade-Begin
+  !NOTIFY_STATUS)
+  NOTIFY_STATUS,
+  EIM_KEY)
+  !GEX-MXT added on 09/14/2007 for Upgrade-End
+  VALUES
+  (&XX.COMPANY,
+  &XX.PAYGROUP,
+  $pay_end_dt,
+  'N', !off_cycle
+  &GLD.PAGE_NUM,
+  &GLD.LINE_NUM,
+  &GLD.ADDL_NBR,
+  $erncd_phm,
+  &GLD.SEPCHK,   ! Separate Check
+  'N', ! Job Pay
+  #reg_hours_phm, !oth_hrs
+  0, !oth_pay
+  0, !oth_earns
+  'N', !Add_Gross
+  'A', !Tax_method
+  01, !ADDL_seq
+  'G', !TL_Source
+  'H', !Rate Used
+  'N', !BAS credit sw
+  ' ', !comp_ratecd
+  0, !comprate
+  0, !comprate used
+  'N', !hrs dist sw
+  0,                !xref_num
+  ' ',              !ex_doc_id
+  ' ',              !ex_doc_type
+  0,                !ex_line_nbr
+  ' ',              !currency_cd
+  ' ',              !vc_plan_id
+  ' ',              !vc_payout_prd_id
+  ' ',              !gb_group_id
+  ' ',              !applid
+  '',               !award_date
+  !GEX-MXT added on 09/14/2007 for Upgrade-Begin
+  'N',              !notify_status
+  'N')
+  !' ')   !GEX-CXB Commented for HCM 9.0 Upgrade
+  !GEX-MXT added on 09/14/2007 for Upgrade-End
+  end-sql
+
+end-if
+
+begin-sql ON-ERROR=SQL-Error-Found('update-hours2')
+UPDATE PS_PAY_EARNINGS reg2
+SET reg2.OK_TO_PAY = 'Y',
+    reg2.PAY_LINE_STATUS = 'U'
+WHERE reg2.PAY_END_DT = $pay_end_dt
+  and reg2.COMPANY    = &XX.COMPANY
+  and reg2.PAYGROUP   = &XX.PAYGROUP
+  and reg2.OFF_CYCLE  = $OFF_CYCLE_phm
+  and reg2.PAGE_NUM      = #PAGE_NUM_phm
+  and reg2.LINE_NUM      = #line_num_phm
+  and reg2.ADDL_NBR      = #ADDL_NBR_phm
+end-sql
+
+end-procedure
+!*********************************************************************
+!Retrieve line details for inserting Rx hours
+!*********************************************************************
+begin-procedure get-line-details
+
+let $gld_found = 'N'	!AXL 11/18/2004 - New
+
+begin-SELECT LOOPS=1
+GLD.COMPANY
+GLD.PAYGROUP
+GLD.PAY_END_DT
+GLD.OFF_CYCLE
+GLD.PAGE_NUM
+GLD.LINE_NUM
+GLD.ADDL_NBR
+GLD.SEPCHK
+
+    let  $gld_found = 'Y'	!AXL 11/18/2004 - New
+
+from PS_PAY_EARNINGS GLD
+where GLD.COMPANY = &XX.COMPANY
+  and GLD.PAYGROUP = &XX.PAYGROUP
+  and GLD.PAY_END_DT = $pay_end_dt
+  and GLD.OFF_CYCLE = 'N'
+  and GLD.EMPLID = &XX.EMPLID
+  and GLD.EARNS_BEGIN_DT >= $pay_Begin_dt
+  and GLD.EARNS_END_DT <= $pay_end_dt
+  and GLD.DEPTID = $home_deptid
+
+end-SELECT
+
+end-procedure
+!AXL 11/18/2004 New - Begin
+!*********************************************************************
+begin-procedure get-line-details-other
+!*********************************************************************
+
+let $gldo_found = 'N'
+
+begin-SELECT LOOPS=1
+GLDo.COMPANY
+GLDo.PAYGROUP
+GLDo.deptid
+GLDo.PAY_END_DT
+GLDo.OFF_CYCLE
+GLDo.PAGE_NUM
+GLDo.LINE_NUM
+GLDo.ADDL_NBR
+GLDo.SEPCHK
+
+    let  $gldo_found = 'Y'
+    do get-other-gldo-hrs
+
+from PS_PAY_EARNINGS GLDo
+where GLDo.COMPANY    = &XX.COMPANY
+  and GLDo.PAYGROUP   = &XX.PAYGROUP
+  and GLDo.PAY_END_DT = $pay_end_dt
+  and GLDo.OFF_CYCLE  = 'N'
+  and GLDo.EMPLID     = &XX.EMPLID
+  and GLDo.EARNS_BEGIN_DT >= $pay_Begin_dt
+  and GLDo.EARNS_END_DT <= $pay_end_dt
+  and GLDo.DEPTID    <> $home_deptid
+
+end-SELECT
+
+end-procedure
+!*********************************************************************
+begin-procedure get-other-gldo-hrs
+!*********************************************************************
+
+let #gld_oth_hrs = 0
+!show 'in get-other-gldo-hrs'
+!show &gldo.PAGE_NUM
+!show &gldo.LINE_NUM
+!show &gldo.ADDL_NBR
+!show $erncd_phm
+
+begin-SELECT
+
+gldoh.OTH_HRS &gld_oth_hrs
+
+  move &gld_oth_hrs to #gld_oth_hrs
+  !show '#gld_oth_hrs ' #gld_oth_hrs
+
+from ps_pay_oth_earns gldoh
+where gldoh.COMPANY    = &XX.COMPANY
+  and gldoh.PAYGROUP   = &XX.PAYGROUP
+  and gldoh.PAY_END_DT = $pay_end_dt
+  and gldoh.OFF_CYCLE  = 'N'
+  and gldoh.PAGE_NUM   = &gldo.PAGE_NUM
+  and gldoh.LINE_NUM   = &gldo.LINE_NUM
+  and gldoh.ADDL_NBR   = &gldo.ADDL_NBR
+  and gldoh.ERNCD      = $erncd_phm
+
+end-select
+
+end-procedure
+!AXL 11/18/2004 New - End
+!*********************************************************************
+!Create temporary table for holding store audit details
+!*********************************************************************
+begin-procedure create-temp-table
+
+begin-sql on-error=sql-error-found('create-temp-table')
+CREATE TABLE [$table_name] (
+       COMPANY      VARCHAR2(3) NOT NULL,
+       PAYGROUP     VARCHAR2(3) NOT NULL,
+       DEPTID       VARCHAR2(10) NOT NULL,
+       TRANS_TOT    NUMBER(7,2) NOT NULL,
+       HRS_SENT_TOT NUMBER(7,2) NOT NULL,
+       HRS_REJ_TOT  NUMBER(7,2) NOT NULL,
+       RX_HRS_ADD   NUMBER(7,2) NOT NULL,
+       RX_HRS_SUB   NUMBER(7,2) NOT NULL,
+       RX_HRS_COVRT NUMBER(7,2) NOT NULL)
+       TABLESPACE TE7TOOLS001
+end-sql
+
+end-procedure
+!*********************************************************************
+!Populate temp table with store totals
+!*********************************************************************
+begin-procedure process-temp-table
+
+let $found = 'N'
+!display 'Processing temp table for: ' noline
+!display $company_upd noline
+!display '/' noline
+!display $paygroup_upd noline
+!display '/' noline
+!display $store_upd
+
+#debug8 show 'company_upd: ' $company_upd
+#debug8 show 'paygroup_upd: ' $paygroup_upd
+#debug8 show 'store_upd: ' $store_upd
+
+
+begin-SELECT on-error=sql-error-found('process-temp-table')
+STT.COMPANY
+STT.PAYGROUP
+STT.DEPTID
+STT.TRANS_TOT
+STT.HRS_SENT_TOT
+STT.HRS_REJ_TOT
+STT.RX_HRS_ADD
+STT.RX_HRS_SUB
+STT.RX_HRS_COVRT
+
+  move 'Y' to $found
+
+from [$table_name] STT
+where STT.COMPANY = $company_upd
+and   STT.PAYGROUP = $paygroup_upd
+and   STT.DEPTID = $store_upd
+end-SELECT
+
+if $found = 'N'
+   do insert-temp-table
+else
+   if $trans_processing = 'Y'
+      do update-temp-table1
+!   else
+!      do update-temp-table2
+   end-if
+end-if
+
+move 0 to #trans_store_total
+move 0 to #hrs_sent_total
+move 0 to #hrs_rej_total
+move 0 to #rx_hrs_add
+move 0 to #rx_hrs_sub
+move 0 to #rx_hrs_covrt
+
+end-procedure
+!*********************************************************************
+! Insert a new store row in temp table
+!*********************************************************************
+begin-procedure insert-temp-table
+
+if $company_upd = ''
+   let $company_upd = ' '
+end-if
+
+if $paygroup_upd = ''
+   let $paygroup_upd = ' '
+end-if
+
+if $store_upd = ''
+   let $store_upd = ' '
+end-if
+
+begin-sql on-error=sql-error-found('insert-temp-table')
+INSERT INTO [$table_name] (
+COMPANY,
+PAYGROUP,
+DEPTID,
+TRANS_TOT,
+HRS_SENT_TOT,
+HRS_REJ_TOT,
+RX_HRS_ADD,
+RX_HRS_SUB,
+RX_HRS_COVRT)
+VALUES (
+$company_upd,
+$paygroup_upd,
+$store_upd,
+#trans_store_total,
+#hrs_sent_total,
+#hrs_rej_total,
+#rx_hrs_add,
+#rx_hrs_sub,
+#rx_hrs_covrt)
+end-sql
+
+end-procedure
+!*********************************************************************
+! Update existing store row in temp table - Transaction processing
+!*********************************************************************
+begin-procedure update-temp-table1
+
+move &STT.TRANS_TOT to #trans_tot
+move &STT.HRS_SENT_TOT to #sent_tot
+move &STT.HRS_REJ_TOT to #rej_tot
+move &STT.RX_HRS_COVRT to #hrs_covrt
+
+begin-sql on-error=sql-error-found('update-temp-table2')
+UPDATE [$table_name]
+set TRANS_TOT = #trans_tot + #trans_store_total,
+    HRS_SENT_TOT = #sent_tot + #hrs_sent_total,
+    HRS_REJ_TOT = #rej_tot + #hrs_rej_total,
+    RX_HRS_COVRT = #hrs_covrt + #rx_hrs_covrt
+
+where COMPANY = $company_upd
+  and PAYGROUP = $paygroup_upd
+  and DEPTID = $store_upd
+end-sql
+
+end-procedure
+!*********************************************************************
+! Update existing store row in temp table - Rx Hours Adjustment
+!*********************************************************************
+begin-procedure update-temp-table2
+
+move &STT.RX_HRS_ADD to #hrs_add
+move &STT.RX_HRS_SUB to #hrs_sub
+move &STT.RX_HRS_COVRT to #hrs_covrt
+
+let #rx_add_upd = #hrs_add + #rx_hrs_add
+let #rx_sub_upd = #hrs_sub + #rx_hrs_sub
+let #rx_covrt_upd = #hrs_covrt + #rx_hrs_covrt
+
+begin-sql on-error=sql-error-found('update-temp-table2')
+UPDATE [$table_name]
+set RX_HRS_ADD = #rx_add_upd,
+    RX_HRS_SUB = #rx_sub_upd,
+    RX_HRS_COVRT = #rx_covrt_upd
+where COMPANY = $company_upd
+  and PAYGROUP = $paygroup_upd
+  and DEPTID = $store_upd
+end-sql
+
+end-procedure
+!*********************************************************************
+!Drop temporary reporting table
+!*********************************************************************
+begin-procedure drop-wrk-table
+
+begin-sql on-error=sql-error-found('drop-wrk-table')
+DROP TABLE [$table_name]
+end-sql
+
+end-procedure
+!************************************************************************
+begin-procedure Edit-Pay-Calendar
+
+move 'N' to $Found
+
+begin-select LOOPS=1
+
+Y1.PAY_END_DT
+Y1.pay_begin_dt
+
+  move 'Y' to $Found
+  move &Y1.PAY_END_DT to $pay_end_dt
+  move &Y1.PAY_BEGIN_DT TO $pay_begin_dt
+  !SHOW $pay_begin_dt '/' $pay_end_dt
+
+  FROM PS_PAY_CALENDAR Y1
+
+where Y1.PAY_SHEETS_RUN = 'Y'
+  AND Y1.PAY_CONFIRM_RUN = 'N'
+  AND Y1.RUN_ID > ' '
+  AND Y1.PAY_END_DT = (SELECT MAX(PAY_END_DT)
+			 FROM PS_PAY_CALENDAR
+			WHERE PAY_SHEETS_RUN = 'Y'
+			  AND PAY_CONFIRM_RUN = 'N'
+			  AND PAY_END_DT <= $AsOfToday)
+
+end-select
+
+!######################################################################
+! TESTING
+ !let $pay_end_dt = '19-MAY-2007'
+ !let $pay_begin_dt = '13-MAY-2007'
+!######################################################################
+
+  if $Found = 'N'
+    display 'Error --  Pay Calendar not found or not setup for the Run ID.'
+    move ' ' to $SlctCompany
+  end-if
+
+end-procedure
+!AXL 11/18/2004 New - Begin
+!*********************************************************************
+begin-procedure check-non-phm-167-rows
+!*********************************************************************
+
+!SHOW '**********************************************************************************************************************'
+move 'N' to $found
+display 'check-non-phm-167-rows - begin: ' noline
+date-time () hh:mi:ss &timeEnded
+display &timeEnded
+
+begin-select ON-ERROR=SQL-Error-Found('check-non-phm-167-rows')
+
+XXX.COMPANY
+XXX.PAYGROUP
+ZZZ.emplid
+YYY.OTH_HRS
+ZZZ.JOBCODE
+
+    let $emplid   = &ZZZ.emplid
+    let $company  = &XXX.COMPANY
+    let $paygroup = &XXX.PAYGROUP
+
+    #debug9 show 'Error 167 erncd for non-pharmacy job emplid  ' $emplid
+
+    add 1 to #ErrorCount
+    do error-found
+    print 'Pharmacy Hours found for non-Pharmacy EE ' (,43)
+    print &zzz.emplid ()
+    print ' Hours: ' ()
+    print &YYY.oth_hrs ()
+    print ' Jobcode: ' ()
+    print &ZZZ.JOBCODE ()
+
+FROM PS_PAY_EARNINGS XXX, PS_PAY_OTH_EARNS YYY, PS_JOB ZZZ
+WHERE XXX.PAY_END_DT = $pay_end_dt
+  and XXX.OFF_CYCLE  = 'N'
+  and XXX.COMPANY    = YYY.COMPANY
+  and XXX.PAYGROUP   = YYY.PAYGROUP
+  and XXX.PAY_END_DT = YYY.PAY_END_DT
+  and XXX.OFF_CYCLE  = YYY.OFF_CYCLE
+  and XXX.PAGE_NUM   = YYY.PAGE_NUM
+  and XXX.LINE_NUM   = YYY.LINE_NUM
+  and XXX.ADDL_NBR   = YYY.ADDL_NBR
+!  and ZZZ.JOBCODE not in ('30170','20138','30299')  !Not a Phm Mgr or Licensed Pharmacist or Floater
+  and ZZZ.JOBCODE not in ('30170','20138','30299','31052','31183','31208')  !ISDVAWD ITG# 1043 - 4/22/2014 - Begin - New jobcode-'31052'  added !TCSXSSS ITG - #1642 added New jobcode-'31183'
+  and XXX.EMPLID = ZZZ.EMPLID
+  and XXX.EMPL_RCD = ZZZ.EMPL_RCD
+  and XXX.EARNS_BEGIN_DT >= $pay_Begin_dt
+  and XXX.EARNS_END_DT <= $pay_end_dt
+  and ZZZ.EFFDT = (SELECT MAX(EFFDT) FROM PS_JOB
+		    WHERE EMPLID = ZZZ.EMPLID
+		      AND EMPL_RCD = ZZZ.EMPL_RCD
+		      AND EFFDT <= $pay_end_Dt)
+  and ZZZ.EFFSEQ = (SELECT MAX(EFFSEQ) FROM PS_JOB
+		    WHERE EMPLID = ZZZ.EMPLID
+		      AND EMPL_RCD = ZZZ.EMPL_RCD
+		      AND EFFDT = ZZZ.EFFDT)
+  and YYY.ERNCD = '167'
+  !and ZZZ.EMPLID = '035341193'
+
+end-select
+
+display 'check-non-phm-167-rows - end: ' noline
+date-time () hh:mi:ss &timeEnded
+display &timeEnded
+
+end-procedure
+!AXL 11/18/2004 New - End
+!*********************************************************************
+!This displays all the sql errors occurred in the program
+!*********************************************************************
+begin-procedure SQL-Error-Found($Proc_Name)
+
+! RKK - 08/05/2009 - Begin
+!  do error-found
+!  print 'SQL Error in ' (,43)
+!  print $Proc_Name (,35)
+!  print $_sql-error (+1,1)
+!  print 'sql-status:' (+1,1)
+!  print #_sql-status () edit 99999
+  show 'SQL Error in '$Proc_Name
+  show 'sql-status:'#_sql-status
+! RKK - 08/05/2009 - End
+
+end-procedure
+!*********************************************************************
+!This displays the error messages for the records in progress
+!*********************************************************************
+begin-procedure Error-Found
+
+  move 'Y' to $ErrorFound
+! RKK - 08/05/2009 - Begin
+!  do Format-Number(#InputTran, $out, '99999')
+!  print $out (+1,1)
+  print $GEX_TIME_COLECT (+1,1)
+  print $EmplId (+1,8)
+! RKK - 08/05/2009 - end
+  print $company (,23)
+  print $paygroup (,33)
+
+end-procedure
+!*********************************************************************
+!Finds out if the employee is active in the entire pay period
+!*********************************************************************
+begin-procedure find-empl-active-all-period
+
+! show '   begin-procedure find-empl-active-all-period starting '
+move 'Y' to $active_all_period
+
+begin-select on-error=sql-error-found('Find-Empl-Active-All-Period')
+U.EFFDT
+U.EMPL_STATUS
+
+   move 'N' to $active_all_Period
+
+FROM PS_JOB U
+WHERE U.EMPLID = &XX.EMPLID
+  AND U.EMPL_RCD = &XX.EMPL_RCD
+  AND (((U.EFFDT >= (select nvl(max(uu.effdt),$pay_begin_dt) from ps_job uu
+                 where uu.emplid = u.emplid
+                   and uu.empl_rcd = u.empl_rcd
+                   and uu.effdt <= $pay_begin_dt)
+  AND U.EFFDT <= (select max(uuu.effdt) from ps_job uuu
+                 where uuu.emplid = u.emplid
+                   and uuu.empl_rcd = u.empl_rcd
+                   and uuu.effdt < $pay_end_dt)
+  AND U.EMPL_STATUS not in ('A'))
+  or (0 = (select count(emplid) from ps_job uu1
+                 where uu1.emplid = u.emplid
+                   and uu1.empl_rcd = u.empl_rcd
+                   and uu1.effdt <= $pay_begin_dt)
+  AND U.EFFDT <= (select max(uuu.effdt) from ps_job uuu
+                 where uuu.emplid = u.emplid
+                   and uuu.empl_rcd = u.empl_rcd
+                   and uuu.effdt <= $pay_end_dt)
+  AND U.EMPL_STATUS = 'A')))
+end-select
+
+end-procedure

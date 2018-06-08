@@ -1,0 +1,799 @@
+!***********************************************************************
+! GEXPYLGL:  Currently, Giant Eagle Payroll Department processes legal *
+! aid for some independent stores in both Ohio and Pennsylvania. This  *
+! process is partially automated and partially manual. This new        *
+! PeopleSoft process will automate the current process with minimal    *
+! manual interaction.                                                  *.
+!                                                                      *
+! In the current process, Payroll receives faxed copies of employee's  *
+! legal aid dues from independent stores. Then that information will be*
+! used to create deduction transactions manually. In PeopleSoft, we    *
+! will create a panel to store employee's legal aid dues every month   *
+! for independent stores. There will be a process status flag on the   *
+! panel that identifies if employee's dues are processed or not.       *
+!                                                                      *
+! This panel information will be loaded into general deduction table   * 
+! prior to calculating pay roll every week. Legal aid deductions should* 
+! be taken only once in a month, but if employee did not work enough   *
+! number of hours in the current pay period, legal aid dues should not *
+! be taken that week. These pending dues should be taken in the next   *
+! week, if employee had worked enough hours that week.                 *
+!                                                                      *
+! A SQR program is necessary to load GEX_LEGAL_AID table information   * 
+! into general deduction table. This SQR will check for enough hours   *
+! worked in the current pay period and only if the minimum hours are   *
+! met general deduction table will be populated with the dues data.    *
+! Otherwise, the process flag will be open, indicating employee needs  *
+! to be processed in the next week. This SQR will be a weekly process  * 
+! running prior to pay calculation.                                    *
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module is the confidential and proprietary information of       *
+! Giant Eagle, Inc.; it is not to be copied, reproduced, or transmitted*
+! in any form, by any means, in whole or in part, nor is it to be used *
+! for any purpose other than that for which it is expressly provided   *
+! without the written permission of Giant Eagle.                       *
+!                                                                      *
+!                                                                      *
+!***********************************************************************
+!                         MODIFICATION HISTORY                         *
+!***********************************************************************
+!  ID#     INITIALS    DATE           DESCRIPTION OF THE CHANGE        *        
+!***********************************************************************
+!GPYC026    SXK        10/05/1998     INITIAL CREATION                 *
+!                                                                      *
+!           SXK        02/22/1999     Modified to insert employees into*
+!				      pay oth earns table              *
+!                                                                      *
+!           SXK        04/07/1999     Modified to look with empl_rcd  *
+!                                                                      *
+!	    SXK        04/28/1999     Modified to include off cycle    *
+!			              while updating pay line status   *
+!                                                                      *
+!           AXL        12/14/2000     Modified to recognize employees  *
+!                                     with 2 or more rows in Legal     *
+!                                     Aid table that were being missed *
+!
+!           SCM         9/18/2001     Ensure that ee's that transferred*
+!                                     do not get legal aid on paysheet *
+!                                     if that company they transferred *
+!                                     to does not have legal aid.      *
+!                                                                      *
+!           AXL        01/15/2002     Select only ON-CYCLE rows from   *
+!                                     PS_PAY_EARNINGS to prevent       *
+!                                     possible UNIQUE-CONSTRAINT insert*
+!                                     issues. Added SHOW stmts for     *
+!                                     debugging.                       *
+!                                                                      *
+!           AXL        04/10/2002     Add join by EMPL_RCD to          *
+!                                     Get-Curr-Company procedure to    *
+!                                     handle multi-job employees.      *
+!                                                                      *
+!           GBD        09/25/2002     v8.3 Upgrade: Added fields to    *
+!                                     Pay_Oth_Earns insert.            *
+!           CWB        02/05/2003     Changed AWARD_DATE value from    *
+!                                     ' ' to '' in Pay_Oth_Earns insert*   
+!           RBC        08/09/2007     Changed record xlattable as      *
+!                                     psxlatitem on line no. 732 & 738 *
+! GEX_SEC_REENG Vahini Katta 09/19/2016                                *
+! Changes related to SSN Conversion                                    *
+!***********************************************************************
+
+#include 'setenv.sqc' !Set environment
+#Include 'setup02.sqc'
+
+begin-report
+
+  do Init-DateTime
+  do Init-Number
+  do stdapi-init
+  move 'GEXPYLGL' to $ReportID
+  move 'Employee Legal Dues Calculation' to $ReportTitle
+  display $ReportTitle
+
+  do Get-Current-DateTime
+
+  let $reportdate_mm = substr($reportdate,1,2)
+  let $reportdate_dd = substr($reportdate,4,2)
+  let $reportdate_yy = substr($reportdate,7,2)
+  do MakeYear4Digits ($reportdate_yy)
+  let $reportdate_ccyy = $reportdate_yy||'-'||$reportdate_mm||'-'||$reportdate_dd
+  do Convert-From-DTU-Date($reportdate_ccyy, $reportdate_dbf)
+  move $reportdate_dbf to $rnctl_date
+  do report
+
+  do Commit-Transaction
+  do stdapi-term
+  !*do Reset
+!************************************************************************
+end-report
+
+!************************************************************************
+
+begin-procedure Report
+
+ move 'N' to $Errorfound
+ move 'N' to $cal_error
+ let #inputtran = 0
+ let #recs_inserted = 0
+ let #recs_updated = 0
+ let #comp_count = 0
+ do select-pay-calendar 
+   if $cal_error = 'N'
+     do process-employee-data
+   end-if
+!   display #comp_count noline
+!   display ' Employees Processed'
+
+
+Report-Exit:
+
+  date-time () hh:mi:ss &timeProcess
+  display #recs_inserted 99999 noline
+  display ' New General Deductions Inserted'
+  display #recs_updated 99999 noline
+  display ' General Deductions Updated'
+  display #InputTran 99999 noline
+  display ' Total Employees Processed'
+!  display &timeProcess
+
+end-procedure
+
+! begin-heading 6 for-reports=(report-log)
+begin-heading 6 
+
+ move 'Employee Legal Dues Calculation - Report Log' to $ReportTitle
+ #Include 'stdhdg01.sqc'
+
+  position (+2)
+  print 'Trans#' (,1) bold
+  print 'Emplid' (,18) bold
+  print 'Message' (,50) bold
+  print '-' (+1,1,176) fill
+ 
+end-heading
+
+!******************************************************************
+!This procedure selects pay calendar details
+!******************************************************************
+
+begin-procedure select-pay-calendar
+
+let $first = 'Y'
+begin-select on-error=sql-error-found('Select-Pay-Calendar')
+A1.COMPANY
+A1.PAYGROUP
+A1.PAY_END_DT
+A1.CHECK_DT
+
+   move 0 to #comp_count
+
+!   display 'Company/Paygroup : ' noline
+!   display &A1.company noline
+!   display ' / ' noline
+!   display &A1.Paygroup
+
+   move &A1.PAY_END_DT to $pay_end_dt
+
+
+   if $first = 'Y'
+!      do get-prev-pay-end-date
+      move 'N' to $first
+   end-if
+   exit-select
+
+FROM PS_PAY_CALENDAR A1
+WHERE A1.PAY_END_DT = (SELECT MAX(PAY_END_DT)
+			 FROM PS_PAY_CALENDAR
+			WHERE PAY_END_DT <= $AsOfToday
+			  AND PAY_SHEETS_RUN = 'Y'
+                          AND PAY_CONFIRM_RUN = 'N')
+end-select
+
+end-procedure
+
+!******************************************************************
+!This procedure selects previous pay end date
+!******************************************************************
+
+begin-procedure get-prev-pay-end-date
+
+move 'N' to $cal_error
+move 'N' to $found
+
+begin-select on-error=sql-error-found('Get-Prev-Pay-End-Date')
+A.PAY_END_DT
+
+   move &A.PAY_END_DT to $prev_pay_end_dt
+   move 'Y' to $found
+
+FROM PS_PAY_CALENDAR A
+WHERE A.COMPANY = &A1.COMPANY
+  AND A.PAYGROUP = &A1.PAYGROUP
+  AND A.PAY_CONFIRM_RUN = 'Y'
+  AND A.PAY_END_DT = (SELECT MAX(PAY_END_DT)
+			FROM PS_PAY_CALENDAR 
+		       WHERE COMPANY = &A1.COMPANY
+			 AND PAYGROUP = &A1.PAYGROUP
+			 AND PAY_CONFIRM_RUN = 'Y'
+                         AND PAY_END_DT < $pay_end_dt)
+   
+end-select
+
+if $found = 'N' 
+  let $cal_error = 'Y'
+  add #1 to #errorcount
+  do error-found
+  print 'No Previous confirmed Pay End Date' (,34)
+end-if
+
+end-procedure
+
+!******************************************************************
+!This procedure processes employees with legal deductions
+!******************************************************************
+
+begin-procedure process-employee-data
+
+ move 'N' to $found
+
+ do select-employees1
+
+end-procedure
+
+!*********************************************************************
+
+begin-procedure select-employees1
+
+move 'N' to $found
+
+begin-select on-error=sql-error-found('Select-Employees1')
+E.EMPLID
+   move &E.EMPLID to $emplid
+E.EMPL_RCD
+   move &E.EMPL_RCD to #empl_rcd
+   move 'Y' to $found
+E.DEPTID
+E.COMPANY                                   !SCM  9/24/2001
+E.EFFDT
+E.FLAT_DED_AMT
+
+!  do update-ded-end-dt1
+
+        add 1 to #inputtran
+        add 1 to #comp_count
+        let $skip_employee_processing = 'N'
+        !AXL 4/10/2002 New requirement to flag termed ee - Begin
+        do check-empl-sts
+        if &ST.EMPL_STATUS <> 'A' AND &ST.EMPL_STATUS <> 'L' AND
+           &ST.EMPL_STATUS <> 'P' AND &ST.EMPL_STATUS <> 'S'
+           let $skip_employee_processing = 'Y'
+           add 1 to #errorcount
+           do error-found
+           do select-xlat-value
+           print 'Employee not active; Curent status is: ' (,34)
+           print &ST.EMPL_STATUS ()
+           print '('			(,+1)
+           print $empl_status_xlatvalue	()
+           print ')'			()
+	end-if
+        !AXL 4/10/2002 New requirement to flag termed ee - End
+
+        if $skip_employee_processing = 'N'
+         do select-hours-worked
+         if (#total_amount < 55 and #total_hrs < 12) or
+           &E.FLAT_DED_AMT > 120 
+           let $skip_employee_processing = 'Y'
+           add 1 to #errorcount
+           do error-found
+           print 'Minimum Criteria is not met; Hours Worked are ' (,34)
+           print #total_hrs ()
+           print '; Amount Earned: ' ()
+           print #total_amount ()
+           print '; Flat Deduction Amount: ' ()
+           print &E.FLAT_DED_AMT ()
+         !***********    SCM   9/18/2001      Begin
+         !  If ee transferred to a different store and that store had no legal (i.e. 
+         !  the ee/company combination is NOT on ps_gex_legal_aid), THEN ensure that the
+         !  legal deduction does not get entered on the paysheet (ps_pay_oth_earns).
+         ! end-if          commented
+         else
+             do get-curr-company
+             if &J.COMPANY <> &E.COMPANY
+                 let $skip_employee_processing = 'Y'
+                 add 1 to #errorcount
+                 do error-found
+                 print 'EE current company does not match company on legal aid deduction panel -' (,34)        
+                 print 'No legal aid added to paysheet' ()
+             end-if
+         end-if
+        end-if
+        !***********    SCM 9/18/2001        End
+
+        if $skip_employee_processing = 'N'
+!           move 'LEGAL' to $dedcd
+           move &E.FLAT_DED_AMT to #dues_amt
+!           do check-the-dedcd-existency
+!           if $found = 'Y' 
+!              do update-dues-amt
+!           else
+!              move 0 to #goal_bal
+!              move 'A' to $ded_calc
+              do add-pay-earnings
+!           end-if
+        end-if
+
+FROM  PS_GEX_LEGAL_AID E
+WHERE E.GEX_PROCESS_IND = 'N'
+  AND E.EFFDT = (select max(effdt) from ps_gex_legal_aid
+		  where emplid 	  = E.EMPLID
+                    and empl_rcd = E.EMPL_RCD
+                   !AXL 12/14/2000 Employees with 2 rows being missed - Begin
+                    AND deptid    = E.DEPTID
+		   !AXL 12/14/2000 Employees with 2 rows being missed - End
+		    and effdt <= $asoftoday)
+  ORDER BY E.DEPTID, E.EMPLID
+end-select
+
+end-procedure
+
+!AXL 4/10/2002  Begin
+!******************************************************************
+begin-procedure check-empl-sts
+!******************************************************************
+begin-select on-error=sql-error-found('check-empl-sts')
+ST.EMPL_STATUS
+FROM  PS_JOB ST
+WHERE ST.EMPLID    = &E.EMPLID  
+  AND ST.EMPL_RCD = &E.EMPL_RCD	
+  AND   ST.EFFDT                =
+         (SELECT MAX(EFFDT) FROM PS_JOB 
+         WHERE  EMPLID          = ST.EMPLID
+         AND    EMPL_RCD       = ST.EMPL_RCD
+         AND    EFFDT          <= $asoftoday) 
+  AND ST.EFFSEQ               =
+         (SELECT MAX(EFFSEQ) FROM PS_JOB 
+         WHERE  EMPLID          = ST.EMPLID
+         AND    EMPL_RCD       = ST.EMPL_RCD
+         AND    EFFDT           = ST.EFFDT)
+ 
+end-select
+
+end-procedure 
+!AXL 4/10/2002 End   
+
+!***********      SCM 9/18/2001       Begin         Added this para to get ee's company
+!************************************
+begin-procedure get-curr-company
+!************************************
+begin-select on-error=sql-error-found('get-curr-company')
+J.EMPLID
+J.COMPANY
+FROM  PS_JOB J      
+WHERE J.EMPLID    = &E.EMPLID  
+  AND J.EMPL_RCD = &E.EMPL_RCD	!4/10/2002 New Join
+  AND   J.EFFDT                =
+         (SELECT MAX(EFFDT) FROM   PS_JOB J1
+         WHERE  J1.EMPLID          = J.EMPLID
+         AND    J1.EMPL_RCD       = J.EMPL_RCD
+         AND    J1.EFFDT          <= $asoftoday) 
+  AND J.EFFSEQ               =
+         (SELECT MAX(EFFSEQ) FROM   PS_JOB J2    
+         WHERE  J2.EMPLID          = J.EMPLID
+         AND    J2.EMPL_RCD       = J.EMPL_RCD
+         AND    J2.EFFDT           = J.EFFDT)
+ 
+end-select
+end-procedure get-curr-company
+!***********      SCM 9/18/2001       End   
+
+ 
+!*********************************************************************
+!begin-procedure update-ded-end-dt1
+
+!begin-sql on-error=sql-error-found('Update-Ded-End-Dt1')
+!UPDATE PS_GENL_DEDUCTION D
+!   SET D.DEDUCTION_END_DT = $prev_pay_end_Dt
+
+!WHERE D.EMPLID = $emplid
+!  AND D.EMPL_RCD = #empl_rcd
+!  AND D.EFFDT = &E.EFFDT
+!  AND D.DEDUCTION_END_DT IS NULL
+!  AND D.DEDCD = 'LEGAL'
+!end-sql
+
+!end-procedure
+!*********************************************************************
+Begin-Procedure Select-Hours-Worked
+
+move 'N' to $found
+let #total_hrs = 0
+let #total_amount = 0
+
+Begin-Select on-error=sql-error-found('Select-Hours-Worked')
+H.REG_PAY_HRS
+H.OT_HRS
+H.REG_PAY
+H.PAGE_NUM
+H.LINE_NUM
+H.ADDL_NBR
+H.COMPANY
+H.PAYGROUP
+H.OFF_CYCLE
+H.SEPCHK
+
+  move 'Y' to $found
+  
+  add &H.REG_PAY_HRS to #total_hrs
+  add &H.OT_HRS to #total_hrs 
+  add &H.REG_PAY to #total_amount
+  do select-oth-earns
+    
+FROM PS_PAY_EARNINGS H
+WHERE H.EMPLID = $emplid
+!SXK 04/07/99 Begin
+  AND H.EMPL_RCD = #empl_rcd
+!SXK 04/07/99 End
+  AND H.PAY_END_DT = $pay_end_dt
+  AND H.OFF_CYCLE = 'N'			!AXL 01/12/2002
+end-select
+
+end-procedure
+
+
+!*********************************************************************
+!This procedure tries to match every non-null column with the source
+!values and if everything matches, passes that row's dues codes and 
+!amounts as the employees general deductions
+!*********************************************************************
+Begin-Procedure select-oth-earns
+begin-select on-error=sql-error-found('Select-Oth-Earns')
+H1.OTH_earns
+H1.OTH_HRS
+H1.ERNCD
+  add &H1.OTH_earns to #total_amount
+  add &H1.OTH_HRS to #total_hrs
+  
+FROM PS_PAY_OTH_EARNS H1
+WHERE H1.COMPANY = &H.COMPANY
+  AND H1.PAYGROUP = &H.PAYGROUP
+  AND H1.PAY_END_DT = $pay_end_Dt
+  AND H1.PAGE_NUM = &H.PAGE_NUM
+  AND H1.LINE_NUM = &H.LINE_NUM
+  AND H1.ADDL_NBR = &H.ADDL_NBR
+  AND H1.OFF_CYCLE = &H.OFF_CYCLE
+  AND (H1.ERNCD BETWEEN '001' AND '499'
+  OR H1.ERNCD IN ('REG','OTP'))
+end-select
+
+end-procedure
+
+!*********************************************************************
+!This procedure checks the GENL_DEDUCTION table for the deduction for 
+!the employee
+!*********************************************************************
+
+!Begin-Procedure Check-the-Dedcd-Existency
+
+!move 'N' to $found
+
+!Begin-Select on-error=sql-error-found('Check-the-Dedcd-Existency')
+!I.EFFDT
+!I.GOAL_AMT
+!I.GOAL_BAL
+
+!  move 'Y' to $found
+
+!FROM PS_GENL_DEDUCTION I
+
+!WHERE I.EMPLID = &E.EMPLID
+!  AND I.EMPL_RCD = &E.EMPL_RCD
+!  AND I.DEDCD = $dedcd
+!  AND I.EFFDT = &E.EFFDT
+!end-select
+
+!end-procedure
+
+!*********************************************************************
+!This procedure updates the dues amount in the GENL_DEDUCTION table
+!for the selected employee
+!*********************************************************************
+
+!Begin-Procedure Update-Dues-Amt
+!  add +1 to #recs_updated
+!Begin-Sql on-error=sql-error-found('Update-Dues-Amt')
+!UPDATE PS_GENL_DEDUCTION J
+!   SET J.DED_ADDL_AMT = #dues_amt,
+!       J.GOAL_AMT = #dues_amt,
+!       J.GOAL_BAL = 0,
+!       J.DEDUCTION_END_DT = ''
+!WHERE J.EMPLID = &E.EMPLID
+!  AND J.EMPL_RCD = &E.EMPL_RCD
+!  AND J.DEDCD = $dedcd
+!  AND J.EFFDT = &I.EFFDT
+!end-sql
+!end-procedure
+
+!*********************************************************************
+!This procedure inserts a row for the selected employee in the 
+!GENL_dEDUCTION table for the non-exist deduction code
+!*********************************************************************
+
+!Begin-Procedure Insert-Genl-Ded
+!  do check-genl-ded-cd
+!  if $found = 'N'
+!     do Insert-Genl-Ded-Cd
+!  end-if
+!  add +1 to #recs_inserted
+
+!Begin-Sql on-error=sql-error-found('Insert-Genl-Ded')
+!INSERT INTO PS_GENL_DEDUCTION 
+!(EMPLID,
+!EMPL_RCD,
+!DEDCD,
+!EFFDT,
+!DED_CALC,
+!DEDUCTION_END_DT,
+!DED_ADDL_AMT,
+!DED_RATE_PCT,
+!GOAL_AMT,
+!GOAL_BAL,
+!LOAN_INT_PCT,
+!BAS_TAXABLE_BEN)
+!VALUES
+!(&E.EMPLID,
+!&E.EMPL_RCD,
+!$dedcd,
+!&E.EFFDT,
+!$ded_calc,
+!'',
+!#dues_amt,
+!0,
+!#dues_amt,
+!0,
+!0,
+!'N')
+!end-sql
+
+!end-procedure
+
+!*********************************************************************
+!This procedure checks the GENL_DED_cd table for the deduction for 
+!the employee
+!*********************************************************************
+
+!Begin-Procedure Check-genl-ded-cd
+
+!move 'N' to $found
+
+!Begin-Select on-error=sql-error-found('Check-Genl-Ded-Cd')
+!'x'
+!  move 'Y' to $found
+
+!FROM PS_GENL_DED_CD IX
+
+!WHERE IX.EMPLID = &E.EMPLID
+!  AND IX.EMPL_RCD = &E.EMPL_RCD
+!  AND IX.DEDCD = $dedcd
+!end-select
+
+!end-procedure
+
+!*********************************************************************
+!This procedure inserts Genl Ded Code rows for EEs
+!*********************************************************************
+
+!Begin-Procedure Insert-Genl-Ded-Cd
+
+!Begin-Sql on-error=sql-error-found('Insert-Genl-Ded-Cd')
+!INSERT INTO PS_GENL_DED_CD 
+!(EMPLID,
+!EMPL_RCD,
+!DEDCD)
+!VALUES
+!(&E.EMPLID,
+!&E.EMPL_RCD,
+!$dedcd)
+!end-sql
+
+!end-procedure
+
+!*********************************************************************
+!Adds information to Earnings table
+!*********************************************************************
+
+begin-procedure Add-Pay-Earnings
+
+   let $erncd = '525'
+
+   !01/15/2002 AXL Show stmts - Begin
+  
+      show ' EMPLID ' &e.emplid
+           ' CMPY '   &H.COMPANY 
+           ' PAYGRP ' &H.PAYGROUP
+           ' PAY END' $pay_end_dt
+           ' PAGE '   &H.PAGE_NUM 
+           ' LINE '   &H.LINE_NUM 
+           ' ADDL_NBR '  &H.ADDL_NBR
+           ' ERNCD '  $ErnCd 
+           ' SEPCHK ' &H.SEPCHK
+           ' DUES '   #dues_amt
+   
+   !01/15/2002 AXL Show stmts - End
+			    
+begin-sql
+INSERT INTO PS_PAY_OTH_EARNS (COMPANY,
+			      PAYGROUP,
+			      PAY_END_DT,
+			      OFF_CYCLE,
+			      PAGE_NUM,
+			      LINE_NUM,
+			      ADDL_NBR,
+			      ERNCD,
+			      SEPCHK,
+			      JOB_PAY,
+			      OTH_HRS,
+			      OTH_PAY,
+			      OTH_EARNS,
+			      ADD_GROSS,
+			      TAX_METHOD,
+			      ADDL_SEQ,
+			      TL_SOURCE,
+			      RATE_USED,
+			      BAS_CREDIT_SW,
+			      COMP_RATECD,     !kmw 3/25/00
+                              COMPRATE,        !kmw 3/25/00
+                              COMPRATE_USED,   !kmw 3/25/00
+!                              TL_PAY_LINK_NUM, !kmw 3/25/00
+                              HRS_DIST_SW,
+                              XREF_NUM,         !GBD 09/25/2002 Begin
+                              EX_DOC_ID,
+                              EX_DOC_TYPE,
+                              EX_LINE_NBR,
+                              CURRENCY_CD,
+                              VC_PLAN_ID,
+                              VC_PAYOUT_PRD_ID,
+                              GB_GROUP_ID,
+                              APPLID,
+                              AWARD_DATE,
+                              NOTIFY_STATUS,!)    !GBD 09/25/2002 End
+			      EIM_KEY )   !vendrbc 08/20/2007
+VALUES                  (     &H.COMPANY,
+			      &H.PAYGROUP,
+			      $pay_end_dt,
+			      'N',
+			      &H.PAGE_NUM,
+			      &H.LINE_NUM,
+			      &H.ADDL_NBR,
+			      $ErnCd,
+			      &H.SEPCHK,
+			      'N',
+			      0,
+			      #dues_amt,
+			      0,
+			      'N',
+			      'A',
+			      01,
+			      'G',
+			      'H',
+			      'N',
+			      ' ',  ! kmw 3/25/00
+                               0,   ! kmw 3/25/00
+                               0,   ! kmw 3/25/00
+!                               0,   ! kmw 3/25/00
+                              'N',
+                               0,   !GBD 09/25/2002 Begin
+                              ' ',              
+                              ' ', 
+                               0,
+                              ' ',
+                              ' ',
+                              ' ',
+                              ' ',
+                              ' ',
+                              '',   !CWB 02/05/2003 changed from space to null.
+                              'N', !)  !GBD 09/25/2002 End
+			      ' ')  !vendrbc 08/20/2007
+end-SQL
+
+add 1 to #recs_inserted
+
+do update-pay-status
+
+end-procedure
+
+!********************************************************************
+Begin-Procedure update-pay-status
+!********************************************************************
+
+begin-sql 
+update ps_pay_earnings
+set ok_to_pay = 'Y',
+    pay_line_status = 'U'
+where company = &H.COMPANY
+  AND PAYGROUP = &H.PAYGROUP
+  AND PAY_END_DT = $pay_end_dt
+!SXK 04/28/1999 Begin
+  AND OFF_CYCLE = 'N'
+!SXK 04/28/1999 End
+  AND PAGE_NUM = &H.PAGE_NUM
+  AND LINE_NUM = &H.LINE_NUM
+  AND ADDL_NBR = &H.ADDL_NBR
+end-sql
+
+end-procedure
+
+!AXL 4/10/2002 New Proc Begin
+!********************************************************************
+begin-procedure select-xlat-value
+!********************************************************************
+move ' ' to $empl_status_xlatvalue
+begin-select
+xlatlongname
+  move &xlatlongname to $empl_status_xlatvalue
+from psxlatitem !vendrbc 08/09/2007
+where fieldname = 'EMPL_STATUS'
+and fieldvalue = &ST.EMPL_STATUS
+!and language_cd = 'ENG' !vendrbc
+and eff_status = 'A'
+and effdt = (select max(effdt)
+		from psxlatitem !vendrbc 08/09/2007
+		where fieldname = 'EMPL_STATUS'
+		and fieldvalue = &ST.empl_status
+		!and language_cd = 'ENG' !vendrbc
+		and effdt <= $asoftoday
+		and eff_Status = 'A')
+end-select
+end-procedure
+!AXL 4/10/2002 New Proc End         
+
+!********************************************************************
+!This procedure displays in the error report if there are any sql erros
+!happened in the program
+!********************************************************************
+
+begin-procedure SQL-Error-Found($Proc_Name) 
+  do error-found
+  print 'SQL Error in ' (,21)
+  print $Proc_Name (,35)  
+  print $_sql-error (+1,1) 
+  print 'sql-status:' (+1,1)
+  print #_sql-status () edit 99999 
+  show $emplid $DEPTID $company $paygroup noline
+  display ' : SQL error ' noline
+  display #_sql-status
+
+end-procedure
+
+!*********************************************************************
+!This procedure displays the error message for the records that are in
+!progress
+!*********************************************************************
+
+begin-procedure Error-Found
+  move 'Y' to $ErrorFound
+  do Format-Number(#InputTran, $out, '99999')
+  print $out (+1,1)
+  move &E.EMPLID to $emplid
+  ! GEX_SEC_REENG Vahini Katta 09/19/2016 Begins
+  !let $EmplId_1st3 = substr($EmplId,1,3)
+  !let $EmplId_mid2 = substr($EmplId,4,2)
+  !let $EmplId_last4 = substr($EmplId,6,4)
+ 
+  !String $EmplId_1st3 $EmplID_mid2 $EmplId_last4 by '-' into $EmplId11
+
+  !print $EmplID11 (,16)
+  print $EmplId (,16)
+  ! GEX_SEC_REENG Vahini Katta 09/19/2016 Ends
+end-procedure
+
+#Include 'tranctrl.sqc'  !Common Transaction Control Procedures
+!*#Include 'reset.sqc'     !Reset printer procedure
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'payrnctl.sqc'  !Select-Parameters
+#Include 'stdapi.sqc'    !Get_Run_Control Procedure
+#Include 'datemath.sqc'  !Does the date-math functions

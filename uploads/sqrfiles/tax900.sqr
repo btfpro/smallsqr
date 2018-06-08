@@ -1,0 +1,759 @@
+!***********************************************************************
+!  TAX900:  Edit wage data prior to annual reporting.                  *
+!           Validate SSN's EIN/s.                                      *
+!           Check for unusual tax balance amounts.                     *
+!           Updated for 1994.                                          *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!                                                                      *
+!                                                                      *
+! This software and related documentation are provided under a         *
+! license agreement containing restrictions on use and                 *
+! disclosure and are protected by intellectual property                *
+! laws. Except as expressly permitted in your license agreement        *
+! or allowed by law, you may not use, copy, reproduce,                 *
+! translate, broadcast, modify, license, transmit, distribute,         *
+! exhibit, perform, publish or display any part, in any form or        *
+! by any means. Reverse engineering, disassembly, or                   *
+! decompilation of this software, unless required by law for           *
+! interoperability, is prohibited.                                     *
+! The information contained herein is subject to change without        *
+! notice and is not warranted to be error-free. If you find any        *
+! errors, please report them to us in writing.                         *
+!                                                                      *
+!                                                                      *
+! Copyright (C) 1988, 2012, Oracle and/or its affiliates.              *
+! All Rights Reserved.                                                 *
+!***********************************************************************
+!                                                                      *
+!          $Date:  2012/11/08:11:50:42                                 !
+!       $Release:  HR9                                                 !
+!    $Resolution:  872695                                              !
+!                                                                      *
+!***********************************************************************
+
+#include 'setenv.sqc' !Set environment
+#Include 'setup32.sqc'  !printer and page-size initialization
+#Include 'usarpt.sqc' !USA-specific variables
+
+begin-report
+  do Init-Report
+  do Process-Main
+  do Stdapi-Term
+end-report
+
+begin-procedure Init-Report
+  move 'TAX900' to $ReportID
+  move 'Annual Reporting Error Listing' to $ReportTitle
+  display $ReportTitle
+
+  do Init-DateTime
+  do Init-Number
+  do Get-Calendar-Year-Id
+  do Stdapi-Init
+  do Get-Tax-Reporting-Run-Controls  !TX.Balance_Year
+
+  move &TX.Balance_Year to $Year 9999
+  let $AsOfDate = $Year || '1231'
+  do Format-DateTime($AsOfDate, $AsOfDate, {DEFCMP}, '', 'native')
+  do Get-Current-DateTime
+  do Get-EIC-Max
+  move 'Y' to $No-errors
+end-procedure
+
+begin-heading 6
+  #Include 'stdhdg02.sqc'
+  print 'Tax Year'          (4,1)
+  print &TX.Balance_Year   (0,+4)
+  print 'PSD'              (6,76)
+  print 'Employee ID  Employee Name'                      (+1,1)
+  print 'SSN     St  Locality   Work   Res   Tax          YTD Gross            '  (0,49)
+  print 'YTD Tax   Message'                               ()
+end-heading
+
+begin-procedure Process-Main
+
+begin-SELECT
+TEMP_SSN_MASK
+FROM PS_INSTALLATION
+end-SELECT
+
+do GET-MAX-LIMITS
+
+begin-SELECT
+C.COMPANY () on-break print=never procedure=Company-Change
+C.EMPLID
+D1.NATIONAL_ID
+PN.NAME
+C.BALANCE_YEAR
+C.STATE
+C.LOCALITY
+C.TAX_CLASS
+C.WORK_PSD_CD
+C.RES_PSD_CD
+C.TXGRS_YTD
+C.TAX_YTD
+CP.TAX_REPORT_TYPE
+
+  if &C.Company <> $Company
+    move &C.Company to $Company  !for use in Heading procedure
+    do Get-Company-Data          !Tax_Report_Type
+    do Company-Edits
+  end-if
+
+  if &C.EmplID <> $EmplID
+
+    do Employee-Edits
+    move &C.EmplID to $EmplID
+    move '' to $TaxClassesProcessed
+    move '' to $TaxClassesProcessedTip
+    move 0.00 to #OASDIGross
+    move 0.00 to #MedicareGross
+    move 0.00 to #OASDIGrossTips
+    move 0.00 to #MedicareGrossTips
+  end-if
+
+  if &CP.TAX_REPORT_TYPE <> '2' AND
+     &CP.TAX_REPORT_TYPE <> 'P' AND
+     &CP.TAX_REPORT_TYPE <> 'R'
+      move 'Non Employee with taxable gross and/or tax withheld' to $Message
+      do Print-Tax-Error-Line
+  end-if
+
+  do Tax-Balance-Edits
+
+  if &C.Tax_Class = 'F' or &C.Tax_Class = 'D'
+    let $TaxClassesProcessed = $TaxClassesProcessed || &C.Tax_Class
+
+    if $TaxClassesProcessed = 'DF' or $TaxClassesProcessed = 'FD'
+
+      if #MedicareGross < #OASDIGross
+        move 'Medicare Gross < OASDI Gross' to $Message
+        do Print-Tax-Error-Line
+        move '' to $TaxClassesProcessed
+      end-if
+    end-if
+  end-if
+
+! Tips logic for Medicare and OASDI follows.....
+
+  if &C.Tax_Class = 'G' or &C.Tax_Class = 'T'
+    let $TaxClassesProcessedTip = $TaxClassesProcessedTip || &C.Tax_Class
+
+    if $TaxClassesProcessedTip = 'GT' or $TaxClassesProcessedTip = 'TG'
+      if #MedicareGrossTIPS < #OASDIGrossTIPS
+        move 'Tips Medicare Gross < Tips OASDI Gross' to $Message
+        do Print-Tax-Error-Line
+        move '' to $TaxClassesProcessedTip
+      end-if
+    end-if
+  end-if
+
+FROM  PS_TAX_BALANCE C, PS_PERSON_NAME PN,  PS_PERS_NID D1,  PS_COMPANY_TBL CP
+WHERE C.EMPLID        = D1.EMPLID AND D1.COUNTRY = {NID_Country}
+  AND D1.NATIONAL_ID_TYPE = $PAYROLL_NID_TYPE
+  AND CP.COMPANY = C.COMPANY
+  AND CP.EFF_STATUS = 'A'
+  AND CP.EFFDT =
+     (SELECT MAX(EFFDT)
+     FROM PS_COMPANY_TBL
+     WHERE  COMPANY = CP.COMPANY
+       AND  EFFDT  <= $AsOfDate)
+  AND ( (CP.TAX_REPORT_TYPE IN ('2','P','R') )
+       OR (CP.TAX_REPORT_TYPE NOT IN ('2','P','R') AND (C.TXGRS_YTD <> 0 OR C.TAX_YTD <> 0)))
+  AND PN.EMPLID = C.EMPLID
+  AND C.BALANCE_YEAR = &TX.Balance_Year
+  AND C.BALANCE_ID    = $Calendar_Year_Id
+  AND C.TAX_CLASS    IN ('H','D','F','C','G','T','7')
+  AND C.BALANCE_PERIOD =
+      (SELECT MAX(BALANCE_PERIOD)
+       FROM   PS_TAX_BALANCE
+       WHERE  EMPLID        = C.EMPLID
+         AND  COMPANY       = C.COMPANY
+         AND  BALANCE_YEAR  = C.BALANCE_YEAR
+         AND  BALANCE_ID    = C.BALANCE_ID
+         AND  STATE         = C.STATE
+         AND  LOCALITY      = C.LOCALITY
+         AND  TAX_CLASS     = C.TAX_CLASS
+         AND  WORK_PSD_CD   = C.WORK_PSD_CD
+         AND  RES_PSD_CD    = C.RES_PSD_CD)
+ORDER BY C.COMPANY,C.EMPLID,C.STATE,C.LOCALITY,C.TAX_CLASS,C.WORK_PSD_CD,C.RES_PSD_CD
+end-SELECT
+ do End-Report-Msg
+end-procedure
+
+
+BEGIN-PROCEDURE GET-MAX-LIMITS
+  do Get-OASDI-Max
+  do Get-Medicare-Max
+  DO GET-OASDI-MAX-TIPS
+  Do Get-Medicare-Max-Tips
+END-PROCEDURE GET-MAX-LIMITS
+
+begin-procedure Company-Change
+
+  do No-errors
+
+  move 'Y' to $No-errors
+  new-page
+
+end-procedure
+
+begin-procedure No-errors
+
+  if $No-errors = 'Y'
+     position (+3)
+     move 'No errors for Company' to $endmessage
+     print $endmessage (0,14)
+     print $company (0,37)
+  end-if
+
+end-procedure
+
+
+begin-procedure Company-Edits
+  let $tmp = SUBSTR(EDIT(&CT.Federal_EIN,'099999999'),1,2)
+  evaluate $tmp
+    when = '00'
+    when = '07'
+    when = '08'
+    when = '09'
+    when = '17'
+    when = '18'
+    when = '19'
+    when = '28'
+    when = '29'
+    when = '49'
+    when = '69'
+    when = '70'
+    when = '78'
+    when = '79'
+    when = '89'
+      move 'Missing or Invalid Federal EIN' to $Message
+      print $Company            (+2,1)
+      print &CT.Descr           (0,14)
+      print &CT.Federal_EIN     (0,45) edit 099999999
+      print $Message            (0,110)
+
+      move 'N' to $No-errors
+
+  end-evaluate
+end-procedure
+
+begin-procedure Employee-Edits
+  let #tmp = TO_NUMBER(&D1.NATIONAL_ID)               !Verify SSN is numeric
+  let $SSN = EDIT(TO_CHAR(#tmp),'099999999')
+
+  let $NATID = substr(&D1.NATIONAL_ID,1,9)
+
+  if #tmp = 0 and $NATID <> 'XXXXXXXXX'
+    move 'Missing SSN or SSN = 000000000' to $Message
+    do Print-Data-Error-Line
+  else
+    if $SSN <> $NATID
+      move 'Invalid SSN' to $Message
+      do Print-Data-Error-Line
+    else                                     !Check for invalid #'s
+    if RTRIM(&D1.NATIONAL_ID, ' ') = ''
+          or $NATID  = '999999999'
+          or SUBSTR(&D1.NATIONAL_ID,1,3) = '000'
+          or SUBSTR(&D1.NATIONAL_ID,1,3) = '666'
+          or SUBSTR(&D1.NATIONAL_ID,1,1) = '9'
+          or SUBSTR(&D1.NATIONAL_ID,4,2) = '00'
+          or SUBSTR(&D1.NATIONAL_ID,6,4) = '0000'
+        move 'Invalid SSN' to $Message
+        do Print-Data-Error-Line
+      end-if
+    end-if
+  end-if
+
+  move 'N' to $FedTaxDataFound
+
+begin-SELECT
+'X'
+  move 'Y' to $FedTaxDataFound
+FROM  PS_FED_TAX_DATA F
+WHERE F.EMPLID        = &C.EmplID
+  AND F.COMPANY       = &C.Company
+  AND F.EFFDT =
+      (SELECT MAX(EFFDT)
+       FROM   PS_FED_TAX_DATA
+       WHERE  EMPLID  = F.EMPLID
+         AND  COMPANY = F.COMPANY
+         AND  EFFDT  <= $AsOfDate)
+end-SELECT
+  if $FedTaxDataFound = 'N'
+    move 'No Fed Tax Data Record' to $Message
+    do Print-Data-Error-Line
+  end-if
+end-procedure
+
+begin-procedure Tax-Balance-Edits
+  if &C.TxGrs_YTD < 0
+    move 'Negative Gross' to $Message
+    do Print-Tax-Error-Line
+  end-if
+
+  if &C.Tax_YTD < 0 and &C.Tax_Class <> 'C'
+    move 'Negative Tax' to $Message
+    do Print-Tax-Error-Line
+  end-if
+
+  if &C.Tax_YTD > 0 and &C.Tax_Class = 'C'
+    move 'EIC Tax-YTD should be < 0' to $Message
+    do Print-Tax-Error-Line
+  end-if
+
+  evaluate &C.Tax_Class
+    when = 'H'  !Withholding
+
+      if  rtrim(&C.State, ' ') = '$U'
+      and &Tax_Report_Type = 'P'
+           if &C.Tax_YTD > 0 or &C.TxGrs_YTD > 0
+              move 'FWT tax balance for Puerto Rico employee'   to $Message
+              do Print-Tax-Error-Line
+           end-if
+      end-if
+
+!      if  rtrim(&C.State, ' ') = 'GU'
+!           if &C.Tax_YTD > 0 or &C.TxGrs_YTD > 0
+!              move 'FWT tax balance for Guam employee'   to $Message
+!              do Print-Tax-Error-Line
+!           end-if
+!      end-if
+
+      if  rtrim(&C.State, ' ') <> '$U' and rtrim(&C.State, ' ') <> 'PR' and rtrim(&C.State, ' ') <> '$UPR'
+      and &Tax_Report_Type = 'P'
+           if &C.Tax_YTD > 0 or &C.TxGrs_YTD > 0
+              let $Message = rtrim(&C.State, ' ')
+              concat ' tax balance- only Puerto Rico tax balance expected' with $Message
+              do Print-Tax-Error-Line
+           end-if
+      end-if
+
+      if  (rtrim(&C.State, ' ') = 'PR' or
+          rtrim(&C.State, ' ') = '$UPR')
+      and &Tax_Report_Type <> 'P'
+        if &C.Tax_YTD > 0 or &C.TxGrs_YTD > 0
+           move 'Puerto Rico tax balance in a non-Puerto Rico company'  to $Message
+           do Print-Tax-Error-Line
+        end-if
+      end-if
+
+      if  rtrim(&C.State, ' ') = 'PA'
+      and rtrim(&C.Locality, ' ') <> ''
+          if (rtrim(&C.Locality, ' ') = '880000' or
+              rtrim(&C.Locality, ' ') = '990000')
+             move 'Locality code is invalid'  to $Message
+             do Print-Tax-Error-Line
+          else
+             if (rtrim(&C.Work_PSD_Cd, ' ') = '' or
+                 rtrim(&C.Res_PSD_Cd, ' ')  = '')
+                move 'Missing one or both PSD Codes'  to $Message
+                do Print-Tax-Error-Line
+             end-if
+          end-if
+      end-if
+
+       break
+    when = 'D'  !FICA/Social Security/State Disability
+
+     if  rtrim(&C.State, ' ') = '$U'  OR  rtrim(&C.State, ' ') = '$UGU' OR  rtrim(&C.State, ' ') = '$UPR'
+                                      OR  rtrim(&C.State, ' ') = '$UVI' OR  rtrim(&C.State, ' ') = '$UAS'
+      move &C.TxGrs_YTD to #OASDIGross
+
+      move #OASDI-TaxRt to #TaxRt
+      move #OASDI-MaxGross to #Maxgross
+      move #OASDI-MaxTax to #MaxTax
+
+      if &C.TxGrs_YTD > #MaxGross
+        move 'OASDI Gross > ' to $Message
+        move #MaxGross to $MaxGross b99,999,999
+        let $Message = $Message || $MaxGross
+        do Print-Tax-Error-Line
+      end-if
+
+      if &C.Tax_YTD > #MaxTax
+        move 'OASDI Tax Withheld > ' to $Message
+        move #MaxTax to $MaxTax b99,999,999.99
+        let $Message = $Message || $MaxTax
+        do Print-Tax-Error-Line
+      end-if
+
+      let #CalcTax = &C.TxGrs_YTD * #TaxRt
+      if (#CalcTax - &C.Tax_YTD) > 0.01 OR (#CalcTax - &C.Tax_YTD) < -0.01
+        move 'OASDI Calc Tax <> Tax Balance' to $Message
+        do Print-Tax-Error-Line
+      end-if
+     end-if
+
+     break
+    when = 'F'  !FICA Medicare
+
+     move &C.TxGrs_YTD to #MedicareGross
+
+      move #MED-TaxRt to #TaxRt
+      move #MED-MaxGross to #MaxGross
+      move #MED-MaxTax to #MaxTax
+
+      if &C.TxGrs_YTD > #MaxGross
+        move 'Medicare Gross > ' to $Message
+        move #MaxGross to $MaxGross b99,999,999
+        let $Message = $Message || $MaxGross
+        do Print-Tax-Error-Line
+      end-if
+
+      if &C.Tax_YTD > #MaxTax
+        move 'Medicare Tax Withheld > ' to $Message
+        move #MaxTax to $MaxTax b99,999,999.99
+        let $Message = $Message || $MaxTax
+        do Print-Tax-Error-Line
+      end-if
+
+      let #CalcTax = &C.TxGrs_YTD * #TaxRt
+      if (#CalcTax - &C.Tax_YTD) > 0.01 OR (#CalcTax - &C.Tax_YTD) < -0.01
+        move 'Medicare Calc Tax <> Tax Balance' to $Message
+        do Print-Tax-Error-Line
+      end-if
+
+      break
+
+    when = 'G'  !FICA OASDI Tips - Employee
+
+     if  rtrim(&C.State, ' ') = '$U'  OR  rtrim(&C.State, ' ') = '$UGU' OR  rtrim(&C.State, ' ') = '$UPR'
+                                      OR  rtrim(&C.State, ' ') = '$UVI' OR  rtrim(&C.State, ' ') = '$UAS'
+
+      move &C.TxGrs_YTD to #OASDIGrossTips
+
+      MOVE #OASDI-TIP-TAXRT to #TaxRt
+      MOVE #OASDI-TIP-MAXGROSS to #MaxGross
+      MOVE #OASDI-TIP-MAXTAX to #MaxTax
+
+      if &C.TxGrs_YTD > #MaxGross
+        move 'OASDI Tips Gross > ' to $Message
+        move #MaxGross to $MaxGross b99,999,999
+        let $Message = $Message || $MaxGross
+        do Print-Tax-Error-Line
+      end-if
+
+      if &C.Tax_YTD > #MaxTax
+        move 'OASDI Tips Tax Withheld > ' to $Message
+        move #MaxTax to $MaxTax b99,999,999.99
+        let $Message = $Message || $MaxTax
+        do Print-Tax-Error-Line
+      end-if
+
+!      let #CalcTax = &C.TxGrs_YTD * #TaxRt
+!      if (#CalcTax - &C.Tax_YTD) > 0.01 OR (#CalcTax - &C.Tax_YTD) < -0.01
+!        move 'OASDI Tips Calc Tax <> Tax Balance' to $Message
+!        do Print-Tax-Error-Line
+!      end-if
+     end-if
+
+     break
+    when = 'J'  !OASDI TIPS ER For checking calculated tax only
+
+!  THIS CODE DEPENDS ON EE RATE being equal to ER RATE!!!
+      if rtrim(&C.State, ' ') = '$U'  OR  rtrim(&C.State, ' ') = '$UGU' OR  rtrim(&C.State, ' ') = '$UPR'
+                                      OR  rtrim(&C.State, ' ') = '$UVI' OR  rtrim(&C.State, ' ') = '$UAS'
+
+        MOVE #OASDI-TIP-TAXRT to #TaxRt
+        MOVE #OASDI-TIP-MAXGROSS to #MaxGross
+        MOVE #OASDI-TIP-MAXTAX to #MaxTax
+
+        let #CalcTax = &C.TxGrs_YTD * #TaxRt
+        if (#CalcTax - &C.Tax_YTD) > 0.01 OR (#CalcTax - &C.Tax_YTD) < -0.01
+          move 'OASDI Tips Calc Tax <> Tax Balance' to $Message
+          do Print-Tax-Error-Line
+        end-if
+      end-if
+      break
+    when = 'T'  !FICA Medicare Tips - Employee
+
+      move &C.TxGrs_YTD to #MedicareGrossTips
+
+      MOVE #MED-TIP-TAXRT to #TaxRt
+      MOVE #MED-TIP-MAXGROSS to #MaxGross
+      MOVE #MED-TIP-MAXTAX to #MaxTax
+
+      if &C.TxGrs_YTD > #MaxGross
+        move 'Medicare Tips Gross > ' to $Message
+        move #MaxGross to $MaxGross b99,999,999
+        let $Message = $Message || $MaxGross
+        do Print-Tax-Error-Line
+      end-if
+
+      if &C.Tax_YTD > #MaxTax
+        move 'Medicare Tips Tax Withheld > ' to $Message
+        move #MaxTax to $MaxTax b99,999,999.99
+        let $Message = $Message || $MaxTax
+        do Print-Tax-Error-Line
+      end-if
+
+!      let #CalcTax = &C.TxGrs_YTD * #TaxRt
+!      if (#CalcTax - &C.Tax_YTD) > 0.01 OR (#CalcTax - &C.Tax_YTD) < -0.01
+!        move 'Medicare Tips Calc Tax <> Tax Balance' to $Message
+!        do Print-Tax-Error-Line
+!      end-if
+       break
+    when = 'Z'  !FICA Medicare Tips ER For checking calculated tax only
+
+!  THIS CODE DEPENDS ON EE RATE being equal to ER RATE!!!
+      if rtrim(&C.State, ' ') = '$U'  OR  rtrim(&C.State, ' ') = '$UGU' OR  rtrim(&C.State, ' ') = '$UPR'
+                                      OR  rtrim(&C.State, ' ') = '$UVI' OR  rtrim(&C.State, ' ') = '$UAS'
+
+        MOVE #MED-TIP-TAXRT to #TaxRt
+        MOVE #MED-TIP-MAXGROSS to #MaxGross
+        MOVE #MED-TIP-MAXTAX to #MaxTax
+
+        let #CalcTax = &C.TxGrs_YTD * #TaxRt
+        if (#CalcTax - &C.Tax_YTD) > 0.01 OR (#CalcTax - &C.Tax_YTD) < -0.01
+          move 'Medicare Tips Calc Tax <> Tax Balance' to $Message
+          do Print-Tax-Error-Line
+        end-if
+      end-if
+
+      break
+    when = 'C'  !Earned Income Credit
+
+      if &C.Tax_YTD < #EICMax
+        move 'EIC Advance Payment Exceeds ' to $Message
+        move #EICMax to $EICMax b99,999,999.99
+        let $Message = $Message || $EICMax
+        do Print-Tax-Error-Line
+      end-if
+
+      if rtrim(&C.State, ' ') = '$UPR'
+        if &C.Tax_YTD > 0 or &C.TxGrs_YTD > 0
+           move 'EIC for Puerto Rico employee'   to $Message
+           do Print-Tax-Error-Line
+        end-if
+      else
+        if rtrim(&C.State, ' ') = '$UAS'
+          if &C.Tax_YTD > 0 or &C.TxGrs_YTD > 0
+             move 'EIC for American Samoa employee'   to $Message
+             do Print-Tax-Error-Line
+          end-if
+        end-if
+      end-if
+      break
+
+    when = '7'  !FICA Additional Medicare
+
+      move &C.TxGrs_YTD to #AddlMedicareGross
+
+      move #AddlMEDTaxRt to #TaxRt
+
+      let #CalcTax = &C.TxGrs_YTD * #TaxRt
+      if abs(#CalcTax - &C.Tax_YTD) > 0.01
+        move 'Additional Medicare Calc Tax <> Tax Balance' to $Message
+        do Print-Tax-Error-Line
+      end-if
+
+      break
+
+  end-evaluate
+end-procedure
+
+begin-procedure Print-Tax-Error-Line
+  position (+1)
+  if &C.EmplID <> $priorEmplID
+    print &C.EmplID         (+1,1)
+    print &PN.Name           (0,14,30)
+    print &D1.NATIONAL_ID   (0,45) edit xxx-xx-xxxx
+    move &C.EmplID to $priorEmplID
+  end-if
+    print &C.State            (0,57,4)
+  print &C.Locality         (0,61)
+  print &C.Work_PSD_Cd      (0,72)
+  print &C.Res_PSD_Cd       (0,79)
+  print &C.Tax_Class        (0,86)
+  do Format-Number(&C.TxGrs_YTD, $out, '99,999,999,999.99mi')
+  print $out                (0,90)
+  do Format-Number(&C.Tax_YTD,   $out, '99,999,999,999.99mi')
+  print $out                (0,109)
+  print $Message            (0,128)
+
+  move 'N' to $No-errors
+
+end-procedure
+
+begin-procedure Print-Data-Error-Line
+  position (+1)
+  if &C.EmplID <> $priorEmplID
+    print &C.EmplID         (+1,1)
+    print &PN.Name           (0,14,30)
+    print &D1.NATIONAL_ID            (0,45) edit xxx-xx-xxxx
+    move &C.EmplID to $priorEmplID
+  end-if
+  print $Message            (0,128)
+
+  move 'N' to $No-errors
+
+end-procedure
+
+begin-procedure Get-OASDI-Max
+
+begin-SELECT
+ST.TAX_RT
+ST.MAX_GROSS
+
+  move &ST.Tax_Rt    to #OASDI-TaxRt
+  move &ST.Max_Gross to #OASDI-MaxGross
+  let #MaxTax = round((&ST.Max_Gross * #OASDI-TaxRT),2)
+  move #MaxTax to $MaxTax
+  let $MaxTax = LTRIM($MaxTax, ' ')
+  move $MaxTax to #OASDI-MaxTax
+
+FROM  PS_ST_OTH_TAX_TBL ST
+WHERE ST.TAX_CLASS = 'D'
+  AND ST.STATE     = '$U'
+  AND ST.EFFDT =
+      (SELECT MAX(S.EFFDT)
+       FROM   PS_ST_OTH_TAX_TBL S
+       WHERE  S.STATE      = ST.STATE
+         AND  S.TAX_CLASS  = ST.TAX_CLASS
+         AND  S.EFFDT     <= $AsOfDate)
+end-SELECT
+end-procedure
+
+BEGIN-PROCEDURE GET-OASDI-MAX-TIPS
+
+BEGIN-SELECT  LOOPS=1
+OMT.TAX_RT
+OMT.MAX_GROSS
+
+  MOVE &OMT.TAX_RT     TO #OASDI-TIP-TAXRT
+  MOVE &OMT.MAX_GROSS  TO #OASDI-TIP-MAXGROSS
+  LET  #MAXTAX         =  ROUND((&OMT.MAX_GROSS * #OASDI-TIP-TAXRT),2)
+  MOVE #MAXTAX         TO $MAXTAX
+  LET  $MAXTAX         =  LTRIM($MAXTAX, ' ')
+  MOVE $MAXTAX         TO #OASDI-TIP-MAXTAX
+
+FROM
+      PS_ST_OTH_TAX_TBL OMT
+
+WHERE
+      OMT.TAX_CLASS = 'G'
+  AND OMT.STATE     = '$U'
+  AND OMT.EFFDT =
+      (SELECT MAX(OMT1.EFFDT)
+       FROM   PS_ST_OTH_TAX_TBL OMT1
+       WHERE  OMT1.STATE      = OMT.STATE
+         AND  OMT1.TAX_CLASS  = OMT.TAX_CLASS
+         AND  OMT1.EFFDT     <= $AsOfDate)
+
+END-SELECT
+
+END-PROCEDURE    ! GET-OASDI-MAX-TIPS
+
+BEGIN-PROCEDURE GET-MEDICARE-MAX-TIPS
+
+BEGIN-SELECT  LOOPS=1
+FMT.TAX_RT
+FMT.MAX_GROSS
+
+  MOVE &FMT.TAX_RT     TO #MED-TIP-TAXRT
+  MOVE &FMT.MAX_GROSS  TO #MED-TIP-MAXGROSS
+  LET  #MAXTAX         =  ROUND((&FMT.MAX_GROSS * #MED-TIP-TAXRT),2)
+  MOVE #MAXTAX         TO $MAXTAX
+  LET  $MAXTAX         =  LTRIM($MAXTAX, ' ')
+  MOVE $MAXTAX         TO #MED-TIP-MAXTAX
+
+FROM
+      PS_ST_OTH_TAX_TBL FMT
+
+WHERE
+      FMT.TAX_CLASS = 'T'
+  AND FMT.STATE     = '$U'
+  AND FMT.EFFDT =
+      (SELECT MAX(FMT1.EFFDT)
+       FROM   PS_ST_OTH_TAX_TBL FMT1
+       WHERE  FMT1.STATE      = FMT.STATE
+         AND  FMT1.TAX_CLASS  = FMT.TAX_CLASS
+         AND  FMT1.EFFDT     <= $AsOfDate)
+
+END-SELECT
+
+END-PROCEDURE    ! GET-MEDICARE-MAX-TIPS
+
+
+
+begin-procedure Get-Medicare-Max
+
+begin-SELECT
+OT.TAX_RT
+OT.MAX_GROSS
+
+  move &OT.Tax_Rt    to #MED-TaxRt
+  move &OT.Max_Gross to #MED-MaxGross
+  let #MaxTax = round((&OT.Max_Gross * #MED-TaxRT),2)
+  move #MaxTax to $MaxTax
+  let $MaxTax = LTRIM($MaxTax, ' ')
+  move $MaxTax to #MED-MaxTax
+
+FROM  PS_ST_OTH_TAX_TBL OT
+WHERE OT.TAX_CLASS = 'F'
+  AND OT.STATE     = '$U'
+  AND OT.EFFDT =
+      (SELECT MAX(O.EFFDT)
+       FROM   PS_ST_OTH_TAX_TBL O
+       WHERE  O.STATE      = OT.STATE
+         AND  O.TAX_CLASS  = OT.TAX_CLASS
+         AND  O.EFFDT     <= $AsOfDate)
+end-SELECT
+
+!  Additional Medicare Tax
+
+begin-SELECT
+AM.TAX_RT
+AM.MAX_GROSS
+
+  move &AM.Tax_Rt    to #AddlMEDTaxRt
+
+FROM  PS_ST_OTH_TAX_TBL AM
+WHERE AM.TAX_CLASS = '7'
+  AND AM.STATE     = '$U'
+  AND AM.EFFDT =
+      (SELECT MAX(AM1.EFFDT)
+       FROM   PS_ST_OTH_TAX_TBL AM1
+       WHERE  AM1.STATE      = AM.STATE
+         AND  AM1.TAX_CLASS  = AM.TAX_CLASS
+         AND  AM1.EFFDT     <= $AsOfDate)
+end-SELECT
+end-procedure
+
+begin-procedure Get-EIC-Max
+begin-SELECT
+TT.SPECIAL_AMT_2
+
+  let #EICMax = (&TT.Special_Amt_2 * -1)
+
+FROM  PS_STATE_TAX_TBL TT
+WHERE TT.STATE     = '$E'
+  AND TT.EFFDT =
+      (SELECT MAX(T.EFFDT)
+       FROM   PS_STATE_TAX_TBL T
+       WHERE  T.STATE      = '$E'
+         AND  T.EFFDT     <= $AsOfDate)
+end-SELECT
+end-procedure
+
+begin-procedure End-Report-Msg
+
+do No-errors
+
+position (+3)
+move 'End of TAX900 Report' to $endmessage
+print $endmessage (0,14)
+end-procedure
+
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'taxrnctl.sqc'  !Get-Tax-Reporting-Run-Controls procedure
+#Include 'getcodta.sqc'  !Get-Company-Data procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'stdapi.sqc'    !Update Process API
+#Include 'getbalid.sqc'  !Get-Calendar-Year-Id
+

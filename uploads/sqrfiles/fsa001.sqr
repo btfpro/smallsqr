@@ -1,0 +1,1757 @@
+!***********************************************************************
+!  FSA001:  Flexible Spending Account Claim Payment Module             *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+!                                                                      *
+! This module contains confidential and proprietary information        *
+! of Oracle; it is not to be copied, reproduced, or transmitted        *
+! in any form, by any means, in whole or in part, nor is it to         *
+! be used for any purpose other than that for which it is              *
+! expressly provided under the applicable license agreement.           *
+!                                                                      *
+! Copyright (C) 2006 Oracle. All Rights Reserved.                      *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+!          $Date:  2006/10/17:03:01:48                                 
+!       $Release:  HR9                                                 
+!      $Revision:  107                                                 
+!                                                                      *
+!***********************************************************************
+!Added the following debug type statements to source - these
+!statements can be activated by adding the -debugFD  parameter
+!when kicking off FSA001.SQU from SQRW.
+!
+!   #ifdef debugF
+!     print 'FLOW : Process-Main                ' (+1,1)
+!   #end-if
+!
+!   #ifdef debugD
+!     print 'DATA : Handle Emplid - Read     =  ' (+1,1)
+!     print $current_emplid                       (0,+1)
+!   #end-if
+!
+!***********************************************************************
+!
+!This program accomplishes the following:
+!  1.  Process PS_FSA_RunCtl by Form_ID, only if the FSA_Run_Status for
+!      the run control is 'R' for Ready, or 'C' for Calculated.  This
+!      program may be run multiple times to reflect amounts approved before
+!      the payments are processed by FSA003.
+!  2.  Using the FSA_Run_ID on the each of the run control, the program will
+!      locate matching values in one or more PS_Ben_Defn_Pgm and process
+!      the resulting programs in groups.
+!  3.  Using the Calendar_Year in the run control, the program will retrieve
+!      and process all the claims for that year.
+!  4.  Upon completion of the "calling" program, the run control status is
+!      updated to "C" for calculated.
+!
+!This program acts on all claims with FSA_Claim_Status of "S" (Submitted)
+!and "P" (Pended).  All claims submitted will initially have a status of 'S'.
+!
+!A Dependent Care claim will be in "P" status if there were
+!insufficient YTD employee and employer contributions available to cover
+!the entire approved claim amount.  Health Care claims will not be assigned
+!a "P" status since the claim amount will be approved as long as it does
+!not exceed the Annual Pledge amount.
+!
+!Claim status will be set to "R" (Ready for Payment) if the original status
+!was "S" or "P' and there is sufficient funds to pay all or part of the
+!claim.  FSA003 (FSA Check Print) will process all payment records flagged
+!to "R".
+!
+!We will process claims one control group at a time, committing approved
+!amounts for later payment.  We'll only pick claims for participants with
+!an "Active" FSA Benefit account.
+!
+!Once we've approved all the claim amounts appropriate to this run, we'll
+!then process the claims for payment.  All the claims for one participant
+!will be grouped by calendar year and plan type (i.e., Health Care and
+!Dependent Day Care) which could result in four separate checks
+!during one run of this program.  For example, if the participant submitted,
+!during early 1993, three 1992 Health Care claims, three 1992 Dependent Day
+!Care claims, and four 1993 Health Care claims, he would (assuming all
+!other conditions are met) receive three separate checks for the ten
+!claims being paid.
+!
+!For a check to be prepared, the total of all claims for a particular
+!calendar year and plan type must equal or exceed the "Minimum Check Amount"
+!specified by the customer in PS_Ben_Defn_Pgm -- there can be different
+!minimums for the calendar years.  Further, for Plan_Type "61"
+!(Dependent Day Care), there must have been sufficient contributions
+!to the participant's account -- after subtracting the YTD claim payments
+!made so far -- to reach the "Minimum Check Amount".  A check is also
+!prepared even if the total claims may not reach the minimum check amount
+!but the claims causes the available funds to be reduced to 0.
+!
+!Each payment/check can represent payment to one or more claim.  In addition,
+!for Dependent Care, each claim can be paid by multiple checks. For example,
+!an employee has pledged $2000 and has contributed $300 to date.
+!If a claim of $500 was submitted, only $300 will be paid with $200
+!pended.  This amount could be paid by a subsequent check as long as the
+!employee has contributed another $200 to the Dependent Care Account.
+!
+!FSA_PAYMENT represents each check issued to an employee.  FSA_PAYMNT_CLAIM
+!represents the claims and the portion of each claim amount that were paid
+!with each check.
+!***********************************************************************
+
+#Include 'setenv.sqc'  !Set Database Environment
+
+!#define DebugS Y
+!#define DebugD Y
+!#define DebugF Y
+
+
+begin-setup
+
+#Include 'ptpsp125.sqc'
+
+Declare-Variable
+  Decimal #ApprovedAmt(38)
+  Decimal #AprBalance(38)
+  Decimal #ClaimPayment(38)
+  Decimal #CheckAmt(38)
+End-Declare
+
+End-setup
+
+
+begin-program
+  do Init-Report
+  do Process-Main
+  do StdAPI-Term
+end-program
+
+
+!***********************************************************************
+! PROCEDURE: Init-Report                                               *
+!***********************************************************************
+begin-procedure Init-Report
+
+  do Init-DateTime
+  do Init-Number
+
+  move 'FSA001' to $ReportID
+  move 'FSA Claim Payment Module' to $ReportTitle
+  display $ReportTitle
+  display ''
+  move ' ' to $FormID
+  move -1 to #PAYCHECK_NBR
+  do StdAPI-Init
+end-procedure
+
+
+!***********************************************************************
+! PROCEDURE: Process-Main                                              *
+!***********************************************************************
+begin-procedure Process-Main
+
+#ifdef debugF
+  print 'FLOW : Process-Main                      ' (+1,1)
+#end-if
+
+begin-SELECT
+A.FORM_ID () on-break print=never after=Form-Change save=$FormID
+A.LAST_FORM_USED,
+B.CALENDAR_YEAR,
+B.FSA_RUN_ID,
+B.CHECK_DT
+
+  move &B.Calendar_Year to $tmp
+  let $in = $tmp || '0101'
+  do Format-DateTime($in, $YearBegin, {DEFCMP},'','native')
+
+  let $in = $tmp || '1231'
+  do Format-DateTime($in, $YearEnd, {DEFCMP},'','native')
+
+  move &B.Calendar_Year to #Year
+  move &A.Form_Id to $Form-Id
+  move &A.Last_Form_Used to $Last-Form-Used
+  move &B.FSA_Run_Id to $FSA-Run-Id
+  move &B.Check_Dt to $Check-Dt
+
+  #ifdef debugD
+    print 'DATA : '         (+1,1)
+    print &a.form_id        (0,+2)
+    print #Year  (0,+2)
+    print &b.fsa_run_id     (0,+2)
+    print &b.check_dt       (0,+2)
+    print $yearbegin        (0,+2)
+    print $yearend          (0,+2)
+  #end-if
+  do Retrieve-Benefit-Table-Records
+
+FROM  PS_PAY_FORM_TBL A,
+      PS_FSA_RUNCTL   B
+WHERE B.FORM_ID         = A.FORM_ID
+  AND B.FSA_RUN_STATUS  IN ('R','C') !Ready or Calculated
+ORDER BY A.FORM_ID,
+         B.CALENDAR_YEAR,
+         B.FSA_RUN_ID
+end-SELECT
+
+let $sql-statement = 'FSA001.SQR,Process-Main,FSA_CLAIM,Update'
+begin-SQL on-error=SQL-Error
+UPDATE PS_FSA_CLAIM
+   SET FSA_CLAIM_STATUS = 'P'    !Pending
+ WHERE FSA_CLAIM_STATUS = 'R'
+end-SQL
+
+let $sql-statement = 'FSA001.SQU,Process-Main,FSA_RunCtl,Update'
+begin-SQL on-error=SQL-Error
+UPDATE PS_FSA_RUNCTL
+   SET FSA_RUN_STATUS = 'C'
+ WHERE FSA_RUN_STATUS IN ('R','C')
+end-SQL
+
+end-procedure
+
+
+!***********************************************************************
+! PROCEDURE: Retrieve-Benefit-Table-Records                            *
+!***********************************************************************
+begin-procedure Retrieve-Benefit-Table-Records
+
+#ifdef debugF
+  print 'FLOW : Retrieve-Benefit-Table-Records->Entry '   (+2,1)
+#end-if
+
+begin-SELECT
+C.BENEFIT_PROGRAM,
+O.FSA_MIN_CHECK_AMT,
+D.PLAN_TYPE,
+D.BENEFIT_PLAN,
+O.SETID,
+O.BALANCE_ID,
+O.SRVC_DT_FROM,
+O.SRVC_DT_THRU
+
+  move &O.FSA_MIN_CHECK_AMT to #Min-Check-Amt
+  #ifdef debugD
+    print 'FLOW : Retrieve-Benefit-Table-Records ->NxtPgm/PlnTyp' (+2,1)
+    print '       ==============================================' (+1,1)
+    print 'DATA : '            (+1,1)
+    print &c.benefit_program   (0,+2)
+    print &O.FSA_MIN_CHECK_AMT (0,+2)
+    print &d.plan_type         (0,+2)
+    print $Benefit-Plan      (0,+2)
+  #end-if
+
+  move &D.BENEFIT_PLAN to $Benefit-Plan
+
+  do Get-BalanceID-Date-Range
+  do Program-Process
+
+FROM  PS_BEN_DEFN_PGM    C,
+      PS_BEN_DEFN_OPTN   D,
+      PS_FSA_BENEF_TBL   O
+WHERE C.EFFDT =
+      (SELECT MAX(C1.EFFDT)
+       FROM   PS_BEN_DEFN_PGM C1
+       WHERE  C1.BENEFIT_PROGRAM = C.BENEFIT_PROGRAM
+         AND  C1.EFFDT          <= $YearEnd)
+  AND C.EFF_STATUS      = 'A'
+  AND C.FSA_RUN_ID      = $FSA-Run-ID
+  AND D.BENEFIT_PROGRAM = C.BENEFIT_PROGRAM
+  AND D.EFFDT           = C.EFFDT
+  AND D.PLAN_TYPE    LIKE '6%'
+  AND D.OPTION_TYPE     = 'O'
+  AND O.PLAN_TYPE = D.PLAN_TYPE
+  AND O.BENEFIT_PLAN = D.BENEFIT_PLAN
+  AND O.EFFDT =
+      (SELECT MAX(EFFDT)
+       FROM   PS_FSA_BENEF_TBL
+       WHERE  PLAN_TYPE    = O.PLAN_TYPE
+         AND  BENEFIT_PLAN = O.BENEFIT_PLAN
+         AND  EFFDT       <= $YearEnd)
+ORDER BY C.BENEFIT_PROGRAM,
+         D.PLAN_TYPE,
+         D.BENEFIT_PLAN
+end-SELECT
+
+end-procedure
+
+
+!***********************************************************************
+! PROCEDURE: Form-Change                                               *
+!***********************************************************************
+begin-procedure Form-Change
+
+  if (#PAYCHECK_NBR <> -1)
+    let $sql-statement = 'FSA001.SQU,Form-Change,Pay_Form_Tbl,Update'
+    begin-SQL on-error=SQL-Error
+    UPDATE PS_PAY_FORM_TBL
+      SET LAST_FORM_USED = #PAYCHECK_NBR
+    WHERE FORM_ID = $Form-Id
+    end-SQL
+  end-if
+
+  move &A.LAST_FORM_USED to #PAYCHECK_NBR
+
+end-procedure
+
+
+!**********************************************************************
+begin-procedure Get-BalanceID-Date-Range
+!**********************************************************************
+
+begin-SELECT
+MIN(P.BEGIN_DT)      &BeginDt,
+MAX(P.END_DT)        &EndDt,
+
+  let $YearBegin = &BeginDt
+  let $YearEnd = &EndDt
+
+FROM  PS_BALANCE_ID_DEF P
+WHERE P.SETID = &O.Setid
+  AND P.BALANCE_ID = &O.Balance_ID
+  AND P.BALANCE_YEAR = #Year
+end-SELECT
+
+end-procedure
+
+
+!***********************************************************************
+! PROCEDURE: Program-Process                                           *
+!***********************************************************************
+begin-procedure Program-Process
+
+#ifdef debugF
+  print 'FLOW : Program-Process'            (+1,1)
+#end-if
+
+  if #PAYCHECK_NBR = -1
+    move $Last-Form-Used to #PAYCHECK_NBR
+  end-if
+
+  do Check-Claim-Plans
+
+  do Commit-Approved-Amounts
+  do Process-Claim-Payments
+  if $Full-Amt-Paid = 'N'
+    do Check-Denied-Claims
+  end-if
+
+end-procedure
+
+!***********************************************************************
+! PROCEDURE: Check-Claim-Plans                                         *
+!***********************************************************************
+begin-procedure Check-Claim-Plans
+
+#ifdef debugF
+  print 'FLOW : Check-Claim-Plans -> Entry'    (+1,1)
+#end-if
+
+begin-SELECT
+AB.EMPLID,
+AB.EMPL_RCD,
+AB.SVC_FROM_DT,
+AB.BENEFIT_PLAN,
+AB.CLAIMID
+
+  #ifdef debugD
+    print 'FLOW : Check-Claim-Plans -> NxtLoop'    (+2,1)
+    print '       =================================='    (+1,1)
+    print 'DATA : '               (+1,1)
+    print &AB.emplid               (0,+1)
+    print &SumAprAmts             (0,+1)
+    print &SumSubAmts             (0,+1)
+    print '<-EE ID,Sum Appr & Sub Amts' (0,+1)
+  #end-if
+
+    do Get-Change-FSA-YTD-Amounts
+
+
+  if &BC.Annual_Pledge <> 0
+  if &BC.Annual_Pledge <> &CD.FSA_Apr_Amt_Ytd
+  do Update-Claim-Plan
+  end-if
+  end-if
+
+FROM  PS_FSA_CLAIM       AB,
+      PS_FSA_BENEFIT     K,
+      PS_BEN_PROG_PARTIC L
+WHERE AB.FSA_CLAIM_STATUS = 'S'  !Submitted
+  AND AB.PLAN_TYPE        = &D.Plan_Type
+  AND AB.SVC_FROM_DT BETWEEN $YearBegin AND &O.SRVC_DT_THRU
+  AND K.EMPLID           = AB.EMPLID
+  AND K.EMPL_RCD        = AB.EMPL_RCD
+  AND K.BENEFIT_NBR     = AB.BENEFIT_NBR
+  AND K.COBRA_EVENT_ID   = 0
+  AND K.PLAN_TYPE        = AB.PLAN_TYPE
+!  AND K.BENEFIT_PLAN     = AB.BENEFIT_PLAN
+  AND K.COVERAGE_ELECT = 'E'
+  AND K.EFFDT =
+      (SELECT MIN(K1.EFFDT)
+       FROM   PS_FSA_BENEFIT K1
+       WHERE  K1.EMPLID         = K.EMPLID
+         AND  K1.EMPL_RCD      = K.EMPL_RCD
+         AND  K1.COBRA_EVENT_ID = K.COBRA_EVENT_ID
+         AND  K1.PLAN_TYPE      = K.PLAN_TYPE
+         AND  K1.BENEFIT_PLAN   = K.BENEFIT_PLAN
+         AND  K1.COVERAGE_BEGIN_DT BETWEEN $YearBegin AND &O.SRVC_DT_THRU)
+         AND (K.FSA_ACCT_STATUS = 'A'
+         OR  (K.FSA_ACCT_STATUS = 'I'
+         AND   K.COVERAGE_END_DT IS NOT NULL))
+  AND L.EMPLID           = AB.EMPLID
+  AND L.COBRA_EVENT_ID   = 0
+  AND L.EMPL_RCD        = AB.EMPL_RCD
+  AND L.BENEFIT_PROGRAM  = &C.Benefit_Program
+  AND L.EFFDT =
+      (SELECT MAX(L1.EFFDT)
+       FROM   PS_BEN_PROG_PARTIC L1
+       WHERE  L1.EMPLID          = L.EMPLID
+         AND  L1.COBRA_EVENT_ID = L.COBRA_EVENT_ID
+         AND  L1.EMPL_RCD       = L.EMPL_RCD
+         AND  L1.EFFDT          <= AB.SVC_FROM_DT)
+GROUP BY AB.EMPLID,
+         AB.EMPL_RCD,
+         AB.SVC_FROM_DT,
+         AB.BENEFIT_PLAN,
+         AB.CLAIMID
+end-SELECT
+
+end-procedure
+
+!***********************************************************************
+! PROCEDURE: Get-Change-FSA-YTD-Amounts                                *
+!***********************************************************************
+begin-procedure Get-Change-FSA-YTD-Amounts
+
+  let $Stop-Processing-Claim = 'N'
+  let $Plan = ''
+#ifdef debugF
+  print 'FLOW : Get-Change-FSA-YTD-Amounts '    (+1,1)
+#end-if
+
+begin-SELECT
+BC.EFFDT,
+BC.ANNUAL_PLEDGE,
+BC.BENEFIT_PLAN,
+CD.FSA_APR_AMT_YTD
+
+  move &BC.BENEFIT_PLAN to $Plan
+  let $FirstClaim = 'N'
+  #ifdef debugD
+    print 'DATA : '            (+1,1)
+    print &bc.effdt             (0,+2)
+    print &bc.annual_pledge     (0,+2)
+    print &cd.fsa_apr_amt_ytd   (0,+2)
+    print #AprBalance          (0,+2)
+    print '<-AnnPldg,ApprYTD,Avail' (0,+1)
+  #end-if
+
+FROM  PS_FSA_BENEFIT BC,
+      PS_FSA_SUMMARY CD
+WHERE BC.EMPLID         = &AB.Emplid
+AND   BC.EMPL_RCD      = &AB.EMPL_RCD
+AND   BC.COBRA_EVENT_ID = 0
+AND   BC.PLAN_TYPE      = &D.Plan_Type
+AND   BC.EFFDT =
+      (SELECT MIN(H1.EFFDT)
+       FROM   PS_FSA_BENEFIT H1
+       WHERE  H1.EMPLID         = BC.EMPLID
+         AND  H1.EMPL_RCD      = BC.EMPL_RCD
+         AND  H1.COBRA_EVENT_ID = BC.COBRA_EVENT_ID
+         AND  H1.PLAN_TYPE      = BC.PLAN_TYPE
+         AND  H1.COVERAGE_ELECT = 'E'
+         AND  H1.COVERAGE_BEGIN_DT BETWEEN $YearBegin AND &O.SRVC_DT_THRU
+         AND  H1.EFFDT = (SELECT MAX(H2.EFFDT)
+                          FROM   PS_FSA_BENEFIT H2
+                          WHERE H2.EMPLID         = H1.EMPLID
+                           AND  H2.EMPL_RCD      = H1.EMPL_RCD
+                           AND  H2.COBRA_EVENT_ID = H1.COBRA_EVENT_ID
+                           AND  H2.PLAN_TYPE      = H1.PLAN_TYPE
+                           AND  H2.COVERAGE_ELECT = 'E'
+                           AND  H2.COVERAGE_BEGIN_DT BETWEEN $YearBegin AND $YearEnd))
+AND   CD.EMPLID       = BC.EMPLID
+AND   CD.PLAN_TYPE    = BC.PLAN_TYPE
+AND   CD.BALANCE_YEAR = #Year
+end-SELECT
+
+end-procedure
+
+!***********************************************************************
+! PROCEDURE: Update-Claim-Plan                                         *
+!***********************************************************************
+begin-procedure Update-Claim-Plan
+
+    let $sql-statement = 'FSA001.SQU,Update-Claim-Plan,FSA_Claim,Update'
+    begin-SQL on-error=SQL-Error
+    UPDATE PS_FSA_CLAIM
+      SET BENEFIT_PLAN = &BC.BENEFIT_PLAN
+    WHERE CLAIMID = &AB.CLAIMID
+      AND EMPLID = &AB.EMPLID
+      AND EMPL_RCD = &AB.EMPL_RCD
+      AND SVC_FROM_DT = &AB.SVC_FROM_DT
+      AND BENEFIT_PLAN = &AB.BENEFIT_PLAN
+    end-SQL
+
+begin-SELECT
+Z.EMPLID,
+Z.EMPL_RCD,
+Z.BENEFIT_PLAN,
+Z.CLAIMID
+
+  move &Z.Benefit_Plan to $Benefit-Plan
+
+FROM PS_FSA_CLAIM Z
+WHERE Z.CLAIMID = &AB.CLAIMID
+end-select
+
+begin-SELECT
+A.FSA_MIN_CHECK_AMT
+
+  move &A.FSA_MIN_CHECK_AMT to #Min-Check-Amt
+
+FROM  PS_FSA_BENEF_TBL   A
+WHERE A.PLAN_TYPE = &D.Plan_Type
+  AND A.BENEFIT_PLAN = $Benefit-Plan
+  AND A.EFFDT =
+      (SELECT MAX(EFFDT)
+       FROM   PS_FSA_BENEF_TBL
+       WHERE  PLAN_TYPE    = A.PLAN_TYPE
+         AND  BENEFIT_PLAN = A.BENEFIT_PLAN
+         AND  EFFDT       <= $YearEnd)
+end-SELECT
+
+
+end-procedure
+
+
+
+
+!***********************************************************************
+! PROCEDURE: Commit-Approved-Amounts                                   *
+!***********************************************************************
+begin-procedure Commit-Approved-Amounts
+
+  let $Full-Amt-Paid = 'Y'
+
+#ifdef debugF
+  print 'FLOW : Commit-Approved-Amounts -> Entry'    (+1,1)
+#end-if
+
+begin-SELECT
+J.EMPLID,
+J.EMPL_RCD,
+J.SVC_FROM_DT,
+J.BENEFIT_PLAN,
+J.CLAIMID
+
+
+#ifdef DB2ALL
+DECIMAL(SUM(J.FSA_CLAIM_APR_AMT),15,3) &SumAprAmts
+DECIMAL(SUM(J.FSA_CLAIM_SUB_AMT),15,3) &SumSubAmts
+#else
+SUM(J.FSA_CLAIM_APR_AMT)  &SumAprAmts
+SUM(J.FSA_CLAIM_SUB_AMT)  &SumSubAmts
+#endif
+
+  #ifdef debugD
+    print 'FLOW : Commit-Approved-Amounts -> NxtLoop'    (+2,1)
+    print '       =================================='    (+1,1)
+    print 'DATA : '               (+1,1)
+    print &j.emplid               (0,+1)
+    print &SumAprAmts             (0,+1)
+    print &SumSubAmts             (0,+1)
+    print '<-EE ID,Sum Appr & Sub Amts' (0,+1)
+  #end-if
+
+    do Get-FSA-YTD-Amounts
+
+  let $From-Denied-Claims = 'N'
+
+  do Check-Other-Enrollments1
+
+  if $Stop-Processing-Claim = 'Y' and $No-Other-Enrollments = 'N'
+
+  do Check-Other-Enrollments
+  else
+  if &H.ANNUAL_PLEDGE <> 0
+  if #AprBalance < &SumAprAmts
+!*********************************************************************
+! To implement Health Care Pend Processing Use:   !HC-Pend           *
+! move &SumAprAmts to #ApprovedAmt                !HC-Pend           *
+!*********************************************************************
+    move #AprBalance to #ApprovedAmt
+    #ifdef debugD
+      print 'DATA : '               (+1,1)
+      print #ApprovedAmt            (0,+2)
+      print '<-SumApr Gt Available' (0,+2)
+    #end-if
+    do Process-Individual-Claims
+    let $Full-Amt-Paid = 'N'
+  else
+    move &SumAprAmts to #ApprovedAmt
+    #ifdef debugD
+      print 'DATA : '               (+1,1)
+      print #ApprovedAmt            (0,+2)
+      print '<-SumApr Lt Available' (0,+2)
+    #end-if
+  end-if
+    do Update-FSA-Status-Ready
+    do Update-FSA-Summary-Record
+  end-if
+  end-if
+
+FROM  PS_FSA_CLAIM       J,
+      PS_FSA_BENEFIT     K,
+      PS_BEN_PROG_PARTIC L
+WHERE J.FSA_CLAIM_STATUS = 'S'  !Submitted
+  AND J.PLAN_TYPE        = &D.Plan_Type
+  AND J.SVC_FROM_DT BETWEEN $YearBegin AND &O.SRVC_DT_THRU
+  AND J.EMPLID          = K.EMPLID
+  AND J.EMPL_RCD        = K.EMPL_RCD
+  AND J.BENEFIT_NBR     = K.BENEFIT_NBR
+  AND J.PLAN_TYPE       = K.PLAN_TYPE
+  AND J.BENEFIT_PLAN    = K.BENEFIT_PLAN
+  AND K.COBRA_EVENT_ID  = 0
+  AND K.EFFDT =
+      (SELECT MAX(K1.EFFDT)
+       FROM   PS_FSA_BENEFIT K1
+       WHERE  K1.EMPLID         = K.EMPLID
+         AND  K1.EMPL_RCD      = K.EMPL_RCD
+         AND  K1.COBRA_EVENT_ID = K.COBRA_EVENT_ID
+         AND  K1.PLAN_TYPE      = K.PLAN_TYPE
+         AND  K1.BENEFIT_PLAN   = K.BENEFIT_PLAN
+         AND  K1.COVERAGE_BEGIN_DT BETWEEN $YearBegin AND $YearEnd)
+         AND (K.FSA_ACCT_STATUS = 'A'
+         OR  (K.FSA_ACCT_STATUS = 'I'
+         AND   K.COVERAGE_END_DT IS NOT NULL))
+  AND L.EMPLID           = J.EMPLID
+  AND L.COBRA_EVENT_ID   = 0
+  AND L.EMPL_RCD        = J.EMPL_RCD
+  AND L.BENEFIT_PROGRAM  = &C.BENEFIT_PROGRAM
+  AND L.EFFDT =
+      (SELECT MAX(L1.EFFDT)
+       FROM   PS_BEN_PROG_PARTIC L1
+       WHERE  L1.EMPLID          = L.EMPLID
+         AND  L1.COBRA_EVENT_ID = L.COBRA_EVENT_ID
+         AND  L1.EMPL_RCD       = L.EMPL_RCD
+         AND  L1.EFFDT          <= J.SVC_FROM_DT)
+GROUP BY J.EMPLID,
+         J.EMPL_RCD,
+         J.SVC_FROM_DT,
+         J.BENEFIT_PLAN,
+         J.CLAIMID
+end-SELECT
+
+end-procedure
+
+!***********************************************************************
+! PROCEDURE: Get-FSA-YTD-Amounts                                       *
+!***********************************************************************
+begin-procedure Get-FSA-YTD-Amounts
+
+  let $Stop-Processing-Claim = 'N'
+
+#ifdef debugF
+  print 'FLOW : Get-FSA-YTD-Amounts '    (+1,1)
+#end-if
+
+begin-SELECT
+H.EFFDT,
+H.ANNUAL_PLEDGE,
+H.BENEFIT_PLAN,
+T.FSA_APR_AMT_YTD
+
+  let $FirstClaim = 'N'
+
+  if &H.Annual_Pledge = &T.FSA_Apr_Amt_Ytd
+    let $Stop-Processing-Claim = 'Y'
+  end-if
+  !Future: Add Employer-Match into #AprBalance...
+  let #AprBalance = &H.Annual_Pledge - &T.FSA_Apr_Amt_YTD
+  if #AprBalance < 0
+     let #AprBalance = 0
+  end-if
+
+  #ifdef debugD
+    print 'DATA : '            (+1,1)
+    print &h.effdt             (0,+2)
+    print &h.annual_pledge     (0,+2)
+    print &t.fsa_apr_amt_ytd   (0,+2)
+    print #AprBalance          (0,+2)
+    print '<-AnnPldg,ApprYTD,Avail' (0,+1)
+  #end-if
+
+FROM  PS_FSA_BENEFIT H,
+      PS_FSA_SUMMARY T
+WHERE H.EMPLID         = &J.Emplid
+AND   H.EMPL_RCD      = &J.EMPL_RCD
+AND   H.COBRA_EVENT_ID = 0
+AND   H.PLAN_TYPE      = &D.Plan_Type
+AND   H.EFFDT =
+      (SELECT MIN(H1.EFFDT)
+       FROM   PS_FSA_BENEFIT H1
+       WHERE  H1.EMPLID         = H.EMPLID
+         AND  H1.EMPL_RCD      = H.EMPL_RCD
+         AND  H1.COBRA_EVENT_ID = H.COBRA_EVENT_ID
+         AND  H1.PLAN_TYPE      = H.PLAN_TYPE
+         AND  H1.COVERAGE_ELECT = 'E'
+         AND  H1.COVERAGE_BEGIN_DT BETWEEN $YearBegin AND &O.SRVC_DT_THRU
+         AND  H1.EFFDT = (SELECT MAX(H2.EFFDT)
+                          FROM   PS_FSA_BENEFIT H2
+                          WHERE H2.EMPLID         = H1.EMPLID
+                           AND  H2.EMPL_RCD      = H1.EMPL_RCD
+                           AND  H2.COBRA_EVENT_ID = H1.COBRA_EVENT_ID
+                           AND  H2.PLAN_TYPE      = H1.PLAN_TYPE
+                           AND  H2.COVERAGE_ELECT = 'E'
+                           AND  H2.COVERAGE_BEGIN_DT BETWEEN $YearBegin AND $YearEnd))
+AND   T.EMPLID       = H.EMPLID
+AND   T.PLAN_TYPE    = H.PLAN_TYPE
+AND   T.BALANCE_YEAR = #Year
+end-SELECT
+
+end-procedure
+
+!***********************************************************************
+! PROCEDURE: Process-Individual-Claims                                 *
+!***********************************************************************
+begin-procedure Process-Individual-Claims
+
+#ifdef debugF
+  print 'FLOW : Process-Individual-Claims -> Entry' (+1,1)
+#end-if
+
+begin-SELECT
+M.SVC_TYPE,
+M.SVC_FROM_DT,
+M.SVC_TO_DT,
+M.FSA_CLAIM_APR_AMT,
+M.CLAIMID
+
+  #ifdef debugD
+    print 'FLOW : Process-Individual-Claims -> NxtLoop' (+2,1)
+    print '       ====================================' (+1,1)
+    print 'DATA : '            (+1,1)
+    print &j.emplid            (0,+1)
+    print &m.claimid           (0,+1)
+    print &m.svc_type          (0,+1)
+    print &m.svc_from_dt       (0,+1)
+    print &m.svc_to_dt         (0,+1)
+    print &m.fsa_claim_apr_amt (0,+1)
+    print '<-ID,Typ,Fr,To,AprAmt' (0,+1)
+  #end-if
+
+  do Analyze-Balances
+
+FROM  PS_FSA_CLAIM M,
+      PS_BEN_PROG_PARTIC N
+WHERE M.FSA_CLAIM_STATUS = 'S' !Submitted
+  AND M.EMPLID           = &J.EmplID
+  AND M.EMPL_RCD        = &J.EMPL_RCD
+  AND M.PLAN_TYPE        = &D.Plan_Type
+  AND M.BENEFIT_PLAN     = $Benefit-Plan
+  AND M.SVC_FROM_DT BETWEEN $YearBegin AND &O.SRVC_DT_THRU
+  AND N.EMPLID           = M.EMPLID
+  AND N.COBRA_EVENT_ID   = 0
+  AND N.EMPL_RCD        = M.EMPL_RCD
+  AND N.BENEFIT_PROGRAM  = &C.Benefit_Program
+  AND N.EFFDT =
+      (SELECT MAX(N1.EFFDT)
+       FROM   PS_BEN_PROG_PARTIC N1
+       WHERE  N1.EMPLID          = N.EMPLID
+         AND  N1.COBRA_EVENT_ID  = N.COBRA_EVENT_ID
+         AND  N1.EMPL_RCD       = N.EMPL_RCD
+         AND  N1.EFFDT          <= M.SVC_FROM_DT)
+ORDER BY M.SVC_FROM_DT,
+         M.SVC_TO_DT
+end-SELECT
+
+end-procedure
+
+
+!***********************************************************************
+! PROCEDURE: Analyze-Balances                                          *
+!***********************************************************************
+begin-procedure Analyze-Balances
+
+  #ifdef debugF
+    print 'FLOW : Analyze-Balances ' (+1,1)
+  #end-if
+
+  #ifdef debugD
+    print 'DATA : '            (+1,1)
+    print &j.emplid            (0,+1)
+    print &m.claimid           (0,+1)
+    print &m.svc_type          (0,+1)
+    print &m.svc_from_dt       (0,+1)
+    print &m.svc_to_dt         (0,+1)
+    print &m.fsa_claim_apr_amt (0,+1)
+    print '<-ID,Typ,Fr,To,AprAmt' (0,+1)
+  #end-if
+
+  if &M.FSA_Claim_Apr_Amt <= #AprBalance
+    subtract &M.FSA_Claim_Apr_Amt from #AprBalance
+    #ifdef debugD
+      print 'DATA : '            (+1,1)
+      print 'Pay full claim amt' (0,+2)
+      print &m.fsa_claim_apr_amt (0,+2)
+      print #AprBalance          (0,+2)
+      print '<-AprAmt,AvailBal'  (0,+1)
+    #end-if
+  else
+
+    #ifdef debugD
+      print 'DATA : '            (+1,1)
+      print 'Deny claim in xs of current approved balance & ' (0,+2)
+      print '          Set ST=J reject if total claim denied' (+1,1)
+    #end-if
+
+    do PS_SQR_Round(#AprBalance, 2, #AprBalance)
+
+    let $sql-statement = 'FSA001.SQU,Analyze-Balances,FSA_Claim,Update'
+    begin-SQL on-error=SQL-Error
+    UPDATE PS_FSA_CLAIM
+       SET FSA_CLAIM_DENY_AMT =
+           FSA_CLAIM_DENY_AMT + FSA_CLAIM_APR_AMT - #AprBalance,
+!*********************************************************************
+! To implement Health Care Pend Processing Use:   !HC-Pend
+!          FSA_Claim_Deny_Rsn = 'P',              !HC-Pend
+!          FSA_Claim_Apr_Amt  = FSA_Claim_Apr_Amt !HC-Pend
+!*********************************************************************
+           FSA_CLAIM_DENY_RSN = 'X',
+           FSA_CLAIM_APR_AMT  = #AprBalance
+    WHERE EMPLID            = &J.EmplID
+       AND EMPL_RCD        = &J.EMPL_RCD
+       AND PLAN_TYPE        = &D.Plan_Type
+       AND BENEFIT_PLAN     = $Benefit-Plan
+       AND SVC_TYPE         = &M.Svc_Type
+       AND SVC_FROM_DT      = &M.Svc_From_Dt
+       AND SVC_TO_DT        = &M.Svc_To_Dt
+       AND CLAIMID          = &M.Claimid
+       AND FSA_CLAIM_STATUS = 'S';
+
+    UPDATE PS_FSA_CLAIM
+!*********************************************************************
+! To implement Health Care Pend Processing Use:   !HC-Pend
+!      SET FSA_Claim_Status   = 'P'               !HC-Pend
+!*********************************************************************
+       SET FSA_CLAIM_STATUS   = 'J'   !Rejected
+    WHERE EMPLID              = &J.EmplID
+       AND EMPL_RCD           = &J.EMPL_RCD
+       AND PLAN_TYPE          = &D.Plan_Type
+       AND BENEFIT_PLAN       = $Benefit-Plan
+       AND SVC_TYPE           = &M.Svc_Type
+       AND SVC_TO_DT          = &M.Svc_To_Dt
+       AND SVC_FROM_DT        = &M.Svc_From_Dt
+       AND CLAIMID            = &M.Claimid
+       AND FSA_CLAIM_STATUS   = 'S'
+       AND FSA_CLAIM_DENY_AMT = FSA_CLAIM_SUB_AMT;
+    end-SQL
+
+    move 0 to #AprBalance
+    #ifdef debugD
+      print 'DATA : '            (+1,1)
+      print 'AprBal after Deny ' (0,+2)
+      print #AprBalance          (0,+2)
+    #end-if
+  end-if
+
+end-procedure
+
+
+!***********************************************************************
+! PROCEDURE: Update-FSA-Status-Ready                                   *
+!***********************************************************************
+begin-procedure Update-FSA-Status-Ready
+
+#ifdef debugF
+  print 'FLOW : Update-FSA-Status-Ready ' (+1,1)
+#end-if
+
+#ifdef debugD
+  print 'DATA : PT ='        (+1,1)
+  print &d.plan_type         (0,+1)
+  print $YearBegin           (0,+2)
+  print $YearEnd             (0,+2)
+  print '<-PlnTyp,YearBeg,YearEnd'  (0,+1)
+  print '           '        (+1,1)
+  print &h.effdt             (0,+2)
+  print '       UpdClmStatus ALL S to R' (+1,1)
+#end-if
+
+let $sql-statement = 'FSA001.SQU,Update-FSA-Status-Ready ,FSA_Claim,Update'
+begin-SQL on-error=SQL-Error
+UPDATE PS_FSA_CLAIM
+   SET FSA_CLAIM_STATUS   = 'R'
+ WHERE EMPLID           = &J.EmplID
+   AND EMPL_RCD        = &J.EMPL_RCD
+   AND PLAN_TYPE        = &D.Plan_Type
+!   AND BENEFIT_PLAN     = $Benefit-Plan
+   AND CLAIMID          = &J.CLAIMID
+   AND SVC_FROM_DT BETWEEN $YearBegin AND &O.SRVC_DT_THRU
+   AND FSA_CLAIM_STATUS = 'S'
+   AND EXISTS
+        (SELECT 'X'
+         FROM  PS_BEN_PROG_PARTIC X1
+         WHERE X1.EMPLID           = &J.EmplID
+         AND   X1.COBRA_EVENT_ID   = 0
+         AND   X1.EMPL_RCD        = &J.EMPL_RCD
+         AND   X1.BENEFIT_PROGRAM  = &C.Benefit_Program
+         AND   X1.EFFDT =
+               (SELECT MAX(X2.EFFDT)
+                FROM  PS_BEN_PROG_PARTIC X2
+                WHERE X2.EMPLID          = X1.EMPLID
+                AND   X2.COBRA_EVENT_ID  = X1.COBRA_EVENT_ID
+                AND   X2.EMPL_RCD       = X1.EMPL_RCD
+                AND   X2.EFFDT          <= PS_FSA_CLAIM.SVC_FROM_DT));
+end-SQL
+
+end-procedure
+
+
+!***********************************************************************
+! PROCEDURE: Update-FSA-Summary-Record                                 *
+!***********************************************************************
+begin-procedure Update-FSA-Summary-Record
+
+#ifdef debugF
+  print 'FLOW : Update-FSA-Summary-Record -> Entry'  (+1,1)
+#end-if
+
+#ifdef debugD
+  print 'FLOW : Update-FSA-Summary-Record -> NxtLoop'  (+2,1)
+  print '       ===================================='  (+1,1)
+  print 'DATA : '            (+1,1)
+  print &j.emplid            (0,+2)
+  print &d.plan_type         (0,+2)
+  print $Benefit-Plan      (0,+2)
+  print '        Upd Sub & Approved with:' (+1,1)
+  print &SumSubAmts          (0,+2)
+  print #ApprovedAmt         (0,+2)
+  print '        Upd all between dates  :' (+1,1)
+  print $yearend             (0,+2)
+#end-if
+
+do PS_SQR_Round(#ApprovedAmt, 2, #ApprovedAmt)
+
+let $sql-statement = 'FSA001.SQU,Update-FSA-Summary-Record,FSA_Summary,Update'
+begin-SQL on-error=SQL-Error
+UPDATE PS_FSA_SUMMARY
+   SET FSA_SUB_AMT_YTD = FSA_SUB_AMT_YTD + &SumSubAmts,
+       FSA_APR_AMT_YTD = FSA_APR_AMT_YTD + #ApprovedAmt
+ WHERE EMPLID       = &J.EmplID
+   AND PLAN_TYPE    = &D.Plan_Type
+   AND BALANCE_YEAR = #Year;
+end-SQL
+
+end-procedure
+
+
+!***********************************************************************
+! PROCEDURE: Process-Claim-Payments                                    *
+!***********************************************************************
+begin-procedure Process-Claim-Payments
+
+#ifdef debugF
+  print 'FLOW : Process-Claim-Payments   '  (+1,1)
+#end-if
+
+begin-SELECT
+SUM(F.FSA_CLAIM_APR_AMT-F.FSA_CLAIM_PD_TO_DT)  &FSApayment
+F.EMPLID,
+F.EMPL_RCD,
+G.EFFDT,
+U.FSA_PD_AMT_YTD,
+G.ANNUAL_PLEDGE,
+U.FSA_APR_AMT_YTD,
+G.PLAN_TYPE
+
+  move &FSApayment to #AmtAvailable
+
+  do Get-Primary-Job(&F.EMPLID,&F.EMPL_RCD,&G.EFFDT,#Primary_Job_Empl_Rcd,$Found)
+
+  #ifdef debugD
+    print 'FLOW : Process-Claim-Payments -> NxtLoop'  (+2,1)
+    print '       ================================='  (+1,1)
+    print 'DATA : '            (+1,1)
+    print &f.emplid            (0,+1)
+    print &g.effdt             (0,+1)
+    print &d.plan_type         (0,+1)
+    print $Benefit-Plan      (0,+1)
+    print #AmtAvailable        (0,+1)
+    print '<-Sum Each Clms Apr-Pd' (0,+1)
+    print '       '            (+1,1)
+    print &g.annual_pledge     (0,+1)
+    print &u.FSA_Apr_Amt_YTD   (0,+1)
+    print &u.FSA_Pd_Amt_YTD    (0,+1)
+    print '<-FSA_Ben Pldg, Apr&Pd YTD' (0,+1)
+  #end-if
+
+  if &FSApayment > 0  !Skip processing if there are no payments
+
+    !Future: Add Employer-Match into #PledgeLeft...
+    let #PledgeLeft = &G.Annual_Pledge - &U.FSA_Pd_Amt_YTD
+
+    if &D.Plan_Type = '60'  !Health Care
+      let #MaxPayment = #PledgeLeft
+    else                    !Dependent Care
+      do Get-Contributions-YTD
+      let #MaxPayment = &ContribsYTD - &U.FSA_Pd_Amt_YTD
+    end-if
+
+    if (#MaxPayment >= #Min-Check-Amt) Or (#MaxPayment >= #PledgeLeft)
+      if (#MaxPayment < &FSApayment)
+        move #MaxPayment to #AmtAvailable
+      end-if
+      if #AmtAvailable > 0
+        do Pay-The-Claims
+      end-if
+    end-if
+
+  end-if
+
+FROM  PS_FSA_CLAIM       F,
+      PS_FSA_BENEFIT     G,
+      PS_BEN_PROG_PARTIC I,
+      PS_FSA_SUMMARY     U
+WHERE F.FSA_CLAIM_STATUS IN ('R','P')   !"Ready to Pay","Pended"
+  AND F.PLAN_TYPE      = &D.Plan_Type
+  AND F.BENEFIT_PLAN   = $Benefit-Plan
+  AND F.SVC_FROM_DT BETWEEN $YearBegin AND &O.SRVC_DT_THRU
+  AND G.EMPLID         = F.EMPLID
+  AND G.EMPL_RCD       = F.EMPL_RCD
+  AND G.BENEFIT_NBR    = F.BENEFIT_NBR
+  AND G.COBRA_EVENT_ID = 0
+  AND G.PLAN_TYPE      = F.PLAN_TYPE
+  AND G.EFFDT =
+      (SELECT MIN(G1.EFFDT)
+       FROM   PS_FSA_BENEFIT G1
+       WHERE  G1.EMPLID         = G.EMPLID
+         AND  G1.EMPL_RCD       = G.EMPL_RCD
+         AND  G1.COBRA_EVENT_ID = G.COBRA_EVENT_ID
+         AND  G1.PLAN_TYPE      = G.PLAN_TYPE
+         AND  G1.COVERAGE_ELECT = 'E'
+         AND  G1.COVERAGE_BEGIN_DT BETWEEN $YearBegin AND &O.SRVC_DT_THRU
+         AND  G1.COVERAGE_BEGIN_DT = (SELECT MAX(A.COVERAGE_BEGIN_DT)
+               FROM PS_FSA_BENEFIT A
+               WHERE A.EMPLID = G1.EMPLID
+               And A.EMPL_RCD = G1.EMPL_RCD
+               And A.COBRA_EVENT_ID = G1.COBRA_EVENT_ID
+               And A.PLAN_TYPE = G1.PLAN_TYPE
+               And A.COVERAGE_ELECT='E'
+               AND A.COVERAGE_BEGIN_DT BETWEEN $YearBegin AND $YearEnd))
+  AND (G.FSA_ACCT_STATUS  = 'A'
+   OR  (G.FSA_ACCT_STATUS = 'I'
+  AND   G.COVERAGE_END_DT IS NOT NULL))
+  AND I.EMPLID          = F.EMPLID
+  AND I.COBRA_EVENT_ID  = 0
+  AND I.EMPL_RCD        = F.EMPL_RCD
+  AND I.BENEFIT_PROGRAM = &C.Benefit_Program
+  AND I.EFFDT =
+      (SELECT MAX(I1.EFFDT)
+       FROM   PS_BEN_PROG_PARTIC I1
+       WHERE  I1.EMPLID         = I.EMPLID
+         AND  I1.COBRA_EVENT_ID = I.COBRA_EVENT_ID
+         AND  I1.EMPL_RCD       = I.EMPL_RCD
+         AND  I1.EFFDT         <= F.SVC_FROM_DT)
+  AND U.EMPLID          = G.EMPLID
+  AND U.PLAN_TYPE       = G.PLAN_TYPE
+  AND U.BALANCE_YEAR    = #Year
+GROUP BY F.EMPLID,F.EMPL_RCD,G.EFFDT,U.FSA_PD_AMT_YTD,
+         G.ANNUAL_PLEDGE,U.FSA_APR_AMT_YTD,G.PLAN_TYPE
+HAVING SUM(F.FSA_CLAIM_APR_AMT-F.FSA_CLAIM_PD_TO_DT) >= #Min-Check-Amt
+    OR G.ANNUAL_PLEDGE <= U.FSA_APR_AMT_YTD
+ORDER BY F.EMPLID,F.EMPL_RCD
+end-SELECT
+
+end-procedure
+
+
+!***********************************************************************
+! PROCEDURE: Get-Contributions-YTD                                     *
+!***********************************************************************
+begin-procedure Get-Contributions-YTD
+
+#ifdef debugF
+  print 'FLOW : Get-Contributions-YTD    '  (+1,1)
+#end-if
+
+begin-SELECT
+SUM(S.DED_YTD)  &ContribsYTD
+
+#ifdef debugD
+  print 'DATA : '             (+1,1)
+  print &f.emplid             (0,+1)
+  print #Year      (0,+1)
+  print &d.plan_type          (0,+1)
+  print $Benefit-Plan       (0,+1)
+  print &ContribsYTD          (0,+1)
+  print '<-Empl Contribs YTD' (0,+1)
+#end-if
+
+FROM  PS_JOB           R,
+      PS_DEDUCTION_BAL S
+WHERE R.EMPLID         = &F.EmplID
+  AND R.EMPL_RCD       = #Primary_Job_Empl_Rcd
+  AND R.EFFDT  =
+      (SELECT  MAX(R1.EFFDT)
+       FROM    PS_JOB R1
+       WHERE   R1.EMPLID    = R.EMPLID
+         AND   R1.EMPL_RCD = R.EMPL_RCD
+         AND   R1.EFFDT    <= &G.EffDt)
+  AND R.EFFSEQ =
+      (SELECT  MAX(R2.EFFSEQ)
+       FROM    PS_JOB R2
+       WHERE   R2.EMPLID    = R.EMPLID
+         AND   R2.EMPL_RCD = R.EMPL_RCD
+         AND   R2.EFFDT     = R.EFFDT)
+  AND S.PLAN_TYPE       = &D.Plan_Type
+  AND S.BALANCE_ID      = &O.Balance_ID
+  AND S.BALANCE_YEAR    = #Year
+  AND S.EMPLID          = R.EMPLID
+  AND (S.COMPANY        = R.COMPANY  OR
+       S.COMPANY IN
+         (SELECT   CP2.COMPANY
+            FROM   PS_COMPANY_TBL CP1,
+                   PS_COMPANY_TBL CP2
+            WHERE  CP1.COMPANY = R.COMPANY
+              AND  CP1.EFFDT <= $YearEnd
+              AND  CP1.EFFDT = (SELECT MAX(X.EFFDT)
+                                FROM   PS_COMPANY_TBL X
+                                WHERE  CP1.COMPANY = X.COMPANY
+                                  AND  X.EFFDT <= $YearEnd)
+              AND ((CP1.COMMON_PAY_ID <> ' '
+                      AND CP1.COMMON_PAY_ID = CP2.COMMON_PAY_ID)
+                   OR
+                   (CP1.COMMON_OTH_ID <> ' '
+                      AND CP1.COMMON_OTH_ID = CP2.COMMON_OTH_ID))
+              AND   CP2.EFFDT <= $YearEnd
+              AND   CP2.EFFDT = (SELECT MAX(X1.EFFDT)
+                                   FROM PS_COMPANY_TBL X1
+                                  WHERE CP2.COMPANY = X1.COMPANY
+                                    AND X1.EFFDT <= $YearEnd)
+              AND  CP2.EFF_STATUS = 'A')
+       )
+
+  AND S.BALANCE_PERIOD =
+      (SELECT MAX(S1.BALANCE_PERIOD)
+       FROM   PS_DEDUCTION_BAL S1
+       WHERE  S1.PLAN_TYPE       = S.PLAN_TYPE
+         AND  S1.BALANCE_ID      = S.BALANCE_ID
+         AND  S1.BALANCE_YEAR    = S.BALANCE_YEAR
+         AND  S1.BENEFIT_RCD_NBR = S.BENEFIT_RCD_NBR
+         AND  S1.EMPLID          = S.EMPLID
+         AND  S1.COMPANY         = S.COMPANY
+         AND  S1.BENEFIT_RCD_NBR = S.BENEFIT_RCD_NBR
+         AND  S1.DEDCD           = S.DEDCD
+         AND  S1.DED_CLASS       = S.DED_CLASS)
+end-SELECT
+
+end-procedure
+
+
+!***********************************************************************
+! PROCEDURE: Pay-The-Claims                                            *
+!***********************************************************************
+begin-procedure Pay-The-Claims
+
+#ifdef debugF
+  print 'FLOW : Pay-The-Claims           '  (+1,1)
+#end-if
+
+  move #AmtAvailable to #ClaimPayment
+  do PS_SQR_Round(#ClaimPayment, 2, #ClaimPayment)
+  add 1              to #PAYCHECK_NBR
+
+begin-SELECT
+V.FSA_CLAIM_APR_AMT-V.FSA_CLAIM_PD_TO_DT  &AmtLeftToPay
+V.CLAIMID,
+V.SVC_TYPE,
+V.SVC_FROM_DT,
+V.SVC_TO_DT,
+V.FSA_CLAIM_SUB_AMT
+
+#ifdef debugD
+  print 'FLOW : Pay-The-Claims -> NxtLoop'  (+2,1)
+  print '       ========================='  (+1,1)
+  print 'DATA : '            (+1,1)
+  print &f.emplid            (0,+1)
+  print &d.plan_type         (0,+1)
+  print $Benefit-Plan      (0,+1)
+  print #AmtAvailable        (0,+1)
+  print &AmtLeftToPay        (0,+1)
+  print '<-AmtAvail, LeftToPay on Claim' (0,+1)
+  print '       '            (+1,1)
+  print &v.claimid           (0,+1)
+  print &v.svc_type          (0,+1)
+  print &v.svc_from_dt       (0,+1)
+  print &v.svc_to_dt         (0,+1)
+  print &v.fsa_claim_sub_amt (0,+1)
+  print '<-ClaimID,,,,Submitted amount' (0,+1)
+#end-if
+
+  if #AmtAvailable < &AmtLeftToPay
+    if #AmtAvailable > 0
+      move #AmtAvailable to #CheckAmt
+      do Update-Current-Claim
+    end-if
+    EXIT-SELECT
+  else
+    if &AmtLeftToPay > 0
+      move &AmtLeftToPay to #CheckAmt
+      do Update-Current-Claim
+      subtract &AmtLeftToPay from #AmtAvailable
+    end-if
+  end-if
+
+FROM  PS_FSA_CLAIM       V,
+      PS_BEN_PROG_PARTIC W
+WHERE V.EMPLID       = &F.EmplID
+  AND V.EMPL_RCD    = &F.EMPL_RCD
+  AND V.PLAN_TYPE    = &D.Plan_Type
+  AND V.BENEFIT_PLAN = $Benefit-Plan
+  AND V.SVC_FROM_DT BETWEEN $YearBegin AND &O.SRVC_DT_THRU
+  AND V.FSA_CLAIM_STATUS IN ('R','P')
+  AND W.EMPLID           = V.EMPLID
+  AND W.COBRA_EVENT_ID   = 0
+  AND W.EMPL_RCD        = V.EMPL_RCD
+  AND W.BENEFIT_PROGRAM  = &C.Benefit_Program
+  AND W.EFFDT =
+      (SELECT MAX(W1.EFFDT)
+       FROM   PS_BEN_PROG_PARTIC W1
+       WHERE  W1.EMPLID          = W.EMPLID
+         AND  W1.COBRA_EVENT_ID  = W.COBRA_EVENT_ID
+         AND  W1.EMPL_RCD       = W.EMPL_RCD
+         AND  W1.EFFDT          <= V.SVC_FROM_DT)
+ORDER BY V.SVC_FROM_DT,
+         V.CLAIMID
+end-SELECT
+
+#ifdef debugD
+  print 'FLOW : Pay-The-Claims -> Cont.  '  (+2,1)
+  print 'DATA : '            (+1,1)
+  print &f.emplid            (0,+1)
+  print &d.plan_type         (0,+1)
+  print $Benefit-Plan      (0,+1)
+  print #PAYCHECK_NBR              (0,+1)
+  print &b.check_dt          (0,+1)
+  print #claimpayment        (0,+1)
+  print '<-Ins FSA_Payment,Ck# & Amt' (0,+1)
+
+  print '       '            (+1,1)
+  print ' | '                (0,+1)
+  print &a.form_id           (0,+1)
+  print ' | '                (0,+1)
+  print #Year     (0,+1)
+  print ' | '                (0,+1)
+  print &f.EMPL_RCD         (0,+1)
+  print ' | '                (0,+1)
+  print '<-Form,CalYr,EERcd#        ' (0,+1)
+#end-if
+
+let $sql-statement = 'FSA001.SQU,Pay-The-Claims,FSA_Payment,Insert'
+begin-SQL on-error=SQL-Error
+INSERT INTO PS_FSA_PAYMENT
+       (FORM_ID, PAYCHECK_NBR, CHECK_DT, FSA_CHECK_AMT, FSA_PAYMENT_STATUS,
+        CALENDAR_YEAR, EMPLID, EMPL_RCD, PLAN_TYPE, BENEFIT_NBR, BENEFIT_PLAN,
+        BENEFIT_PROGRAM, SETID, VENDOR_ID)
+VALUES ($Form-Id, #PAYCHECK_NBR, $Check-Dt, #ClaimPayment, 'R', #Year,
+        &F.EmplID, &F.EMPL_RCD, &D.Plan_Type, 0, $Benefit-Plan,
+        &C.Benefit_Program, ' ', ' ');
+end-SQL
+
+#ifdef debugD
+  print 'DATA : '            (+1,1)
+  print &f.emplid            (0,+1)
+  print &d.plan_type         (0,+1)
+  print $Benefit-Plan        (0,+1)
+  print #claimpayment        (0,+1)
+  print '<-Upd FSA_Summary.PdYTD, Paymnt Amt' (0,+1)
+#end-if
+
+let $sql-statement = 'FSA001.SQU,Pay-The-Claims,FSA_Summary,Update'
+
+begin-SQL on-error=SQL-Error
+UPDATE PS_FSA_SUMMARY
+   SET FSA_PD_AMT_YTD = FSA_PD_AMT_YTD + #ClaimPayment
+ WHERE EMPLID       = &F.EmplID
+   AND PLAN_TYPE    = &D.Plan_Type
+   AND BALANCE_YEAR = #Year;
+end-SQL
+
+end-procedure
+
+
+!***********************************************************************
+! PROCEDURE: Update-Current-Claim                                      *
+!***********************************************************************
+begin-procedure Update-Current-Claim
+
+#ifdef debugF
+  print 'FLOW : Update-Current-Claim     '  (+1,1)
+#end-if
+
+#ifdef debugD
+  print 'DATA : '            (+1,1)
+  print &f.emplid            (0,+1)
+  print &d.plan_type         (0,+1)
+  print $Benefit-Plan      (0,+1)
+  print &V.Svc_Type          (0,+1)
+  print &V.Svc_From_Dt       (0,+1)
+  print &V.FSA_Claim_Sub_Amt (0,+1)
+  print #checkamt            (0,+1)
+  print '<-Upd FSA_ClaimPdToDt, Clm&Ck Amts' (0,+1)
+#end-if
+
+#ifdef debugD
+  print 'DATA : '            (+1,1)
+  print &f.emplid            (0,+1)
+  print &d.plan_type         (0,+1)
+  print $Benefit-Plan      (0,+1)
+  print &v.claimID           (0,+1)
+  print #PAYCHECK_NBR              (0,+1)
+  print #CheckAmt            (0,+1)
+  print '<-Ins FSA_Paymt_Claim, ID,Ck# & Amt' (0,+1)
+#end-if
+
+do PS_SQR_Round(#CheckAmt, 2, #CheckAmt)
+
+let $sql-statement = 'FSA001.SQU,Update-Current-Claim,FSA_Claim,Update/Insert'
+begin-SQL on-error=SQL-Error
+UPDATE PS_FSA_CLAIM
+   SET FSA_CLAIM_PD_TO_DT = FSA_CLAIM_PD_TO_DT + #CheckAmt
+ WHERE EMPLID            = &F.EmplID
+   AND EMPL_RCD         = &F.EMPL_RCD
+   AND PLAN_TYPE         = &D.Plan_Type
+   AND BENEFIT_PLAN      = $Benefit-Plan
+   AND SVC_TYPE          = &V.Svc_Type
+   AND SVC_FROM_DT       = &V.Svc_From_Dt
+   AND SVC_TO_DT         = &V.Svc_To_Dt
+   AND CLAIMID           = &V.Claimid
+   AND FSA_CLAIM_STATUS IN ('R','P');
+
+INSERT INTO PS_FSA_PAYMT_CLAIM
+(FORM_ID,PAYCHECK_NBR,CHECK_DT,CLAIMID,PLAN_TYPE,BENEFIT_PLAN,FSA_CLAIM_AMT_PD)
+VALUES ($Form-Id,#PAYCHECK_NBR,$Check-Dt,&V.ClaimID,&D.Plan_Type,
+        $Benefit-Plan,#CheckAmt);
+
+UPDATE PS_FSA_CLAIM
+!*********************************************************************
+! To implement Health Care Pend Processing Use:   !HC-Pend
+! SET FSA_Claim_Status   = 'F',                   !HC-Pend
+!     FSA_Claim_Deny_Amt =  0,                    !HC-Pend
+!     FSA_Claim_Deny_Rsn = ' '                    !HC-Pend
+!*********************************************************************
+   SET FSA_CLAIM_STATUS = 'F'                        !Fully Processed
+ WHERE EMPLID            = &F.EmplID
+   AND EMPL_RCD         = &F.EMPL_RCD
+   AND PLAN_TYPE         = &D.Plan_Type
+   AND BENEFIT_PLAN      = $Benefit-Plan
+   AND SVC_TYPE          = &V.Svc_Type
+   AND SVC_FROM_DT       = &V.Svc_From_Dt
+   AND SVC_TO_DT         = &V.Svc_To_Dt
+   AND CLAIMID           = &V.Claimid
+   AND FSA_CLAIM_STATUS IN ('R','P')
+   AND FSA_CLAIM_APR_AMT = FSA_CLAIM_PD_TO_DT;
+
+UPDATE PS_FSA_CLAIM
+  SET FSA_CLAIM_STATUS = 'P'                         !Pended
+ WHERE EMPLID            = &F.EmplID
+   AND EMPL_RCD         = &F.EMPL_RCD
+   AND PLAN_TYPE         = &D.Plan_Type
+   AND BENEFIT_PLAN      = $Benefit-Plan
+   AND SVC_TYPE          = &V.Svc_Type
+   AND SVC_FROM_DT       = &V.Svc_From_Dt
+   AND SVC_TO_DT         = &V.Svc_To_Dt
+   AND CLAIMID           = &V.Claimid
+   AND FSA_CLAIM_STATUS  = 'R'
+   AND FSA_CLAIM_APR_AMT <> FSA_CLAIM_PD_TO_DT;
+end-SQL
+
+#ifdef debugD
+  print 'DATA : '            (+1,1)
+  print '<-Upd FSA_Claim_Status To F from R or P' (0,+1)
+  print '       '            (+1,1)
+  print '      when Appr Amt = Paid Amt'          (0,+1)
+#end-if
+
+#ifdef debugD
+  print 'DATA : '            (+1,1)
+  print '<-Upd FSA_Claim_Status To P from R'      (0,+1)
+  print '       '            (+1,1)
+  print '      when Appr Amt <> Paid Amt'          (0,+1)
+#end-if
+
+end-procedure
+
+!***********************************************************************
+! Sections for checking Multiple Enrollments and Claiming from them if *
+! the Dates fall within the Service Date Range of the Plans.           *
+!***********************************************************************
+
+!***********************************************************************
+! PROCEDURE: Check-Other-Enrollments1                                   *
+!***********************************************************************
+begin-procedure Check-Other-Enrollments1
+
+  let $No-Other-Enrollments = 'Y'
+
+begin-SELECT
+CH.EMPLID,
+CH.EMPL_RCD,
+CH.PLAN_TYPE,
+CH.BENEFIT_PLAN,
+CH.COVERAGE_BEGIN_DT
+
+  let $No-Other-Enrollments = 'N'
+
+FROM PS_FSA_BENEFIT CH
+WHERE CH.EMPLID = &E.Emplid
+  AND CH.EMPL_RCD = &E.EMPL_RCD
+  AND CH.PLAN_TYPE = &D.Plan_Type
+  AND CH.COVERAGE_BEGIN_DT = (SELECT MAX(D.COVERAGE_BEGIN_DT)
+                  FROM PS_FSA_BENEFIT D
+                  WHERE CH.EMPLID = D.EMPLID
+                    AND CH.EMPL_RCD = D.EMPL_RCD
+                    AND CH.PLAN_TYPE = D.PLAN_TYPE
+                    AND CH.COBRA_EVENT_ID = D.COBRA_EVENT_ID
+                    AND CH.BENEFIT_NBR = D.BENEFIT_NBR
+                    AND D.COVERAGE_ELECT = 'E'
+                    AND CH.COVERAGE_ELECT = 'E'
+                    AND D.COVERAGE_BEGIN_DT BETWEEN &O.Srvc_Dt_From AND &O.Srvc_Dt_Thru)
+end-select
+
+end-procedure
+
+!***********************************************************************
+! PROCEDURE: Check-Denied-Claims                                       *
+!***********************************************************************
+begin-procedure Check-Denied-Claims
+
+  let $From-Denied-Claims = 'Y'
+
+begin-SELECT
+E.EMPLID,
+E.EMPL_RCD,
+E.CLAIMID,
+E.PLAN_TYPE,
+E.BENEFIT_PLAN,
+E.SVC_FROM_DT
+
+  let $From-Denied-Claims = 'Y'
+  do Check-Other-Enrollments
+
+FROM PS_FSA_CLAIM E
+WHERE E.FSA_CLAIM_DENY_AMT > 0
+AND E.FSA_CLAIM_DENY_RSN = 'X'
+AND E.FSA_SPLIT_CLAIMS <> 'Y'
+AND E.SVC_FROM_DT BETWEEN $YearBegin AND &O.Srvc_Dt_Thru
+end-select
+
+end-procedure
+
+!***********************************************************************
+! PROCEDURE: Check-Other-Enrollments                                   *
+!***********************************************************************
+begin-procedure Check-Other-Enrollments
+
+  if $From-Denied-Claims <> 'Y'
+  let $Stop-Processing-Claim = 'N'
+  end-if
+
+begin-SELECT
+B.EMPLID,
+B.EMPL_RCD,
+B.PLAN_TYPE,
+B.BENEFIT_PLAN,
+B.COVERAGE_BEGIN_DT
+
+ move &B.EMPLID to $EmplId
+ move &B.EMPL_RCD to #Empl_Rcd
+ move &B.PLAN_TYPE to $Plan_Type
+ move &B.BENEFIT_PLAN to $Benefit_Plan
+ move &B.COVERAGE_BEGIN_DT to $Cvrg_Begin_Dt
+
+  if $From-Denied-Claims = 'Y'
+  move $Cvrg_Begin_Dt to $Dt
+  do Format-DateTime($Dt, $PlanBegin, {DEFCMP},'','')
+  do Get-DateComponents($PlanBegin, #Year, #Month, #Date)
+
+  let $tmp = To_Char(#Year)
+  let $in = $tmp || '0101'
+  do Format-DateTime($in, $YearBegin, {DEFCMP},'','native')
+
+  let $in = $tmp || '1231'
+  do Format-DateTime($in, $YearEnd, {DEFCMP},'','native')
+
+   do Get-New-BalanceID-Date-Range
+   do Get-Curr-FSA-YTD-Amounts
+  else
+   let $Stop-Processing-Claim = 'Y'
+  end-if
+
+ if #NewAprBalance > 0
+ do Insert-Claim
+ end-if
+
+FROM PS_FSA_BENEFIT B
+WHERE B.EMPLID = &E.Emplid
+  AND B.EMPL_RCD = &E.EMPL_RCD
+  AND B.PLAN_TYPE = &D.Plan_Type
+  AND B.COVERAGE_BEGIN_DT = (SELECT MAX(D.COVERAGE_BEGIN_DT)
+                  FROM PS_FSA_BENEFIT D
+                  WHERE B.EMPLID = D.EMPLID
+                    AND B.EMPL_RCD = D.EMPL_RCD
+                    AND B.PLAN_TYPE = D.PLAN_TYPE
+                    AND B.COBRA_EVENT_ID = D.COBRA_EVENT_ID
+                    AND B.BENEFIT_NBR = D.BENEFIT_NBR
+                    AND D.COVERAGE_ELECT = 'E'
+                    AND B.COVERAGE_ELECT = 'E'
+                    AND D.COVERAGE_BEGIN_DT BETWEEN &O.Srvc_Dt_From AND &O.Srvc_Dt_Thru)
+end-select
+
+end-procedure
+
+!***********************************************************************
+! PROCEDURE: Get-New-BalanceID-Date-Range                             *
+!***********************************************************************
+begin-procedure Get-New-BalanceID-Date-Range
+
+begin-SELECT
+MIN(P.BEGIN_DT)      &Begin,
+MAX(P.END_DT)        &End,
+
+  let $YearBegin = &Begin
+  let $YearEnd = &End
+
+FROM  PS_BALANCE_ID_DEF P
+WHERE P.SETID = &O.Setid
+  AND P.BALANCE_ID = &O.Balance_ID
+  AND P.BALANCE_YEAR = #Year
+end-SELECT
+
+end-procedure
+
+!***********************************************************************
+! PROCEDURE: Get-Curr-FSA-YTD-Amounts                                  *
+!***********************************************************************
+begin-procedure Get-Curr-FSA-YTD-Amounts
+
+#ifdef debugF
+  print 'FLOW : Get-Curr-FSA-YTD-Amounts '    (+1,1)
+#end-if
+
+begin-SELECT
+A.EFFDT,
+A.ANNUAL_PLEDGE,
+A.BENEFIT_PLAN,
+B.FSA_APR_AMT_YTD
+
+  !Future: Add Employer-Match into #AprBalance...
+  let #NewAprBalance = &A.Annual_Pledge - &B.FSA_Apr_Amt_YTD
+  let $FirstClaim = 'N'
+  if #NewAprBalance < 0
+     let #NewAprBalance = 0
+  end-if
+
+  #ifdef debugD
+    print 'DATA : '            (+1,1)
+    print &a.effdt             (0,+2)
+    print &a.annual_pledge     (0,+2)
+    print &b.fsa_apr_amt_ytd   (0,+2)
+    print #PrevAprBalance          (0,+2)
+    print '<-AnnPldg,ApprYTD,Avail' (0,+1)
+  #end-if
+
+FROM  PS_FSA_BENEFIT A,
+      PS_FSA_SUMMARY B
+WHERE A.EMPLID         = $Emplid
+AND   A.EMPL_RCD      = #EMPL_RCD
+AND   A.COBRA_EVENT_ID = 0
+AND   A.PLAN_TYPE      = $Plan_Type
+AND   A.EFFDT =
+      (SELECT MAX(H1.EFFDT)
+       FROM   PS_FSA_BENEFIT H1
+       WHERE  H1.EMPLID         = A.EMPLID
+         AND  H1.EMPL_RCD      = A.EMPL_RCD
+         AND  H1.COBRA_EVENT_ID = A.COBRA_EVENT_ID
+         AND  H1.PLAN_TYPE      = A.PLAN_TYPE
+         AND  H1.COVERAGE_ELECT = 'E'
+         AND  H1.COVERAGE_BEGIN_DT BETWEEN $YearBegin AND $YearEnd)
+AND   B.EMPLID       = A.EMPLID
+AND   B.PLAN_TYPE    = A.PLAN_TYPE
+AND   B.BALANCE_YEAR = #Year
+end-SELECT
+
+end-procedure
+
+!***********************************************************************
+! PROCEDURE: Insert-Claim                                              *
+!***********************************************************************
+begin-procedure Insert-Claim
+
+  let $Split = 'Y'
+
+let $sql-statement = 'FSA001.SQU,Insert-Claim,INSTALLATION,Update'
+begin-SQL on-error=SQL-Error
+UPDATE
+PS_INSTALLATION
+SET FSA_CLAIM_NBR_LAST = FSA_CLAIM_NBR_LAST + 1
+end-sql
+
+#ifdef debugF
+  print 'FLOW : Insert-Claim->Claim ID '   (+2,1)
+#end-if
+
+begin-SELECT
+I.FSA_CLAIM_NBR_LAST
+  move &I.Fsa_Claim_Nbr_Last to $ClaimId
+FROM PS_INSTALLATION I
+end-select
+
+  let #ClaimID-Length = Length($ClaimId)
+  let #Max-Length = 8
+  let $Tmp = ''
+  let #i = 0
+  while #i < #Max-Length - #ClaimID-Length
+  let $Tmp = $Tmp || '0'
+  let #i = #i + 1
+  end-while
+
+  let $ClaimId = $Tmp || $ClaimId
+
+#ifdef debugF
+  print 'FLOW : Insert-Claim->Entry '   (+2,1)
+#end-if
+
+begin-SELECT
+X.EMPLID,
+X.EMPL_RCD,
+X.PLAN_TYPE,
+X.BENEFIT_NBR,
+X.BENEFIT_PLAN,
+X.SVC_FROM_DT,
+X.SVC_TO_DT,
+X.SVC_TYPE,
+X.FSA_CLAIM_SUB_AMT,
+X.FSA_CLAIM_SUB_DT,
+X.CLAIMID,
+X.FSA_SPLIT_CLAIMS,
+X.SVC_PROVIDER,
+X.PATIENT_CD,
+X.NAME,
+X.FSA_CLAIM_DENY_AMT,
+X.FSA_CLAIM_DENY_DT,
+X.FSA_CLAIM_DENY_RSN,
+X.FSA_CLAIM_APR_AMT,
+X.FSA_CLAIM_PD_TO_DT,
+X.FSA_CLAIM_STATUS,
+X.ACTION_DT,
+X.SETID,
+X.VENDOR_ID,
+X.FSA_CLAIM_COMMENT
+FROM PS_FSA_CLAIM X
+WHERE X.EMPLID = &E.EmplId
+AND X.CLAIMID = &E.ClaimId
+end-select
+
+  if &X.EmplId <> ''
+  if &X.FSA_CLAIM_APR_AMT > 0
+
+    let $sql-statement = 'FSA001.SQU,Insert-Claim,FSA_CLAIM,Insert'
+    begin-SQL on-error=SQL-Error
+INSERT INTO PS_FSA_CLAIM 
+(EMPLID , EMPL_RCD, PLAN_TYPE, BENEFIT_NBR, BENEFIT_PLAN, SVC_FROM_DT,
+SVC_TO_DT, SVC_TYPE, FSA_CLAIM_SUB_AMT, FSA_CLAIM_SUB_DT, CLAIMID, 
+FSA_SPLIT_CLAIMS, SVC_PROVIDER, PATIENT_CD, NAME, FSA_CLAIM_DENY_AMT, 
+FSA_CLAIM_DENY_DT, FSA_CLAIM_DENY_RSN, FSA_CLAIM_APR_AMT, 
+FSA_CLAIM_PD_TO_DT, FSA_CLAIM_STATUS, ACTION_DT, SETID, VENDOR_ID, 
+FSA_CLAIM_COMMENT)
+VALUES (&X.EMPLID,
+&X.EMPL_RCD,
+&X.PLAN_TYPE,
+&X.BENEFIT_NBR,
+&B.BENEFIT_PLAN,
+&X.SVC_FROM_DT,
+&X.SVC_TO_DT,
+&X.SVC_TYPE,
+&X.FSA_CLAIM_SUB_AMT,
+&X.FSA_CLAIM_SUB_DT,
+$ClaimId,
+$Split,
+&X.SVC_PROVIDER,
+&X.PATIENT_CD,
+&X.NAME,
+&X.FSA_CLAIM_APR_AMT,
+&X.FSA_CLAIM_DENY_DT,
+'A',
+&X.FSA_CLAIM_DENY_AMT,
+0,
+'S',
+&X.ACTION_DT,
+&X.SETID,
+&X.VENDOR_ID,
+&X.FSA_CLAIM_COMMENT)
+end-SQL
+
+  else
+
+    begin-SQL on-error=SQL-Error
+INSERT INTO PS_FSA_CLAIM 
+(EMPLID , EMPL_RCD, PLAN_TYPE, BENEFIT_NBR, BENEFIT_PLAN, SVC_FROM_DT,
+SVC_TO_DT, SVC_TYPE, FSA_CLAIM_SUB_AMT, FSA_CLAIM_SUB_DT, CLAIMID, 
+FSA_SPLIT_CLAIMS, SVC_PROVIDER, PATIENT_CD, NAME, FSA_CLAIM_DENY_AMT, 
+FSA_CLAIM_DENY_DT, FSA_CLAIM_DENY_RSN, FSA_CLAIM_APR_AMT, 
+FSA_CLAIM_PD_TO_DT, FSA_CLAIM_STATUS, ACTION_DT, SETID, VENDOR_ID, 
+FSA_CLAIM_COMMENT)
+VALUES (&X.EMPLID,
+&X.EMPL_RCD,
+&X.PLAN_TYPE,
+&X.BENEFIT_NBR,
+&B.BENEFIT_PLAN,
+&X.SVC_FROM_DT,
+&X.SVC_TO_DT,
+&X.SVC_TYPE,
+&X.FSA_CLAIM_SUB_AMT,
+&X.FSA_CLAIM_SUB_DT,
+$ClaimId,
+$Split,
+&X.SVC_PROVIDER,
+&X.PATIENT_CD,
+&X.NAME,
+&X.FSA_CLAIM_APR_AMT,
+NULL,
+'A',
+&X.FSA_CLAIM_DENY_AMT,
+&X.FSA_CLAIM_PD_TO_DT,
+'S',
+&X.ACTION_DT,
+&X.SETID,
+&X.VENDOR_ID,
+&X.FSA_CLAIM_COMMENT)
+end-SQL
+  end-if
+  end-if
+
+    let $sql-statement = 'FSA001.SQU,Insert-Claim,FSA_CLAIM,Update Split Claims'
+    begin-SQL on-error=SQL-Error
+UPDATE PS_FSA_CLAIM
+SET FSA_SPLIT_CLAIMS = 'Y'
+WHERE EMPLID = &X.EMPLID
+AND EMPL_RCD = &X.EMPL_RCD
+AND PLAN_TYPE = &X.PLAN_TYPE
+AND BENEFIT_PLAN = &X.BENEFIT_PLAN
+AND CLAIMID = &X.CLAIMID
+AND FSA_CLAIM_SUB_DT = &X.FSA_CLAIM_SUB_DT
+end-SQL
+
+end-procedure
+
+
+
+
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'datemath.sqc'  !Routines for date math.
+#Include 'stdapi.sqc'    !Update Process API
+#Include 'bnprijob.sqc'  !Get-Primary-Job()

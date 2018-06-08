@@ -1,0 +1,726 @@
+!***********************************************************************
+!  TAX860VA:  Create Wage Listing for UI - Virginia - MMREF            *
+!                                                                      *
+!             NOTE: "#IFDEF TAXTEST" in main SELECT is used for        *
+!                   testing this report against DEMO database          *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+!                                                                      *
+! This module contains confidential and proprietary information        *
+! of Oracle; it is not to be copied, reproduced, or transmitted        *
+! in any form, by any means, in whole or in part, nor is it to         *
+! be used for any purpose other than that for which it is              *
+! expressly provided under the applicable license agreement.           *
+!                                                                      *
+! Copyright (C) 2006 Oracle. All Rights Reserved.                      *
+!                                                                      *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!          $Date:  2006/07/20:06:59:42                                 
+!       $Release:  HR9                                                 
+!      $Revision:  101                                                 
+!                                                                      *
+!***********************************************************************
+
+#include 'setenv.sqc' !Set environment
+#include 'setup31.sqc' !Printer and page-size initialization
+#include 'usarpt.sqc'  ! NID_COUNTRY defined
+
+begin-report
+  do Init-Report
+
+! These variables are used by rptsmmry.sqc
+  Let $Prnt_CoTxGrs = 'N'
+  Let $Prnt_CoExGrs = 'N'
+
+  do Process-Main
+
+  close 10
+
+  if $RecordWritten = 'Y'
+    display ''
+    display 'Upon successful conclusion of this program, one or more'
+    display 'files will have been created, as follows:'
+    display ''
+    display '  TAX860VA  contains 512-character records in the MMREF-1'
+    display '            format required for tape submission to the'
+    display '            Virginia Employment Commission.'
+    display '     or '
+    display '  TAX860VA.nnn  where "nnn" represents a volume number.'
+    display '            The file contains 512-character records in the'
+    display '            MMREF-1 format required for diskette reporting'
+    display '            to the Virginia Employment Commission. '
+    display ''
+    display 'Follow the instructions from the commission for preparing'
+    display 'and submitting the tape or diskette file.'
+    display ''
+  else
+    do Print-Summary-Data('NoData')
+  end-if
+
+  do Stdapi-Term
+
+end-report
+
+begin-procedure Init-Report
+  do Init-DateTime
+  do Init-Number
+
+  do Get-Current-DateTime
+  do Get-Calendar-Year-Id
+  do Stdapi-Init
+
+  do Initialization
+  move 'TAX860VA' to $ReportID
+
+ if $FileType = 'D'
+  move 'Virginia Quarterly UI Wage Report - Diskette' to $ReportTitle
+  display ''
+  display 'Creating Diskette File for Virginia UI Wage Reporting'
+ else
+  move 'Virginia Quarterly UI Wage Report - Tape' to $ReportTitle
+  display ''
+  display 'Creating Tape File for Virginia UI Wage Reporting'
+ end-if
+end-procedure
+
+begin-procedure Initialization
+#ifdef TAXTEST
+  move 'CA'              to $State
+#else
+  move 'VA'              to $State
+#endif
+  move '51'              to $StateNumCd
+
+  do Get-Tax-Reporting-Run-Controls
+  move &TX.Balance_Year to $RptYear 9999
+  let $ReportingPeriod = $QtrEndMonth || $RptYear
+  move $PeriodEndDate    to $AsOfDate
+
+  display ' '
+  display 'Processing balances for '   noline
+  display $RptQtrYr
+
+  move 512 to #RecordLength
+  add 2 to #RecordLength
+
+  if $PRCS_Process_Instance = ''
+    Display 'Report cannot be run outside of PeopleSoft, please use process scheduler.'
+    Stop
+  else
+     do Select-Parameters
+     do Convert-Parameters
+  end-if
+  do Calculate-Diskette-Capacity
+  move 0 to #RecordCount
+  do Open-File
+end-procedure
+
+begin-procedure Open-File
+
+if $FileType = 'D'
+   if #FileExtension <> 0
+      close 10
+   end-if
+   move 0 to #RecordCount
+   add 1 to #FileExtension
+   move #FileExtension to $FileExtension 099
+#ifdef OS400
+   let $FileExtension = '(D' || $FileExtension || ')'
+   let $FileID = '{IMPORTPREFIX}' || 'TAX860VA' || $FileExtension
+#else
+   let $FileID = '{IMPORTPREFIX}' || 'TAX860VA.' || $FileExtension
+#endif
+
+   open $FileID as 10 for-writing record=512:fixed
+else
+  open '{IMPORTPREFIX}TAX860VA{IMPORTSUFFIX}' as 10 for-writing record=512:fixed
+end-if
+end-procedure
+
+begin-procedure Process-Main
+
+  move &TX.Company       to $Company  !TX.Company is the Transmitter
+  if RTRIM($Company,' ') = ''
+    display '*** Company field blank on Tax Run Control Record ***'
+    display '***************** Processing stopped ****************'
+    stop
+  end-if
+  do Get-Company-Data                 !Transmitter identifying data
+
+  do Write-Transmitter-Record
+
+begin-SELECT
+TEMP_SSN_MASK
+FROM PS_INSTALLATION
+end-SELECT
+
+begin-SELECT
+A.COMPANY
+A.DESCR
+A.FEDERAL_EIN
+A.ADDRESS1
+A.ADDRESS2
+A.CITY
+A.STATE
+A.POSTAL
+A.COUNTRY
+
+  move &A.Company to $Company
+
+  move '' to $priorEmplID
+  do Read-Employee-Data
+
+FROM  PS_COMPANY_TBL A
+WHERE A.EFF_STATUS = 'A'
+  AND A.TAX_REPORT_TYPE = '2'
+  AND A.EFFDT =
+  (SELECT MAX(EFFDT)
+     FROM PS_COMPANY_TBL
+     WHERE  COMPANY = A.COMPANY
+       AND  EFFDT  <= $AsOfDate)
+ORDER BY COMPANY
+end-SELECT
+  if #Count_F > 0
+    do Write-F-Record
+    do Print-Summary-Data('FileTotal')
+  end-if
+end-procedure
+
+begin-procedure Read-Employee-Data
+begin-SELECT
+C.COMPANY    () on-break print=never before=Before-Company
+                                     AFTER=AFTER-COMPANY
+C.EMPLID
+C.STATE
+C.TXGRS_QTD
+C.NLGRS_QTD
+D1.NATIONAL_ID
+PN.LAST_NAME
+PN.FIRST_NAME
+PN.MIDDLE_NAME
+PN.NAME_SUFFIX
+   Do Get-Empl-Address (&C.Emplid,'HOME', $AddressFound)
+
+   Let $COUNTRY  = $GETADDR_Country
+   let $ADDRESS1 = $GETADDR_Address1
+   let $ADDRESS2 = $GETADDR_Address2
+   let $ADDRESS3 = $GETADDR_Address3
+   let $ADDRESS4 = $GETADDR_Address4
+   let $CITY = $GETADDR_CITY
+   let $STATE_EE =$GETADDR_STATE
+   let $POSTAL = $GETADDR_POSTAL
+
+  if &C.NlGrs_QTD > 0
+    do Process-Employee
+  else
+    do Print-Summary-Data('NegWage')
+  end-if
+
+FROM  PS_TAX_BALANCE C, PS_PERSON_NAME PN, PS_PERS_NID D1
+WHERE C.COMPANY       = &A.Company
+  AND PN.EMPLID       = C.EMPLID
+  AND C.TAX_CLASS     = 'U'
+  AND C.BALANCE_ID    = $Calendar_Year_Id
+  AND C.BALANCE_YEAR  = &TX.Balance_Year
+  AND C.BALANCE_QTR   = &TX.Balance_Qtr
+#ifdef TAXTEST
+  AND C.STATE         = 'CA'
+#else
+  AND C.STATE         = 'VA'
+#endif
+  AND C.LOCALITY      = ' '
+  AND C.BALANCE_PERIOD  =
+      (SELECT MAX(BALANCE_PERIOD)
+       FROM   PS_TAX_BALANCE
+       WHERE  EMPLID        = C.EMPLID
+         AND  COMPANY       = C.COMPANY
+         AND  BALANCE_ID    = C.BALANCE_ID
+         AND  BALANCE_YEAR  = C.BALANCE_YEAR
+         AND  BALANCE_QTR   = C.BALANCE_QTR
+         AND  STATE         = C.STATE
+         AND  LOCALITY      = C.LOCALITY
+         AND  TAX_CLASS     = C.TAX_CLASS)
+  AND C.NLGRS_QTD <> 0
+  AND C.EMPLID            = D1.EMPLID
+  AND D1.COUNTRY          = {NID_Country}
+  AND D1.NATIONAL_ID_TYPE = $Payroll_NID_Type
+ORDER BY D1.NATIONAL_ID
+end-SELECT
+end-procedure
+
+begin-procedure Process-Employee
+  move &D1.NATIONAL_ID to $S123 xxx       !isolate first 3 digits
+  if $S123 = &Temp_SSN_Mask or RTRIM(&D1.NATIONAL_ID, ' ') = ''
+    move '000000000'   to $NATIONAL_ID
+  else
+    move &D1.NATIONAL_ID        to $NATIONAL_ID
+  end-if
+  move &PN.LAST_NAME   to $LastName
+  move &PN.FIRST_NAME  to $FirstName
+  move &PN.MIDDLE_NAME to $MiddleName
+  move &PN.NAME_SUFFIX to $Suffix
+
+  move $Address1 to $EEAddress1
+  move $Address2 to $EEAddress2
+  move $City     to $EECity
+
+  let  $StateCd   = rtrim($State_EE, ' ')
+  move $Postal   to $Zip
+  move $Country  to $Country
+
+  do Foreign-Address-Test('Format 3',25)
+
+  If $ForeignAddrInd = 'X'
+     Let $US_Zip      = ' '
+     Let $US_ZipXtnsn = ' '
+     Let $US_State    = ' '
+     Let $Frgn_Zip    = $Zip
+     Let $Frgn_State  = $StateName
+  Else
+     Let $US_Zip      = $Zip
+     Let $US_ZipXtnsn = $ZipExtsn
+     Let $US_State    = $StateCd
+     Let $Frgn_Zip    = ' '
+     Let $Frgn_State  = ' '
+     Let $Country-2Char   = ' '
+  End-if
+
+  uppercase $LastName
+  uppercase $FirstName
+  uppercase $MiddleName
+  uppercase $Suffix
+  uppercase $EEAddress1
+  uppercase $EEAddress2
+  uppercase $EECity
+
+  move &C.NlGrs_QTD to #NlGrs_QTD
+  add #NlGrs_QTD to #Co_NlGrs_QTD
+  multiply 100 times #NlGrs_QTD
+
+  do write-s-record
+  add 1 to #Count_R
+  add 1 to #Count_S
+
+end-procedure
+
+begin-procedure Before-Company
+  do Get-Company-Data
+
+  do Get-State-Tax-Data             !Employer ID
+  if RTRIM(&Employer_ID_SUT,' ') = ''
+    display '*** State Unemployment ID missing in Company State Tax Table ***'
+    display '*********************** Processing stopped *********************'
+    display 'Company'
+    display $Company
+    stop
+  end-if
+
+  let $StateEIN = EDIT(RTRIM(&Employer_ID_SUT,' '),'09999999999999999999')
+
+  do Write-E-Record
+end-procedure
+
+begin-procedure After-Company
+
+  do Print-Summary-Data('CoTotal')
+  do Write-T-Record
+
+  add #Co_NlGrs_QTD to #Tot_NlGrs_QTD
+  add #Count_S to #Count_F
+  add #Count_R to #Count_R_Total
+
+  move 0 to #Co_NlGrs_QTD
+  move 0 to #Count_S
+  move 0 to #Count_R
+  new-page
+end-procedure
+
+
+Begin-Procedure Write-E-Record
+
+  move &A.Federal_EIN  to $FedEIN   099999999
+  move &A.Descr        to $ErName
+  move &A.Address1     to $ErAddress1
+  move &A.Address2     to $ErAddress2
+  move &A.City         to $City
+  move &A.State        to $StateCd
+  move &A.Postal       to $Zip
+  move &A.Country      to $Country
+
+  do Foreign-Address-Test('Format 3',25)
+
+  If $ForeignAddrInd = 'X'
+     Let $US_Zip      = ' '
+     Let $US_ZipXtnsn = ' '
+     Let $US_State    = ' '
+     Let $Frgn_Zip    = $Zip
+     Let $Frgn_State  = $StateName
+  Else
+     Let $US_Zip      = $Zip
+     Let $US_ZipXtnsn = $ZipExtsn
+     Let $US_State    = $StateCd
+     Let $Frgn_Zip    = ' '
+     Let $Frgn_State  = ' '
+     Let $Country-2Char   = ' '
+  End-if
+
+  uppercase $ErName
+  uppercase $ErAddress1
+  uppercase $ErAddress2
+  uppercase $City
+  uppercase $StateCd
+
+  if $FileType = 'D'
+    if #RecordCount >= #MaxRecordsPerDiskette
+      do Open-File
+    end-if
+  end-if
+
+  write 10 from    'RE':2  ! 2
+               $RptYear:4  ! 3 - 6
+                    $Sp:1  ! 7             Agent Indicator
+                $FedEIN:9  ! 8 - 16
+                    $Sp:9  ! 17 - 25       Agent EIN
+                    $Sp:1  ! 26
+                    $Sp:4  ! 27 - 30       Establishment Number
+                    $Sp:9  ! 31 - 39
+               $ErName:57  ! 40 - 96
+           $ErAddress1:22  ! 97 - 118
+           $ErAddress2:22  ! 119 - 140
+                 $City:22  ! 141 - 162
+             $US_State:2   ! 163 - 164
+               $US_Zip:5   ! 165 - 169
+          $US_ZipXtnsn:4   ! 170 - 173
+                   $Sp:5   ! 174 - 178
+           $Frgn_State:23  ! 179 - 201
+             $Frgn_Zip:15  ! 202 - 216
+        $Country-2Char:2   ! 217 - 218
+   &TX.Employment_Type:1   ! 219          Employment Code
+                   $Sp:1   ! 220          tax jurisdiction
+                   $Sp:292 ! 221 - 512
+
+  add 1 to #RecordCount
+  move 'Y' to $RecordWritten
+
+End-Procedure
+
+
+begin-procedure Write-S-Record
+
+  move 'B'               to $TaxingEntityCd
+  move 'B'               to $Tax_Type_Cd
+
+  move #NlGrs_QTD        to $NlGrs_QTD   09999999999
+
+  if $FileType = 'D'
+    if #RecordCount >= #MaxRecordsPerDiskette
+      do Open-File
+    end-if
+  end-if
+
+  write 10 from 'RS':2    ! 1 - 2
+         $StateNumCd:2    ! 3 - 4
+     $TaxingEntityCd:5    ! 5 - 9
+        $NATIONAL_ID:9    ! 10 - 18
+          $FirstName:15   ! 19 - 33
+         $MiddleName:15   ! 34 - 48
+           $LastName:20   ! 49 - 68
+             $Suffix:4    ! 69 - 72
+         $EEAddress1:22   ! 73 - 94
+         $EEAddress2:22   ! 95 - 116
+             $EECity:22   ! 117 - 138
+           $US_State:2    ! 139 - 140
+             $US_Zip:5    ! 141 - 145
+        $US_ZipXtnsn:4    ! 146 - 149
+                 $Sp:5    ! 150 - 154
+         $Frgn_State:23   ! 155 - 177
+           $Frgn_Zip:15   ! 178 - 192
+      $Country-2Char:2    ! 193 - 194
+                 $Sp:2    ! 195 - 196
+    $ReportingPeriod:6    ! 197 - 202
+          $NlGrs_QTD:11   ! 203 - 213
+                 $Sp:11   ! 214 - 224
+                 $Sp:2    ! 225 - 226
+                 $Sp:8    ! 227 - 234
+                 $Sp:8    ! 235 - 242
+                 $Sp:5    ! 243 - 247
+           $StateEIN:20   ! 248 - 267
+                 $Sp:40   ! 268 - 307
+        $Tax_Type_Cd:1    ! 308
+                 $Sp:204  ! 309 - 512
+
+  add 1 to #RecordCount
+  move 'Y' to $RecordWritten
+
+  move '' to $NlGrs_QTD
+  move 0  to #NlGrs_QTD
+end-procedure
+
+
+Begin-Procedure Write-T-Record
+
+  if $FileType = 'D'
+    if #RecordCount >= #MaxRecordsPerDiskette
+      do Open-File
+    end-if
+  end-if
+
+  write 10 from 'RT':2    ! 1 - 2
+                 $Sp:510  ! 3 - 512
+
+  add 1 to #RecordCount
+  move 'Y' to $RecordWritten
+
+End-Procedure
+
+
+Begin-Procedure Write-F-Record
+
+  write 10 from 'RF':2    ! 1 - 2
+                 $Sp:510  ! 3 - 512
+
+  add 1 to #RecordCount
+
+End-Procedure
+
+
+begin-procedure Convert-Parameters
+
+  move $RC_QTR_UI.Reporting_Medium to $FileType
+  move $RC_QTR_UI.Diskette_Type    to $DisketteType
+end-procedure
+
+
+begin-procedure Foreign-Address-Test($Format,#MaxLength)
+  Let $_StateName = ''
+  If $_Country = 'USA'
+    move ' ' to $_ForeignAddrInd
+    move $_Zip to $_ZipExtsn ~~~~~~xxxx
+    If instr($_Zip,'-',6) = 0
+    and $_ZipExtsn <> '    '
+      let $_Zip = substr($_Zip,1,5) || '-' || substr($_Zip,6,4)
+    End-if
+    move $_Country to $priorCountry
+  else
+    move 'X' to $_ForeignAddrInd
+
+    If $_Country <> $priorCountry
+      do Get-Country-Code
+      move $_Country to $priorCountry
+      move &_Descr   to $CountryName
+      move &_COUNTRY_CD_1042 to $_Country-2Char
+    End-if
+
+    if $_StateCd = ''
+      Show '      Note: No state code for this record.  Country - ' $_Country
+    else
+      do Get-State-Code
+      move &_STATE.DESCR to $_StateName
+      uppercase $_StateName
+    end-if
+
+    Evaluate $Format
+      when = 'Format 1'
+        let #Length = LENGTH(RTRIM($CountryName,' '))
+        let $_City = SUBSTR(RTRIM($_City,' '),1,(#MaxLength - #Length - 4) )
+        let $_City = $_City || ' ' || $_StateCd || ' ' || $CountryName
+        move ' ' to $_StateCd
+      when = 'Format 2'
+        let $_StateCd = $_StateCd || ' ' || $CountryName
+        uppercase $_StateCd
+      when = 'Format 3'
+        let $_StateCd = $_StateCd
+        uppercase $_StateCd
+    End-evaluate
+  End-if
+  uppercase $_City
+  let $EditZip = RTRIM($_Zip, ' ')
+  let #DashPosition = INSTR($EditZip,'-',1)
+  if #DashPosition <> 6
+    move $_Zip to $_ZipExtsn ~~~~~xxxx
+  else
+    move $_Zip to $_ZipExtsn ~~~~~~xxxx
+  end-if
+End-Procedure
+
+
+Begin-Procedure Get-Country-Code
+  Let $Record_found = 'N'
+Begin-Select
+COUNTRY_2CHAR
+DESCR
+  Let $Record_found = 'Y'
+FROM  PS_COUNTRY_TBL
+WHERE COUNTRY = $Country
+End-Select
+
+ If $Record_found = 'N'
+   Show ' Two Character Country code for ' $Country ' doesn''t exist in Country table.'
+   Stop
+ End-if
+
+  Let $Record_found = 'N'
+Begin-Select
+COUNTRY_CD_1042
+  Let $Record_found = 'Y'
+FROM  PS_CNTRY_1042_TBL
+WHERE COUNTRY = $Country
+End-Select
+
+ If $Record_found = 'N'
+   Show ' Two Character Country code for ' $Country ' doesn''t exist in Country 1042 table.'
+   Stop
+ End-if
+End-Procedure
+
+
+Begin-Procedure Get-State-Code
+  Let $Record_found = 'N'
+Begin-Select
+STATE.DESCR
+  Let $Record_found = 'Y'
+FROM  PS_STATE_NAMES_TBL  STATE
+WHERE STATE.COUNTRY = $Country
+  AND STATE.STATE   = $StateCd
+End-Select
+
+ If $Record_found = 'N'
+   Show ' State code State : ' $StateCd ', Country : ' $Country ' doesn''t exist in State table.'
+   Stop
+ End-if
+End-Procedure
+
+
+Begin-Procedure Write-Transmitter-Record
+
+Begin-Select
+RC960.EMPLR_PIN
+RC960.RESUB_INDICATOR
+RC960.RESUB_TLCN
+RC960.CONTACT_NAME_SSA
+RC960.TELEPHONE_NBR
+RC960.PHONE_EXTN
+RC960.EMAIL_ADDR_MMREF
+RC960.CONTACT_FAX
+RC960.NOTIFY_METHOD
+
+FROM PS_TAX960_PARM RC960
+End-Select
+
+  if rtrim(&RC960.CONTACT_NAME_SSA, ' ') = ''
+    Show 'MMREF Parameters must be set up on SETUP Menu.'
+    Show 'Re-execute after establishing MMREF Parameters.'
+    Stop
+  End-if
+
+  Let $RC960.CONTACT_NAME_SSA    = translate(&RC960.CONTACT_NAME_SSA,',','')
+  move &CT.Federal_EIN          to $FedEIN  099999999
+  move &RC960.EMPLR_PIN         to $EmprPIN ! 09999999999999999
+  move &RC960.EMAIL_ADDR_MMREF  to $RC960.Email_addr
+  move '99'  to $SoftwareCd
+
+  If &RC960.RESUB_INDICATOR = 'Y'
+    Let $RS_Ind = '1'
+  Else
+    Let $RS_Ind = '0'
+  End-if
+
+  If &RC960.PHONE_EXTN <> 0
+    move &RC960.PHONE_EXTN to $Phone_Extn
+  Else
+    move '    ' to $Phone_Extn
+  End-if
+
+  move &RC960.RESUB_TLCN      to $TLCN
+  move &CT.Descr        to $Xmitr_Name
+  move &CT.Address1     to $X.Address1
+  move &CT.Address2     to $X.Address2
+  move &CT.City         to $City
+  let  $StateCd = rtrim(&CT.State, ' ')
+  move &CT.Postal       to $Zip
+  move &CT.Country      to $Country
+  do Foreign-Address-Test('Format 3',25)
+
+  uppercase $Xmitr_Name
+  uppercase $X.Address1
+  uppercase $X.Address2
+  uppercase $City
+  uppercase $StateCd
+  uppercase $RC960.Email_addr
+
+  If $ForeignAddrInd = 'X'
+     Let $US_Zip      = ' '
+     Let $US_ZipXtnsn = ' '
+     Let $US_State    = ' '
+     Let $Frgn_Zip    = $Zip
+     Let $Frgn_State  = $StateName
+  Else
+     Let $US_Zip      = $Zip
+     Let $US_ZipXtnsn = $ZipExtsn
+     Let $US_State    = $StateCd
+     Let $Frgn_Zip    = ' '
+     Let $Frgn_State  = ' '
+     Let $Country-2Char   = ' '
+  End-if
+
+          write 10 from 'RA':2      ! 1 - 2
+                     $FedEIN:9      ! 3 - 11
+                    $EmprPIN:17     ! 12 - 28
+                     $RS_Ind:1      ! 29 - 29
+                       $TLCN:6      ! 30 - 35
+                 $SoftwareCD:2      ! 36 - 37
+                 $Xmitr_Name:57     ! 38 - 94
+                 $X.Address1:22     ! 95 - 116
+                 $X.Address2:22     ! 117 - 138
+                       $City:22     ! 139 - 160
+                   $US_State:2      ! 161 - 162
+                     $US_Zip:5      ! 163 - 167
+                $US_ZipXtnsn:4      ! 168 - 171
+                         $Sp:5      ! 172 - 176
+                 $Frgn_State:23     ! 177 - 199
+                   $Frgn_Zip:15     ! 200 - 214
+              $Country-2Char:2      ! 215 - 216
+                 $Xmitr_Name:57     ! 217 - 273
+                 $X.Address1:22     ! 274 - 295
+                 $X.Address2:22     ! 296 - 317
+                       $City:22     ! 318 - 339
+                   $US_State:2      ! 340 - 341
+                     $US_Zip:5      ! 342 - 346
+                $US_ZipXtnsn:4      ! 347 - 350
+                         $Sp:5      ! 351 - 355
+                 $Frgn_State:23     ! 356 - 378
+                   $Frgn_Zip:15     ! 379 - 393
+              $Country-2Char:2      ! 394 - 395
+     $RC960.Contact_name_ssa:27     ! 396 - 422
+        &RC960.Telephone_Nbr:15     ! 423 - 437
+                 $Phone_Extn:5      ! 438 - 442
+                         $Sp:3      ! 443 - 445
+           $RC960.Email_addr:40     ! 446 - 485
+                         $Sp:3      ! 486 - 488
+          &RC960.Contact_Fax:10     ! 489 - 498
+        &RC960.Notify_Method:1      ! 499
+                         'L':1      ! 500          Preparer Code - Self Prepared
+                         $Sp:12     ! 501 - 512
+
+  add 1 to #RecordCount
+
+End-Procedure
+
+
+#Include 'taxrnctl.sqc'  !Get-Tax-Reporting-Run-Controls procedure
+#Include 'getcodta.sqc'  !Get-Company-Data procedure
+#Include 'getstdta.sqc'  !Get-State-Tax-Data procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'getfrmat.sqc'  !Get-Diskette-Format procedure
+#Include 'rptsmmry.sqc'  !Print-Summary-Data procedure
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'getbalid.sqc'  !Get-Calendar-Year-Id
+#Include 'stdapi.sqc'    !Update Process API
+#Include 'txrnctl1.sqc'  !Process Scheduler Run Controls
+#Include 'getaddr.sqc'   !Get Current Person Address

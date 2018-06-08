@@ -1,0 +1,439 @@
+!********************************************************
+!  OHS018.SQR - OSHA 300 Incident Log                   !
+!********************************************************
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module contains confidential and proprietary information        *
+! of Oracle; it is not to be copied, reproduced, or transmitted        *
+! in any form, by any means, in whole or in part, nor is it to         *
+! be used for any purpose other than that for which it is              *
+! expressly provided under the applicable license agreement.           *
+!                                                                      *
+! Copyright (C) 2006 Oracle. All Rights Reserved.                      *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+!          $Date:  2006/07/19:14:12:18                                 *
+!       $Release:  HR9                                                 *
+!      $Revision:  101                                                 *
+!                                                                      *
+!***********************************************************************
+!                              *
+!                              *
+!***********************************************************************
+
+#DEFINE DEBUG
+
+! These are used to calculate when the put a page break
+!----------------------------------------------------------------------
+#define eLineLength 25
+#define fLineLength 38
+#define linesPerPage 22
+
+#include 'setenv.sqc'   !Set environment
+
+! No printout for this process, so manually include #setupdb.sqc
+! Output will be in RTF format in the {FILE-PREFIX} directory
+!----------------------------------------------------------------------
+Begin-Setup
+#include 'setupdb.sqc'
+End-Setup
+
+!----------------------------------------------------------------------
+!---------Program------------------------------------------------------
+!----------------------------------------------------------------------
+
+!----------------------------------------------------------------------
+Begin-Program
+#DEBUG DISPLAY 'Begin-Program'
+
+  do Init-DateTime
+  do Init-Number
+  do Get-Current-DateTime
+  do Init-Report
+  do Init-Array 
+
+  do Process-Main
+
+  ! Update the Process Scheduler
+  !------------------------------------------------------------
+  DO Stdapi-Term
+
+End-Program
+
+!----------------------------------------------------------------------
+!---------Init-Report--------------------------------------------------
+!----------------------------------------------------------------------
+! We need to get the calendar year from the process instance
+!----------------------------------------------------------------------
+
+begin-procedure Init-Report
+#DEBUG DISPLAY 'Flow: Init-Report'
+
+  move 'OHS018' to $ReportID
+  move 'OSHA 300 Incident Log' to $ReportTitle
+  move 'OSHA300' to $ProcessName
+
+  #DEBUG DISPLAY $ReportTitle
+
+  do Stdapi-Init
+
+  if $prcs_process_instance = ''
+     #DEBUG DISPLAY ''
+     #DEBUG DISPLAY 'REPORT CAN NOT BE EXECUTED OUTSIDE OF PEOPLESOFT,PLEASE USE PROCESS SCHEDULER.'
+     #DEBUG DISPLAY ''
+     STOP QUIET
+  else
+     do Select-Parameters
+  end-if
+
+end-procedure
+
+!----------------------------------------------------------------------
+!---------Get-Values---------------------------------------------------
+!----------------------------------------------------------------------
+! Fetch run control parameters
+!----------------------------------------------------------------------
+begin-procedure Get-Values
+#DEBUG DISPLAY 'Flow: Get-Values'
+   do Get-From-Thru-Date
+   do Get-Establishment
+
+   LET $Quote = ''''
+   LET $CRLF = chr(13) || chr(10) ! Line break read correctly on all platforms
+   LET $RTFPageBreak = chr(123) || '\par \page \par }' || $CRLF
+   LET $RTFDocumentEnd = '}' || $CRLF
+
+end-procedure Get-Values
+
+
+!----------------------------------------------------------------------
+!---------Process-Main-------------------------------------------------
+!----------------------------------------------------------------------
+!----------------------------------------------------------------------
+begin-procedure Process-Main
+
+DO Get-Establishment-Info
+DO Format-DateTime($ThruDate, $TempDate, {DEFCMP},'','')
+LET $Reporting_Year = {ps-substr}($TempDate, 1, 4)
+LET #RTF_Seq_Nbr = 1
+DO RTF-Add-Token('%YEAR%', $Reporting_Year)
+DO Process-RTF-Header
+DO RTF-Clear-Tokens
+
+LET #PageRowCount = 0
+
+BEGIN-SELECT
+A.ESTABID 
+A.CASE_NBR_USA
+A.NAME
+A.JOB_TITLE
+A.INCIDENT_DT
+A.EXACT_LOCATION
+A.OSHA_200_DESCR
+A.FATALITY_SW
+A.INJURY_ILLNESS
+A.RESTRICTD_WORKDAYS
+A.AWAY_FROM_WORKDAYS
+A.OSHA_INJ_CLASS
+A.ILLNESS_RESULT
+A.PRIVACY_CASE
+
+   LET #Restricted = &A.RESTRICTD_WORKDAYS
+   LET #Away       = &A.AWAY_FROM_WORKDAYS
+   LET $A_CASE_NBR_USA = &A.CASE_NBR_USA
+   
+   ! Here, we need to check for any unterminated absences in PS_INJURY_ABSENCES
+   ! and calculate the number of days as of the $ThruDate
+   ! --------------------------------------------------------------------------
+   do Unterminated-Leave-Check
+   do Add-Job-Transfers
+
+   SHOW '------------------------'
+   SHOW '&A.CASE_NBR_USA: ' &A.CASE_NBR_USA
+   SHOW '#Restricted: ' #Restricted
+   SHOW '#Away: ' #Away
+   SHOW '------------------------'
+   
+   
+   DO RTF-Add-Token('%CASE%', &A.CASE_NBR_USA)
+   IF &A.PRIVACY_CASE = 'N' 
+   DO RTF-Add-Token('%EMPLOYEENAME%', &A.NAME)
+   ELSE
+   DO RTF-Add-Token('%EMPLOYEENAME%', 'Privacy Case')
+   END-IF
+   
+   DO RTF-Add-Token('%JOBTITLE%', &A.JOB_TITLE)
+
+   DO Format-DateTime(&A.INCIDENT_DT, $TEMP, {DEFDATE}, '', '')
+   Let $TEMP=SUBSTR($TEMP 1,5)
+   DO RTF-Add-Token('%DATEOFINJURY%', $TEMP)
+
+   DO RTF-Add-Token('%WHEREEVENT%', &A.EXACT_LOCATION)
+   DO RTF-Add-Token('%INJURY_DESCR%', &A.OSHA_200_DESCR)
+   
+   ! Here, we look at the location and injury description, and use whichever one takes
+   ! more lines and add it to our total lines variable which will be used to deterine
+   ! when to make a page break.
+   !----------------------------------------------------------------------
+   LET $locString = RTRIM(&A.EXACT_LOCATION,' ')
+   LET $descrString = RTRIM(&A.OSHA_200_DESCR,' ')
+   LET #locLines = LENGTH($locString) / {eLineLength} + 1
+   LET #descrLines = LENGTH($descrString) / {fLineLength} + 1
+
+   #DEBUG SHOW '#locLines: ' #locLines
+   #DEBUG SHOW '#descrLines: ' #descrLines
+
+   IF #locLines > #descrLines 
+      ADD #locLines TO #PageRowCount
+   ELSE
+      ADD #descrLines TO #PageRowCount
+   END-IF
+
+   IF #PageRowCount >= {linesPerPage}
+      DO Totals-And-New-Page
+      IF #locLines > #descrLines 
+         LET #PageRowCount =  #locLines
+      ELSE
+          LET #PageRowCount = #descrLines
+      END-IF
+   END-IF
+   
+   #DEBUG SHOW '#PageRowCount: ' #PageRowCount
+
+   IF rtrim(&A.FATALITY_SW,' ') = 'Y'
+       LET PAGE_TOTALS.withDeaths(1) = PAGE_TOTALS.withDeaths(1) + 1
+       DO RTF-Add-Token('%DEATH%', 'X')
+       DO RTF-Add-Token('%DAYSAWAY%', ' ')
+       DO RTF-Add-Token('%JOBTRANSFER%', ' ')  
+       DO RTF-Add-Token('%OTHERRECORDABLE%', ' ')
+   ELSE
+       IF &A.AWAY_FROM_WORKDAYS > 0
+          LET PAGE_TOTALS.withDaysAway(1) = PAGE_TOTALS.withDaysAway(1) + 1
+          DO RTF-Add-Token('%DEATH%', ' ')
+          DO RTF-Add-Token('%DAYSAWAY%', 'X')
+          DO RTF-Add-Token('%JOBTRANSFER%', ' ')  
+          DO RTF-Add-Token('%OTHERRECORDABLE%', ' ')
+      ELSE
+          LET $ILLNESS_RESULT = rtrim(&A.ILLNESS_RESULT,' ')
+          IF (&A.RESTRICTD_WORKDAYS > 0) OR ($ILLNESS_RESULT = 'X')
+             LET PAGE_TOTALS.withTransfer(1) = PAGE_TOTALS.withTransfer(1) + 1
+             DO RTF-Add-Token('%DEATH%', ' ')
+             DO RTF-Add-Token('%DAYSAWAY%', ' ')
+             DO RTF-Add-Token('%JOBTRANSFER%', 'X')  
+             DO RTF-Add-Token('%OTHERRECORDABLE%', ' ')
+          ELSE
+             LET PAGE_TOTALS.withOther(1) = PAGE_TOTALS.withOther(1) + 1
+             DO RTF-Add-Token('%DEATH%', ' ')
+             DO RTF-Add-Token('%DAYSAWAY%', ' ')
+             DO RTF-Add-Token('%JOBTRANSFER%', ' ')  
+             DO RTF-Add-Token('%OTHERRECORDABLE%', 'X')
+          END-IF
+      END-IF
+   END-IF    
+   
+   LET $TEMP = TO_CHAR(#Restricted)
+   DO RTF-Add-Token('%ONJOBXFER%', $TEMP)
+   LET PAGE_TOTALS.Transfers(1) = PAGE_TOTALS.Transfers(1) + #Restricted
+
+   LET $TEMP = TO_CHAR(#Away)
+   DO RTF-Add-Token('%TOTALDAYSAWAY%', $TEMP)
+   LET PAGE_TOTALS.AwayFromWork(1) = PAGE_TOTALS.AwayFromWork(1) + #Away
+
+   LET #Injury = TO_NUMBER(&A.OSHA_INJ_CLASS)
+
+   LET #I_Loop = 1
+   WHILE #I_Loop <= 6
+      LET $TEMP = '%' || TO_CHAR(#I_Loop) || '%'
+      IF #I_Loop = #Injury
+         DO RTF-Add-Token($TEMP, 'X')
+         LET PAGE_INJURY_TOTALS.countForType(#I_Loop) = PAGE_INJURY_TOTALS.countForType(#I_Loop) + 1
+      ELSE
+         DO RTF-Add-Token($TEMP, ' ')
+      END-IF
+      ADD 1 to #I_Loop
+   END-WHILE
+
+   DO RTF-Add-Row
+   DO RTF-Clear-Tokens
+   
+FROM PS_OSHA_300_RPT A
+WHERE A.ESTABID = $Estab
+  AND A.INCIDENT_DT >= $FromDate
+  AND A.INCIDENT_DT <= $ThruDate
+ORDER BY A.CASE_NBR_USA, A.INCIDENT_DT
+END-SELECT    
+
+DO Totals-Only
+
+DO RTF-Close-Files
+end-procedure Process-Main
+
+!----------------------------------------------------------------------
+!---------Init-Array---------------------------------------------------
+!----------------------------------------------------------------------
+begin-procedure Init-Array
+#DEBUG DISPLAY 'Flow: Init-Array'
+
+CREATE-ARRAY NAME=OSHA
+             SIZE=100
+            FIELD=search:char
+            FIELD=replace:char
+
+CREATE-ARRAY NAME=PAGE_TOTALS
+             SIZE=2
+            FIELD=withDeaths:number
+            FIELD=withDaysAway:number 
+            FIELD=withTransfer:number
+            FIELD=withOther:number 
+            FIELD=Transfers:number
+            FIELD=AwayFromWork:number
+
+CREATE-ARRAY NAME=PAGE_INJURY_TOTALS
+             SIZE=7
+             FIELD=countForType:number
+
+end-procedure Init-Array
+!----------------------------------------------------------------------
+!---------RTF-Close-Files----------------------------------------------
+!----------------------------------------------------------------------
+! Originally, this routine was used to close all the files that had 
+! been opened, and to add the final bit of RTF to the output document.
+! Now that the templates are stored in the database, closing files is
+! no longer necessary, but we still need to add the last bit of RTF, 
+! so that is why this function is misnamed.
+!----------------------------------------------------------------------
+begin-procedure RTF-Close-Files
+#DEBUG DISPLAY 'Flow: RTF-Close-Files'
+LET $RTFFile = 'ohs018d.dat'
+DO RTF-Fetch-and-Process
+
+end-procedure
+!
+!----------------------------------------------------------------------
+!---------Totals-Only--------------------------------------------------
+!----------------------------------------------------------------------
+begin-procedure Totals-Only
+#DEBUG DISPLAY 'Flow: Totals-Only'
+! Add token values for page totals
+! --------------------------------
+LET $TEMP = TO_CHAR(PAGE_TOTALS.withDeaths(1))
+DO RTF-Add-Token('%DT%', $TEMP)
+LET $TEMP = TO_CHAR(PAGE_TOTALS.withDaysAway(1))
+DO RTF-Add-Token('%DAT%', $TEMP)
+LET $TEMP = TO_CHAR(PAGE_TOTALS.withTransfer(1))
+DO RTF-Add-Token('%JTT%', $TEMP)
+LET $TEMP = TO_CHAR(PAGE_TOTALS.withOther(1))
+DO RTF-Add-Token('%ORT%', $TEMP)
+LET $TEMP = TO_CHAR(PAGE_TOTALS.Transfers(1))
+DO RTF-Add-Token('%OJTT%', $TEMP)
+LET $TEMP = TO_CHAR(PAGE_TOTALS.AwayFromWork(1))
+DO RTF-Add-Token('%AT%', $TEMP)
+
+LET #PG_LOOP = 1
+WHILE #PG_LOOP <= 6
+   LET $TEMP = TO_CHAR(PAGE_INJURY_TOTALS.countForType(#PG_LOOP))
+   LET $TEMPKEY = '%' || TO_CHAR(#PG_LOOP)
+   LET $TEMPKEY = $TEMPKEY || 'T%'
+   DO RTF-Add-Token($TEMPKEY, $TEMP)
+   ADD 1 to #PG_LOOP
+END-WHILE
+
+LET $RTFFile = 'ohs018c.dat'
+DO RTF-Fetch-and-Process
+
+
+! And reset the page counts
+! -------------------------
+DO Reset-Page-Totals
+
+end-procedure Totals-Only
+!----------------------------------------------------------------------
+!---------Totals-And-New-Page------------------------------------------
+!----------------------------------------------------------------------
+begin-procedure Totals-And-New-Page
+#DEBUG DISPLAY 'Flow: Totals-And-New-Page'
+! Print and Calculate totals for page
+! -----------------------------------
+DO Totals-Only
+
+! And skip to the next page
+! -------------------------
+LET $Data = $RTFPageBreak
+DO RTF-Chunk-Write
+
+end-procedure Totals-And-New-Page
+!----------------------------------------------------------------------
+!---------Reset-Page-Totals--------------------------------------------
+!----------------------------------------------------------------------
+begin-procedure Reset-Page-Totals
+#DEBUG DISPLAY 'Flow: Reset-Page-Totals'
+
+CLEAR-ARRAY NAME=PAGE_TOTALS
+CLEAR-ARRAY NAME=PAGE_INJURY_TOTALS
+LET #PageRowCount = 0
+
+end-procedure Reset-Page-Totals
+!----------------------------------------------------------------------
+!---------Get-Establishment-Info---------------------------------------
+!----------------------------------------------------------------------
+
+!----------------------------------------------------------------------
+Begin-Procedure Get-Establishment-Info 
+#DEBUG DISPLAY 'Flow: Get-Establishment-Info'
+
+BEGIN-SELECT
+QQ.DESCR
+QQ.CITY
+QQ.STATE
+        DO RTF-Add-Token('%ESTABNAME%', &QQ.DESCR)
+        DO RTF-Add-Token('%CITY%', &QQ.CITY)
+        DO RTF-Add-Token('%STATE%', &QQ.STATE)
+FROM PS_ESTAB_TBL QQ
+WHERE QQ.ESTABID = $Estab
+  AND QQ.EFFDT = (SELECT MAX(QQ1.EFFDT) 
+                  FROM PS_ESTAB_TBL QQ1
+                  WHERE QQ1.ESTABID = QQ.ESTABID
+                    AND QQ1.EFF_STATUS = 'A'
+                    AND QQ1.EFFDT <= $ThruDate)
+
+END-SELECT
+End-Procedure Get-Establishment-Info
+!----------------------------------------------------------------------
+!---------RTF-Add-Row--------------------------------------------------
+!----------------------------------------------------------------------
+!----------------------------------------------------------------------
+Begin-Procedure RTF-Add-Row
+#DEBUG DISPLAY 'Flow: RTF-Add-Row'
+
+LET $RTFFile = 'ohs018b.dat'
+LET $RTFTemplate = ''
+
+DO RTF-Fetch-and-Process
+
+End-Procedure RTF-Add-Row
+!----------------------------------------------------------------------
+!---------Process-RTF-Header-------------------------------------------
+!----------------------------------------------------------------------
+!----------------------------------------------------------------------
+Begin-Procedure Process-RTF-Header
+#DEBUG DISPLAY 'Flow: Process-RTF-Header'
+LET $RTFFile = 'ohs018a.dat'
+DO RTF-Fetch-and-Process
+
+End-Procedure Process-RTF-Header
+!----------------------------------------------------------------------
+!---------SQCs---------------------------------------------------------
+!----------------------------------------------------------------------
+#include 'osha.sqc'
+#include 'stdapi.sqc'      !Routine to update run status
+#include 'rgrnctl1.sqc'    !Get run control parameter values
+#include 'rggetval.sqc'    !Get values mask routines
+#include 'askcalyr.sqc'    !Ask Calendar Year input
+#Include 'curdttim.sqc'    !Get-Current-DateTime procedure
+#Include 'datetime.sqc'    !Routines for date and time formatting
+#Include 'datemath.sqc'    !Routines for date and time calculations
+#Include 'number.sqc'      !Routines to format numbers
+   

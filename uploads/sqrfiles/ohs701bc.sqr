@@ -1,0 +1,1348 @@
+!***********************************************************************
+!  ECOUT001   Outbound EC Agent                                        *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+!   This module contains confidential and proprietary information      *
+!   of Oracle; it is not to be copied, reproduced, or transmitted      *
+!   in any form, by any means, in whole or in part, nor is it to       *
+!   be used for any purpose other than that for which it is            *
+!   expressly provided under the applicable license agreement.         *
+!                                                                      *
+!   Copyright (C) 2006 Oracle. All Rights Reserved.                    *
+!----------------------------------------------------------------------
+!                                                                      *
+!                                                                      *
+!***********************************************************************
+!                                                                      
+!          $Date:  2006/07/19:14:16:56                                 
+!       $Release:  HR9                                                 
+!      $Revision:  101                                                 
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+! This program extracts data out of the application EC staging areas   *
+! and writes the data to PeopleSoft Business Document files.           *
+! It is driven by the ECQUEUE table and the EDI Outbound Mapping Defn  *
+! tables.                                                              *
+!                                                                      *
+! This program relies heavily on the logic contained in ECOUTMAP.SQC.  *
+! This sqc contains application select statements for extracting the   *
+! data and is created by program ECPREP.SQR.                           *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+! CHANGE HISTORY
+! 06/20/96 - Added code in File-Write-Prep to check for long data type.
+! For long character strings, it will strip out CR/LF data.
+! 06/20/96 - Removed code that explicitly added row IDs to the first
+! three bytes of each flat file record. Now, it will pick up row id from
+! the map definition.
+! 06/21/96 - Changed the Put-Value-In-Array function so that it does no
+! field length formatting. This is all done in File-Write-Prep now. This
+! allows 0 length field data to be saved for parent reference (but not
+! printed).
+! 06/21/96 - Fixed bug with Append-List-File so that it writes out the
+! correct file information.
+! 07/03/96 - Converted Work List processing to support V6 Business Process
+! definitions. This required a changed to call 'Log-WL-Entry' and call
+! to 'Worklist-gen'.
+! 07/09/96 - Added support to for data conversion profiles. Added
+! "Cvt_Profile_ID" global variable.
+! 07/22/96 - Created new function 'Get-List_File_Spec' which retrieves
+! the output destination path and list file name from the trading partner
+! profile. The TP profile is derived via ECQUEUE info. Also removed old
+! code which used the RUNCNTL to determine output info.
+! 08/20/96 - Added call to "Update-Prcs-Run-Status" to update the run
+! control status in process scheduler.
+! 08/22/96 - Added new include file for 'timemath'
+! 08/28/96 - Added support for new date time standard in PSBD. Standard is                                                                     *
+! now YYYY/MM/DD HH:MM:SS. 'File-Write-Prep' now calls the 'Format-Datetime'
+! function to convert native DB format to the standard.
+! 09/05/96 - Changed the 'Put-Value-In-Array' function to handle both before
+! and after field values. The before value comes from the DB, the after comes
+! from the Move functions in ECOUTMAP.
+! 09/11/96 - Added the 'begin-setup' routine to include DB specific stuff.
+! This forces 4 digit date selection on Oracle.
+! 09/17/96 - Checked for CR/LF in character fields with length = 354. This
+! handles the PS standard NOTES field (TEXT354). It does not handle any other
+! character field which may be defined as a 'long edit' in panel designer.
+! Yes, this is a kludge fix!!!
+! 09/35/96 - Changed correlation table names so that they don't match
+! actual table names. This fix is for DB2 support. In most cases dropped
+! correlation usage.
+! 10/17/96 - Due to DB2 returning trailing blanks, needed to use 'rtrim'
+! function for all selected character columns.
+! 10/24/96 - Added support for MVS and OS/400 file naming conventions. This
+! will be done with conditional compiles to build the file names properly.
+! 10/28/96 - Dropped usage of local $Current_datetime variable and
+! referenced the standard $SysDateTime variable.
+! 11/29/96 - Changed the 'write_value' for each line to pad out to the
+! record length. Some translators can't have a premature CR/LF that cuts
+! off many fields.
+! 01/10/96 - Right adjusted numeric fields and made decimal point explicit
+! for whole numbers returned from DB. Changed 'File-Write-Prep' routine.
+! Also changed the way the max record size is calculated.
+! 02/26/97 - Changed the size of the field map arrays to handle large
+! table definitions.
+! 03/03/97 - Updated #Max_PS_ECOUTMAPFLD to be 300
+! per incident T-MARMSTR3-0003.  This increases field map arrays to handle large
+! table definitions.
+! 03/17/97 - Implemented Changes Necessary for Forced Agent Mapping as
+! well as Flexible Date Formating.
+! 06/10/97 - Implemented changes necessary for csv files as well as strip char
+!
+!***********************************************************************
+
+#include 'setenv.sqc'
+
+!----------------------------------------------------------------------!
+!  Begin Setup
+!----------------------------------------------------------------------!
+begin-setup
+#include "setupdb.sqc"
+end-setup
+
+!----------------------------------------------------------------------!
+!  Begin Report
+!----------------------------------------------------------------------!
+begin-Report
+
+   do Init-Report
+
+end-Report
+
+
+!----------------------------------------------------------------------!
+! Initialize Report
+!----------------------------------------------------------------------!
+begin-Procedure Init-Report
+   #debugh do debug-msg('Init-Report')
+
+   do Init-Variables
+
+   do Init-DateTime
+
+   do Define-Prcs-Vars
+
+   do Get-Current-DateTime
+
+   do Get-Run-Control-Parms
+
+   do Just-Do-It
+
+   do Update-Prcs-Run-Status
+
+end-procedure
+
+!----------------------------------------------------------------------!
+! Initialize Variables
+! This proc initializes global constants used through out the program.
+!----------------------------------------------------------------------!
+begin-Procedure Init-Variables
+   #debugh do debug-msg('Init-Variables')
+
+   let $sql_char  = ''''
+   let $comma = ','
+   encode '<13><10>' into $CRLF
+   #define Year4      '1'                ! Forces 4 digit year to be used for flat file
+   let $Bus_Doc_In_Out_Sw = 'O'
+   let #ectransid_size       = 15
+   let #ec_tp_id_size        = 16
+   let #ec_entitycd_size     = 4
+
+   let $Logged_Status     = '0'
+   let $PreLoad_Status    = '1'
+   let $Load_Error_Status = '2'
+   let $Loaded_Status     = '3'
+
+   let $Rowid_999 = '999'
+
+   let #Max_Index   = 35
+   let #Max_PS_ECOUTMAPFLD   = 300
+   let #message_set_nbr = 109
+   let #Luw_Load_Total = 0
+   let #Luw_Error_Total = 0
+
+   let $force_flag = 'N'         ! N means do NOT suppress the 999
+   let $csv_flag = 'N'           ! N means fixed format as per map definitions
+   let $csv_delimiter = ''''
+   let $csv_separator = ','
+   let $suppress_rowid = 'N'     ! N means write out the rowid
+   let #temp=1
+
+
+   Create-Array name= PS_ECOUTMAPREC size = 1
+         field=ecmapid:char:35
+         field=ecfilerowid:char:35
+         field=recname:char:35
+         field=echdrrecsw:char:35
+         field=whereclause:char:35
+         field=totalfilefields:number:35
+         field=totalreclength:number:35         ! Total length of flat file record
+
+   Create-Array name= PS_ECOUTMAPFLD size = 300
+         field=ecmapid:char:35
+         field=ecfilerowid:char:35
+         field=seqno:number:35
+         field=fieldname:char:35
+         field=fieldtype:number:35
+         field=ecstartpos:number:35
+         field=length:number:35
+         field=decimalpos:number:35
+         field=ecfieldvaluecd:char:35
+         field=ectpcvtid:char:35
+         field=ecdefaultvalue:char:35
+         field=ecdrivercalccd:char:35
+         field=errornumber:number:35
+         field=filefldval:char:35
+         field=dbfldval:char:35
+         field=curseqnovalue:number:35=1
+         field=delimit_date:char:35
+         field=year_start:number:35
+         field=year_len:number:35
+         field=month_start:number:35
+         field=month_len:number:35
+         field=day_start:number:35
+         field=day_len:number:35
+         field=ecpad:char:35
+         field=eccap:char:35
+         field=ecstrip_char:char:35
+
+
+   Create-Array name= FILEWRITE size = 1
+         field=writevalue:char:1000
+         field=ecfilerowid:char:1000
+         field=ecqueueinstance:number:1000
+         field=luwlinenum:number:1000
+         field=ectransid:char:1000
+         field=message_set_nbr:number:1000
+         field=message_nbr:number:1000
+         field=error_misc:char:1000
+
+   Create-Array name= FLEX_DATE size = 21
+         field=dtchar:char:1
+
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+!  Just-Do-It
+!----------------------------------------------------------------------!
+begin-procedure Just-Do-It
+
+      #debugh do debug-msg('get-import-request')
+
+      let $more_request = 'Y'
+      display 'proc oprid  '
+      display $prcs_oprid
+      display 'proc cntrl  '
+      display $prcs_run_cntl_id
+      let $prcs_oprid = rtrim($prcs_oprid, ' ')
+      let $prcs_run_cntl_id = rtrim($prcs_run_cntl_id, ' ')
+      display 'proc oprid  '
+      display $prcs_oprid
+      display 'proc cntrl  '
+      display $prcs_run_cntl_id
+
+begin-select
+
+ECRUNCNTL.OPRID,
+ECRUNCNTL.RUN_CNTL_ID,
+ECRUNCNTL.ECOUTOPT_ECTRANSID,
+ECRUNCNTL.ECOUTOPT_BU,
+ECRUNCNTL.ECOUTOPT_ECAPPTPID,
+ECRUNCNTL.ECTRANSID_WRK,
+ECRUNCNTL.BUSINESS_UNIT,
+ECRUNCNTL.ECCUSTVNDRVAL,
+ECRUNCNTL.ECFORCEFLG,
+ECRUNCNTL.ECCSVFLG,
+ECRUNCNTL.ECCSVDEL,
+ECRUNCNTL.ECCSVSEP,
+ECRUNCNTL.ECSUPROW
+
+
+   let $force_flag ='Y'
+   let $csv_flag = 'N'
+   let $csv_delimiter = &ECRUNCNTL.ECCSVDEL
+   let $csv_separator = &ECRUNCNTL.ECCSVSEP
+   let $suppress_rowid = 'Y'
+
+
+   do Build-ECQUEUE-Where
+   do Process-ECQUEUE
+
+FROM PS_ECRUNCNTL ECRUNCNTL
+WHERE ECRUNCNTL.OPRID       = $prcs_oprid
+AND   ECRUNCNTL.RUN_CNTL_ID = $prcs_run_cntl_id
+end-select
+
+
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+!  Build-ECQUEUE-Where
+!  This proc completes the where clause to be used in selecting data from
+!  the queue. Since the run control data can select entries by business
+!  unit, transaction, and trading partner ID; it appends this info
+!  onto the where clause. It returns ecqueue_where as output.
+!----------------------------------------------------------------------!
+begin-procedure Build-ECQUEUE-Where
+      #debugh do debug-msg('Build-ECQUEUE-Where')
+
+   let $Single_Quote = ''''
+
+   let $ecqueue_where   = ' WHERE PS_ECQUEUE1.ECTRANSINOUTSW = ' ||
+                          $Single_Quote || $Bus_Doc_In_Out_Sw || $Single_Quote ||
+                          ' AND PS_ECQUEUE1.ECQUEUESTATUS = ' ||
+                          $Single_Quote || 'L' || $Single_Quote
+
+   let $ecqueue_groupby = ''
+
+   let $where_temp1 = ''
+   let $where_temp2 = ''
+   let $where_temp3 = ''
+   let $where_temp  = ''
+
+   if &ECRUNCNTL.ECOUTOPT_ECTRANSID = 'Y'
+      let $where_temp1 = ' PS_ECQUEUE1.ECTRANSID = ' ||
+                        $Single_Quote || rtrim(&ECRUNCNTL.ECTRANSID_WRK, ' ') ||
+                        $Single_Quote
+   end-if
+
+   if &ECRUNCNTL.ECOUTOPT_BU = 'Y'
+      let $where_temp2 = ' PS_ECQUEUE1.BUSINESS_UNIT = ' ||
+                        $Single_Quote || rtrim(&ECRUNCNTL.BUSINESS_UNIT, ' ') ||
+                        $Single_Quote
+   end-if
+
+   if &ECRUNCNTL.ECOUTOPT_ECAPPTPID = 'Y'
+      let $where_temp3 = ' PS_ECQUEUE1.ECCUSTVNDRVAL = ' ||
+                        $Single_Quote || rtrim(&ECRUNCNTL.ECCUSTVNDRVAL, ' ') ||
+                        $Single_Quote
+   end-if
+
+   if $where_temp1 <> '' or $where_temp2 <> '' or $where_temp3 <> ''
+      if $where_temp1 <> ''
+         let $where_temp = $where_temp1
+         let $groupby    = $groupby1
+      end-if
+      if $where_temp2 <> ''
+         if $where_temp <> ''
+            let $And = ' AND '
+         else
+            let $AND = ''
+         end-if
+         let $where_temp = $where_temp || $And || $where_temp2
+      end-if
+      if $where_temp3 <> ''
+         if $where_temp <> ''
+            let $And = ' AND '
+         else
+            let $AND = ''
+         end-if
+         let $where_temp = $where_temp || $And || $where_temp3
+      end-if
+   end-if
+
+   if $where_temp <> ''
+      let $ecqueue_where   = $ecqueue_where || ' AND ' || $where_temp
+   end-if
+
+   #debugv display '$ecqueue_where'
+   #debugv display $ecqueue_where
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+!  Process-ECQUEUE
+!
+!  Processs each ECQUEUE entry one at a time.  Since the output goes to
+!  a flat file, we cannot use set processing.
+!
+!  Since the outbound flow assumes that the queue encompasses an entire
+!  transaction, the queue business unit will drive the setid processing
+!  for all lower level customer/vendor lookups.
+!
+!----------------------------------------------------------------------!
+begin-procedure Process-ECQUEUE
+      #debugh do debug-msg('Process-ECQUEUE')
+
+begin-select
+
+PS_ECQUEUE1.ECTRANSID,
+PS_ECQUEUE1.ECENTITYCD_EXT,
+PS_ECQUEUE1.ECCUSTVNDRVAL,
+PS_ECQUEUE1.ECENTITYCD_BU,
+PS_ECQUEUE1.BUSINESS_UNIT,
+PS_ECQUEUE1.ECQUEUEINSTANCE
+
+   let $ECTRANSID = rtrim(&PS_ECQUEUE1.ECTRANSID, ' ')
+   let $ECentitycd_Ext = rtrim(&PS_ECQUEUE1.ECENTITYCD_EXT, ' ')
+   let $ECCUSTVNDRVAL = rtrim(&PS_ECQUEUE1.ECCUSTVNDRVAL, ' ')
+   let $ECentitycd_BU = rtrim(&PS_ECQUEUE1.ECENTITYCD_BU, ' ')
+   let $Q_BUSINESS_UNIT = rtrim(&PS_ECQUEUE1.BUSINESS_UNIT, ' ')
+   let $Active_Business_Unit = $Q_BUSINESS_UNIT
+
+   let #ECQUEUEINSTANCE = &PS_ECQUEUE1.ECQUEUEINSTANCE
+   let $ECQUEUEINSTANCE = to_char(#ECQUEUEINSTANCE)
+
+   do Process-ECQUEUEINSTANCE
+
+   let $ECTRANSID_PREV = rtrim(&PS_ECQUEUE1.ECTRANSID, ' ')
+   let $ECCUSTVNDRVAL_PREV = rtrim(&PS_ECQUEUE1.ECCUSTVNDRVAL, ' ')
+   let $Q_BUSINESS_UNIT_PREV = rtrim(&PS_ECQUEUE1.BUSINESS_UNIT, ' ')
+!  let $ECmapid_Prev = $ECMAPID
+   let $ECmapid_Prev = 'BCWCB'
+
+FROM  PS_ECQUEUE PS_ECQUEUE1
+[$ecqueue_where]
+ORDER BY
+PS_ECQUEUE1.ECTRANSID,
+PS_ECQUEUE1.ECCUSTVNDRVAL,
+PS_ECQUEUE1.BUSINESS_UNIT,
+PS_ECQUEUE1.ECQUEUEINSTANCE
+
+end-select
+
+   if $ECbusdoc_Filename <> ''
+      CLOSE 1
+      do Update-ECBUSDOCHDR(#ECBUSDOCID, 'N', #luw_load_total, #luw_error_total)
+   end-if
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+!  Process-ECQUEUEINSTANCE
+!
+!  If the ECCUSTVNDRVAL, ECTRANSID, or BUSINESS_UNIT changes, retrieve
+!  the new mapid, calculate the new 999 row values, and write the data
+!  to a different PeopleSoft Business Document file.
+!
+!----------------------------------------------------------------------!
+begin-procedure Process-ECQUEUEINSTANCE
+      #debugh do debug-msg('Process-ECQUEUEINSTANCE')
+
+   let #Total_Write_Lines = -1      ! Reset file pointer for each queue instance
+   clear-array name=FILEWRITE
+
+   if $ECCUSTVNDRVAL <> $ECCUSTVNDRVAL_PREV OR
+      $ECTRANSID <> $ECTRANSID_PREV OR
+      $Q_BUSINESS_UNIT <> $Q_BUSINESS_UNIT_PREV
+
+      do Get-ECENTITYCD_Type($Ecentitycd_Ext, $temp, $entitycd_recname)
+      do Convert-Internal_Cust_Vndr($Q_BUSINESS_UNIT, $ECCUSTVNDRVAL,
+                      $ECentitycd_Ext, $entitycd_recname, $Q_Ext_Tp_Id)
+      if isblank($Q_Ext_Tp_Id)
+         do Terminate-New_Bus_Doc_Error('Could NOT Convert External ID at the EC Queue Level.',
+               #ECQUEUEINSTANCE, $ECTRANSID, $Q_BUSINESS_UNIT, $ECCUSTVNDRVAL, $ECentitycd_Ext)
+      end-if
+
+      do Get-ECPROFILEIDS($Q_Ext_Tp_Id, $ecmapprofileid, $ec_profile_id, $Cvt_Profile_Id)
+
+      do Convert-Business_Unit($Q_BUSINESS_UNIT, $ECentitycd_BU, $Q_Ext_Tp_Id,
+         $ec_int_tp_id, $ec_alias_tp_id)
+      if isblank($ec_alias_tp_id)
+         do Terminate-New_Bus_Doc_Error('Could NOT Convert EC Queue Level Business Unit.',
+               #ECQUEUEINSTANCE, $ECTRANSID, $Q_BUSINESS_UNIT, $Q_Ext_Tp_Id, $ECentitycd_BU)
+      end-if
+
+      do Get-ECMAPID($ecmapprofileid, $ECTRANSID, $Bus_Doc_In_Out_Sw, $ECMAPID)
+      if isblank($ECMAPID)
+         do Terminate-New_Bus_Doc_Error('Could NOT Retrieve EC Map Definition.',
+               #ECQUEUEINSTANCE, $ECTRANSID, $Q_BUSINESS_UNIT, $Q_Ext_Tp_Id, $ECentitycd_BU)
+      end-if
+
+      do Process-New-Bus-Doc
+
+   end-if
+
+   #debugv display '$ectransid='             noline
+   #debugv display $ECTRANSID
+   #debugv display '$Q_Ext_Tp_Id='           noline
+   #debugv display $Q_Ext_Tp_Id
+   #debugv display '$ec_int_tp_id='          noline
+   #debugv display $ec_int_tp_id
+   #debugv display '$ecmapid='               noline
+   #debugv display $ECMAPID
+   #debugv display '#ecqueueinstance='       noline
+   #debugv display #ecqueueinstance
+   #debugv display '$ECbusdoc_Filename='     noline
+   #debugv display $ECbusdoc_Filename
+
+   do Core-Processing
+
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+!  Process-New-Bus-Doc
+!  This proc builds the '999' output record, closes any open files,
+!  updates the business document header with previous iteration's data,
+!  opens up a new business document file, and appends the doc list file.
+!
+!  Keep this proc GLOBAL due to global variable refs.
+!
+!----------------------------------------------------------------------!
+begin-procedure Process-New-Bus-Doc
+   #debugh do debug-msg('Process-New-Bus-Doc')
+
+   if $ECMAPID <> $ECmapid_Prev
+      do Load-PS_ECOUTMAPREC
+   end-if
+
+   let $write_value = $Rowid_999 || rpad($ECTRANSID,#ectransid_size,' ') ||
+                      rpad($ECentitycd_Ext ,#ec_entitycd_size,' ') ||
+                      rpad($Q_Ext_Tp_Id ,#ec_tp_id_size,' ') ||
+                      rpad($ECentitycd_BU ,#ec_entitycd_size,' ') ||
+                      rpad($ec_alias_tp_id,#ec_tp_id_size,' ')
+   #debugv display '999 output record:'
+   #debugv display $write_value
+   #debugv display 'Should we Suppress The 999 ?'
+   #debugv display $force_flag
+
+  if $force_flag = 'N'  ! user did not request to suppress the 999
+
+   add 1 to #Total_Write_Lines    ! pre-increment to new pointer in file
+   #debugv display 'Total_Write_Lines ' noline
+   #debugv display #Total_Write_Lines
+   put              ! store the 999 line into the output buffer
+      $Rowid_999
+      #ecqueueinstance
+      $ECTRANSID
+      $write_value
+   into FILEWRITE(0)
+      ecfilerowid(#Total_Write_Lines)
+      ecqueueinstance(#Total_Write_Lines)
+      ectransid(#Total_Write_Lines)
+      writevalue(#Total_Write_Lines)
+   end-if
+
+   if $ECbusdoc_Filename <> ''
+       CLOSE 1
+      do Update-ECBUSDOCHDR(#ECBUSDOCID, 'N', #luw_load_total, #luw_error_total)
+   end-if
+
+   do Get-ECBUSDOCID
+   do Get-List_File_Spec($Ec_Profile_ID, $fpath, $fname)
+
+begin-SELECT
+FILE_NAME_BC_CAN
+ Let $bcwcbnm=&FILE_NAME_BC_CAN
+FROM PS_WCB_MSGHD_EC
+end-SELECT
+
+   let $ECBUSDOCID = to_char(#ECBUSDOCID)
+   #ifdef MVS
+      let $ecbusdoc_listfilename =  $fname
+      let $ECbusdoc_Filename = {ps-substr}($Q_Ext_Tp_Id,1,8)  ! this will be DDNAME
+   #else
+   #ifdef OS400
+      let $ecbusdoc_listfilename =  $fname
+      let $ECbusdoc_Filename = {ps-substr}($Q_Ext_Tp_Id,1,10)  ! this will be DDNAME
+   #else
+      let $ecbusdoc_listfilename =  $fpath || $fname
+      let $ECbusdoc_Filename = $fpath || $bcwcbnm
+   #endif
+   #endif
+   do Open-Bus-Doc-File($ECbusdoc_Filename)
+   do Append-List-File($ecbusdoc_listfilename, $ECbusdoc_Filename)
+
+   do Process-ECBUSDOCHDR( #ECBUSDOCID, $ECbusdoc_Filename, $Bus_Doc_In_Out_Sw, $Logged_Status)
+
+   let #Luw_Load_Total = 0
+   let #Luw_Error_Total = 0
+
+end-procedure
+
+
+
+!----------------------------------------------------------------------!
+!   Get-List_File_Spec($Ec_Profile_ID, $fpath, $fname)
+!----------------------------------------------------------------------!
+begin-procedure Get-List_File_Spec($pro_id, :$file_path, :$file_name)
+   #debugh do debug-msg('Get-List_File_Spec')
+   #debugv display 'Input profile=' noline
+   #debugv display $pro_id
+let $file_name = ' '
+let $file_path = ' '
+begin-select
+ECOUTFILELISTPATH,
+ECOUTFILELISTNAME
+
+   let $file_path = rtrim(&ECOUTFILELISTPATH, ' ')
+   let $file_name = rtrim(&ECOUTFILELISTNAME, ' ')
+
+FROM PS_ECTPPROFILE
+WHERE TP_PROFILE_ID = $pro_id
+
+end-select
+
+   #debugv display 'Output file info=' noline
+   #debugv display $file_path noline
+   #debugv display $file_name
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+!  Open-Bus-Doc-File
+!----------------------------------------------------------------------!
+begin-procedure Open-Bus-Doc-File($out_file)
+      #debugh do debug-msg('Open-Bus-Doc-File')
+
+   open $out_file as 1  for-writing record=4000:vary
+   status = #filestat
+
+   if #filestat = 0
+      Display 'Opening Output file ' noline
+      Display $out_file
+   else
+      let $out_file = 'Cannot open output file = ' || $out_file
+      do Terminate-New_Bus_Doc_Error($out_file,
+               #ECQUEUEINSTANCE, $ECTRANSID, $Q_BUSINESS_UNIT, $Q_Ext_Tp_Id, $ECentitycd_BU)
+   end-if
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+!  Append-List-File
+!
+!  Append the new PSFT Business Document file name to the outbound list
+!  file. File name is passed as input.
+!
+!----------------------------------------------------------------------!
+begin-procedure Append-List-File($list_file_name, $bus_doc_file_name)
+   #debugh do debug-msg('Append-List-File')
+   #debugv display 'List file name ' noline
+   #debugv display $list_file_name
+
+   open $list_file_name as 2 for-append record=500:vary
+
+   if #filestat <> 0
+      let $list_file_name = 'Cannot open output list file = ' || $list_file_name
+      do Terminate-New_Bus_Doc_Error($list_file_name,
+               #_ECQUEUEINSTANCE, $_ECTRANSID, $_Q_BUSINESS_UNIT, $_Q_Ext_Tp_Id, $_ECentitycd_BU)
+   end-if
+   write 2 from $bus_doc_file_name
+
+   close 2
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+!  Core-Processing
+!
+!  Base processing on the current ECMAPID.  Note that the logic contained
+!  in Evaluate-Mapid is created by program ECPREP.SQR and resides in
+!  ECOUTMAP.SQC.
+!
+!----------------------------------------------------------------------!
+begin-procedure Core-Processing
+   #debugh do debug-msg('Core-Processing')
+
+! Reset global data values and file_write array for next Q instance
+   let $ecdatavalue = ''
+   let #Total_Good_Lines = 0
+   let $LUW_Error_Sw = 'N'
+   let #LUWlinenum = 0
+
+
+   do Evaluate-Mapid
+   if $LUW_Error_Sw = 'N'
+      do Update-ECQUEUE($ECTRANSID, $Bus_Doc_In_Out_Sw, #ECQUEUEINSTANCE, #ECBUSDOCID, 'P')
+   else
+      do Update-ECQUEUE($ECTRANSID, $Bus_Doc_In_Out_Sw, #ECQUEUEINSTANCE, #ECBUSDOCID, 'E')
+   end-if
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+!  Put-Value-In-Array
+!
+!  The each field value retrieved into array PS_ECOUTMAPFLD.
+!  File-Write-Prep then parses the data together into a single line
+!  that is written to the PSFT bus doc file.
+!
+!----------------------------------------------------------------------!
+begin-procedure Put-Value-In-Array($fetch_value, $db_value, #idx, $rowid)
+   #debugh do debug-msg('Put-Value-In-Array')
+
+   let #ecfilerowid_index = to_number($rowid)
+
+   #debugv display '$fetch_value'
+   #debugv display $fetch_value
+   #debugv display '#Array_Index'
+   #debugv display #idx
+   #debugv display '#Ecfilerowid_index'
+   #debugv display #Ecfilerowid_index
+
+   if #idx >= 0
+
+      let PS_ECOUTMAPFLD.filefldval(#idx,#ecfilerowid_index) = $fetch_value
+      let PS_ECOUTMAPFLD.dbfldval(#idx,#ecfilerowid_index) = $db_value
+
+   end-if
+
+end-procedure
+
+!----------------------------------------------------------------------!
+!  File-Write-Prep
+!
+!  Parse the field values together into a single row that can be written
+!  to a PeopleSoft Business Document file.  The file write value is stored
+!  in array FILEDATA and is actually written to file in File-Write. Note,
+!  the global pointer into filedata "Total_Write_Lines" is PRE incremented
+!  in this routine.
+!
+!  Error Handling - This routine also processes any previous errors. At most
+!  one error per file row id can be logged. The error number, EC queue instance,
+!  output record info, and the in error data are all saved within the FILEDATA
+!  array. The procedure Process-LUW_Error will log the error in the ECBUSDOC
+!  tables. When errors are encountered during processing, the message_nbr and
+!  error_misc variables should be set. In error data can be saved in error_misc.
+!
+!----------------------------------------------------------------------!
+begin-procedure File-Write-Prep($rowid, $mapid)
+   #debugh do debug-msg('File-Write-Prep')
+
+   #debugv display 'FWP ecfilerowid ' noline
+   #debugv display $rowid
+   #debugv display 'FWP ecmapid ' noline
+   #debugv display $mapid
+   let #rowid_index = to_number($rowid)
+
+   add 1 to #_Total_Write_Lines
+   let #i = 0
+   let #j = 0
+   let $write_value = ' '
+   let #rowid_length = 3
+
+   if $_csv_delimiter = ' '         ! delim can't be blank...sep can
+     let $_csv_delimiter = ''
+   end-if
+
+
+
+   while #i < #_Max_Index
+
+      get
+         $ecmapid_temp
+         $ecfilerowid_temp
+         #totalfields
+         #totalreclength
+      from PS_ECOUTMAPREC(0)
+         ecmapid(#i)
+         ecfilerowid(#i)
+         totalfilefields(#i)
+         totalreclength(#i)
+
+      #debugv display '$ecmapid_temp=' noline
+      #debugv display $ecmapid_temp
+      #debugv display '#totalfields=' noline
+      #debugv display #totalfields
+      #debugv display '#totalreclength=' noline
+      #debugv display #totalreclength
+
+      if $ecmapid_temp = $mapid and
+         $ecfilerowid_temp = $rowid
+         break
+      else
+         add 1 to #i
+      end-if
+
+   end-while
+
+   if #i = #_Max_Index
+      let #_Message_Nbr = 101
+      let $_Error_Misc = 'File-Write-Prep could not find EC File Row ID value'
+      let $_LUW_Error_Sw = 'Y'
+   else
+      let $write_value = rpad($write_value, #totalreclength, ' ')   ! set buffer to blank
+
+      while #j <= #totalfields
+
+         get
+            $value
+            #fieldtype
+            #start_pos
+            #length
+            #decimalpos
+            $delimit_date
+            #year_start
+            #year_len
+            #month_start
+            #month_len
+            #day_start
+            #day_len
+            $pad_char
+            $cap_flag
+            $field_name
+            $strip_char
+
+         from PS_ECOUTMAPFLD(#j)
+            filefldval(#rowid_index)
+            fieldtype(#rowid_index)
+            ecstartpos(#rowid_index)
+            length(#rowid_index)
+            decimalpos(#rowid_index)
+            delimit_date(#rowid_index)
+            year_start(#rowid_index)
+            year_len(#rowid_index)
+            month_start(#rowid_index)
+            month_len(#rowid_index)
+            day_start(#rowid_index)
+            day_len(#rowid_index)
+            ecpad(#rowid_index)
+            eccap(#rowid_index)
+            fieldname(#rowid_index)
+            ecstrip_char(#rowid_index)
+
+
+         if $_csv_flag = 'N'
+           let $left_value = {ps-substr}($write_value, 1, #start_pos - 1)
+           let $right_value = {ps-substr}($write_value, #start_pos + #length,
+                              #totalreclength - (#start_pos + #length))
+         end-if
+
+
+         evaluate #fieldtype
+
+         when = 0            ! Strip out any Cr/LF in the NOTES Fields
+            if #length = 254
+               let $value = translate($value, $_CRLF, '  ')
+            end-if
+            if $cap_flag = 'Y'
+               let $value = upper($value)
+            end-if
+            if nvl($pad_char,'u') <> 'u' and $pad_char <> ' '
+               let $value = lpad($value,#length,$pad_char)
+            end-if
+
+         when = 1            ! Strip out any Cr/LF in the long char data
+            let $value = translate($value, $_CRLF, '  ')
+
+         when = 2
+         when = 3   ! Numeric MAY WANT TO RIGHT JUSTIFY
+            let $mask = ''
+
+            if #decimalpos > 0  ! Append decimal point
+               let $mask = rpad($mask, #length - (#decimalpos + 1), '9')
+               let $mask = $mask || '.'
+               let $mask = rpad($mask, #length, '9')
+            else
+               let $mask = rpad($mask, #length, '9')
+            end-if
+                                     ! if the pad character is a 0 (only valid one for number) then fill
+            if $pad_char = '0'
+              let $mask = '0'||{ps-substr}($mask,2,length($mask) - 1)
+            end-if
+
+           #debugv display 'Right Adjustment mask=' noline
+           #debugv display $mask
+           #debugv display $pad_char
+
+            move $value to $value :$mask  ! right adjust with assignment
+
+         when = 4       ! date
+            do Format-Datetime($value, $value, {DEFYMD}, '', '')
+
+      ! skip this if we're already at YYYY/MM/DD or we probably don't have a date format
+            if (#year_start <> 1 or #year_len <> 4 or #month_start <> 6 or #month_len <> 2 or
+               #day_start <> 9 or #day_len <> 2) AND (#year_start + #month_start + #day_start) >= 7
+
+              do Process-Flex-Date($value,$value,#year_start,#year_len,#month_start,#month_len,#day_start,
+                              #day_len,$delimit_date,'O')
+            end-if
+
+         when = 6
+            do Format-Datetime($value, $value, {DEFYMD}, 'time', '')
+         end-evaluate
+
+
+                    ! any characters found in strip_char should be removed from the field.
+         if length($strip_char) >= 1 and $strip_char <> ' '
+
+            do Process-Strip-Char($value,$value,$strip_char)
+
+         end-if
+
+
+         if $_csv_flag = 'N'
+           ! complete total output line, make sure value is fixed length = field size
+           let $value = rpad($value,#length,' ')
+           let $write_value  = $left_value || {ps-substr}($value, 1, #length) || $right_value
+         else
+           ! csv is comma separated variable file format (like excel reads)
+
+           let $value = ltrim($value,' ')
+           let $value = rtrim($value,' ')
+
+           let $value = $_csv_delimiter || $value || $_csv_delimiter || $_csv_separator
+           let $write_value = rtrim($write_value,' ') || $value
+
+         end-if
+
+
+         if $field_name = 'ECFILEROWID'
+           let #rowid_len = #length + 1
+         end-if
+
+
+         #debugv display 'Left/Right/WriteValue :'
+         #debugv display $left_value
+         #debugv display $right_value
+         #debugv display $write_value
+         #debugv display $field_name
+
+         add 1 to #j
+
+      end-while
+
+      let $write_value = rtrim($write_value,' ')       ! make record variable length
+      let #write_len = length($write_value)
+
+      if $_csv_flag <> 'N'                              ! trim off the last delimiter
+       if {ps-substr}($write_value,#write_len,1) = $_csv_separator
+         let $write_value = {ps-substr}($write_value,1,#write_len - 1)
+       end-if
+      end-if
+
+                                !  if they don't want the rowid, strip it off
+                                ! this should probably be done earlier, however, it
+                                ! would mess up starting positions
+
+      if $_suppress_rowid = 'Y'
+         if $_csv_flag <> 'N'
+            if $_csv_delimiter <> ' '
+               let #rowid_len = #rowid_len + 2
+            end-if
+            let #rowid_len = #rowid_len + 1      ! for the delimiter
+         end-if
+
+         let $write_value = {ps-substr}($write_value,#rowid_len,#write_len - #rowid_len)
+      end-if
+
+
+
+      #debugv display 'FWP end data line:'
+      #debugv display $write_value
+
+   end-if
+
+   put
+      $rowid
+      #_ecqueueinstance
+      $_ECTRANSID
+      #_LUWlinenum
+      $write_value
+   into FILEWRITE(0)
+      ecfilerowid(#_Total_Write_Lines)
+      ecqueueinstance(#_Total_Write_Lines)
+      ectransid(#_Total_Write_Lines)
+      luwlinenum(#_Total_Write_Lines)
+      writevalue(#_Total_Write_Lines)
+
+   add 1 to #_LUWlinenum       ! May not need this variable since it = total_write_lines
+
+   if $_LUW_Error_Sw = 'Y'
+      #debugv display 'LUW Error Sw = Y ==> error results :'
+     put
+         #_Message_Set_Nbr
+         #_Message_Nbr
+         $_Error_Misc
+      into FILEWRITE(0)
+         message_set_nbr(#_Total_Write_Lines)
+         message_nbr(#_Total_Write_Lines)
+         error_misc(#_Total_Write_Lines)
+      #debugv display $rowid
+      #debugv display #_ECqueueinstance
+      #debugv display #_LUWlinenum
+      #debugv display $_ECTRANSID
+      #debugv display #_Message_Set_Nbr
+      #debugv display #_Message_Nbr
+      #debugv display $_Error_Misc
+
+   end-if
+
+end-procedure
+
+!----------------------------------------------------------------------!
+!  File-Write
+!
+!  Loop thru array FILEDATA and write each row to the PSFT Bus Doc file.
+!
+!----------------------------------------------------------------------!
+begin-procedure File-Write
+   #debugh do debug-msg('File-Write')
+
+   let #j = 0
+
+   while #j <= #Total_Write_Lines
+
+      get
+         $Write_Value
+      from FILEWRITE(0)
+         writevalue(#j)
+
+      #debugv display 'File Write Output :'
+      #debugv display $Write_Value
+
+      write 1 from $Write_Value
+
+      add 1 to #j
+
+   end-while
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+!  Process-LUW_Error
+!  This proc logs an error into the EC Business Document structures in the
+!  database. It first create the header line for the current global
+!  queue instance. It then retrieves the error information for each line
+!  in the file write buffer. If the line contains an error, then its details
+!  are writtern to the DB. It also increments the LUW error count for entry into
+!  the Business Document Header audit trail.
+!
+!  NOTES : Lots of global vars are created/set here for later work list
+!  processing.
+!----------------------------------------------------------------------!
+begin-procedure Process-LUW_Error
+   #debugh do debug-msg('Process-LUW_Error')
+
+   add 1 to #Luw_Error_Total
+   do Process-ECBUSDOCLN(#ECBUSDOCID, $ECTRANSID, #ECQUEUEINSTANCE, $Bus_Doc_In_Out_Sw)
+   do Log-WL-Entry('Manage EDI',
+                   'Manage Outbound EDI Agent',
+                   'Run Outbound Agent',
+                   'Work Outbound Agent Errors',
+                   'ECBUSDOCLN_WL',
+                   'ECOUT001',
+                   #ECBUSDOCID, $ECTRANSID,
+                   #ECQUEUEINSTANCE, $Bus_Doc_In_Out_Sw)
+
+   let #j = 0
+   #debugv display 'Process-LUW_Error total write lines=' noline
+   #debugv display #Total_Write_Lines
+
+   while #j <= #Total_Write_Lines
+
+      get
+         $ECDATAVALUE
+         $ecfilerowid_filedata0
+         #ecqueueinstance_err
+         #LUWlinenum
+         $ECTRANSID
+         #message_set_nbr
+         #message_nbr
+         $error_misc
+      from FILEWRITE(0)
+         writevalue(#j)
+         ecfilerowid(#j)
+         ecqueueinstance(#j)
+         luwlinenum(#j)
+         ectransid(#j)
+         message_set_nbr(#j)
+         message_nbr(#j)
+         error_misc(#j)
+
+      if $ecfilerowid_filedata0 <> $Rowid_999            ! Skip over the 999 row
+
+         if #message_nbr > 0
+            let $ECBUSDOCDTL_Status = $Load_Error_Status
+         else
+            let $ECBUSDOCDTL_Status = $Logged_Status
+         end-if
+
+         do Process-ECBUSDOCDTL     ! save the detail info regardless of error
+
+         if #message_nbr > 0
+            do Process-ECBUSDOCERR
+         end-if
+
+      end-if
+      add 1 to #j
+
+   end-while
+
+end-procedure
+
+!----------------------------------------------------------------------!
+! convert-value
+! This proc converts a data value based on a MAP ID specific conversion.
+! The outbound map setup has specified that a certain column is to be
+! converted based only on map information. It needs both I/O data value
+! parms so that the input value does not get clobbered.
+!----------------------------------------------------------------------!
+begin-procedure Convert-Value($mapid, $rowid, #seqno, $in_value, :$out_value)
+   #debugh do debug-msg('Convert-Value')
+   #debugv display 'Map ID=' noline
+   #debugv display $mapid
+   #debugv display 'Row ID=' noline
+   #debugv display $rowid
+   #debugv display 'Seq No=' noline
+   #debugv display #seqno
+   #debugv display 'Source Value=' noline
+   #debugv display $in_value
+   let $out_value = ''
+
+begin-select
+
+ECCVTTOVALUE
+
+  let $out_value = rtrim(&ECCVTTOVALUE, ' ')
+
+FROM PS_ECOUTMAPCVT
+WHERE ECMAPID        = $mapid
+AND   ECFILEROWID    = $rowid
+AND   SEQNO          = #seqno
+AND   ECCVTFROMVALUE = $in_value
+
+end-select
+
+end-procedure
+
+!----------------------------------------------------------------------!
+!  Load-PS_ECOUTMAPREC
+!----------------------------------------------------------------------!
+begin-procedure Load-PS_ECOUTMAPREC
+   #debugh do debug-msg('Load-PS_ECOUTMAPREC ')
+
+begin-select
+
+PS_ECOUTMAPREC1.ECFILEROWID,
+PS_ECOUTMAPREC1.RECNAME
+
+            let $ecfilerowid = rtrim(&PS_ECOUTMAPREC1.ECFILEROWID, ' ')
+            let #ecfilerowid_index = to_number($ecfilerowid)
+            let $recname     = rtrim(&PS_ECOUTMAPREC1.RECNAME, ' ')
+
+            #debugv display '#ecfilerowid_index=' noline
+            #debugv display #ecfilerowid_index
+            #debugv display '$ecmapid=' noline
+            #debugv display $ECMAPID
+
+            do Load-PS_ECOUTMAPFLD
+
+            do Retrieve-Whereclause
+
+            put
+               $ECMAPID
+               $ecfilerowid
+               $recname
+               $whereclause
+            into PS_ECOUTMAPREC(0)
+               ecmapid(#ecfilerowid_index)
+               ecfilerowid(#ecfilerowid_index)
+               recname(#ecfilerowid_index)
+               whereclause(#ecfilerowid_index)
+
+FROM
+PS_ECOUTMAPREC  PS_ECOUTMAPREC1
+WHERE
+ECMAPID = $ECMAPID
+
+end-select
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+!  Retrieve-Whereclause
+!----------------------------------------------------------------------!
+begin-procedure Retrieve-Whereclause
+   #debugh do debug-msg('Retrieve-Whereclause')
+
+  let $whereclause = ''
+
+begin-select
+
+SEQNO,
+ECWHERE
+
+   let $whereclause = $whereclause || rtrim(&ECWHERE, ' ')
+
+FROM PS_ECOUTMAPWHERE
+WHERE ECMAPID  = $ECMAPID
+AND   ECFILEROWID = $ecfilerowid
+ORDER BY SEQNO
+
+end-select
+
+end-procedure
+
+!----------------------------------------------------------------------!
+!  Load-PS_ECOUTMAPFLD
+!  This proc will select all the field definitions for the current
+!  row id and map id (global). It then inserts them into the global array
+!  for future reference. It also calculates the maximum length of the
+!  record. This is done by finding the max start position and adding length.
+!
+!----------------------------------------------------------------------!
+begin-procedure Load-PS_ECOUTMAPFLD
+
+      #debugh do debug-msg('Load-PS_ECOUTMAPFLD')
+
+      let #i = 0
+      let #cur_rec_len = 3        ! Allow for three byte record ID field
+      let #max_start_pos = 0
+
+
+begin-select on-error=SQLError
+
+PS_ECOUTMAPFLD1.ECMAPID,
+PS_ECOUTMAPFLD1.ECFILEROWID,
+PS_ECOUTMAPFLD1.SEQNO,
+PS_ECOUTMAPFLD1.FIELDNAME,
+PS_ECOUTMAPFLD1.FIELDTYPE,
+PS_ECOUTMAPFLD1.ECSTARTPOS,
+PS_ECOUTMAPFLD1.LENGTH,
+PS_ECOUTMAPFLD1.DECIMALPOS,
+PS_ECOUTMAPFLD1.ECFIELDVALUECD,
+PS_ECOUTMAPFLD1.ECTPCVTID,
+PS_ECOUTMAPFLD1.ECDEFAULTVALUE,
+PS_ECOUTMAPFLD1.ECDRIVERCALCCD,
+PS_ECOUTMAPFLD1.DELIMIT_DATE,
+PS_ECOUTMAPFLD1.YEAR_START,
+PS_ECOUTMAPFLD1.YEAR_LEN,
+PS_ECOUTMAPFLD1.MONTH_START,
+PS_ECOUTMAPFLD1.MONTH_LEN,
+PS_ECOUTMAPFLD1.DAY_START,
+PS_ECOUTMAPFLD1.DAY_LEN,
+PS_ECOUTMAPFLD1.ECPAD,
+PS_ECOUTMAPFLD1.ECCAP,
+PS_ECOUTMAPFLD1.ECSTRIP_CHAR
+
+  do Put-PS_ECOUTMAPFLD(#i,#ecfilerowid_index)
+  if &PS_ECOUTMAPFLD1.ECSTARTPOS > #max_start_pos
+     let #cur_rec_len = &PS_ECOUTMAPFLD1.ECSTARTPOS + &PS_ECOUTMAPFLD1.LENGTH
+     let #max_start_pos = &PS_ECOUTMAPFLD1.ECSTARTPOS
+  end-if
+
+  add 1 to #i
+
+FROM PS_ECOUTMAPFLD PS_ECOUTMAPFLD1
+WHERE ECMAPID  = $ECMAPID
+AND   ECFILEROWID = $ecfilerowid
+ORDER BY SEQNO
+
+end-select
+
+   put              ! Update record level totals
+       #cur_rec_len
+       #i
+   into PS_ECOUTMAPREC(0)
+       totalreclength(#ecfilerowid_index)
+       totalfilefields(#ecfilerowid_index)
+   #debugv display 'LPE total record length=' noline
+   #debugv display #cur_rec_len
+   #debugv display 'LPE total field count=' noline
+   #debugv display #i
+end-procedure
+
+!----------------------------------------------------------------------!
+!  Terminate-New_Bus_Doc_Error
+!  This proc handles error processing when errrors occur at the EC Queue
+!  level during a switch to a new business document.
+!
+!----------------------------------------------------------------------!
+begin-procedure Terminate-New_Bus_Doc_Error($err_msg, #qinstance, $transid,
+                    $bu, $ext_tpid, $entity_cd)
+
+   do debug-msg($err_msg)
+   display 'EC Queue Instance = ' noline
+   display #qinstance
+   display 'EC Transaction ID = '
+   display $transid
+   display 'EC Queue Business Unit = ' noline
+   display $bu
+   display 'EC Queue Customer or Vendor Value/TPID = ' noline
+   display $ext_tpid
+   display 'EC Queue Entity Code = ' noline
+   display $entitycd
+   let #prcs_run_status = #prcs_run_status_error
+   do Update-Prcs-Run-Status
+   STOP
+end-procedure
+
+!----------------------------------------------------------------------!
+!  Reset-Sequence_Number
+!  This proc will reset the ECOUTMAPFLD array's sequence numbers. For the
+!  input file row id, it loops through all fields and resets the counter
+!  variable.
+!
+!----------------------------------------------------------------------!
+begin-procedure Reset-Sequence_Number($row_id,#temp)
+   #debugh do debug-msg('Reset-Sequence_Number')
+   #debugv display 'Input rowid=' noline
+   #debugv display $row_id
+
+   move $row_id to #row_id
+   let #i = 0
+   while #i < #_Max_PS_ECOUTMAPFLD
+      if  isblank(PS_ECOUTMAPFLD.fieldname(#i, #row_id))
+         break
+      end-if
+      let PS_ECOUTMAPFLD.curseqnovalue(#i, #row_id) = #temp
+      add 1 to #i
+   end-while
+
+end-procedure
+
+!----------------------------------------------------------------------!
+! Called SQC Procedures                                                !
+!----------------------------------------------------------------------!
+   #include 'ohs701bc.sqc'
+   #include 'ecmapfld.sqc'
+   #include 'ecwhere.sqc'
+   #include 'ecbusdoc.sqc'
+   #include 'wlgen.sqc'
+   #include 'fsgetshr.sqc'
+   #include 'number.sqc'
+   #include 'reset.sqc'     !Reset Printer Procedure
+   #include 'curdttim.sqc'  !Get Current Date Time
+   #include 'datemath.sqc'  !SQR date arithmetic procedures
+   #include 'timemath.sqc'  !SQR time arithmetic procedures
+   #include 'datetime.sqc'  !Routines for date and time formatting
+   #include 'prcsapi.sqc'   !Update Process Request API
+   #include 'prcsdef.sqc'   !Update Process Request variable declare
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

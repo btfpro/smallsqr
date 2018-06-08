@@ -1,0 +1,482 @@
+!***********************************************************************
+!  TAX516AZ:  State Tax Data Update - ARIZONA                          *
+!                                                                      *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!                                                                      *
+!                                                                      *
+! This software and related documentation are provided under a         *
+! license agreement containing restrictions on use and                 *
+! disclosure and are protected by intellectual property                *
+! laws. Except as expressly permitted in your license agreement        *
+! or allowed by law, you may not use, copy, reproduce,                 *
+! translate, broadcast, modify, license, transmit, distribute,         *
+! exhibit, perform, publish or display any part, in any form or        *
+! by any means. Reverse engineering, disassembly, or                   *
+! decompilation of this software, unless required by law for           *
+! interoperability, is prohibited.                                     *
+! The information contained herein is subject to change without        *
+! notice and is not warranted to be error-free. If you find any        *
+! errors, please report them to us in writing.                         *
+!                                                                      *
+!                                                                      *
+! Copyright (C) 1988, 2010, Oracle and/or its affiliates.              *
+! All Rights Reserved.                                                 *
+!***********************************************************************
+!                                                                      *
+!          $Date:  2010/04/30:14:45:28                                 !
+!       $Release:  HR9                                                 !
+!    $Resolution:  804998                                              !
+!                                                                      *
+!***********************************************************************
+
+
+#include 'setenv.sqc'  !Set environment
+#include 'setup02.sqc' !printer and page-size initialization
+#Include 'usarpt.sqc'  !Get USA variables
+
+begin-report
+  do Init-Report
+  do Process-Main
+  do NTR-Check
+  do Stdapi-Term
+end-report
+
+begin-procedure Init-Report
+  do Init-DateTime
+  move '1' to $MMLZero
+  move '1' to $DDLZero
+  move '1' to $Year4
+  move '-' to $DDelimiter
+  do Stdapi-Init
+
+  if $Prcs_Process_Instance = ''
+    do Prompts
+  else
+    do Select-Parameters
+  end-if
+  move 'TAX516AZ' to $ReportID
+  move 'TAX516AZ' to $Program
+  if $ActionType = 'U'
+    move 'Arizona State Tax Data Update Report' to $ReportTitle
+  else
+    move 'Arizona State Tax Data Audit Report' to $ReportTitle
+  end-if
+  display ' '
+  display $ReportTitle
+  display ' '
+
+  do Get-Current-DateTime
+  let $StartDate = $AsOfToday
+  do Convert-To-DTU-date($AsOfToday,$StDate)
+  do dtu-subtract-days($StDate, 1,$EndDate)
+  do Convert-From-DTU-Date ($EndDate,$OldEffDt)  !native
+  do Format-DateTime($OldEffDt, $OldEffDate, {DEFCMP}, '', '')
+  move 'N' to $EmpFound
+  move $AsOfToday to $NewEffDt
+
+end-procedure
+
+begin-heading 7
+  #include 'stdhdg01.sqc'
+  print $heading_dt                   (-1,,) center
+
+  print 'Insert/ Update'                              (+3,80)
+  print 'Prior Percent'                                (, 98)
+  print 'New Percent'                                  (,114)
+  print 'Employee Id'                                 (+1, 1)
+  print 'Company'                                      (, 15)
+  print 'Name'                                         (, 30)
+  print 'Effective Date'                               (, 80)
+  print 'of FWT'                                       (, 101)
+  print 'of Tax Gross'                                 (, 114)
+  print 'Comments'                                     (, 129)
+end-heading
+
+
+begin-procedure Process-Main
+
+begin-SELECT
+AA.EMPLID
+AA.COMPANY
+AA.EFFDT
+AA.STATE
+AA.PERCENT_OF_FWT
+BA.LAST_NAME
+BA.FIRST_NAME
+BA.MIDDLE_NAME
+AC.ACTION
+
+  let $COMPANY = &AA.COMPANY
+  let $EMPLID  = &AA.EMPLID
+  let $EFFDT   = &AA.EFFDT
+
+  move &AA.EFFDT to $AA.EFFDT
+  let $State = RTRIM(&AA.State,' ')
+  do Convert-To-DTU-Date ($AA.EFFDT,$EEeffdt)  !native
+
+  if $EEeffdt = $StDate
+
+    do Effdt-is-Today
+  else
+    move $NewEffDt to $EmplidEffDt
+    do Process-EE
+  end-if
+
+FROM PS_STATE_TAX_DATA AA, PS_PERSONAL_DATA BA, PS_JOB  AC
+WHERE AA.EFFDT <= $NewEffDt
+  AND AA.EFFDT  = (SELECT MAX(A1.EFFDT) FROM PS_STATE_TAX_DATA A1
+                  WHERE A1.EMPLID  = AA.EMPLID
+                    AND A1.EFFDT <= $NewEffDt
+                    AND A1.COMPANY = AA.COMPANY)
+  AND AA.EMPLID = BA.EMPLID
+  AND AA.EMPLID = AC.EMPLID
+  AND AA.COMPANY = AC.COMPANY
+  AND AA.STATE = 'AZ'
+  AND AC.ACTION <> 'TER'
+  AND AC.EFFSEQ = (SELECT MAX(EFFSEQ) FROM PS_JOB AC1
+                        WHERE AC1.EMPLID = AC.EMPLID
+                        AND AC1.EFFDT = AC.EFFDT
+                        AND AC1.COMPANY = AC.COMPANY)
+  AND AC.EFFDT = (SELECT MAX(EFFDT) FROM PS_JOB
+                 WHERE EMPLID = AA.EMPLID
+                   AND COMPANY = AA.COMPANY
+                   AND EFFDT <= $NewEffDt)
+ORDER BY AA.COMPANY,AA.EMPLID
+
+end-SELECT
+
+  do Check-for-Future-AZRows
+
+end-procedure
+
+
+begin-procedure Process-EE
+
+   if &AA.Emplid <> $HoldEmplid
+     move &AA.Emplid to $HoldEmplid
+     move 'N' to $AlreadyUpdated
+   end-if
+   if &AA.Company <> $HoldCompany
+     move &AA.Company to $HoldCompany
+     move 'N' to $AlreadyUpdated
+   end-if
+   let $err-flag = 'N'
+   do Get-Fed-Tax-Data
+
+   if $err-flag = 'N'
+     do Get-State-Tax-Data
+     do Get-Local-Tax-Data
+   end-if
+
+end-procedure
+
+begin-procedure Process-State
+
+  move &C.PERCENT_OF_FWT to #OldPercent
+
+    if $C.STATE = 'AZ'
+      do Evaluate-Percent
+      do Print-Name
+      do Print-Info
+      if $UpdateNeeded = 'Y'  and $ActionType = 'U'
+         if $InsertedFed = 'N'
+           do Insert-New-Fed-Row
+         end-if
+         do Insert-New-St-Row
+      end-if
+    else
+
+      if $ActionType = 'U'
+        if $InsertedFed = 'N'
+           do Insert-New-Fed-Row
+        end-if
+        do Insert-New-St-Row
+      end-if
+    end-if
+
+
+  move '                           ' to $error
+
+end-procedure
+
+
+begin-procedure Evaluate-Percent
+
+      evaluate #OldPercent
+         when = 0
+           move 0 to #NewPercent
+           move 'Y' to $UpdateNeeded
+           break
+         when = 10.7
+           move  1.3 to #NewPercent
+           move 'Y' to $UpdateNeeded
+           break
+         when = 20.3
+           move  1.8 to #NewPercent
+           move 'Y' to $UpdateNeeded
+           break
+         when = 24.5
+           move  2.7 to #NewPercent
+           move 'Y' to $UpdateNeeded
+           break
+         when = 26.7
+           move  3.6 to #NewPercent
+           move 'Y' to $UpdateNeeded
+           break
+         when = 33.1
+           move  4.2 to #NewPercent
+           move 'Y' to $UpdateNeeded
+           break
+         when = 39.5
+           move  5.1 to #NewPercent
+           move 'Y' to $UpdateNeeded
+           break
+         when-other
+           do Percent-Not-Found
+           move 'N' to $UpdateNeeded
+           break
+       end-evaluate
+
+end-procedure
+
+
+begin-procedure Check-for-Future-AZRows
+
+begin-SELECT
+G.EMPLID
+G.COMPANY
+G.EFFDT
+G.STATE
+G.PERCENT_OF_FWT
+PERSON.LAST_NAME
+PERSON.FIRST_NAME
+PERSON.MIDDLE_NAME
+
+    move &G.PERCENT_OF_FWT to #OldPercent
+    move &G.EFFDT to $G.EffDT
+    move &G.EFFDT to $EmplidEffDt
+
+    move 'N' to $UpdateNeeded
+    do Evaluate-Percent
+    if $UpdateNeeded = 'Y'  and $ActionType = 'U'
+       do Update-State-Tax-Row-NEW
+    end-if
+    do Found-Future
+    move '                           ' to $error
+FROM PS_STATE_TAX_DATA G, PS_PERSONAL_DATA PERSON, PS_JOB JB
+WHERE G.EFFDT > $NewEffDt
+  AND G.STATE  = 'AZ'
+  AND G.EMPLID = PERSON.EMPLID
+  AND G.EMPLID = JB.EMPLID
+  AND G.COMPANY = JB.COMPANY
+  AND JB.ACTION <> 'TER'
+  AND JB.EFFSEQ = (SELECT MAX(EFFSEQ) FROM PS_JOB JB1
+                        WHERE JB1.EMPLID = JB.EMPLID
+                        AND JB1.EFFDT = JB.EFFDT
+                        AND JB1.COMPANY = JB.COMPANY)
+  AND JB.EFFDT = (SELECT MAX(EFFDT) FROM PS_JOB
+                 WHERE EMPLID = G.EMPLID
+                   AND COMPANY = G.COMPANY
+                   AND EFFDT <= G.EFFDT)
+ORDER BY G.COMPANY,G.EMPLID
+
+end-SELECT
+end-procedure
+
+begin-procedure Update-State-Tax-Row-NEW
+
+  let $sql-statement = 'TAX516AZ.SQR,Update-State-Tax-Row-NEW,Update,PS_STATE_TAX_DATA'
+BEGIN-SQL
+UPDATE PS_STATE_TAX_DATA
+ SET PERCENT_OF_FWT = #NewPercent
+
+WHERE STATE  = 'AZ'
+  AND &G.EMPLID  = EMPLID
+  AND &G.COMPANY = COMPANY
+  AND $G.EffDT = EFFDT
+end-sql
+END-PROCEDURE
+
+begin-procedure Print-Name
+  print &AA.EMPLID                 (+1,1,11)
+  print &AA.COMPANY                (0,17,3)
+
+  print &BA.LAST_NAME              (0,30,20)
+  print ', '                       ()
+  let $FIRST_NAME = rtrim(&BA.FIRST_NAME,' ')
+  print $FIRST_NAME                (0,53,25)
+  print &BA.MIDDLE_NAME            (0,80,1) edit bx
+
+end-procedure
+
+
+begin-procedure Print-Info
+  move 'Y' to $EmpFound
+  print $EmplidEffDt              (0,82,11)
+  print #OldPercent               (0,102)
+  print '%'                       (0,109)
+  print #NewPercent               (0,118)
+  print '%'                       (0,125)
+  print $error                    (0,129)
+
+end-procedure
+
+begin-procedure Print-Name-Future-Row
+  print &G.EMPLID                 (+1,1,11)
+  print &G.COMPANY                (0,17,3)
+
+  print &PERSON.LAST_NAME          (0,30,20)
+  print ', '                       ()
+  let $FIRST_NAME = rtrim(&PERSON.FIRST_NAME,' ')
+  print $FIRST_NAME                (0,53,25)
+  print &PERSON.MIDDLE_NAME        (0,80,1) edit bx
+
+end-procedure
+
+begin-procedure Found-Future
+
+  if $UpdateNeeded = 'Y'
+     show &G.COMPANY ' ' &G.EMPLID ' has a future dated tax row => ' $StartDate '.'
+     move 'Found tax row dated => Eff Date. Updated.'   to $error
+  end-if
+  do Print-Name-Future-Row
+  do Print-Info
+end-procedure
+
+
+begin-procedure Fed-State-Sync
+
+  move 0 to #OldPercent
+  move 0 to #NewPercent
+  show &AA.COMPANY ' ' &AA.EMPLID 'AZ and US tax rows EFFDT not equal.'
+
+  move 'Fed and ST tax rows EFFDT not equal - No update.' to $error
+  do Print-Name
+  do Print-Info
+end-procedure
+
+begin-procedure Percent-Not-Found
+
+  move #OldPercent to #NewPercent
+  show &AA.COMPANY ' ' &AA.EMPLID ' has an incorrect Tax Percentage for Arizona ' $StartDate '.'
+
+  move 'Existing AZ Tax Percent Invalid - No Update.'  to $error
+
+end-procedure
+
+begin-procedure AlreadyUpdated
+
+  move 0 to #OldPercent
+  move 0 to #NewPercent
+  show &AA.COMPANY ' ' &AA.EMPLID ' has Multiple Jobs and the tax record has been already updated.'
+
+  move 'Multi Job - Same Company - Already Updated.'  to $error
+  do Print-Name
+  do Print-Info
+
+end-procedure
+
+begin-procedure Effdt-is-Today
+
+  move &AA.PERCENT_OF_FWT to #OldPercent
+  do Evaluate-Percent
+  if $UpdateNeeded = 'Y'  and $ActionType = 'U'
+     do Update-Row-Effdt-Today
+  end-if
+
+  if $UpdateNeeded = 'Y'
+     show &AA.COMPANY ' ' &AA.EMPLID ' has a tax row dated today. Updated.'
+     move 'Found tax row dated = Eff Date. Updated.'   to $error
+  end-if
+
+  do Print-Name
+  do Print-Info
+
+end-procedure
+
+begin-procedure Update-Row-Effdt-Today
+
+  let $sql-statement = 'TAX516AZ.SQR,Update-Row-Effdt-Today,Update,PS_STATE_TAX_DATA'
+BEGIN-SQL
+UPDATE PS_STATE_TAX_DATA
+ SET PERCENT_OF_FWT = #NewPercent
+
+WHERE STATE  = 'AZ'
+  AND &AA.EMPLID  = EMPLID
+  AND &AA.COMPANY = COMPANY
+  AND $AA.EffDT = EFFDT
+end-sql
+
+
+end-procedure
+
+begin-procedure Prompts
+  display 'This report will exclude updates to records with ACTION = TER on the '
+  display 'employee PS_JOB record when the effective date of the termination is less '
+  display 'than or equal to the run date of the report.  These represent currently  '
+  display 'terminated employees. '
+  display '  '
+  display '  '
+  while $ActionType = ''
+    input $ActionType 'Audit or Update? (A, U or Q to quit)'
+    uppercase $ActionType
+    if INSTR('AUQ',$ActionType,1) = 0
+      display ' '
+      display '***** Enter A, U, or Q *****'
+      display ' '
+      move '' to $ActionType
+    end-if
+  end-while
+  if $ActionType = 'Q'
+     display 'Quit selected - run stopped '
+     stop
+  end-if
+end-procedure
+
+
+begin-procedure NTR-Check
+  if $EmpFound = 'N'
+    display ' '
+    display '****** No Employee Records Selected ******'
+    display ' '
+    print '********************************'  (+3,1)
+    print '  No Employee Records Selected  '  (+1,1)
+    print '********************************'  (+1,1)
+    date-time () hh:mi:ss &t2
+    display &t2
+  end-if
+end-procedure
+
+begin-procedure Select-Parameters
+
+Begin-select
+MASS.ACTION_TYPE
+
+    let $ActionType     = RTRIM(&MASS.ACTION_TYPE, ' ')
+
+FROM PS_RC_MASS_EE_UPD MASS
+WHERE MASS.OPRID         = $Prcs_OprID
+  AND MASS.RUN_CNTL_ID   = $Prcs_Run_Cntl_ID
+end-SELECT
+end-procedure
+
+begin-procedure Emplid-Check-A
+
+! dummy procedure
+
+end-procedure
+
+begin-procedure Emplid-Check-B
+
+! dummy procedure
+
+end-procedure
+
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'datemath.sqc'  !dtu-subtract-days
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'stdapi.sqc'    !Update Process API
+#include 'gettxdta.sqc'  !Get Employee Tax Data for Update

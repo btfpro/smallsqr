@@ -1,0 +1,2573 @@
+
+!***********************************************************************
+!  PKG001:      Salary Packaging Enrolment Process                     *
+!                                                                      *
+!  Description: This SQR is part of a process that automatically       *
+!               enrols employees into the Salary Package.              *
+!                                                                      *
+!               The SQR takes the values that were cacluated in        *
+!               Salary Packaging and inserts the details into          *
+!               temporary tables that are then used by                 *
+!               Component Interface to populate the relevant Job data. *
+!                                                                      *
+!               The steps for each package are as follows:             *
+!                                                                      *
+!              1. Load all the package Components and relevant         *
+!                 compensation data from COMP_RATECD_TBL               *
+!                 into Compensation array
+!                                                                      *
+!              2. Determine all the dates within package duration,     *
+!                 when the contents of the package changes             *
+!                  - components start of end                           *
+!                 Create Job array for those dates                     *
+!                                                                      *
+!              Process Job array - for every date found:               *
+!                                                                      *
+!              3. Read Job record                                      *
+!                                                                      *
+!              4. Scan through Component array and insert/update       *
+!                 all the Comp_Ratecd records on Compensation temp     *
+!                 table that are active for the currently processed JOB*
+!                 record accumulating comprates for the Job record     *
+!                                                                      *
+!              6. Insert a new row on JOB_SP_TMPdata with action       *
+!                  of pay rate change,                                 *
+!                  reason 'PKE' (Enrol Salary Package),                *
+!                  compensation from the current package model, salary *
+!                  packaged flag checked, TPV/TEC values and Benefits  *
+!                  Base amount from the new package model. If the      *
+!                  existing job data is of the same effective date as  *
+!                  the new package model, effective sequence will be   *
+!                  inserted.                                           *
+!                                                                      *
+!              7. Verify if there are any future dated Job records     *
+!                  with effective date between currently processed     *
+!                  date and the next effective date in the array.      *
+!                  For every record found perform (4) (6)              *
+!                                                                      *
+!              8. Create budget amounts on the package expenses table  *
+!                  for each pay period included in the package period, *
+!                  and clear out any remaining budgets from the        *
+!                  previous package.                                   *
+!                                                                      *
+!              9. Change the package status of the previously          *
+!                  confirmed ?Current? model to ?History? and change   *
+!                  the package status of the enrolling Package model   *
+!                  from ?Proposed? to ?Current?.                       *
+!                                                                      *
+!               This process will also create an audit trail of ALL    *
+!               the payroll records maintained by the process.         *
+!                                                                      *
+!***********************************************************************
+
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+!                                                                      *
+! This module contains confidential and proprietary information        *
+! of Oracle; it is not to be copied, reproduced, or transmitted        *
+! in any form, by any means, in whole or in part, nor is it to         *
+! be used for any purpose other than that for which it is              *
+! expressly provided under the applicable license agreement.           *
+!                                                                      *
+! Copyright (C) 2007 Oracle. All Rights Reserved.                      *
+!                                                                      *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!          $Date:  2007/08/08:21:23:00                                 !
+!       $Release:  HR9                                                 !
+!    $Resolution:  689848                                              !
+!                                                                      *
+!***********************************************************************
+!  Version 8.0                                                         *
+!  Date                     Incident                                   *
+!  ~~~~                     ~~~~~~~~                                   *
+!                                 *
+!***********************************************************************
+
+begin-setup
+#include 'setenv.sqc'    !Set environment
+#Include 'ptset02.sqc'  ! Landscape Printer and page-size initialization
+end-setup
+
+begin-report
+  do Init-DateTime
+  do Get-Current-DateTime
+  do Init-Report
+  do Process-Main
+  do Reset
+  do Stdapi-Term
+end-report
+
+begin-heading 7
+  #Include 'stdhdg01.sqc'
+  Print $Header0 (+1, 1)
+  Print $Header1 (+2, 1)
+  Print $Header2 ( 0, 0)
+  Print $Header3 ( 0, 0)
+end-heading
+
+
+!**************************************************************************
+!
+! Procedure: Init-Report
+!
+! Description: Initialise header and run control variables.
+!
+!**************************************************************************
+begin-procedure Init-Report
+
+ !*** Define Pay Calendar array
+
+  CREATE-ARRAY Name=Pay_Calendar Size=100 Field=Pay_Begin:char
+                                          Field=Pay_End:char
+!                                         Field=Pay_Period:char
+ !*** Define Job array
+
+  CREATE-ARRAY Name=Job_Changes Size=25  Field=EffDt:char
+
+
+ !*** Define Compensation array
+
+
+  create-array name=CompArray size=50 field=cp_effseq:number
+                                      field=cp_comp_effseq:number
+                                      field=cp_comp_ratecd:char
+                                      field=cp_enrol_ben_bse:char
+                                      field=cp_ben_bse_cmprtcd:char
+                                      field=cp_comp_rate_points:number
+                                      field=cp_comprate:number
+                                      field=cp_comp_pct:number
+                                      field=cp_comp_frequency:char
+                                      field=cp_currency_cd:char
+                                      field=cp_manual_sw:char
+                                      field=cp_convert_comprt:number
+                                      field=cp_rate_code_group:char
+                                      field=cp_fte_indicator:char
+                                      field=cp_component_amt:number
+                                      field=cp_component_per_amt:number
+                                      field=cp_comp_start:char
+                                      field=cp_component:char
+                                      field=cp_comp_end:char
+                                      field=cp_taxable_amt:number
+                                      field=cp_benefit_base:number
+                                      field=cp_br_ann_contrib:number
+                                      field=cp_en_ann_contrib:number
+                                      field=cp_base_pay:char
+
+
+
+  move 'PKG001' to $ReportID
+  move 'Salary Packaging Enrolment Process Batch Insertion' to
+       $ReportTitle
+  display $ReportTitle
+
+  do Stdapi-Init
+  ! let $prcs_process_instance = '1'
+  display '$prcs_process_instance: ' noline
+  display $prcs_process_instance
+  display '$Prcs_OprID: ' noline
+  display $Prcs_OprID
+  display '$Prcs_Run_Cntl_ID: ' noline
+  display $Prcs_Run_Cntl_ID
+
+  if $prcs_process_instance = ''
+    ! no SQRW prompt
+        display 'no process instance'
+  else
+    do Select-Parameters
+  end-if
+
+  do Define-Values
+end-procedure
+
+
+!**************************************************************************
+!
+! Procedure: Define-Values
+!
+! Description: Define general SQL Dynamic Query Variables.
+!
+!**************************************************************************
+begin-procedure Define-Values
+
+
+  If $RC.Pkg_ProcessType > ' '
+     evaluate $RC.Pkg_ProcessType
+     when = 'E'
+      let $RC.Emp_Rcd  = Edit(#RC.Empl_Rcd,'09')
+      let $Where_Para1 = 'JOB.EMPLID = ''' || $RC.Emplid ||
+                       ''' AND JOB.EMPL_RCD = ' || $RC.EMP_RCD
+
+      break
+     when = 'C'
+       let $Where_Para1 = 'JOB.COMPANY = ''' || $RC.Company || ''' '
+       break
+     when = 'P'
+       let $Where_Para1 = 'JOB.COMPANY = ''' || $RC.Company ||
+                       ''' AND JOB.PAYGROUP = ''' || $RC.Paygroup || ''' '
+      break
+    end-evaluate
+  else
+     evaluate $RC.Pkg_ProcessTp_GP
+     when = 'E'
+      let $RC.Emp_Rcd  = Edit(#RC.Empl_Rcd,'09')
+
+     let $Where_Para1 = 'JOB.EMPLID = ''' || $RC.Emplid ||
+                       ''' AND JOB.EMPL_RCD = ' || $RC.EMP_RCD
+      break
+     when = 'P'
+       let $Where_Para1 = 'JOB.GP_PAYGROUP = ''' || $RC.GP_Paygroup || ''' '
+
+      break
+    end-evaluate
+  end-if
+
+
+
+end-procedure
+
+
+!**************************************************************************
+!
+! Procedure: Process-Main
+!
+! Description: Main processing section
+!              Extract Job and Package data for all Employees satisfying selection
+!               criteria from RC record and have confirmed Salary Package
+!              For every employee record found:
+!              1. Get all the package Components and relevant compensation
+!                 data for the package into array
+!              2. Determine all the dates within package duration, when the
+!                 contents of the package changes - components start of end
+!                 Create Job array for those dates
+!              3. Process Job array - for every date found
+!                 (a) read Job record
+!                 (b) scan through Component array and insert/update all the
+!                     Comp_Ratecd records on Compensation table that are
+!                     active for the currently processed JOB record
+!                     accumulating comprates for the Job record
+!                 (c) Calculate compensation rates for Job record
+!                 (d) Insert Job record
+!                 (e) Verify if there are any future dated Job records with
+!                     effective date between currently processed date and the
+!                     next effective date in the array. For every record found
+!                     perform (b) (c) (d)
+!              4. Update Package Status
+!
+!**************************************************************************
+begin-procedure Process-Main
+  let $Header0 = ''
+  let $Header1 = 'Record Name      Action      '
+  let $Header2 = 'Key1 Value     Key2 Value     Key3 Value     '
+  let $Header3 = 'Key4 Value     Key5 Value     Key6 Value     '
+
+  let $sql-statement = 'Process-Main-PS_JOB'
+  begin-SELECT on-error=SQL-Error
+JOB.EMPLID
+JOB.EMPL_RCD
+JOB.EFFDT
+JOB.EFFSEQ
+JOB.COMPANY
+JOB.PAYGROUP
+JOB.GP_PAYGROUP
+PMT.EMPLID
+PMT.EMPL_RCD
+PMT.EFFDT
+PMT.EFFSEQ
+PMT.PKG_END_DT
+PMT.PKG_START_DT
+PMT.TPV_CURRENT
+PMT.TEC_CURRENT
+PMT.CURRENCY_CD
+
+    clear-array name=Job_Changes
+    clear-array name=CompArray
+
+
+    let $Key_Start_Dt  = &PMT.Pkg_Start_Dt
+    do Convert-To-DTU-Date(&PMT.Pkg_End_Dt, $Pkg_End_Dt)
+
+    do Get_Processing_Data
+
+    do Clear_Budgets
+
+    print 'Processing Employee Job........................................'(+2,1)
+
+   !--------------------------------------------------------
+   !*** Load compensation data for all Components for the
+   !*** Package into array for further processing
+   !--------------------------------------------------------
+
+   do Get-All-Components
+
+   !--------------------------------------------------------
+   !*** Add Effective date of Package start as a first
+   !*** row in the Job array
+   !--------------------------------------------------------
+
+   do Convert-To-DTU-Date(&PMT.Effdt, $dtu_Effdt)
+
+   let $Cmp_Start_Dt = $dtu_Effdt
+   let $Nat_Start_Dt = &PMT.EffDt
+
+   let  $EffDt_Arr  = $dtu_Effdt
+
+   let #Num_Jobs = 1
+   PUT $EffDt_Arr  INTO Job_Changes(1)
+
+   !--------------------------------------------------------
+   !*** Build Job array - find all the dates when Package
+   !*** changes - start or end of package components within
+   !*** duration of the Package
+   !*** Each one of the dates retrieved will require a new
+   !*** Job record and set of Compensation records to be generated
+   !--------------------------------------------------------
+
+   do Get-All-Jobs
+   let #NJ = 1
+
+   WHILE #NJ <= #Num_Jobs
+
+      !--------------------------------------------------------
+      !*** Get next date from Job array for processing
+      !--------------------------------------------------------
+
+      GET $New_EffDt  FROM Job_Changes(#NJ)
+
+      do Convert-from-dtu-Date($New_EffDt, $New_Job_Effdt)
+
+      !--------------------------------------------------------
+      !*** Get next date after the processed one
+      !*** This date will be used to determine updates for
+      !*** any existing future dated rows
+      !--------------------------------------------------------
+
+      if #NJ < #Num_Jobs
+         let #NN = #NJ + 1
+         GET $Next_EffDt FROM Job_Changes(#NN)
+      else
+         let $Next_EffDt = '2199-12-31'
+      end-if
+
+      do Convert-from-dtu-Date($Next_EffDt, $Nav_Next_EffDt)
+
+      !--------------------------------------------------------
+      !*** Read and process the JOB record for currently
+      !*** processed Effective date
+      !--------------------------------------------------------
+
+      !*** Setup part of Where clause for Select statement
+
+      let $Where_EffDt = ' J.EFFDT = (SELECT MAX(J1.EFFDT) FROM PS_JOB J1 WHERE J1.EMPLID = J.EMPLID' ||
+          ' AND J1.EMPL_RCD  = J.EMPL_RCD AND J1.EFFDT <=  '''  ||
+           $New_Job_Effdt ||''') '
+
+
+      let $Processing_Future = 'N'
+
+      do Read-Job
+
+      do Process-Job
+
+      let #NJ = #NJ + 1
+
+    end-while
+
+    !--------------------------------------------------------
+    !*** Update Package Status to 'C' on PKG_MDL_TBL
+    !***  and delete budget from PKG_MDL_BUDGET
+    !--------------------------------------------------------
+
+    do Update_Package_Status
+
+
+  FROM PS_PKG_MDL_TBL PMT,
+     PS_JOB JOB
+  WHERE PMT.PKG_CONFIRMED = 'Y'
+    AND PMT.PKG_STATUS    = 'P'
+    AND JOB.EMPLID    = PMT.EMPLID
+    AND JOB.EMPL_RCD =  PMT.EMPL_RCD
+    AND JOB.EFFDT     = (SELECT MAX(JOB1.EFFDT)
+                         FROM PS_JOB JOB1
+                        WHERE JOB1.EMPLID    = JOB.EMPLID
+                          AND JOB1.EMPL_RCD =  JOB.EMPL_RCD
+                          AND JOB1.EFFDT    <= PMT.EFFDT)
+    AND JOB.EFFSEQ    = (SELECT MAX(JOB2.EFFSEQ)
+                         FROM PS_JOB JOB2
+                        WHERE JOB2.EMPLID    = JOB.EMPLID
+                          AND JOB2.EMPL_RCD = JOB.EMPL_RCD
+                          AND JOB2.EFFDT     = JOB.EFFDT)    
+    AND   [$Where_Para1]
+    AND NOT EXISTS (SELECT 'X' FROM PS_JOB_SP_TMP TMP
+    WHERE JOB.EMPLID    = TMP.EMPLID
+    AND JOB.EMPL_RCD =  TMP.EMPL_RCD)
+  End-SELECT
+end-procedure
+
+!**************************************************************************
+!
+! Procedure: Get-All-Components
+!
+! Description: Load  Compensation data for all the Components attached
+!              to the packagea into an array for further processing
+!
+!**************************************************************************
+begin-procedure Get-All-Components
+
+   move 0 to #cp_idx
+   move 0 to #cp_cnt
+
+  !-------------------------------------------------------------------------
+  !*** Retireve all the relevant data from PKG_MDL_BSE_CMP, PKG_MDL_ADD_CMP
+  !*** and related information from COMP_RATECD_TBL
+  !*** Load every Component record into Compensation array
+  !-------------------------------------------------------------------------
+
+  begin-SELECT on-error=SQL-Error
+
+BC.COMPONENT_AMT
+BC.COMPONENT_PCT
+BC.COMPONENT_PER_AMT
+BC.COMPONENT_START
+BC.COMPONENT_END
+BC.COMPONENT
+BC.TAXABLE_AMT
+BC.BENEFIT_BASE
+BC.EN_ANN_CONTRIB
+BC.BR_ANN_CONTRIB
+BCT.COMP_RATECD
+BCT.COMPONENT_TYPE
+BCT.ENROL_BENEF_BASE
+BCT.BEN_BSE_COMPRATECD
+CP.COMP_FREQUENCY
+CP.CURRENCY_CD
+CP.FTE_INDICATOR
+CP.COMP_BASE_PAY_SW
+
+
+   add 1 to #cp_idx
+
+   do Convert-To-DTU-Date(&BC.Component_End, $Cmp_Fin_Dt)
+   do Convert-To-DTU-Date(&BC.Component_Start, $Cmp_Start_Dt)
+
+   put 0                     into CompArray (#cp_idx) cp_comp_effseq
+   put &BCT.COMP_RATECD      into CompArray (#cp_idx) cp_comp_ratecd
+   put &BCT.ENROL_BENEF_BASE into CompArray (#cp_idx) cp_enrol_ben_bse
+   put &BCT.BEN_BSE_COMPRATECD into CompArray (#cp_idx) cp_ben_bse_cmprtcd
+
+   put 0                     into CompArray (#cp_idx) cp_comp_rate_points
+   put 0                     into CompArray (#cp_idx) cp_comprate
+   put 0                     into CompArray (#cp_idx) cp_comp_pct
+   if &CP.COMP_FREQUENCY > '0'
+      put &CP.COMP_FREQUENCY into CompArray (#cp_idx) cp_comp_frequency
+   else
+      put 'A'                into CompArray (#cp_idx) cp_comp_frequency
+   end-if
+
+   put &CP.CURRENCY_CD       into CompArray (#cp_idx) cp_currency_cd
+   put 0                     into CompArray (#cp_idx) cp_convert_comprt
+   put ' '                   into CompArray (#cp_idx) cp_rate_code_group
+   put &CP.FTE_INDICATOR     into CompArray (#cp_idx) cp_fte_indicator
+
+
+   put &BC.COMPONENT_AMT     into CompArray (#cp_idx) cp_component_amt
+   put &BC.COMPONENT_PER_AMT into CompArray (#cp_idx) cp_component_per_amt
+   put $Cmp_Start_Dt         into CompArray (#cp_idx) cp_comp_start
+   put $Cmp_Fin_Dt           into CompArray (#cp_idx) cp_comp_end
+   put &BC.COMPONENT         into CompArray (#cp_idx) cp_component
+   put &BC.TAXABLE_AMT       into CompArray (#cp_idx) cp_taxable_amt
+   put &BC.BENEFIT_BASE      into CompArray (#cp_idx) cp_benefit_base
+   put &BC.BR_ANN_CONTRIB    into CompArray (#cp_idx) cp_br_ann_contrib
+   put &BC.EN_ANN_CONTRIB    into CompArray (#cp_idx) cp_en_ann_contrib
+   put &CP.COMP_BASE_PAY_SW  into CompArray (#cp_idx) cp_base_pay
+
+   !------------------------------------
+   !*** Setup data for budget processing
+   !------------------------------------
+
+
+    let $Cmp_Start_Disp     = &BC.Component_Start
+    let $Nat_Start_Dt       = &BC.Component_Start
+
+    let #Key_Component_Amt  = &BC.Component_Per_Amt
+
+    if $Cmp_Fin_Dt >= $Pkg_End_Dt
+      let $Cmp_End_Dt = $Null_Date
+      let $Nat_End_Dt = $Null_Date
+    else
+      let $Cmp_End_Dt = $Cmp_Fin_Dt
+      let $AsOfDate   = $Cmp_End_Dt
+      do Convert-from-dtu-Date($Cmp_End_Dt, $Nat_End_Dt)
+    end-if
+
+    if &BCT.COMPONENT_TYPE = 'FBRD'
+       let #CF_Period_Amt  = &BC.EN_ANN_CONTRIB
+    else
+       let #CF_Period_Amt  = &BC.BR_ANN_CONTRIB
+    end-if
+   !------------------------------------
+   !*** Create budgets for Component
+   !------------------------------------
+
+  do  Get_Frequency_Rate
+  do  Create_Component_Budgets
+
+   !--------------------------------------
+   !*** Process all Additional Components
+   !*** attachaed to the current Component
+   !--------------------------------------
+
+  do  Get-Additional-Components
+
+  FROM PS_PKG_MDL_BSE_CMP  BC,
+      PS_PKG_BSE_CMP_TBL   BCT,
+      PS_COMP_RATECD_TBL   CP
+
+      WHERE BC.EMPLID         = &PMT.EMPLID
+      AND BC.EMPL_RCD         = &PMT.EMPL_RCD
+      AND BC.EFFDT            = &PMT.EFFDT
+      AND BC.EFFSEQ           = &PMT.EFFSEQ
+      AND BC.COMPONENT_AMT    <> 0
+      AND BC.COMPONENT        = BCT.COMPONENT
+      AND BCT.EFFDT           = (SELECT MAX(BCT1.EFFDT)
+                                   FROM PS_PKG_BSE_CMP_TBL BCT1
+                                  WHERE BCT1.COMPONENT = BCT.COMPONENT
+                                    AND BCT1.EFFDT    <= &PMT.EFFDT)
+      AND BCT.COMP_RATECD     = CP.COMP_RATECD
+      AND CP.EFFDT            = (SELECT MAX(CP1.EFFDT)
+                                   FROM PS_COMP_RATECD_TBL CP1
+                                  WHERE CP1.COMP_RATECD = CP.COMP_RATECD
+                                    AND CP1.EFFDT       <= &PMT.EFFDT)
+
+  end-SELECT
+
+   move #cp_idx to #cp_cnt
+
+end-procedure
+
+!**************************************************************************
+!
+! Procedure: Get-Additional-Components
+!
+! Description: Load  Compensation data for all the Additional Components attached
+!              attached to the currently processed Component into the Compensation
+!              array for further processing
+!
+!**************************************************************************
+begin-procedure Get-Additional-Components
+
+
+  !-------------------------------------------------------------------------
+  !*** Retireve all the relevant data from PKG_MDL_BSE_CMP, PKG_MDL_ADD_CMP
+  !*** and related information from COMP_RATECD_TBL
+  !*** Load every Component record into Compensation array
+  !-------------------------------------------------------------------------
+
+
+  begin-SELECT on-error=SQL-Error
+
+AC.EMPLID,
+AC.EMPL_RCD,
+AC.EFFDT,
+AC.EFFSEQ,
+AC.COMPONENT,
+AC.COMPONENT_START,
+AC.ADD_COMPONENT,
+AC.ADD_CMP_AMT,
+AC.ADD_CMP_AMT_PER,
+AC.ADD_CMP_ENROL_AMT,
+ACT.COMP_RATECD,
+ACT.EFFDT
+
+   add 1 to #cp_idx
+
+   if rtrim(&ACT.COMP_RATECD,' ') <> ''
+      do Get-Comp-Rate-Dtl
+   end-if
+
+   !-------------------------------------------
+   !*** Set up data for budget processing
+   !-------------------------------------------
+
+    let #Key_Component_Amt = &AC.Add_Cmp_Amt_Per
+
+    if &BC.Component_Per_Amt = 0
+       let #CF_Period_Amt  = 0
+    else
+       let #CF_Period_Amt  = #CF_Period_Amt * #Key_Component_Amt / &BC.Component_Per_Amt
+    end-if
+
+    do Get_Frequency_Rate
+
+   !-------------------------------------------
+   !*** Create budgets for Additional Component
+   !-------------------------------------------
+
+   do  Create_Addl_Comp_Budgets
+
+   FROM PS_PKG_MDL_ADD_CMP AC,
+       PS_PKG_ADD_CMP_TBL ACT
+
+      WHERE AC.EMPLID         = &PMT.EMPLID
+      AND AC.EMPL_RCD         = &PMT.EMPL_RCD
+      AND AC.EFFDT            = &PMT.EFFDT
+      AND AC.EFFSEQ           = &PMT.EFFSEQ
+      AND AC.COMPONENT        = &BC.COMPONENT
+      AND AC.COMPONENT_START  = &BC.COMPONENT_START
+      AND AC.ADD_CMP_AMT_PER > 0
+      AND ACT.ADD_COMPONENT   = AC.ADD_COMPONENT
+      AND ACT.EFFDT           = (SELECT MAX(AC1.EFFDT)
+                                  FROM PS_PKG_ADD_CMP_TBL AC1
+                                 WHERE AC1.ADD_COMPONENT = AC.ADD_COMPONENT
+                                   AND AC1.EFFDT        <= &PMT.EFFDT)
+
+  end-SELECT
+
+end-procedure
+
+!**************************************************************************
+!
+! Procedure: Get-Comp-Rate-Dtl
+!
+! Description: This procedure will fetch comp rate details for
+!              processing for this SQR.
+!**************************************************************************
+begin-procedure Get-Comp-Rate-Dtl
+
+  begin-SELECT on-error=SQL-Error
+
+CPT.COMP_FREQUENCY,
+CPT.CURRENCY_CD,
+CPT.FTE_INDICATOR,
+CPT.COMP_BASE_PAY_SW,
+ACT2.COMP_RATECD
+
+   put 0                     into CompArray (#cp_idx) cp_comp_effseq
+
+   put &ACT.COMP_RATECD      into CompArray (#cp_idx) cp_comp_ratecd
+   put 0                     into CompArray (#cp_idx) cp_comp_rate_points
+   put 0                     into CompArray (#cp_idx) cp_comprate
+   put 0                     into CompArray (#cp_idx) cp_comp_pct
+   if &CPT.COMP_FREQUENCY > '0'
+      put &CPT.COMP_FREQUENCY into CompArray (#cp_idx) cp_comp_frequency
+   else
+      put 'A'                into CompArray (#cp_idx) cp_comp_frequency
+   end-if
+   put &CPT.CURRENCY_CD      into CompArray (#cp_idx) cp_currency_cd
+   put 0                     into CompArray (#cp_idx) cp_convert_comprt
+   put ' '                   into CompArray (#cp_idx) cp_rate_code_group
+   put &CPT.FTE_INDICATOR    into CompArray (#cp_idx) cp_fte_indicator
+   put 'N'                   into CompArray (#cp_idx) cp_enrol_ben_bse
+   put ' '                   into CompArray (#cp_idx) cp_ben_bse_cmprtcd
+
+
+   put &AC.ADD_CMP_ENROL_AMT into CompArray (#cp_idx) cp_component_amt
+   put &AC.ADD_CMP_AMT_PER   into CompArray (#cp_idx) cp_component_per_amt
+   put $Cmp_Start_Dt         into CompArray (#cp_idx) cp_comp_start
+   put $Cmp_Fin_Dt           into CompArray (#cp_idx) cp_comp_end
+   put &AC.ADD_COMPONENT     into CompArray (#cp_idx) cp_component
+   put &CPT.COMP_BASE_PAY_SW into CompArray (#cp_idx) cp_base_pay
+
+   FROM PS_PKG_ADD_CMP_TBL ACT2,
+       PS_COMP_RATECD_TBL CPT
+
+      WHERE ACT2.ADD_COMPONENT   = &AC.ADD_COMPONENT
+      AND ACT2.COMP_RATECD     = CPT.COMP_RATECD
+      AND ACT2.EFFDT           = &ACT.EFFDT
+      AND CPT.EFFDT            = (SELECT MAX(CPT1.EFFDT)
+                                   FROM PS_COMP_RATECD_TBL CPT1
+                                  WHERE CPT1.COMP_RATECD = CPT.COMP_RATECD
+                                    AND CPT1.EFFDT       <= &AC.EFFDT)
+
+  end-SELECT
+
+end-procedure Get-Comp-Rate-Dtl
+
+!**************************************************************************
+!
+! Procedure: Get_Processing_Data
+!
+! Description: This procedure will fetch all general data needed for the
+!              processing for this SQR.
+!**************************************************************************
+begin-procedure Get_Processing_Data
+
+
+  !-------------------------------------------------------
+  !*** Initialise fields for record insertion
+  !-------------------------------------------------------
+
+  let #Zero = 0
+  let $Null = ' '
+  let $Null_Date = ''
+
+  !-------------------------------------------------------
+  !*** Load Pay Calendar into an array
+  !*** Retrieve pay periods dates and default frequency
+  !*** PKG_PROCESS_TYPE of spaces indicates Global Payroll
+  !*** installation  - access Global Payroll tables
+  !*** Otherwise - we are processing in HR only installation
+  !*** - access PKG_Calendar and Paygroup table
+  !-------------------------------------------------------
+
+  let #Num_Pays = #Zero
+
+  If $RC.Pkg_ProcessType > ' '
+     do Get-HR-Freq
+     let $Cal_Company      = &JOB.COMPANY
+     let $Cal_Paygroup     = &JOB.PAYGROUP
+     let $Cal_GP_Paygroup  = ' '
+  Else
+     do Get-GP-Freq
+     let $Cal_Company      = ' '
+     let $Cal_Paygroup     = ' '
+     let $Cal_GP_Paygroup  = &JOB.GP_PAYGROUP
+  end-if
+  do Get-Calendar
+
+  if $Monhly_Freq = ' '
+    let $Monhly_Freq = 'M'
+  end-if
+
+  if $Daily_Freq = ' '
+    let $Daily_Freq = 'D'
+  end-if
+
+
+  !-------------------------------------------------------
+  !*** Get TEC and TPV Comp Ratecd from Company table
+  !-------------------------------------------------------
+   let $TEC_Ratecd = ' '
+   let $TPV_Ratecd = ' '
+
+   let $sql-statement = 'SELECT PS_COMPANY_TBL'
+   begin-SELECT on-error=SQL-Error
+C.TEC_COMP_RATECD
+C.TPV_COMP_RATECD
+    let $TEC_Ratecd = &C.TEC_COMP_RATECD
+    let $TPV_Ratecd = &C.TPV_COMP_RATECD
+
+  FROM PS_COMPANY_TBL C
+  WHERE C.COMPANY  = &JOB.Company
+    and C.EFFDT    =
+      (SELECT MAX(C1.EFFDT)
+        FROM  PS_COMPANY_TBL C1
+        WHERE C.COMPANY = C1.COMPANY
+          AND C1.EFFDT <= &PMT.Effdt)
+
+   end-SELECT
+
+  !-------------------------------------------------------
+
+ ! Calculate $Term_End_DT (coverage end date for previous enrolments)
+  do Convert-To-DTU-Date(&PMT.Effdt, $dtu_Effdt)
+  do dtu-add-days($dtu_Effdt, -1, $dtu_Term_End_Dt)
+  do Convert-From-DTU-Date($dtu_Term_End_Dt, $Term_End_Dt)
+
+  let $Cmp_Start_Dt = $dtu_Effdt
+  let $Nat_Start_Dt = &PMT.EffDt
+
+end-procedure
+
+
+
+!**************************************************************************
+!
+! Procedure: Get-Calendar
+!
+! Description: This procedure will fetch Pay Period dates and frequency
+!              in HR Only installation
+!**************************************************************************
+begin-procedure Get-Calendar
+
+    !--------------------------------------------------------
+    !*** Read PKG_CALENDAR for period dates
+    !--------------------------------------------------------
+
+   let $sql-statement = 'SELECT PS_PKG_CALENDAR'
+   begin-SELECT on-error=SQL-Error
+CAL.PAY_BEGIN_DT
+CAL.PAY_END_DT
+
+      let #Num_Pays = #Num_Pays + 1
+      do Convert-To-DTU-Date(&CAL.Pay_Begin_Dt, $Beg_Dt)
+      do Convert-To-DTU-Date(&CAL.Pay_End_Dt, $End_Dt)
+      PUT $Beg_Dt $End_Dt  INTO Pay_Calendar(#Num_Pays)
+     FROM PS_PKG_CALENDAR CAL
+
+    WHERE CAL.COMPANY     = $Cal_Company
+      AND CAL.PAYGROUP    = $Cal_Paygroup
+      AND CAL.GP_PAYGROUP = $Cal_GP_Paygroup
+      AND (CAL.PAY_END_DT   BETWEEN &PMT.EffDt AND &PMT.Pkg_End_Dt
+       OR  CAL.PAY_BEGIN_DT BETWEEN &PMT.EffDt AND &PMT.Pkg_End_Dt)
+  end-SELECT
+
+end-procedure
+
+!**************************************************************************
+!
+! Procedure: Get-HR-Freq
+!
+! Description: This procedure will fetch Pay Period dates and frequency
+!              in HR Only installation
+!**************************************************************************
+begin-procedure Get-HR-Freq
+
+   !--------------------------------------------------------
+   !*** Read  PayGroup table to get frequencies
+   !--------------------------------------------------------
+
+  let $sql-statement = 'SELECT PS_PAYGROUP_TBL'
+  begin-SELECT on-error=SQL-Error
+P.PAY_FREQUENCY
+P.FREQ_ID_DAILY
+P.FREQ_ID_MONTHLY
+
+       let $Daily_Freq    = &P.Freq_Id_Daily
+       let $Monthly_Freq  = &P.Freq_Id_Monthly
+       let $Pay_Frequency = &P.PAY_FREQUENCY
+
+   FROM PS_PAYGROUP_TBL P
+  WHERE P.COMPANY  = &JOB.COMPANY
+    AND P.PAYGROUP = &JOB.PAYGROUP
+    AND P.EFFDT    = (SELECT MAX(P1.EFFDT)
+                        FROM PS_PAYGROUP_TBL P1
+                       WHERE P1.COMPANY    =  P.COMPANY
+                         AND   P1.PAYGROUP =  P.PAYGROUP
+                         AND   P1.EFFDT   <= &PMT.EFFDT)
+   end-SELECT
+
+end-procedure
+
+!**************************************************************************
+!
+! Procedure: Get-GP-Freq
+!
+! Description: This procedure will fetch Pay Period dates and frequency
+!              in Global Payroll installation
+!**************************************************************************
+begin-procedure Get-GP-Freq
+
+
+   !--------------------------------------------------------
+   !*** Read GP PayGroup table  to get frequencies
+   !--------------------------------------------------------
+
+  let $sql-statement = 'SELECT PS_HR_GP_PYGRP_TBL'
+  begin-SELECT on-error=SQL-Error
+PG.PAY_FREQUENCY
+
+        let $Daily_Freq    = 'D'
+        let $Monthly_Freq  = 'M'
+
+        let $Pay_Frequency = &PG.PAY_FREQUENCY
+
+   FROM PS_GP_PG_DTL_SGPAU PG
+   WHERE PG.GP_PAYGROUP = &Job.GP_PAYGROUP
+    AND  PG.EFFDT       = (SELECT MAX(PG1.EFFDT)
+                        FROM PS_GP_PG_DTL_SGPAU PG1
+                        WHERE  PG1.GP_PAYGROUP =  PG.GP_PAYGROUP
+                         AND   PG1.EFFDT       <= &PMT.EFFDT)
+   end-SELECT
+
+end-procedure
+
+
+
+
+!**************************************************************************
+!
+! Procedure: Get-All-Jobs
+!
+! Description: Build Job array - find all the dates when Package
+!              changes - start or end of package components within
+!              duration of the Package
+!              Each one of the dates retrieved will require a new
+!              Job record and set of Compensation records to be generated
+!
+!**************************************************************************
+begin-procedure Get-All-Jobs
+
+  let $Header0 = ''
+  let $Header1 = 'Record Name      Action      '
+  let $Header2 = 'Key1 Value     Key2 Value     Key3 Value     '
+  let $Header3 = 'Key4 Value     Key5 Value     Key6 Value     '
+
+  let $sql-statement = 'Get-All-Jobs-PS_JOB'
+  begin-SELECT on-error=SQL-Error
+
+MB.COMPONENT
+MB.COMPONENT_START
+MB.COMPONENT_END
+MT.PKG_START_DT
+MT.PKG_END_DT
+
+  if &MT.Pkg_Start_Dt <> &MB.Component_Start
+     do Convert-To-DTU-Date(&MB.Component_Start, $dtu_Date)
+     let $EffDt_Arr = $dtu_Date
+     do Add-To-Job
+  end-if
+
+  if &MT.Pkg_End_Dt <> &MB.Component_End
+
+     !*** In case of End date - effective date of the Job record
+     !*** will be end date + 1
+
+     do Convert-To-DTU-Date(&MB.Component_End, $dtu_Date)
+     do dtu-add-days($dtu_Date, +1, $dtu_Eff_End_Dt)
+     do Convert-From-DTU-Date($dtu_Eff_End_Dt, $Eff_End_Dt)
+     let $EffDt_Arr = $Eff_End_Dt
+     do Add-To-Job
+  end-if
+
+  FROM PS_PKG_MDL_TBL MT,
+     PS_PKG_MDL_BSE_CMP MB
+  WHERE MT.EMPLID        = &PMT.Emplid
+    AND MT.EMPL_RCD      = &PMT.Empl_Rcd
+    AND MT.EFFDT         = &PMT.Effdt
+    AND MT.EFFSEQ        = &PMT.Effseq
+    AND MT.EMPLID        = MB.EMPLID
+    AND MT.EMPL_RCD      = MB.EMPL_RCD
+    AND MT.EFFDT         = MB.EFFDT
+    AND MT.EFFSEQ        = MB.EFFSEQ
+    AND (MB.COMPONENT_START <> MT.PKG_START_DT
+      OR MB.COMPONENT_END   <> MT.PKG_END_DT )
+
+  End-SELECT
+end-procedure
+
+!**************************************************************************
+!
+! Procedure: Add-To-Job
+!
+! Description: Adding Effective Date to Job array - keep array in ascending
+!              order
+!
+!*************************************************************************
+
+begin-procedure Add-To-Job
+
+  let #X = 1
+  let $Updated = 'N'
+
+  WHILE #X <= #Num_Jobs
+
+    GET $X_EffDt FROM Job_Changes(#X)
+
+    if $X_EffDt = $EffDt_Arr
+      !*** Date already in the array
+      let $Updated = 'Y'
+      break
+    end-if
+
+    if $X_EffDt > $EffDt_Arr
+
+      !*** Move all dates greater than the current one
+      !***  up in the array starting with the last date
+
+      let #Y = #Num_Jobs
+      WHILE #Y >= #X
+        GET $Y_EffDt   FROM Job_Changes(#Y)
+        let #Z = #Y + 1
+        PUT $Y_EffDt  INTO Job_Changes(#Z)
+        let #Y = #Y - 1
+      end-WHILE
+      break
+   end-if
+   let #X = #X + 1
+ end-WHILE
+
+ if $Updated = 'N'
+    let #Num_Jobs = #Num_Jobs + 1
+    PUT $EffDt_Arr  INTO Job_Changes(#X)
+ end-if
+
+end-procedure
+
+
+!**************************************************************************
+!
+! Procedure: Read-Job
+!
+! Description: Read Job record for a given effective date
+!
+!**************************************************************************
+begin-procedure Read-Job
+
+  let $sql-statement = 'Read-Job-PS_JOB'
+  begin-SELECT on-error=SQL-Error
+J.EMPLID
+J.EMPL_RCD
+J.EFFDT
+J.EFFSEQ
+J.DEPTID
+J.JOBCODE
+J.EMPL_STATUS
+J.ACTION
+J.ACTION_DT
+J.ACTION_REASON
+J.JOB_ENTRY_DT
+J.DEPT_ENTRY_DT
+J.POSITION_ENTRY_DT
+J.STD_HOURS
+J.STD_HRS_FREQUENCY
+J.GRADE_ENTRY_DT
+J.STEP_ENTRY_DT
+J.COMP_FREQUENCY
+J.COMPRATE
+J.ANNUAL_RT
+J.ANNL_BENEF_BASE_RT
+J.CURRENCY_CD
+J.FORCE_PUBLISH
+J.EXPECTED_END_DATE
+
+    !-------------------------------------------------------------------------
+    !*** Save value of old Compensation for calculation of
+    !*** the rate change
+    !-------------------------------------------------------------------------
+
+    let #Old_Annual_Rt    = &J.Annual_Rt
+    let #Old_Comprate     = &J.Comprate
+    let #Old_Benefit_Base = &J.ANNL_BENEF_BASE_RT
+    let $Old_JOB_Freq     = &J.COMP_FREQUENCY
+
+    !-------------------------------------------------------------------------
+    !*** Intialise Compensation rate accumulator
+    !-------------------------------------------------------------------------
+
+    let #Job_Comprate   = 0
+
+    if $Processing_Future = 'Y'
+       do Insert-Future-Job
+    end-if
+
+
+   FROM  PS_JOB J
+   WHERE J.EMPLID    = &JOB.EMPLID
+    AND J.EMPL_RCD  = &JOB.EMPL_RCD
+    AND J.EFFSEQ    = (SELECT MAX(J2.EFFSEQ)
+                         FROM PS_JOB J2
+                        WHERE J2.EMPLID    = J.EMPLID
+                          AND J2.EMPL_RCD = J.EMPL_RCD
+                          AND J2.EFFDT     = J.EFFDT)
+    AND [$Where_EffDt]
+
+  end-SELECT
+end-procedure
+
+
+!**************************************************************************
+!
+! Procedure:   Process-Job
+!
+! Description: This section contains compensation processing for new Package
+!              1. Determine Annual Factors for compensation calculation
+!              2. Setup new Effective Date and Sequence for the new JOB
+!                 and COMPENSATION records
+!              3. Process all the Comp Rate Codes attached to the Package
+!                 accumulating JOB rates
+!              4. Process all Comp Rate Codes that have been added to the
+!                 previous JOB records, outside of Salary Packaging
+!              5. Calculate rates and rate changes for JOB
+!              6. Insert new JOB record
+!              7. Process all the future dated records
+!**************************************************************************
+begin-procedure  Process-Job
+
+  !-------------------------------------------------------------------------
+  !*** Calculate new effdt & effseq
+  !-------------------------------------------------------------------------
+
+    do Convert-To-DTU-Date(&J.EffDt,$Job_EffDt)
+
+  !-------------------------------------------------------------------------
+  !*** If Effective Date of old and new record differs
+  !***   record for the new Eff Date will be inserted
+  !***   Otherwise, new record in sequence will be inserted
+  !-------------------------------------------------------------------------
+
+
+   if $Job_EffDt <> $New_EffDt
+    let $sql-statement = 'SELECT PS_JOB'
+    begin-SELECT on-error=SQL-Error
+COUNT(*)        &Num_Seq
+MAX(EFFSEQ)     &Max_Sq
+       FROM PS_JOB
+      WHERE EMPLID   = &J.Emplid
+        AND EMPL_RCD = &J.EMPL_RCD
+        AND EFFDT    = $New_Job_Effdt
+    end-SELECT
+
+    if &Num_Seq > 0
+      let #New_EffSeq = &Max_Sq + 1
+    else
+      let #New_EffSeq = 0
+    end-if
+
+  else
+    !** next record in sequence to be inserted
+    let #New_EffSeq = &J.EffSeq + 1
+  end-if
+
+
+      let $Comp_Effdt =  $Nav_Next_EffDt
+      let #Comp_EffSeq = #New_EffSeq
+
+
+  !-------------------------------------------------------------------------
+  !*** Process all Comp Rate Codes attached to the Package
+  !-------------------------------------------------------------------------
+     
+  !Begin Resolution 720983
+       let $Sal_Pkg_Flag  = 'N'
+       let $From_EffDt    = &J.EffDt
+       let #From_EffSeq   = &J.EffSeq
+       let $To_EffDt      = $New_Job_Effdt
+       let #To_EffSeq     = #New_EffSeq
+  !End Resolution 720983
+      do Process-All-Components
+
+  !-------------------------------------------------------------------------
+  !*** Calculate all JOB Rates and changes
+  !-------------------------------------------------------------------------
+
+      do Calc-Job-Rates
+
+  !-------------------------------------------------------------------------
+  !*** Save Effective Date and Sequence for future use - to determine
+  !*** which set of Compensation records to copy for the future dated
+  !*** Job records
+  !-------------------------------------------------------------------------
+
+     let $Pkg_Chg_EffDt  = $New_Job_Effdt
+     let #Pkg_Chg_EffSeq = #New_EffSeq
+
+  !-------------------------------------------------------------------------
+  !*** Insert new JOB record
+  !-------------------------------------------------------------------------
+
+  let $New_Eff_Date = $New_Job_Effdt
+  let #New_Eff_Seq =  #New_EffSeq
+
+  do Insert-Job-Record
+
+  !-------------------------------------------------------------------------
+  !*** Retrieve all future dated records with effective date between
+  !*** currently processed effective date and the next date from the
+  !*** Job array
+  !-------------------------------------------------------------------------
+
+  do Process-Future-Jobs
+
+
+end-procedure
+
+
+!**************************************************************************
+!
+! Procedure: Process-All-Components
+!
+! Description: Process all components active for the effective date of the
+!              Job record, including all the non-packaged comp rate codes
+!              and TPV and TEC comp rate codes
+!
+!**************************************************************************
+begin-procedure  Process-All-Components
+
+   !------------------------------------------------------------
+   !*** Copy all non-packaged comp rate codes added to previous JOB
+   !*** Call Copy-Components procedure with both Sal_Pkg_Flag set to 'N'
+   !------------------------------------------------------------
+   !Begin Resolution 720983
+       !let $Sal_Pkg_Flag  = 'N'
+       !let $From_EffDt    = &J.EffDt
+       !let #From_EffSeq   = &J.EffSeq
+       !let $To_EffDt      = $New_Job_Effdt
+       !let #To_EffSeq     = #New_EffSeq
+   !End Resolution 720983
+       do Copy-Components
+
+   !------------------------------------------------------------
+   !*** Scan through the Compensation array and process all the
+   !*** components active for the processed effective date
+   !------------------------------------------------------------
+
+      let #N = 1
+
+      while #N <= #cp_cnt
+
+       get $Arr_Comp_Start from    CompArray (#N) cp_comp_start
+       get $Arr_Comp_End   from    CompArray (#N) cp_comp_end
+
+
+       if $Arr_Comp_Start <= $New_EffDt
+         and $Arr_Comp_End >= $New_EffDt
+
+          let $Comp_Job_Effdt    = $New_Job_Effdt
+          let #Comp_Job_EffSeq   = #New_EffSeq
+
+
+         get #Comp_EffSeq           from    CompArray (#N) cp_comp_effseq
+         get $Comp_Ratecd           from    CompArray (#N) cp_comp_ratecd
+         get #Comp_Rate_Points      from    CompArray (#N) cp_comp_rate_points
+         get #Comp_Amount           from    CompArray (#N) cp_comprate
+         get #Comp_Pct              from    CompArray (#N) cp_comp_pct
+         get $Comp_Comp_Frequency   from    CompArray (#N) cp_comp_frequency
+         get $Comp_Currency_Cd      from    CompArray (#N) cp_currency_cd
+         get #Comp_Convert_Comprate from    CompArray (#N) cp_Convert_comprt
+         get $Comp_Rate_Code_Group  from    CompArray (#N) cp_rate_code_group
+         get $Comp_FTE_Indicator    from    CompArray (#N) cp_fte_indicator
+         get #Comp_Comp_Amt         from    CompArray (#N) cp_component_amt
+         get $Comp_Component        from    CompArray (#N) cp_component
+         get $Enrol_Ben_Bse         from    CompArray (#N) cp_enrol_ben_bse
+         get $Comp_Ben_Bse_Cmprtcd  from    CompArray (#N) cp_ben_bse_cmprtcd
+         get #Benefit_Base          from    CompArray (#N) cp_benefit_base
+         get $Base_Pay              from    CompArray (#N) cp_base_pay
+         let $Comp_Src_Ind      = 'N'
+
+         !-------------------------------------------------------------------------
+         !*** Convert Component Amount from annual to the frequency specified
+         !*** on Comp Ratecd Table
+         !-------------------------------------------------------------------------
+
+         do Convert-Frequency ($To_EffDt, #Comp_Comp_Amt, 'A', $Comp_Comp_Frequency,
+               &J.STD_Hours, &J.Std_Hrs_Frequency, #Comp_Amount )
+
+         !-------------------------------------------------------------------------
+         !*** Insert or update Compensation record for Comp Rate Code
+         !-------------------------------------------------------------------------
+
+         do Process-Component
+
+         !-------------------------------------------------------------------------
+         !*** Accumulate annual rate for the Job
+         !-------------------------------------------------------------------------
+         if $Base_Pay = 'Y'
+            let #Job_Comprate = #Job_Comprate + #Comp_Comp_Amt
+         end-if
+
+         !-------------------------------------------------------------------------
+         !*** Enrol Benefit Base if requested
+         !-------------------------------------------------------------------------
+
+         if $Enrol_Ben_Bse = 'Y'
+            do Process-Benefit-Base
+         end-if
+
+       end-if
+
+       let #N = #N + 1
+
+      end-while
+
+      !------------------------------------------------------------
+      !*** Insert Compensation records for TEC and TPV Comp Ratecd
+      !------------------------------------------------------------
+      let $TEC_Ratecd = nvl($TEC_Ratecd,'   ')
+      let $TPV_Ratecd = nvl($TPV_Ratecd,'   ')
+
+      if isblank($TEC_Ratecd) = 0
+       or isblank($TPV_Ratecd) = 0
+         do Create-TPV-TEC
+     end-if
+
+
+end-procedure
+
+!**************************************************************************
+!
+! Procedure: Process-Benefit-Base
+!
+! Description: This routine will process Benefit Base
+!**************************************************************************
+
+begin-procedure Process-Benefit-Base
+
+
+         let $Comp_Ratecd             = $Comp_Ben_Bse_Cmprtcd
+         let #Comp_Comp_Amt           = #Benefit_Base
+
+
+  let $sql-statement = 'SELECT PS_COMP_RATECD_TBL'
+
+  begin-SELECT on-error=SQL-Error
+CRT.COMP_FREQUENCY
+CRT.CURRENCY_CD
+CRT.FTE_INDICATOR
+
+         let $Comp_Comp_Frequency     = &CRT.COMP_FREQUENCY
+         let $Comp_Currency_Cd        = &CRT.CURRENCY_CD
+         let $Comp_FTE_Indicator      = &CRT.FTE_INDICATOR
+
+ FROM PS_COMP_RATECD_TBL CRT
+ WHERE CRT.COMP_RATECD  = $Comp_Ratecd
+  AND  CRT.EFFDT        = (SELECT MAX(CRT1.EFFDT)
+                          FROM PS_COMP_RATECD_TBL CRT1
+                          WHERE CRT1.COMP_RATECD = CRT.COMP_RATECD
+                          AND CRT1.EFFDT       <= &PMT.EFFDT)
+
+ end-select
+
+        !-------------------------------------------------------------------------
+         !*** Convert Component Amount from annual to the frequency specified
+         !*** on Comp Ratecd Table
+         !-------------------------------------------------------------------------
+
+         do Convert-Frequency ($To_EffDt, #Comp_Comp_Amt, 'A', $Comp_Comp_Frequency,
+               &J.STD_Hours, &J.Std_Hrs_Frequency, #Comp_Amount )
+
+         !-------------------------------------------------------------------------
+         !*** Insert or update Compensation record for Comp Rate Code
+         !-------------------------------------------------------------------------
+
+         do Process-Component
+
+
+
+end-procedure
+
+!**************************************************************************
+!
+! Procedure: Create-TPV-TEC
+!
+! Description: This routine creates records for TEC and TPV amounts
+!
+!**************************************************************************
+begin-procedure Create-TPV-TEC
+      !------------------------------------------------------------
+      !*** Insert Compensation records for TEC and TPV Comp Ratecd
+      !------------------------------------------------------------
+
+         let $Comp_Job_Effdt        = $New_Job_Effdt
+         let #Comp_Job_EffSeq       = #New_EffSeq
+         let #Comp_Seq              = 0
+         let $Comp_Ratecd           = $TEC_Ratecd
+         let $Comp_Rate_Points      = 0
+         let #Comp_Amount           = &PMT.TEC_CURRENT
+         let #Comp_Pct              = 0
+         let $Comp_Comp_Frequency   = 'A'
+         let $Comp_Currency_Cd      = &J.CURRENCY_CD
+         let $Comp_Manual_Sw        = 'N'
+         let #Comp_Convert_Comprate = 0
+         let $Comp_Rate_Code_Group  = ' '
+         let #Comp_Change_Amt       = 0
+         let #Comp_Change_PCT       = 0
+         let #Comp_Change_PTS       = 0
+         let $Comp_FTE_Indicator    = 'N'
+         let $Comp_Src_Ind          = 'N'
+         if isblank($TEC_Ratecd) = 0
+            do Process-Component
+         end-if
+
+         if isblank($TPV_Ratecd) = 0
+           let #Comp_Seq              = 0
+           let $Comp_Ratecd           = $TPV_Ratecd
+           let #Comp_Amount           = &PMT.TPV_CURRENT
+           do Process-Component
+         end-if
+
+end-procedure
+
+!**************************************************************************
+!
+! Procedure: Copy-Components
+!
+! Description: This routine copies all components for one effective date/
+!              sequence to the new effective date/sequence
+!
+!**************************************************************************
+
+begin-procedure Copy-Components
+  let $sql-statement = 'SELECT PS_COMPENSATION_TBL'
+
+  begin-SELECT on-error=SQL-Error
+CMP.EMPLID
+CMP.EMPL_RCD
+CMP.EFFDT
+CMP.EFFSEQ
+CMP.COMP_EFFSEQ
+CMP.COMP_RATECD
+CMP.COMP_RATE_POINTS
+CMP.COMPRATE
+CMP.COMP_PCT
+CMP.COMP_FREQUENCY
+CMP.CURRENCY_CD
+CMP.MANUAL_SW
+CMP.CONVERT_COMPRT
+CMP.RATE_CODE_GROUP
+CMP.CHANGE_AMT
+CMP.CHANGE_PCT
+CMP.CHANGE_PTS
+CMP.FTE_INDICATOR
+CMP.CMP_SRC_IND
+CMPR.COMP_BASE_PAY_SW
+
+    let #Comp_EffSeq           = &CMP.COMP_EffSeq
+    let $Comp_Ratecd           = &CMP.COMP_RATECD
+    let #Comp_Rate_Points      = &CMP.COMP_RATE_POINTS
+    let #Comp_Amount           = &CMP.COMPRATE
+    let #Comp_Pct              = &CMP.COMP_PCT
+    let $Comp_Comp_Frequency   = &CMP.COMP_FREQUENCY
+    let $Comp_Currency_Cd      = &CMP.CURRENCY_CD
+    let $Comp_Manual_Sw        = &CMP.MANUAL_SW
+    let #Comp_Convert_Comprate = &CMP.CONVERT_COMPRT
+    let $Comp_Rate_Code_Group  = &CMP.RATE_CODE_GROUP
+    let $Comp_FTE_Indicator    = &CMP.FTE_INDICATOR
+    let $Comp_Src_Ind          = &CMP.CMP_SRC_IND
+
+    !-------------------------------------------------------------------------
+    !*** When copying Compensation records from the latest
+    !*** Job Effdt - comprate changes will be the same
+    !*** When copying pckaged components - they are copied
+    !*** not from the latest Job Effdt, so the change will
+    !*** need to be calculated.
+    !*** Get Previous Comprate for the Comp Ratecd, if exists
+    !*** use it to calculate  comprate change
+    !-------------------------------------------------------------------------
+
+    let #Comp_Change_Amt  = 0
+    let #Comp_Change_PCT  = 0
+    let #Comp_Change_PTS  = 0
+
+    let  $Comp_Job_EffDt  = $To_EffDt
+    let  #Comp_Job_EffSeq = #To_EffSeq
+    let  #Comp_Seq        = #Comp_EffSeq
+
+
+    !-------------------------------------------------------------------------
+    !*** Insert Compensation record
+    !-------------------------------------------------------------------------
+
+      do   Insert-Compensation
+
+    !-------------------------------------------------------------------------
+    !*** Convert Comprate to Annual
+    !*** and accumulate comp rate for the Job
+    !-------------------------------------------------------------------------
+
+    do Convert-Frequency ($To_EffDt,#Comp_Amount,$Comp_Comp_Frequency,
+              'A',&J.STD_Hours,&J.Std_Hrs_Frequency,#Comp_Component_Amt)
+
+    if &CMPR.COMP_BASE_PAY_SW = 'Y'
+       let #Job_Comprate = #Job_Comprate + #Comp_Component_Amt
+    end-if
+
+  FROM PS_COMPENSATION CMP,
+     PS_COMP_RATECD_TBL CMPR
+  WHERE CMP.EMPLID     = &JOB.EMPLID
+  AND CMP.EMPL_RCD     = #JOB.EMPL_RCD
+  AND CMP.EFFDT        = $From_Effdt
+  AND CMP.EFFSEQ       = #From_Effseq
+  AND CMPR.COMP_RATECD = CMP.COMP_RATECD
+  AND CMPR.EFFDT   =
+         (SELECT MAX(CMPR1.EFFDT)
+          FROM PS_COMP_RATECD_TBL CMPR1
+          WHERE CMPR1.COMP_RATECD = CMPR.COMP_RATECD
+            AND CMPR1.EFFDT <= $From_Effdt)
+  AND CMPR.SAL_PKG_WARN = $Sal_Pkg_Flag
+
+
+ end-select
+
+end-procedure
+
+
+
+!**************************************************************************
+!
+! Procedure: Get-Prev-Comprate
+!
+! Description: Read Compensation table for currently processed Comp
+!              Ratecd and previous Job effective date to get previous
+!              comprate
+!
+!**************************************************************************
+begin-procedure Get-Prev-Comprate
+
+  let #Old_Comp_Comprate     = 0
+  let #Old_Comp_Rate_Points  = 0
+  let #Old_Comp_Pct          = 0
+
+  let $sql-statement = 'SELECT PS_COMPENSATION'
+  begin-SELECT on-error=SQL-Error
+OCMP.EMPLID
+OCMP.EMPL_RCD
+OCMP.EFFDT
+OCMP.EFFSEQ
+OCMP.COMP_EFFSEQ
+OCMP.COMP_RATECD
+OCMP.COMP_RATE_POINTS
+OCMP.COMPRATE
+OCMP.COMP_PCT
+OCMP.COMP_FREQUENCY
+
+    let #Old_Comp_Comprate     = &OCMP.Comprate
+    let #Old_Comp_Rate_Points  = &OCMP.Comp_Rate_Points
+    let #Old_Comp_Pct          = &OCMP.Comp_Pct
+    let $Old_Comp_Freq         = &OCMP.COMP_FREQUENCY
+
+    if $Old_Comp_Freq   <> $Comp_Comp_Frequency
+          do CONVERT-FREQUENCY(&J.EFFDT,#Old_Comp_Comprate,$Old_Comp_Freq,$Comp_Comp_Frequency,
+           &J.STD_HOURS,&J.STD_HRS_FREQUENCY,#Old_work_Comprate)
+          let #Old_Comp_Comprate = #Old_work_Comprate
+    end-if
+
+    let #Comp_Change_Amt     = #Comp_Amount    - #Old_Comp_Comprate
+    let #Comp_Change_Pts     = #Comp_Rate_Points - #Old_Comp_Rate_Points
+
+    if #Old_Comp_Comprate > 0
+       let #Comp_Change_Pct = round(#Comp_Change_Amt / #Old_Comp_Comprate * 100, 3)
+    else
+       let #Comp_Change_Pct = 0
+    end-if
+
+ FROM PS_COMPENSATION OCMP
+ WHERE OCMP.EMPLID       = &Job.EMPLID
+  AND OCMP.EMPL_RCD      = #Job.EMPL_RCD
+  AND OCMP.COMP_RATECD   = $Comp_Ratecd
+  AND OCMP.COMP_EFFSEQ   = #Comp_Seq
+  AND OCMP.EFFDT   =
+         (SELECT MAX(OCMP1.EFFDT)
+          FROM PS_COMPENSATION  OCMP1
+          WHERE OCMP1.EMPLID    = OCMP.EMPLID
+            AND OCMP1.EMPL_RCD  = OCMP.EMPL_RCD
+            AND OCMP1.EFFDT < $To_Effdt)
+  AND OCMP.EFFSEQ   =
+         (SELECT MAX(OCMP2.EFFSEQ)
+          FROM PS_COMPENSATION  OCMP2
+          WHERE OCMP2.EMPLID    = OCMP.EMPLID
+            AND OCMP2.EMPL_RCD  = OCMP.EMPL_RCD
+            AND OCMP2.EFFDT     = OCMP.EFFDT)
+
+
+
+ end-SELECT
+
+end-procedure
+
+
+
+
+!**************************************************************************
+!
+! Procedure: Process-Component
+!
+! Description: Process Component from the Component array
+!              1. Read Compensation table to check if the record for
+!                 Comp Rate Cd already exists for the currently processed Job
+!              2. If record exists - add amounts and update
+!              3. If record does not exist - insert it into Compensation table
+!
+!**************************************************************************
+begin-procedure Process-Component
+
+    let  $Comp_Job_EffDt  = $New_Job_Effdt
+    let  #Comp_Job_EffSeq = #New_Effseq
+    let  #Comp_Seq        = #Comp_Effseq
+
+    do  Insert-Compensation
+
+end-procedure
+
+
+
+!**************************************************************************
+!
+! Procedure: Insert_Compensation
+!
+! Description: Insert new Job record into Compensation record
+!
+!**************************************************************************
+begin-procedure Insert-Compensation
+
+    let $sql-statement = 'INSERT PS_COMP_SP_TMP'
+    begin-SQL on-error=SQL-Error
+ INSERT INTO PS_COMP_SP_TMP
+ ( EMPLID
+ , EMPL_RCD
+ , EFFDT
+ , EFFSEQ
+ , COMP_EFFSEQ
+ , COMP_RATECD
+ , COMP_RATE_POINTS
+ , COMPRATE
+ , COMP_PCT
+ , COMP_FREQUENCY
+ , CURRENCY_CD
+ , MANUAL_SW
+ , CONVERT_COMPRT
+ , RATE_CODE_GROUP
+ , CHANGE_AMT
+ , CHANGE_PCT
+ , CHANGE_PTS
+ , FTE_INDICATOR
+ , CMP_SRC_IND
+ , SP_PROC_STAT)
+ VALUES
+ ( &Job.EmplID
+ , &Job.Empl_Rcd
+ , $Comp_Job_Effdt
+ , #Comp_Job_Effseq
+ , #Comp_Seq
+ , $Comp_Ratecd
+ , #Comp_Rate_Points
+ , #Comp_Amount
+ , #Comp_Pct
+ , $Comp_Comp_Frequency
+ , $Comp_Currency_Cd
+ , 'N'
+ , 0
+ , ' '
+ , 0
+ , 0
+ , 0
+ , 'N'
+ , $Comp_Src_Ind
+ , 'N')
+
+ end-SQL
+
+end-procedure
+
+
+!**************************************************************************
+!
+! Procedure: Calc-Job-Rates
+!
+! Description: Calculate comp rates and variance for the new Job record
+!
+!**************************************************************************
+begin-procedure Calc-Job-Rates
+
+  !-----------------------------------------------------------------------------
+  !*** Convert Accumulated annual comprate to com frequency from the JOB record
+  !-----------------------------------------------------------------------------
+
+     do Convert-Frequency ($To_EffDt, #Job_Comprate, 'A', $Old_Job_Freq,
+               &J.STD_Hours, &J.Std_Hrs_Frequency, #New_CompRate )
+
+  !--------------------------------------------
+  !*** Calculate all JOB Rates and changes
+  !--------------------------------------------
+
+
+    let #New_Annual_Rt  = #Job_Comprate
+
+    do DET-MONTHLY-RT ($To_EffDt, #New_Annual_Rt,'A', $Monthly_Freq,
+              &J.STD_Hours, &J.Std_Hrs_Frequency, #New_Monthly_Rt )
+    do DET-Daily-RT ($To_EffDt, #New_Annual_Rt,'A', $Daily_Freq,
+              &J.STD_Hours, &J.Std_Hrs_Frequency, #New_Daily_Rt )
+    do DET-HOURLY-RT ($To_EffDt, #New_Annual_Rt,'A',
+              &J.STD_Hours, &J.Std_Hrs_Frequency, #New_Hourly_Rt )
+
+    let #New_Change_Amt = #New_CompRate - #Old_Comprate
+
+    if #Old_Annual_Rt > #Zero
+      let #New_Change_Pct = round(#New_Change_Amt / #Old_Comprate * 100, 3)
+    else
+      let #New_Change_Pct = #Zero
+    end-if
+
+
+
+
+end-procedure
+
+
+!**************************************************************************
+!
+! Procedure: Insert_Job_Record
+!
+! Description: Insert new Job record for Salary Packaging
+!
+!**************************************************************************
+begin-procedure Insert-Job-Record
+
+
+  IF isblank (&J.JOB_ENTRY_DT) = 1
+     let $JOB_ENTRY_DT = ''
+  else
+     let $JOB_ENTRY_DT = &J.JOB_ENTRY_DT
+  end-if
+  IF isblank (&J.DEPT_ENTRY_DT) = 1
+     let $DEPT_ENTRY_DT = ''
+  else
+     let $DEPT_ENTRY_DT = &J.DEPT_ENTRY_DT
+  end-if
+  IF isblank (&J.POSITION_ENTRY_DT) = 1
+     let $POSITION_ENTRY_DT = ''
+  else
+     let $POSITION_ENTRY_DT = &J.POSITION_ENTRY_DT
+  end-if
+  IF isblank (&J.GRADE_ENTRY_DT) = 1
+     let $Gade_Entry_Dt = ''
+  else
+     let $Grade_Entry_Dt = &J.GRADE_ENTRY_DT
+  end-if
+   IF isblank (&J.STEP_ENTRY_DT) = 1
+     let $STEP_ENTRY_DT = ''
+  else
+     let $STEP_ENTRY_DT = &J.STEP_ENTRY_DT
+  end-if
+
+  IF isblank (&J.FORCE_PUBLISH) = 1
+     let $FORCE_PUBLISH = ''
+  else
+     let $FORCE_PUBLISH= &J.FORCE_PUBLISH
+  end-if
+  
+  IF isblank (&J.EXPECTED_END_DATE) = 1
+     let $EXPECTED_END_DATE = ''
+  else
+     let $EXPECTED_END_DATE = &J.EXPECTED_END_DATE
+  end-if
+  !*** Setup Audit Trial info
+
+  let $key2 = edit(&J.EMPL_RCD, '09')
+  !do Convert-From-DTU-Date($New_Eff_Date, $Key3)
+  let $Key3 = $New_Eff_Date
+  let $Key4 = edit(#New_Eff_Seq, '9')
+  do Print_Audit_Trail ('JOB', 'Inserted', &J.EmplID, $Key2,
+                        $Key3, $Key4, '', '')
+
+  let $sql-statement = 'INSERT PS_JOB_SP_TMP'
+  begin-SQL on-error=SQL-Error
+  INSERT INTO PS_JOB_SP_TMP
+  ( EMPLID
+  , EMPL_RCD
+  , EFFDT
+  , EFFSEQ
+  , ACTION
+  , ACTION_DT
+  , ACTION_REASON
+  , JOB_ENTRY_DT
+  , DEPT_ENTRY_DT
+  , POSITION_ENTRY_DT
+  , GRADE_ENTRY_DT
+  , STEP_ENTRY_DT
+  , COMPRATE
+  , CHANGE_AMT
+  , CHANGE_PCT
+  , ANNUAL_RT
+  , MONTHLY_RT
+  , DAILY_RT
+  , HOURLY_RT
+  , FORCE_PUBLISH
+  , EXPECTED_END_DATE
+  , SP_PROC_STAT)
+  VALUES ( &J.EMPLID
+  , &J.EMPL_RCD
+  , $New_Eff_Date
+  , #New_Eff_Seq
+  , 'PAY'
+  , $AsofToday
+  , 'PKE'
+  , $JOB_ENTRY_DT
+  , $DEPT_ENTRY_DT
+  , $POSITION_ENTRY_DT
+  , $GRADE_ENTRY_DT
+  , $STEP_ENTRY_DT
+  , #New_CompRate
+  , #New_Change_Amt
+  , #New_Change_Pct
+  , #New_Annual_Rt
+  , #New_Monthly_Rt
+  , #New_Daily_Rt
+  , #New_Hourly_Rt
+  , $FORCE_PUBLISH
+  , $EXPECTED_END_DATE
+  , 'N')
+  
+  end-SQL
+
+ 
+  !-----------------------------------------------------------
+  !*** Insert the corresponding row into the Job Junior table
+  !-----------------------------------------------------------
+
+   if $Processing_Future = 'N'
+     let $JJR_New_Effdt   = $New_Eff_Date
+     let #JJR_New_Effseq  = #New_Eff_Seq
+     let $JJR_Effdt       = &J.EffDt
+     let #JJR_Effseq      = &J.EffSeq
+
+   else
+
+    let $JJR_New_EffDt   = &J.EffDt
+    let #JJR_New_Effseq  = #New_Eff_Seq
+    let $JJR_EffDt       = &J.EffDt
+    let #JJR_Effseq      = &J.EffSeq
+
+   end-if
+
+   do Get-Job-Jr
+
+
+end-procedure
+
+
+
+!**************************************************************************
+!
+! Procedure: Get-Job-Jr
+!
+! Description: Retrieve JOB_JR record that matches currently processed JOB
+!
+!**************************************************************************
+begin-procedure Get-Job-Jr
+
+
+  let $sql-statement = ' PS_JOB_JR'
+
+  begin-SELECT on-error=SQL-Error
+JR.EMPLID
+JR.EMPL_RCD
+JR.EFFDT
+JR.EFFSEQ
+JR.LASTUPDDTTM
+JR.LASTUPDOPRID
+AUS.SALARY_PACKAGED
+
+  !*** Insert JOB JR record for new eff date/seq
+
+  do Insert-Job-Jr
+
+  FROM  PS_JOB_JR JR, PS_JOB_AUS AUS
+  WHERE JR.EMPLID = AUS.EMPLID
+    AND JR.EMPL_RCD   = AUS.EMPL_RCD
+    AND JR.EFFDT      = AUS.EFFDT
+    AND JR.EFFSEQ     = AUS.EFFSEQ
+    AND JR.EMPLID     = &Job.EMPLID
+    AND JR.EMPL_RCD   = &Job.EMPL_RCD
+    AND JR.EFFDT      = $JJR_Effdt
+    AND JR.EFFSEQ     = #JJR_Effseq
+    AND JR.LASTUPDDTTM =
+       (SELECT MAX(JR1.LASTUPDDTTM)
+                         FROM PS_JOB_JR JR1
+                        WHERE JR1.EMPLID    = JR.EMPLID
+                          AND JR1.EMPL_RCD  = JR.EMPL_RCD
+                          AND JR1.EFFDT     = JR.EFFDT
+                          AND JR1.EFFSEQ    = JR.EFFSEQ )
+
+  end-SELECT
+end-procedure
+
+!**************************************************************************
+!
+! Procedure: Insert-Job-Jr
+!
+! Description: Insert JOB_JR record that matches currently processed JOB
+!
+!**************************************************************************
+begin-procedure Insert-Job-Jr
+
+  let $SQL-Statement = 'INSERT JOB_JR_SP_TMP'
+
+!*** Oracle database requires {DatetimeIn-Prefix} on insert statement
+
+ begin-SQL on-error=SQL-Error
+ INSERT INTO PS_JOB_JR_SP_TMP
+ ( EMPLID
+ , EMPL_RCD
+ , EFFDT
+ , EFFSEQ
+ , LASTUPDDTTM
+ , LASTUPDOPRID
+ , SALARY_PACKAGED
+ , SP_PROC_STAT)
+ VALUES
+ ( &JR.EMPLID
+ , &JR.EMPL_RCD
+ , $JJR_New_EffDt
+ , #JJR_New_EffSeq
+ , {DatetimeIn-Prefix}$SysDateTime{DatetimeIn-Suffix} !From Curdttim routines
+ , $RC.OperatorId
+ , 'Y'
+ , 'N')
+
+  end-SQL
+end-procedure
+
+
+
+!**************************************************************************
+!
+! Procedure: Process-Future-Jobs
+!
+! Description: All the future dated records need to be updated
+!
+!**************************************************************************
+begin-procedure Process-Future-Jobs
+
+      !-----------------------------------------------------------
+      !*** Setup part of the WHERE clause for SELECT statement
+      !***  for selection of the future dated rows
+      !***  where effective date falls between dates from Job array
+      !-----------------------------------------------------------
+
+      let $Processing_Future = 'Y'
+
+
+      let $Where_EffDt = ' J.EFFDT > ''' || $New_Job_Effdt ||
+         ''' AND J.EFFDT <  ''' || $Nav_Next_EffDt ||
+         ''' AND J.EMPL_STATUS NOT IN (''T'' , ''U'' , ''V'' ) '
+
+
+       do Read-Job
+
+end-procedure
+
+!**************************************************************************
+!
+! Procedure: Insert-Future-Job
+!
+! Description: Process all Components, recalculate Job rate, insert Job rec
+!
+!**************************************************************************
+begin-procedure Insert-Future-Job
+
+    !-------------------------------------------------------------------------
+    !*** The new Job record will be added for the same effective date
+    !*** and effective sequence increased by 1
+    !-------------------------------------------------------------------------
+
+       Let #New_Effseq =  &J.EffSeq + 1
+
+       let $Comp_Effdt =  &J.EffDt
+       let #Comp_EffSeq = #New_EffSeq
+
+
+    !-------------------------------------------------------------------------
+    !*** Copy all non-packaged comp rate codes added to the last
+    !*** future dated record processed
+    !*** Call Copy-Components procedure with flag set to 'N'
+    !-------------------------------------------------------------------------
+
+      let $Sal_Pkg_Flag = 'N'
+
+      let $From_EffDt  = &J.EffDt
+      let #From_EffSeq = &J.EffSeq
+      let $To_EffDt    = &J.EffDt
+      let #To_EffSeq   = #New_EffSeq
+    !Begin Resolution 720983
+      let $New_Job_Effdt = &J.EffDt
+      !do Copy-Components
+      do Process-All-Components
+    !End Resolution 720983
+
+    !-------------------------------------------------------------------------
+    !*** Copy all packaged comp rate codes from the last inserted
+    !*** record for the package
+    !*** Call Copy-Components procedure with flag set to 'Y'
+    !-------------------------------------------------------------------------
+
+       let $Sal_Pkg_Flag = 'Y'
+       let $From_EffDt   = $Pkg_Chg_EffDt
+       let #From_EffSeq  = #Pkg_Chg_EffSeq
+       let $To_EffDt     = &J.EffDt
+       let #To_EffSeq    = #New_EffSeq
+       do Copy-Components
+
+     !-------------------------------------------------------------------------
+     ! calculate Job rates and changes
+     !-------------------------------------------------------------------------
+
+       do Calc-Job-Rates
+
+     !-------------------------------------------------------------------------
+     ! insert new Job record
+     !-------------------------------------------------------------------------
+
+        let $New_Eff_Date = &J.Effdt
+        let #New_Eff_Seq =  #New_EffSeq
+
+       do Insert-Job-Record
+
+
+end-procedure
+
+
+
+
+!**************************************************************************
+!
+! Procedure: Update_Package_Status
+!
+! Description: Update Salary Package Status to 'H'
+!
+!**************************************************************************
+begin-procedure Update_Package_Status
+
+  print 'Processing Update Package Status...............................'(+2,1)
+
+  let $sql-statement = 'UPDATE PS_PKG_MDL_TBL'
+  begin-SQL on-error=SQL-Error
+    UPDATE PS_PKG_MDL_TBL
+       SET PKG_STATUS = 'H'
+     WHERE EMPLID     = &PMT.EMPLID
+       AND EMPL_RCD  = &PMT.EMPL_RCD
+       AND PKG_STATUS = 'C'
+  end-SQL
+
+  let $sql-statement = 'UPDATE PS_PKG_MDL_TBL'
+  begin-SQL on-error=SQL-Error
+    UPDATE PS_PKG_MDL_TBL
+       SET PKG_STATUS = 'C'
+     WHERE EMPLID        = &PMT.EMPLID
+       AND EMPL_RCD     = &PMT.EMPL_RCD
+       AND EFFDT         = &PMT.EffDt
+       AND EFFSEQ        = &PMT.EffSeq
+       AND PKG_STATUS    = 'P'
+       AND PKG_CONFIRMED = 'Y'
+  end-SQL
+
+  let $SQL-Statement = 'DELETE PS_PKG_MDL_BUDGET'
+  begin-SQL on-error=SQL-Error
+    DELETE FROM PS_PKG_MDL_BUDGET
+     WHERE EMPLID     = &PMT.Emplid
+       AND EMPL_RCD   = &PMT.EMPL_RCD
+       AND EFFDT      = &PMT.EffDt
+       AND EFFSEQ     = &PMT.EffSeq
+  end-SQL
+
+end-procedure
+
+
+
+!**************************************************************************
+!
+! Procedure: Clear_Budgets
+!
+! Description: Clear out the period budgets that existed from the old package
+!
+!**************************************************************************
+begin-procedure Clear_Budgets
+
+  !-------------------------------------------------
+  !  Delete any unused budgets from the old package
+  !-------------------------------------------------
+
+  let $sql-statement = 'DELETE PS_PKG_EXP_PER_TBL'
+  begin-SQL on-error=SQL-Error
+    DELETE FROM PS_PKG_EXP_PER_TBL
+     WHERE EMPLID        = &PMT.Emplid
+       AND EMPL_RCD     = &PMT.EMPL_RCD
+       AND PERIOD_START >= &PMT.EffDt
+  end-SQL
+
+  !---------------------------------------------------------------------------------
+  !  And if the new package starts mid period, pro-rate the budgets for the old one
+  !---------------------------------------------------------------------------------
+
+  let $ProRated = 'N'
+
+  let $sql-statement = 'SELECT PS_PKG_EXP_PER_TBL'
+  begin-SELECT on-error=SQL-Error
+EXP.EFFDT
+EXP.PERIOD_END
+EXP.COMPONENT
+EXP.ADD_COMPONENT
+EXP.PERIOD_START
+EXP.BUDGET_AMT
+EXP.TAXABLE_AMT
+
+      let $ProRated = 'Y'
+      do ProRate_Period_Budget
+
+     FROM PS_PKG_EXP_PER_TBL EXP
+    WHERE EMPLID       = &PMT.Emplid
+      AND EMPL_RCD    = &PMT.EMPL_RCD
+      AND PERIOD_END  >= &PMT.EffDt
+      AND PERIOD_START < &PMT.EffDT
+  end-SELECT
+
+end-procedure
+
+
+!**************************************************************************
+!
+! Procedure: ProRate_Period_Budget
+!
+! Description: Pro-Rate budgets when the new package starts mid period
+!
+!**************************************************************************
+begin-procedure ProRate_Period_Budget
+
+  do Convert-To-DTU-Date(&EXP.Period_Start, $Exp_Start)
+  do Convert-To-DTU-Date(&EXP.Period_End, $Exp_End)
+  do Partial_Period($Exp_Start, $dtu_Term_End_Dt, $Exp_Start,
+                    $Exp_End, #Part_Period)
+  let #Bud_Amt     = Round(&EXP.Budget_Amt * #Part_Period, 2)
+  let #Taxable_Amt = Round(&EXP.Taxable_Amt * #Part_Period, 2)
+  let $Old_EffDt   = &EXP.EffDt
+
+  let $SQL-Statement = 'UPDATE PS_PKG_EXP_PER_TBL 2'
+  begin-SQL on-error=SQL-Error
+    UPDATE PS_PKG_EXP_PER_TBL
+       SET BUDGET_AMT       = #Bud_Amt,
+           TAXABLE_AMT      = #Taxable_Amt,
+           REMAINING_BUDGET = 0,
+           PERIOD_END       = $Term_End_Dt,
+           EXPENSE_AMT      = 0
+     WHERE EMPLID        = &PMT.Emplid
+       AND EMPL_RCD      = &PMT.EMPL_RCD
+       AND EFFDT         = &EXP.EffDt
+       AND PERIOD_END    = &EXP.Period_End
+       AND COMPONENT     = &EXP.Component
+       AND ADD_COMPONENT = &EXP.Add_Component
+  end-SQL
+
+end-procedure
+
+!**************************************************************************
+!
+! Procedure: Get_Frequency_Rate
+!
+! Description: Calculate the corresponding rate value per pay period.
+!
+!**************************************************************************
+begin-procedure Get_Frequency_Rate
+
+  let #Num_Pers = 0
+
+!  Count the number of pay periods included in the component period
+!  where the component will be paid.
+
+  let #First_Per = #Zero
+  let #Last_Per  = #Zero
+  let #Num_Pers  = #Zero
+  let #I         = 1
+
+  WHILE #I <= #Num_Pays
+
+    GET $Cal_Pay_Begin $Cal_Pay_End  FROM Pay_Calendar(#I)
+
+    if   $Cal_Pay_End >= $Cmp_Start_Dt
+     and $Cal_Pay_End <= $Cmp_Fin_Dt
+
+      let #Num_Pers = #Num_Pers + 1
+      if $Cal_Pay_Begin < $Cmp_Start_Dt
+        let #First_Per = #I
+      end-if
+    else
+      if   $Cal_Pay_End  > $Cmp_Fin_Dt
+       and $Cal_Pay_Begin <= $Cmp_Fin_Dt
+        let #Last_Per = #I
+      end-if
+    end-if
+    let #I = #I + 1
+  end-WHILE
+
+
+!  If it starts in the middle of a pay period, find the fraction of the
+!  period that it will active for.
+
+  if #First_Per > #Zero
+    GET $Cal_Pay_Begin $Cal_Pay_End FROM Pay_Calendar(#First_Per)
+    do Partial_Period($Cmp_Start_Dt, $Cal_Pay_End, $Cal_Pay_Begin,
+                      $Cal_Pay_End, #First_Part_Per)
+  else
+    let #First_Part_Per = 1
+  end-if
+
+!  If it ends in the middle of a pay period, find the fraction of the
+!  period that it will be active for.
+
+  if #Last_Per > #Zero
+    GET $Cal_Pay_Begin $Cal_Pay_End FROM Pay_Calendar(#Last_Per)
+    do Partial_Period($Cal_Pay_Begin, $Cmp_Fin_Dt, $Cal_Pay_Begin,
+                      $Cal_Pay_End, #Last_Part_Per)
+  else
+    let #Last_Part_Per = 0
+  end-if
+  let #Num_Pers       = #Num_Pers + #First_Part_Per + #Last_Part_Per - 1
+  let #Cmp_Period_Amt = Round(#Key_Component_Amt / #Num_Pers, 2)
+
+  let #Cmp_Per_Amt_Adj = Round((#Key_Component_Amt + #CF_Period_Amt) / #Num_Pers , 2)
+
+
+
+end-procedure
+
+
+!**************************************************************************
+!
+! Procedure: Create_Component_Budgets
+!
+! Description: Create budget amounts for each pay period for the component
+!              If they have been entered manually, just copy those to the
+!              Expenses table, otherwise calculate the regular amounts and
+!              generate a budget for each pay period included in the
+!              component period.
+!
+!**************************************************************************
+begin-procedure Create_Component_Budgets
+
+  let $Models_Exist  = 'N'
+  let #Rem_Bud       = #Key_Component_Amt
+  let $Pay_Frequency = rtrim($Pay_Frequency,' ')
+
+  let $SQL-Statement = 'SELECT PS_PKG_MDL_BUDGET'
+  begin-SELECT on-error=SQL-Error
+MB.PERIOD_END
+MB.PERIOD_START
+MB.COMPONENT_AMT
+
+      let $Models_Exist = 'Y'
+      do Copy_Model_Budget
+
+     FROM PS_PKG_MDL_BUDGET MB
+    WHERE EMPLID          = &PMT.Emplid
+      AND EMPL_RCD       = &PMT.EMPL_RCD
+      AND EFFDT           = &PMT.EffDt
+      AND EFFSEQ          = &PMT.EffSeq
+      AND COMPONENT       = &BC.Component
+      AND COMPONENT_START = &BC.Component_Start
+  end-SELECT
+
+  if $Models_Exist = 'N'
+    evaluate $Pay_Frequency
+      when = 'M'
+        let #Periods_per_Yr = 12
+        break
+      when = 'B'
+        let #Periods_per_Yr = 26
+        break
+      when = 'S'
+        let #Periods_per_Yr = 24
+        break
+      when = 'W'
+        let #Periods_per_Yr = 52
+        break
+      when = 'Q'
+        let #Periods_per_Yr = 4
+        break
+      when = 'D'
+        let #Periods_per_Yr = 365
+        break
+      when-other
+        let #Periods_per_Yr = #NUM_PERS
+        break
+    end-evaluate
+
+    let #Txbl_Period_Amt = Round(&BC.Taxable_Amt / #Periods_per_Yr, 2)
+
+    let #I = 1
+    WHILE #I <= #Num_Pays
+
+      GET $Cal_Pay_Begin $Cal_Pay_End  FROM Pay_Calendar(#I)
+
+      if   $Cal_Pay_End   >= $Cmp_Start_Dt
+       and $Cal_Pay_Begin <= $Cmp_Fin_Dt
+
+        do Calculate_Budget
+      end-if
+      let #I = #I + 1
+    end-WHILE
+  end-if
+end-procedure
+
+
+!**************************************************************************
+!
+! Procedure: Copy_Model_Budget
+!
+! Description: Create budget amounts on the expense table using the values
+!              from the model budget table
+!
+!**************************************************************************
+begin-procedure Copy_Model_Budget
+
+
+  let #Rem_Bud  = #Rem_Bud - &MB.Component_Amt
+  let #Txbl_Amt = Round(&MB.Component_Amt * &BC.Taxable_Amt
+                      / &BC.Component_Amt, 2)
+
+  let $fnd = 'N'
+  let $sql-statement = 'SELECT PS_PKG_EXP_PER_TBL 2'
+  begin-SELECT on-error=SQL-Error
+T.EMPLID
+
+    let $fnd = 'Y'
+
+    FROM PS_PKG_EXP_PER_TBL T
+
+   WHERE EMPLID        = &PMT.Emplid
+     AND EMPL_RCD     = &PMT.EMPL_RCD
+     AND EFFDT         = &PMT.Pkg_Start_Dt
+     AND PERIOD_END    = &MB.Period_End
+     AND COMPONENT     = &BC.Component
+     AND ADD_COMPONENT = $Null
+  end-SELECT
+
+  if $fnd = 'N'
+
+    let $sql-statement = 'INSERT PS_PKG_EXP_PER_TBL 2'
+
+    begin-SQL on-error=SQL-Error
+      INSERT INTO PS_PKG_EXP_PER_TBL
+             (EMPLID, EMPL_RCD, EFFDT, PERIOD_END,
+              COMPONENT, ADD_COMPONENT, PERIOD_START, BUDGET_AMT,
+              TAXABLE_AMT, EXPENSE_AMT, REMAINING_BUDGET)
+
+      VALUES (&PMT.Emplid, &PMT.EMPL_RCD, &PMT.Pkg_Start_Dt, &MB.Period_End,
+              &BC.Component, $Null, &MB.Period_Start, &MB.Component_Amt,
+              #Txbl_Amt, 0, #Rem_Bud)
+    end-SQL
+  else
+    let $sql-statement = 'UPDATE PS_PKG_EXP_PER_TBL 2'
+    begin-SQL on-error=SQL-Error
+      UPDATE PS_PKG_EXP_PER_TBL
+         SET BUDGET_AMT  = &MB.Component_Amt,
+             TAXABLE_AMT = #Txbl_Amt,
+             REMAINING_BUDGET = #Rem_Bud
+       WHERE EMPLID        = &PMT.Emplid
+         AND EMPL_RCD     = &PMT.EMPL_RCD
+         AND EFFDT         = &PMT.Pkg_Start_Dt
+         AND PERIOD_END    = &MB.Period_End
+         AND COMPONENT     = &BC.Component
+         AND ADD_COMPONENT = $Null
+    end-SQL
+  end-if
+
+end-procedure
+
+
+!**************************************************************************
+!
+! Procedure: Calculate_Budget
+!
+! Description: Create budget amounts for each pay period for the component
+!              Calculated from the regular amounts.
+!
+!**************************************************************************
+begin-procedure Calculate_Budget
+
+  if $Cal_Pay_Begin < $Cmp_Start_Dt
+    let #Bud_Amt  = Round(#Cmp_Period_Amt * #First_Part_Per, 2)
+    let #Txbl_Amt = Round(#Txbl_Period_Amt * #First_Part_Per, 2)
+    let $End_Dt   = $Cal_Pay_End
+    let $Start_Dt = &BC.Component_Start
+  else
+    if $Cal_Pay_End > $Cmp_Fin_Dt
+      let #Bud_Amt  = Round(#Cmp_Period_Amt * #Last_Part_Per, 2)
+      let #Txbl_Amt = Round(#Txbl_Period_Amt * #Last_Part_Per, 2)
+      do Convert-from-dtu-Date($Cal_Pay_Begin, $Start_Dt)
+      let $End_Dt   = $Cmp_Fin_Dt
+    else
+      let #Bud_Amt  = #Cmp_Period_Amt
+      let #Txbl_Amt = #Txbl_Period_Amt
+      do Convert-from-dtu-Date($Cal_Pay_Begin, $Start_Dt)
+      let $End_Dt   = $Cal_Pay_End
+    end-if
+  end-if
+  do Convert-from-dtu-Date($End_Dt, $Nav_End_Dt)
+
+  if $End_Dt >= $Cmp_Fin_Dt
+    let #Bud_Amt = #Rem_Bud
+  end-if
+
+  let #Rem_Bud = #Rem_Bud - #Bud_Amt
+
+  let $fnd = 'N'
+
+  let $sql-statement = 'SELECT PS_PKG_EXP_PER_TBL 3'
+  begin-SELECT on-error=SQL-Error
+Q.EMPLID
+
+    let $fnd = 'Y'
+
+    FROM PS_PKG_EXP_PER_TBL Q
+
+   WHERE EMPLID        = &PMT.Emplid
+     AND EMPL_RCD     = &PMT.EMPL_RCD
+     AND EFFDT         = &PMT.Pkg_Start_Dt
+     AND PERIOD_END    = $Nav_End_Dt
+     AND COMPONENT     = &BC.Component
+     AND ADD_COMPONENT = $Null
+  end-SELECT
+
+  if $fnd = 'N'
+
+    let $sql-statement = 'INSERT PS_PKG_EXP_PER_TBL 3'
+
+    begin-SQL on-error=SQL-Error
+      INSERT INTO PS_PKG_EXP_PER_TBL
+             (EMPLID, EMPL_RCD, EFFDT, PERIOD_END,
+              COMPONENT, ADD_COMPONENT, PERIOD_START, BUDGET_AMT,
+              TAXABLE_AMT, EXPENSE_AMT, REMAINING_BUDGET)
+
+      VALUES (&PMT.Emplid, &PMT.EMPL_RCD, &PMT.Pkg_Start_Dt, $Nav_End_Dt,
+              &BC.Component, $Null, $Start_Dt, #Bud_Amt,
+              #Txbl_Amt, 0, #Rem_Bud)
+    end-SQL
+  else
+    let $sql-statement = 'UPDATE PS_PKG_EXP_PER_TBL 3'
+
+    begin-SQL on-error=SQL-Error
+      UPDATE PS_PKG_EXP_PER_TBL
+         SET BUDGET_AMT  = #Bud_Amt,
+             TAXABLE_AMT = #Txbl_Amt,
+             REMAINING_BUDGET = #Rem_Bud
+       WHERE EMPLID        = &PMT.Emplid
+         AND EMPL_RCD     = &PMT.EMPL_RCD
+         AND EFFDT         = &PMT.Pkg_Start_Dt
+         AND PERIOD_END    = $Nav_End_Dt
+         AND COMPONENT     = &BC.Component
+         AND ADD_COMPONENT = $Null
+    end-SQL
+  end-if
+
+end-procedure
+
+
+!**************************************************************************
+!
+! Procedure: Create_Addl_Comp_Budgets
+!
+! Description: Create budget amounts for each pay period for the additional
+!              component in proportion to the base component budgets.
+!
+!**************************************************************************
+begin-procedure Create_Addl_Comp_Budgets
+
+  let #Rem_Bud = #Key_Component_Amt
+  let $sql-statement = 'SELECT PS_PKG_EXP_PER_TBL 3'
+  begin-SELECT on-error=SQL-Error
+ET.PERIOD_END
+ET.PERIOD_START
+ET.BUDGET_AMT
+ET.TAXABLE_AMT
+
+      do Create_Addl_Budget
+
+     FROM PS_PKG_EXP_PER_TBL ET
+    WHERE EMPLID           = &PMT.Emplid
+      AND EMPL_RCD        = &PMT.EMPL_RCD
+      AND EFFDT            = &PMT.Pkg_Start_Dt
+      AND COMPONENT        = &BC.Component
+      AND ADD_COMPONENT    = $Null
+      AND PERIOD_END BETWEEN $Nat_Start_Dt AND &BC.Component_End
+  end-SELECT
+
+end-procedure
+
+
+!**************************************************************************
+!
+! Procedure: Create_Addl_Budget
+!
+! Description: Create budget amounts for each pay period for the additional
+!              component in proportion to the base component budgets.
+!
+!**************************************************************************
+begin-procedure Create_Addl_Budget
+
+  if &ET.Period_End = &BC.Component_End
+    let #Bud_Amt = #Rem_Bud
+  else
+    let #Bud_Amt = Round(&AC.ADD_CMP_AMT * &ET.Taxable_Amt
+                         / &BC.Taxable_Amt , 2)
+    let #Rem_Bud      = #Rem_Bud - #Bud_Amt
+  end-if
+
+  let $fnd = 'N'
+
+  let $SQL-Statement = 'SELECT PS_PKG_EXP_PER_TBL 4'
+  begin-SELECT on-error=SQL-Error
+ET1.PERIOD_END
+
+      let $fnd = 'Y'
+
+     FROM PS_PKG_EXP_PER_TBL ET1
+    WHERE EMPLID        = &PMT.Emplid
+      AND EMPL_RCD     = &PMT.EMPL_RCD
+      AND EFFDT         = &PMT.Pkg_Start_Dt
+      AND COMPONENT     = &BC.Component
+      AND ADD_COMPONENT = &AC.Add_Component
+      AND PERIOD_END    = &ET.Period_End
+  end-SELECT
+
+  if $fnd = 'Y'
+    let $SQL-Statement = 'UPDATE PS_PKG_EXP_PER_TBL 4'
+    begin-SQL on-error=SQL-Error
+      UPDATE PS_PKG_EXP_PER_TBL
+         SET BUDGET_AMT = #Bud_Amt
+       WHERE EMPLID        = &PMT.Emplid
+         AND EMPL_RCD     = &PMT.EMPL_RCD
+         AND EFFDT         = &PMT.Pkg_Start_Dt
+         AND COMPONENT     = &BC.Component
+         AND ADD_COMPONENT = &AC.Add_Component
+         AND PERIOD_END    = &ET.Period_End
+    end-SQL
+  else
+    let $SQL-Statement = 'INSERT PS_PKG_EXP_PER_TBL 4'
+    begin-SQL on-error=SQL-Error
+      INSERT INTO PS_PKG_EXP_PER_TBL
+
+             (EMPLID, EMPL_RCD, EFFDT, PERIOD_END,
+              COMPONENT, ADD_COMPONENT, PERIOD_START, BUDGET_AMT,
+              TAXABLE_AMT, EXPENSE_AMT, REMAINING_BUDGET)
+
+      VALUES (&PMT.Emplid, &PMT.EMPL_RCD, &PMT.Pkg_Start_Dt, &ET.Period_End,
+              &BC.Component, &AC.Add_Component, &ET.Period_Start, #Bud_Amt,
+              0, 0, 0)
+    end-SQL
+  end-if
+
+end-procedure
+
+
+!**************************************************************************
+!
+! Procedure: Partial_Period
+!
+! Description: Calculate the number of days in two periods, each defined by
+!              from & to dates, and return the fraction of the first period
+!              over the second
+!
+!**************************************************************************
+begin-procedure Partial_Period ($Sub_Start, $Sub_End, $Per_Start, $Per_End,
+                                :#Part_Per)
+
+   do dtu-diff-days($Sub_Start, $Sub_End, #Sub_Days)
+   do dtu-diff-days($Per_Start, $Per_End, #Per_Days)
+   let #Part_Per = (#Sub_Days + 1) / (#Per_Days + 1)
+
+end-procedure
+
+
+!**************************************************************************
+!
+! Procedure: Print_Audit_Trail
+!
+! Description: Print audit trail
+!
+!**************************************************************************
+begin-procedure Print_Audit_Trail ($Record_Name, $Action,
+                                   $Key1, $Key2, $Key3, $Key4, $Key5, $Key6)
+  print $Record_Name (+1,1 )
+  print $Action      ( 0,18)
+  print $Key1        ( 0,30)
+  print $Key2        ( 0,45)
+  do Format-DateTime($Key3, $Key3formated, {DEFDATE}, '', '')
+  print $Key3formated        ( 0,60)
+  print $Key4        ( 0,75)
+  print $Key5        ( 0,90)
+end-procedure
+
+#Include 'reset.sqc'     !Reset printer procedure
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'datemath.sqc'  !Routines for date arithmetic
+#Include 'currency.sqc'  !Currency Conversion Routines
+#Include 'stdapi.sqc'    !Routines to Update Run Status
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'pkgrnctl.sqc'  !Select-Parameters procedure
+#Include 'pkgtrgr.sqc'  !Select-Parameters procedure
+
+
+

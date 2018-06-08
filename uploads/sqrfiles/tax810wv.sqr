@@ -1,0 +1,486 @@
+!***********************************************************************
+!  TAX810WV:  Qtrly Wage List - Tape - WEST VIRGINIA                   *
+!                                                                      *
+!             NOTE: "#IFDEF TAXTEST" in main SELECT is used for        *
+!                   testing this report against DEMO database          *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module contains confidential and proprietary information        *
+! of Oracle; it is not to be copied, reproduced, or transmitted        *
+! in any form, by any means, in whole or in part, nor is it to         *
+! be used for any purpose other than that for which it is              *
+! expressly provided under the applicable license agreement.           *
+!                                                                      *
+! Copyright (C) 2006 Oracle. All Rights Reserved.                      *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+!          $Date:  2006/07/20:06:55:42                                 !
+!       $Release:  HR9                                                 !
+!      $Revision:  102                                                 !
+!                                                                      *
+!***********************************************************************
+
+#include 'setenv.sqc' !Set environment
+#include 'setup31.sqc' !Printer and page-size initialization
+#include 'usarpt.sqc'  ! NID_COUNTRY defined
+
+begin-report
+  do Init-Report
+
+! These variables are used by rptsmmry.sqc
+  Let $Prnt_CoTxGrs = 'N'
+  Let $Prnt_CoExGrs = 'N'
+
+  do Process-Main
+
+  close 10
+
+  if $RecordWritten = 'Y'
+    display ''
+    display 'Upon successful conclusion of this program, one or more'
+    display 'files will have been created, as follows:'
+    display ''
+    display '  TAX810WV.nnn  contains 275-character records in the format'
+    display '            required for diskette submission to the West Virginia'
+    display '            Department of Employment Security, where "nnn" '
+    display '            represents a volume number.'
+    display ''
+    display 'Follow the instructions from the division for preparing'
+    display 'and submitting the diskette file.'
+    display ''
+  else
+    do Print-Summary-Data('NoData')
+  end-if
+
+  do Stdapi-Term
+
+end-report
+
+begin-procedure Init-Report
+  do Init-DateTime
+  do Init-Number
+  do Get-Current-DateTime
+  do Get-Calendar-Year-Id
+  do Stdapi-Init
+  do Initialization
+  move 'TAX810WV' to $ReportID
+
+  move 'West Virginia Quarterly UI Wage Report - Diskette' to $ReportTitle
+  display ''
+  display 'Creating Diskette File for West Virginia UI Wage Reporting'
+
+end-procedure
+
+begin-procedure Initialization
+#ifdef TAXTEST
+  move 'CA'              to $State
+#else
+  move 'WV'              to $State
+#endif
+
+  do Get-Tax-Reporting-Run-Controls
+  move &TX.Balance_Year to $RptYear 9999
+  move $RptYear          to $RptYear ~~xx
+  move $PeriodEndDate    to $AsOfDate
+
+  display ' '
+  display 'Processing balances for '   noline
+  display $RptQtrYr
+
+  move 275 to #RecordLength
+  add 2 to #RecordLength
+
+  if $PRCS_Process_Instance = ''
+     do Prompts
+  else
+     do Select-Parameters
+     do Convert-Parameters
+  end-if
+  do Evaluate-File-Type
+  do Calculate-Diskette-Capacity
+  do Open-File
+
+end-procedure
+
+begin-procedure Open-File
+
+   move 0 to #RecordCount
+   if #FileExtension <> 0
+      close 10
+   end-if
+   add 1 to #FileExtension
+   move #FileExtension to $FileExtension 099
+#ifdef OS400
+   let $FileExtension = '(D' || $FileExtension || ')'
+   let $FileID = '{IMPORTPREFIX}' || 'TAX810WV' || $FileExtension
+#else
+   let $FileID = '{IMPORTPREFIX}' || 'TAX810WV.' || $FileExtension
+#endif
+   open $FileID as 10 for-writing record=275:fixed
+end-procedure
+
+begin-procedure Process-Main
+  move &TX.Company       to $Company  !TX.Company is the Transmitter
+  if RTRIM($Company,' ') = ''
+    display '*** Company field blank on Tax Run Control Record ***'
+    display '***************** Processing stopped ****************'
+    stop
+  end-if
+  do Get-Company-Data                 !Transmitter identifying data
+  do Write-A-Record
+  do Write-B-Record
+
+begin-SELECT
+TEMP_SSN_MASK
+FROM PS_INSTALLATION
+end-SELECT
+
+begin-SELECT
+A.COMPANY
+A.DESCR
+
+  move &A.Company to $Company
+
+  move '' to $priorEmplID
+  do Read-Employee-Data
+
+FROM  PS_COMPANY_TBL A
+WHERE A.EFF_STATUS = 'A'
+  AND A.TAX_REPORT_TYPE = '2'
+  AND A.EFFDT =
+  (SELECT MAX(EFFDT)
+     FROM PS_COMPANY_TBL
+     WHERE  COMPANY = A.COMPANY
+       AND  EFFDT  <= $AsOfDate)
+ORDER BY COMPANY
+end-SELECT
+  if #Count_F > 0
+    do Write-F-Record
+    do Print-Summary-Data('FileTotal')
+  end-if
+end-procedure
+
+begin-procedure Read-Employee-Data
+begin-SELECT
+C.COMPANY    () on-break print=never before=Before-Company
+                                     AFTER=AFTER-COMPANY
+C.EMPLID
+C.NLGRS_QTD
+C.TXGRS_QTD
+D1.NATIONAL_ID
+D.LAST_NAME
+D.FIRST_NAME
+D.MIDDLE_NAME
+
+  if &C.NlGrs_QTD > 0
+    do Process-Employee
+  else
+    do Print-Summary-Data('NegWage')
+  end-if
+
+FROM  PS_TAX_BALANCE C, PS_PERSON_NAME D, PS_PERS_NID D1
+WHERE C.COMPANY       = &A.Company
+  AND D.EMPLID        = C.EMPLID
+  AND C.TAX_CLASS     = 'U'
+  AND C.BALANCE_ID    = $Calendar_Year_Id
+  AND C.BALANCE_YEAR  = &TX.Balance_Year
+  AND C.BALANCE_QTR   = &TX.Balance_Qtr
+#ifdef TAXTEST
+  AND C.STATE         = 'CA'
+#else
+  AND C.STATE         = 'WV'
+#endif
+  AND C.LOCALITY      = ' '
+  AND C.BALANCE_PERIOD  =
+      (SELECT MAX(BALANCE_PERIOD)
+       FROM   PS_TAX_BALANCE
+       WHERE  EMPLID        = C.EMPLID
+         AND  COMPANY       = C.COMPANY
+         AND  BALANCE_ID    = C.BALANCE_ID
+         AND  BALANCE_YEAR  = C.BALANCE_YEAR
+         AND  BALANCE_QTR   = C.BALANCE_QTR
+         AND  STATE         = C.STATE
+         AND  LOCALITY      = C.LOCALITY
+         AND  TAX_CLASS     = C.TAX_CLASS)
+  AND C.NLGRS_QTD <> 0
+  AND D.EMPLID            = D1.EMPLID
+  AND D1.COUNTRY          = {NID_Country}
+  AND D1.NATIONAL_ID_TYPE = $Payroll_NID_Type
+ORDER BY D1.NATIONAL_ID
+end-SELECT
+end-procedure
+
+begin-procedure Process-Employee
+  move &D1.NATIONAL_ID to $S123 xxx       !isolate first 3 digits
+  if $S123 = &Temp_SSN_Mask or RTRIM(&D1.NATIONAL_ID, ' ') = ''
+    move '000000000'   to $NATIONAL_ID
+  else
+    move &D1.NATIONAL_ID        to $NATIONAL_ID
+  end-if
+
+  let $LastName   = rtrim(&D.LAST_NAME, ' ')
+  let $FirstName  = rtrim(&D.FIRST_NAME, ' ')
+  let $MidInitial = {ps-substr}(&D.MIDDLE_NAME,1,1)
+  uppercase $LastName
+  uppercase $FirstName
+  uppercase $MidInitial
+
+  move &C.NlGrs_QTD to #NlGrs_QTD
+  add #NlGrs_QTD to #Co_NlGrs_QTD
+  multiply 100 times #NlGrs_QTD
+  do Format-Number(#NlGrs_QTD,  $NlGrs_QTD,  '09999999999999')
+
+  add 1 to #Count_S
+  do Write-S-Record
+  move 'Y' to $RecordWritten
+  move 0 to #DetailCount
+end-procedure
+
+begin-procedure Before-Company
+  do Get-Company-Data
+  #ifdef TAXTEST
+    move 'CA' to $State
+  #else
+    move 'WV' to $State
+  #endif
+  do Get-State-Tax-Data             !Employer ID
+  if RTRIM(&Employer_ID_SUT,' ') = ''
+    display '*** State Unemployment ID missing in Company State Tax Table ***'
+    display '*********************** Processing stopped *********************'
+    display 'Company ' noline
+    display $Company
+    stop
+  end-if
+  let $StateEIN = EDIT(RTRIM(&Employer_ID_SUT,' '),'099999999999999')
+  do Write-E-Record
+end-procedure
+
+begin-procedure After-Company
+  if #Count_S > 0
+    do Write-T-Record
+  end-if
+
+  do Print-Summary-Data('CoTotal')
+
+  add #Co_NlGrs_QTD to #Tot_NlGrs_QTD
+  add #Count_S to #Count_F
+
+  move 0 to #Co_NlGrs_QTD
+  move 0 to #Count_S
+  new-page
+end-procedure
+
+begin-Procedure Write-A-Record
+  move $CompanyName    to $TransmitterName
+  move &CT.Federal_EIN to $FedEIN 099999999
+  move &CT.address1     to $Transmitteraddress
+  move &CT.City        to $TransmitterCity
+  move &CT.State       to $TransmitterState
+  move &CT.Postal      to $Zip
+  move $Zip            to $ZipExtsn ~~~~~~xxxx
+  if instr($Zip,'-',6) = 0
+  and $ZipExtsn <> '    '
+    let $Zip = substr($Zip,1,5) || '-' || substr($Zip,6,4)
+  end-if
+  move $Zip            to $ZipExtsn ~~~~~xxxxx
+
+  uppercase $TransmitterName
+  uppercase $Transmitteraddress
+  uppercase $TransmitterCity
+
+  write 10 from  'A':1
+    &TX.Balance_Year:4
+                 $Sp:18
+    $TransmitterName:50
+  $Transmitteraddress:40
+    $TransmitterCity:25
+   $TransmitterState:2
+                 $Sp:13
+                $Zip:5
+           $ZipExtsn:5
+                 $Sp:30
+       $ContactPhone:10
+                 $Sp:72
+
+  add 1 to #RecordCount
+end-procedure
+
+begin-procedure Write-B-Record
+
+    write 10 from 'B':1
+     &TX.Balance_Year:4
+                  $Sp:9
+        $Computer_Mfr:8
+          $Tape_Label:2
+                  $Sp:1
+             $Density:2
+        $Recording_Cd:3
+              $Tracks:2
+     $Blocking_Factor:2
+                  $Sp:112
+     $TransmitterName:44
+  $Transmitteraddress:35
+     $TransmitterCity:20
+    $TransmitterState:2
+                  $Sp:5
+                 $Zip:5
+            $ZipExtsn:5
+                  $Sp:13
+
+  add 1 to #RecordCount
+end-procedure
+
+begin-procedure Write-E-Record
+  if #RecordCount >= #MaxRecordsPerDiskette
+    do Open-File
+    do Write-A-Record
+  end-if
+
+  write 10 from 'E':1
+   &TX.Balance_Year:4
+                $Sp:165
+               '54':2
+          $StateEIN:15
+       $QtrEndMonth:2
+                $Sp:86
+
+  move 'Y' to $RecordWritten
+  add 1 to #RecordCount
+  add 1 to #Count_E
+end-procedure
+
+begin-procedure Write-S-Record
+  if #RecordCount >= #MaxRecordsPerDiskette
+    do Open-File
+    do Write-A-Record
+  end-if
+
+  write 10 from 'S':1
+       $NATIONAL_ID:9
+          $LastName:20
+         $FirstName:12
+        $MidInitial:1
+               '54':2
+                $Sp:4
+         $NlGrs_QTD:14
+                $Sp:83
+          $StateEIN:15
+                $Sp:53
+       $QtrEndMonth:2
+   &TX.Balance_Year:4
+                $Sp:55
+
+  move '' to $NlGrs_QTD
+  move 0  to #NlGrs_QTD
+  add 1 to #RecordCount
+end-procedure
+
+begin-procedure Write-T-Record
+  if #RecordCount >= #MaxRecordsPerDiskette
+    do Open-File
+    do Write-A-Record
+  end-if
+
+  move #Co_NlGrs_QTD to #TEMP
+  multiply 100 times #TEMP
+  do Format-Number (#TEMP,  $T_NlGrs,  '09999999999999')
+
+  write 10 from 'T':1
+                $Sp:11
+           $T_NlGrs:14
+                $Sp:249
+
+  add 1 to #RecordCount
+end-procedure
+
+begin-procedure Write-F-Record
+  move #Count_F to $F_Count 0999999999
+  move #Count_E to $E_Count 0999999999
+  move #Tot_NlGrs_QTD to #TEMP
+  multiply 100 times #TEMP
+  do Format-Number (#TEMP,  $F_NlGrs,  '099999999999999')
+
+  write 10 from 'F':1
+           $F_Count:10
+           $E_Count:10
+                $Sp:4
+           $F_NlGrs:15
+                $Sp:235
+end-procedure
+
+begin-procedure Prompts
+
+  while $FileType = ''
+    input $FileType 'Enter D for diskette file or Q to quit?'
+    uppercase $FileType
+    if INSTR('DQ',$FileType,1) = 0
+      display ' '
+      display '***** Enter D or Q *****'
+      display ' '
+      move '' to $FileType
+    end-if
+  end-while
+end-procedure
+
+begin-procedure Convert-Parameters
+
+  move $RC_QTR_UI.Reporting_Medium to $FileType
+  move $RC_QTR_UI.Diskette_Type    to $DisketteType
+  move $RC_QTR_UI.Contact_Phone    to $ContactPhone
+
+  unstring  $ContactPhone by '/' into $str1 $str2
+  unstring $str2 by '-' into $str3 $str4
+  let $ContactPhone  = $str1 || $str3 || $str4
+end-procedure
+
+begin-procedure Evaluate-File-Type
+
+  evaluate $FileType
+    when = 'Q'
+      stop
+
+    when = 'D'
+      if $Prcs_Process_Instance = ''
+         do Get-Diskette-Format
+      end-if
+      move ' '                   to $Density
+      move &TX.Recording_Cd      to $Recording_Cd
+      move ' '                   to $Tape_Label
+      move &TX.Computer_Mfr      to $Computer_Mfr
+      move '  '                  to $Blocking_Factor
+      move ' '                   to $Tracks
+      break
+
+    when = 'T'
+      display ''
+      display 'Diskette is the only option for the State of West Virginia.'
+      display '*** Invalid Tape Reporting Medium specified in the run control ***'
+      display '************************ Processing stopped **********************'
+      stop
+
+    when = 'C'
+      display ''
+      display 'Diskette is the only option for the State of West Virginia.'
+      display '*** Invalid Cartridge Reporting Medium specified in the run control ***'
+      display '************************** Processing stopped *************************'
+      stop
+  end-evaluate
+
+end-procedure
+
+
+#Include 'taxrnctl.sqc'  !Get-Tax-Reporting-Run-Controls procedure
+#Include 'getcodta.sqc'  !Get-Company-Data procedure
+#Include 'getstdta.sqc'  !Get-State-Tax-Data procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'getfrmat.sqc'  !Get-Diskette-Format procedure
+#Include 'rptsmmry.sqc'  !Print-Summary-Data procedure
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'getbalid.sqc'  !Get-Calendar-Year-Id
+#Include 'stdapi.sqc'    !Update Process API
+#Include 'txrnctl1.sqc'  !Process Scheduler Run Controls

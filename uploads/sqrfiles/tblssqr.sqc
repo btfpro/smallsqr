@@ -1,0 +1,443 @@
+!***********************************************************************
+! TBLSSQR: Analysis of Table Access by SQR Programs
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module contains confidential and proprietary information        *
+! of Oracle; it is not to be copied, reproduced, or transmitted        *
+! in any form, by any means, in whole or in part, nor is it to         *
+! be used for any purpose other than that for which it is              *
+! expressly provided under the applicable license agreement.           *
+!                                                                      *
+! Copyright (C) 2006 Oracle. All Rights Reserved.                      *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+!          $Date:  2006/07/19:15:36:19                                 !
+!       $Release:  HR9                                                 !
+!      $Revision:  101                                                 !
+!                                                                      *
+!***********************************************************************
+
+#define RELLANG_SQC      'RELLANG.SQC'
+
+#define SQUOTE_TOKEN     ''''
+#define SELECT_TOKEN     'BEGIN-SELECT'
+#define FROM_TOKEN       'FROM '
+#define SQL_TOKEN        'BEGIN-SQL'
+#define UPDATE_TOKEN     'UPDATE '
+#define DELETE_TOKEN     'DELETE '
+#define INSERT_TOKEN     'INSERT '
+#define SELECT_CANCEL    'END-SELECT'
+#define SQL_CANCEL       'END-SQL'
+#define INCLUDE_TOKEN    '#INCLUDE '
+#define DEFINE_TOKEN     '#DEFINE '
+#define MAX_PS_RECNAME   15
+
+!***********************************
+begin-procedure Analyze-SQR-Programs
+!***********************************
+
+   do Init-SQR-Report
+   do Step-Through-TopLevel-SQRs
+
+end-procedure
+
+!*******************************
+begin-procedure Init-SQR-Report
+!*******************************
+
+   !----- Establish global variables -----
+   let $SQRFileName = ''
+   let #CallsRelLang = 0
+
+   let #InSelect = 0
+   let #InSelectFrom = 0
+   let #InDML = 0
+   let #InSQL = 0
+
+end-procedure
+
+!*****************************************
+begin-procedure Step-Through-TopLevel-SQRs
+!*****************************************
+
+   display ''
+
+Begin-SELECT Distinct
+P.PRCSNAME    &SQR.PRCSNAME
+P.DESCR       &SQR.DESCR
+
+   !Reset to prepare for analysis...
+   do ClearLinkedList
+   do ClearStack
+   let #UsesRelLang = 0
+   let #CallsRelLang = 0
+   let #SubstTablesUsed = 0
+   let #PgmNotFound = 0
+   let #AnalysisError = 0
+
+   let $PgmFile = RTrim(&SQR.PRCSNAME,' ') || '.' || {SQR_EXT}
+   let $PgmFile = Upper($PgmFile)
+   let $PgmTitle = &SQR.DESCR
+
+   let #ItemCnt = #ItemCnt + 1
+   do Progress-Display($PgmFile)
+
+   do Push($PgmFile)
+   do Analyze-SQR-SQC
+   do Validate-Tables($IncludeToolsTables)
+   do Print-Table-Access-Report
+
+From PS_PRCSDEFN P,
+     PS_PRCSDEFNPNL C,
+     PSPNLGRPDEFN G
+Where P.PRCSTYPE Like 'SQR%'
+[$TargetPgmClause]
+And C.PRCSNAME = P.PRCSNAME
+And G.PNLGRPNAME = C.PNLGRPNAME
+[$OwnerIDClause]
+UNION
+Select Distinct
+P.PRCSNAME,
+J.DESCR
+From PS_PRCSJOBDEFN J,
+     PS_PRCSJOBITEM P,
+     PS_PRCSJOBPNL C,
+     PSPNLGRPDEFN G
+Where P.PRCSJOBNAME=J.PRCSJOBNAME
+And P.PRCSTYPE like 'SQR%'
+[$TargetPgmClause]
+And C.PRCSJOBNAME=J.PRCSJOBNAME
+And G.PNLGRPNAME=C.PNLGRPNAME
+[$OwnerIDClause]
+UNION
+Select Distinct
+#ifdef SYBASE
+CONVERT(CHAR(12),P.TAU_APPNAME),
+#else
+P.TAU_APPNAME,
+#endif
+[$XRPT-NO-DESCR-AVAIL]
+From PS_TAU_PGM_LIST P
+Where P.TAU_APPNAME Not In
+   (Select PRCSNAME
+    From PS_PRCSDEFN
+    Where PRCSTYPE Like 'SQR%')
+Order By 1, 2
+End-SELECT
+
+end-procedure
+
+!******************************
+begin-procedure Analyze-SQR-SQC
+!******************************
+
+   !Read through each line of the source file and analyze it...
+
+   do Pop($FileName, #EOS)
+   while Not (#EOS)
+
+      let #LineNumber = 0
+      let #InSelect = 0
+      let #InSelectFrom = 0
+      let #InSQL = 0
+      let #InDML = 0
+      let $SQRFileName = Upper($FileName)
+
+#ifdef UNIX
+      let $FileName = Lower($FileName)
+#end-if
+      do Make-FileSpec($SourcePath, $FileName, '', $FileSpec)
+      do Open-File($FileSpec, {MAX_BUFFER}, #PgmFileNo)
+      if (#PgmFileNo)
+
+         do Read-Line(#PgmFileNo, $Str, #EOF)
+         while (Not #EOF)
+            let #LineNumber = #LineNumber + 1
+            do Analyze-SQR-Source-Line($Str)
+            do Read-Line(#PgmFileNo, $Str, #EOF)
+         end-while
+
+         do Close-File(#PgmFileNo)
+      else
+
+         let #FileAccessErrors = 1
+         let #AnalysisError = 1
+         if ($SQRFileName = $PgmFile)
+            let #PgmNotFound = 1
+         end-if
+      end-if
+
+      if (#CallsRelLang)
+         do Analyze-For-RelLanguage($FileName)
+      end-if
+
+      do Pop($FileName, #EOS)
+   end-while
+
+end-procedure
+
+!********************************************
+begin-procedure Analyze-SQR-Source-Line($Str)
+!********************************************
+
+   !Bypass empty lines and Comment lines ...
+   do PreProcess-SQR-Line($Str)
+   let #Len = Length($Str)
+   if (#Len = 0)
+      goto EXIT_EARLY
+   end-if
+
+   !Look for termination of SELECT or SQL...
+
+   let #CancelSelect = 0
+   let #CancelSQL = 0
+   if (#_InSelect)
+      let #CancelSelect = InStr($Str, {SELECT_CANCEL}, 1)
+   end-if
+   if (#_InSQL)
+      let #CancelSQL = InStr($Str, {SQL_CANCEL}, 1)
+   end-if
+   if (#CancelSelect) Or (#CancelSQL)
+      let #_InSQL = 0
+      let #_InSelect = 0
+      let #_InSelectFrom = 0
+      let #_InDML = 0
+      goto EXIT_EARLY
+   end-if
+
+   !Look for start of SELECT/FROM or SQL/DML...
+
+   let $DMLAccess = ''
+   if (#_InSelect) And (Not #_InSelectFrom)
+      let #_InSelectFrom = InStr($Str, {FROM_TOKEN}, 1)
+   end-if
+   if (#_InSQL) And (Not #_InDML)
+      if InStr($Str, {UPDATE_TOKEN}, 1)
+         let $DMLAccess = 'U'
+      end-if
+      if InStr($Str, {DELETE_TOKEN}, 1)
+         let $DMLAccess = 'D'
+      end-if
+      if InStr($Str, {INSERT_TOKEN}, 1)
+         let $DMLAccess = 'I'
+      end-if
+      let #_InDML = (Not IsBlank($DMLAccess))
+   end-if
+   if (Not #_InSelect) And (Not #_InSQL)
+      let #_InSelect = InStr($Str, {SELECT_TOKEN}, 1)
+      let #_InSQL = InStr($Str, {SQL_TOKEN}, 1)
+      if (#_InSelect) Or (#_InSQL)
+         goto EXIT_EARLY
+      end-if
+   end-if
+
+   !Look for #Include file ...
+
+   let #IncludeFile = InStr($Str, {INCLUDE_TOKEN}, 1)
+   if (#IncludeFile)
+      do Parse-Include-File($Str, $IncFileName)
+      if Not IsBlank($IncFileName)
+         do IsToolsSQC($IncFileName, #IsToolsSQC)
+         if Not (#IsToolsSQC)
+            do Push($IncFileName)
+         end-if
+      end-if
+   end-if
+
+   !Look for Tables in SELECT...
+
+   if (#_InSelectFrom)
+
+      do Find-PS-Table($Str, $TableName)
+      while Not IsBlank ($TableName)
+
+         do Find-Key($TableName, #Link)
+         if Not (#Link)
+            do Add-Key-To-List($TableName, #Link)
+         end-if
+         do Set-Access(#Link, 'S', $AccessList)
+         do Record-Module(#Link, $_SQRFileName, $ModuleList)
+         put $AccessList $ModuleList into List(#Link) StrData1 StrData2
+
+         do Find-PS-Table($Str, $TableName)
+      end-while
+
+   end-if
+
+   !Look for Tables in SQL...
+
+   if (#_InSQL)
+
+      do Find-PS-Table($Str, $TableName)
+      while Not IsBlank ($TableName)
+
+         do Find-Key($TableName, #Link)
+         if Not (#Link)
+            do Add-Key-To-List($TableName, #Link)
+         end-if
+         if (#_InDML)
+            do Set-Access(#Link, $DMLAccess, $AccessList)
+            let #_InDML = 0
+         else
+            do Set-Access(#Link, 'S', $AccessList)
+         end-if
+         do Record-Module(#Link, $_SQRFileName, $ModuleList)
+         put $AccessList $ModuleList into List(#Link) StrData1 StrData2
+
+         do Find-PS-Table($Str, $TableName)
+      end-while
+
+   end-if
+
+ EXIT_EARLY:
+
+end-procedure
+
+!*****************************************
+begin-procedure PreProcess-SQR-Line(:$Str)
+!*****************************************
+
+   let $Str = Upper($Str)
+
+   !Truncate string at Comment...
+   let $COMMENT = Chr(33)
+   let #Comment = InStr($Str, $COMMENT, 1)
+   if (#Comment)
+      let $Str = SubStr($Str, 1, #Comment - 1)
+   end-if
+
+end-procedure
+
+!****************************************************
+begin-procedure Parse-Include-File($Str, :$TableName)
+!****************************************************
+
+   let $TableName = ''
+   let #Pos = InStr($Str, {INCLUDE_TOKEN}, 1)
+   if (#Pos)
+      let #StartPos = InStr($Str, {SQUOTE_TOKEN}, #Pos)
+      if (#StartPos)
+         let #StartPos = #StartPos + 1
+         let #StopPos = InStr($Str, {SQUOTE_TOKEN}, #StartPos)
+         if (#StopPos)
+            let #Len = #StopPos - #StartPos
+            let $TableName = SubStr($Str, #StartPos, #Len)
+         end-if
+      end-if
+   end-if
+
+end-procedure
+
+!**************************************************
+begin-procedure IsToolsSQC($FileName, :#IsToolsSQC)
+!**************************************************
+
+   let #IsToolsSQC = 0
+
+   if ($_IncludeToolsTables = 'N')
+      if Not IsBlank($_ToolsSourcePath)
+#ifdef UNIX
+         let $FileName = Lower($FileName)
+#end-if
+         do Make-FileSpec($_ToolsSourcePath, $FileName, '', $FileSpec)
+         let #IsToolsSQC = Not Exists($FileSpec)
+      end-if
+   end-if
+
+   !Special case - this SQC is a global access routine...
+   if (Upper($FileName) = {RELLANG_SQC})
+      let #IsToolsSQC = 1
+      let #_UsesRelLang = 1
+      let #_CallsRelLang = 1
+   end-if
+
+end-procedure
+
+!***********************************************
+begin-procedure Find-PS-Table(:$Str, :$TableName)
+!***********************************************
+
+   do Get-PS-Table($Str, $TableName)
+   if (SubStr($TableName, 1, 1) = '[')
+      let #_SubstTablesUsed = 1
+   end-if
+
+end-procedure
+
+!*************************************************
+begin-procedure Analyze-For-RelLanguage($FileName)
+!*************************************************
+
+   !When rellang.sqc is used, the application must set a #Define statement
+   !to indicate which of the 1700+ table routines is to be compiled.  This
+   !function attempts to identify related-language use by analyzing for those
+   !indicative #Defines.
+
+   let #_CallsRelLang = 0
+
+   do Make-FileSpec($_SourcePath, $FileName, '', $FileSpec)
+   do Open-File($FileSpec, {MAX_BUFFER}, #PgmFileNo)
+   if (#PgmFileNo)
+
+      do Read-Line(#PgmFileNo, $Str, #EOF)
+      while (Not #EOF)
+
+         do PreProcess-SQR-Line($Str)
+         let $Str = Upper($Str)
+         let #DefineStmt = InStr($Str, {DEFINE_TOKEN}, 1)
+         if (#DefineStmt)
+
+            do Parse_Token($Str, ' ', $Dummy, $Str)
+            do Parse_Token($Str, ' ', $TableName, $Str)
+            do Check-For-RelLanguage($TableName, $RelLangName)
+            if Not IsBlank($RelLangName)
+
+               do Find-Key($RelLangName, #Link)
+               if Not (#Link)
+                  do Add-Key-To-List($RelLangName, #Link)
+               end-if
+               do Set-Access(#Link, 'S', $AccessList)
+               do Record-Module(#Link, {RELLANG_SQC}, $ModuleList)
+               put $AccessList $ModuleList into List(#Link) StrData1 StrData2
+               let #_UsesRelLang = 0
+            end-if
+         end-if
+
+         do Read-Line(#PgmFileNo, $Str, #EOF)
+      end-while
+
+      do Close-File(#PgmFileNo)
+   end-if
+
+end-procedure
+
+!***************************************************************
+begin-procedure Check-For-RelLanguage($TableName, :$RelLangName)
+!***************************************************************
+
+   let $RelLangName = ''
+
+   !Defensive - some platforms choke if bindvar is too big
+   if Length($TableName) <= {MAX_PS_RECNAME}
+
+Begin-SELECT
+RELLANGRECNAME
+
+   let $RelLangName = RTrim(&RELLANGRECNAME,' ')
+   if (SubStr($RelLangName,1,2) <> 'PS')
+      let $RelLangName = 'PS_' || $RelLangName
+   end-if
+
+From PSRECDEFN
+Where RECNAME = $TableName
+End-SELECT
+
+   end-if
+
+end-procedure
+
+!*************************** End of TBLS_SQR.SQC ******************************
+

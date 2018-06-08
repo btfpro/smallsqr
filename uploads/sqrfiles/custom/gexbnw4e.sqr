@@ -1,0 +1,1595 @@
+!***********************************************************************
+! GEXBNW4E:  Giant Eagle 401k eligibility is based on a service        *
+!            requirement, Hours worked and a minimum age requirement.  *
+!            This program determines employee's eligibility for 401k.  *
+!            For the employees that met the eligibility, a new row     *
+!            will be created in the JOB table with elig_config1 first  *
+!            three bytes as SAV, so that, the next Ben Admin run will  *
+!            pick up these employees and enroll them in 401k.          *  
+!                                                                      *
+!            Once Service and hours are met, the employee is considered*
+!            eligible and age requirement determination will be done   * 
+!            by another process to trigger Ben Admin to process        *
+!            employee.                                                 *
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module is the confidential and proprietary information of       *
+! Giant Eagle, Inc.; it is not to be copied, reproduced, or transmitted*
+! in any form, by any means, in whole or in part, nor is it to be used *
+! for any purpose other than that for which it is expressly provided   *
+! without the written permission of Giant Eagle.                       *
+!                                                                      *
+!                                                                      *
+!***********************************************************************
+!                         MODIFICATION HISTORY                         *
+!***********************************************************************
+!  ID#     INITIALS    DATE           DESCRIPTION OF THE CHANGE        *        
+!***********************************************************************
+!  GBNC016   SXK       06/09/1998     INITIAL CREATION                 *
+!                                                                      *
+!  GBNC016   SXK       08/31/1998     Modified 'FIND-CURRENT-BENEFIT-  *
+!                                     PROGRAM to find most current BP  *
+!                                     as of pay end dt. Also, modified *
+!                                     to get employees, that met       *
+!                                     required service months only     *
+!                                     during the pay period or if they *
+!                                     are rehired and as of rehire,had *
+!                                     required service months, need to *
+!                                     process for eligibility.         *
+!                                                                      *
+!  GBNC016   SXK       09/01/1998     Modified logic to look for >=    *
+!                                     required service months as of pay*
+!                                     period for transfers.            *
+!                                                                      *
+!	     sXK       12/07/1998     Shows displays only when debugging
+!                                                                      *
+!	     SXK       04/12/1999     Modified to skip employee        *
+!                                     processing if employee's either  *
+!                                     term row or hire row is not found*
+!                                     when he/she is evaluated in      *
+!                                     transfer class.  Also, modified  *
+!                                     to not look at saving_plan for   *
+!                                     previous benefit plan, in case of*
+!                                     transfer evaluation              *
+!                                                                      *
+!	     SXK       04/27/1999     Modified to use end dt as effdt  *
+!                                     for job insert, if employee is   *
+!                                     classified either rehire or      *
+!                                     transfer and service months not  *
+!                                     met in current pay period. Also, *
+!                                     modified to use start dt + either*
+!                                     11 or 12 as effdt, if service is *
+!                                     met during current pay period.   *   
+!                                                                      *
+!	     SXK       04/30/1999     Modified gexbncf1 sqc to have    *
+!                                     no prefix attached to in the     *
+!                                     subselect in procedure           *
+!                                     get-current-job-row Also,        *
+!                                     initialized recent_hire_dt       *
+!                                     before selecting it.             *
+!                                                                      *
+!            AXL       01/04/2000     Added logic to handle transfers  *
+!                                     being missed.  Also, added a     *
+!                                     separate report to print all     *
+!                                     transfers.                       *
+!                                                                      *
+!            AXL       01/07/2000     Further modifications made to    *
+!                                     transfer logic to ensure the     *
+!                                     correct JOB insert date.  Also   *
+!                                     added new  flag to stop newhires *
+!                                     from being processed as a        *
+!                                     transfer.                        *
+!                                                                      *
+!            AXL       01/10/2000     Cloned Find-Currrent-Benefit-    *
+!                                     Program procedure to handle New  *
+!                                     Hires and Rehires only.  Also    *
+!                                     moved Date Eval & Match Hrs procs*
+!                                     out of main select.              *
+!                                                                      *
+!            AXL       01/18/2000     Stopped using PAY END DT as      *
+!                                     insert date for transfers        *
+!                                                                      *
+!  HR10306   GBD       08/26/2002     Added Empl_Rcd field to Earnings *
+!                                     Balance table lookup.            *
+!            PSR       08/27/2002     EMPL_RCD is now part of the key for 
+!                                     PS_EARNINGS_BAL - Upgrade 8.3
+!                                                                      *
+!            CJH       02/25/2003     Remove empl_rcd join criteria in
+!                                     earnings bal.  Need balances across
+!                                     all jobs                         *
+! VENDNYS    NYS       08/30/2007     Upgrade 8.3 to 9.0               *
+! GEX-MXT              03/24/2008     Fixed for REHIRE DT issue in 9.0 *
+! GEX_SEC_REENG 2015-06-24 Vahini Katta                                *
+! Changes related to gex_emplid_mapp/7 digit emplid                    *
+!***********************************************************************
+
+#include 'setenv.sqc' !Set environment
+
+begin-setup
+
+#include 'setup32a.sqc'
+
+#define #col_cmp	 1
+#define #col_pgp	 6
+#define #col_bpn	14
+#define #col_ssn        19
+#define #col_nam	32
+
+declare-report Report-log
+Printer-Type=HPLASERJET
+  layout=DEFAULT
+end-declare
+
+declare-report Report-audit
+Printer-Type=HPLASERJET
+  layout=DEFAULT
+end-declare
+
+end-setup
+
+!*********************************************************************
+!Initial processing, retrieving current dates and calls the main 
+!procedure to do the processing.                                     
+!*********************************************************************
+begin-report
+
+  !use-report Report-log    AXL 1/2000 Commeneted out because of mult rpt
+
+  do Init-DateTime
+  do Init-Number
+  do stdapi-init
+  
+  !move 'GEXBNW4E' to $ReportID
+  move 'Ben Admin 401K Eligibility Process' to $ReportTitle
+  display $ReportTitle
+
+  do Array-Initialization
+
+  do Get-Current-DateTime
+  let $reportdate_mm = substr($reportdate,1,2)
+  let $reportdate_dd = substr($reportdate,4,2)
+!GBD 08/26/2002 - pulling year incorrectly
+  let $reportdate_yy = substr($reportdate,7,4)
+!  let $reportdate_yy = substr($reportdate,7,2)
+!  do MakeYear4Digits ($reportdate_yy)
+
+  let $reportdate_ccyyyy = $reportdate_mm||'/'||$reportdate_dd||'/'||$reportdate_yy
+
+  do format-datetime($reportdate_ccyyyy,$reportdate_ccyy,{DEFMDY},'','NATIVE') 
+
+  do Report
+  do Commit-Transaction
+  date-time () hh:mi:ss &timeEnded
+  display 'Report Ended: ' noline
+  display &timeEnded
+  do stdapi-term
+
+end-report
+
+!*********************************************************************
+!If this Program is being executed through process scheduler, 
+!the run control parameters and calls the main processing procedure.
+!Otherwise, interrogates the user for the run control parameters and 
+!validates them. If the run control parameters are invalid, stops the
+!execution.
+!*********************************************************************
+begin-procedure Report
+
+date-time () hh:mi:ss &timeBegan
+display 'Report Began: ' noline
+display &timeBegan
+
+move 'N' to $Errorfound
+
+move $reportdate_ccyyyy to $rnctl_date
+
+let $rnctl_mm = substr($rnctl_Date,1,2)
+let $rnctl_dd = substr($rnctl_Date,4,2)
+let $rnctl_yyyy = substr($rnctl_Date,7,4)       
+let $rnctl_yy  = substr($rnctl_date,9,2)
+move $rnctl_yyyy to #rnctl_yyyy
+move $rnctl_yy to #rnctl_yy
+
+do Retrieve-401K-Benefit-Programs
+
+if $ben_pgm_found = 'Y'
+   do process-employee-data
+end-if
+
+Report-Exit:
+
+
+  date-time () hh:mi:ss &timeProcess
+  display #InputTran 99999 noline
+  display ' Transactions Processed: ' 
+  display #job_inserts 99999 noline
+  display ' Transactions Inserted into JOB: ' noline
+
+  display &timeProcess
+
+end-procedure
+
+!*********************************************************************
+!Prints the header information in the report log.
+!*********************************************************************
+
+begin-heading 8 for-reports=(report-log)
+
+ move 'BNW4ELOG' to $ReportID
+ #Include 'stdhdg01.sqc'
+
+!  date-time () DD-MON-YYYY &curr_Date 
+!  print &curr_Date ()
+  position (-1)
+  print 'Report Log' () center bold
+
+  position (+3)
+  print 'Trans#' (,1) bold
+  print 'Emplid' (,18) bold
+  print 'Message' (,50) bold
+  print '-' (+1,1,127) fill
+ 
+
+end-heading
+
+!*********************************************************************
+!Prints the footer in the report log
+!*********************************************************************
+
+begin-footing 2 for-reports=(Report-log)
+page-number (1,108) 'Page '  
+last-page () ' of ' '.'
+
+end-footing
+
+!*********************************************************************
+begin-heading 8 for-reports=(report-audit)
+!*********************************************************************
+!  Prints the header information in the audit report.
+
+  move 'BNW4EXFR' to $ReportID
+  move 'Weekly 401k Eligibility Report' to $ReportTitle
+
+  #Include 'stdhdg01.sqc'  
+
+  position (-1)
+  print 'Audit Report Listing of Transfers' () center bold
+ 
+  position (+2)
+ 
+  print 'Cmpy PayGrp' 	(+1,1)  bold
+  print 'Pgm'		(,{#col_bpn}) bold
+  print 'Emplid'	(,{#col_ssn}) bold
+  print 'Name'  	(,{#col_nam}) bold
+  print '-' 		(+1,1,50) fill
+ 
+end-heading
+
+!*********************************************************************
+! Array Initialization
+!*********************************************************************
+begin-procedure Array-Initialization
+   
+   create-array name=rules                       -
+		size=200                         -
+		field=Ben_Pgm:char               -
+		field=Ben_Plan:char              -
+		field=spcl_accum:char            -
+		field=serv_hrs:number:8.2        -
+		field=Ec1_Byte_Val:char          -
+		field=serv_months_1:number:38    -
+		field=serv_months_2:number:38
+
+!** Create default values for array fields **
+
+   move 0 to #init
+
+   while #init <= #Max
+     put                 ' '        -
+			 ' '        -
+			 ' '        -
+			 0          -
+			 ' '        -
+			 0          -
+			 0          -
+       into rules(#init) Ben_pgm    -
+			 ben_plan   -
+			 spcl_accum -
+			 serv_hrs   -
+			 ec1_byte_val  -
+			 serv_months_1 -
+			 serv_months_2
+     add 1 to #init
+   end-while
+
+    
+end-procedure
+
+!*********************************************************************
+!Retrieves the benefit programs that contain 401k benefit plan
+!*********************************************************************
+
+Begin-Procedure Retrieve-401K-Benefit-Programs
+
+do get-pay-end-dt   
+
+move 'N' to $errorfound
+move 'N' to $found
+move 'N' to $Ben_Pgm_Found
+
+let #init = 0
+
+Begin-Select on-error=sql-error-found('Retrieve-401K-Benefit-Programs')
+BP.BENEFIT_PROGRAM
+ELG.GEX_SPCL_ACCUM_CD
+OPT.BENEFIT_PLAN
+ELG.GEX_SERVICE_HRS
+ELG.GEX_EC1_BYTE_VAL
+ELG.GEX_SERV_MONTHS_1
+ELG.GEX_SERV_MONTHS_2
+
+    move 'Y' to $ben_pgm_found
+
+    put &BP.BENEFIT_PROGRAM &OPT.BENEFIT_PLAN &ELG.GEX_SPCL_ACCUM_CD   -
+	&ELG.GEX_SERVICE_HRS &ELG.GEX_EC1_BYTE_VAL &ELG.GEX_SERV_MONTHS_1 -
+	&ELG.GEX_SERV_MONTHS_2                                            -
+    into rules(#init)
+
+    add 1 to #init
+
+FROM PS_BEN_DEFN_PGM BP,
+     PS_BEN_DEFN_OPTN OPT,
+     PS_GEX_ELIG_RULES ELG
+
+WHERE OPT.PLAN_TYPE = '40'    !401k Plan type
+  AND OPT.BENEFIT_PROGRAM = BP.BENEFIT_PROGRAM
+  AND OPT.ELIG_RULES_ID = ELG.ELIG_RULES_ID
+  AND BP.EFF_STATUS = 'A'
+  AND ELG.EFF_STATUS = 'A'
+  AND BP.EFFDT = (SELECT MAX(EFFDT)
+		   FROM PS_BEN_DEFN_PGM
+		  WHERE BENEFIT_PROGRAM = BP.BENEFIT_PROGRAM
+		    AND EFFDT <= $pay_end_dt)
+  AND OPT.EFFDT = (SELECT MAX(EFFDT)
+		   FROM PS_BEN_DEFN_OPTN
+		  WHERE BENEFIT_PROGRAM = BP.BENEFIT_PROGRAM
+		    AND EFFDT <= $pay_end_dt)
+  AND ELG.EFFDT = (SELECT MAX(EFFDT)
+		   FROM PS_GEX_ELIG_RULES 
+		  WHERE ELIG_RULES_ID = ELG.ELIG_RULES_ID
+		    AND EFFDT <= $pay_end_dt)
+
+ORDER BY BP.BENEFIT_PROGRAM, OPT.BENEFIT_PLAN
+end-select
+
+if $ben_pgm_found = 'N'
+   do error-found
+   print 'No Benefit Programs with 401k plan' (,34)
+else
+   move #init to #Max
+   let #max = #max - 1
+end-if
+
+end-procedure
+
+!*********************************************************************
+!Gets the pay end date of the previous pay cycle.
+!*********************************************************************
+
+Begin-Procedure get-pay-end-dt
+
+move 'N' to $found
+
+begin-select on-error=sql-error-found('Get-Pay-End-Dt')
+PAY.PAY_BEGIN_DT
+PAY.PAY_END_DT
+
+  move &PAY.PAY_END_DT to $pay_end_Dt
+  move &PAY.PAY_BEGIN_DT to $pay_begin_dt
+  display 'Pay Begin Date:' noline
+  display $pay_begin_dt
+  display 'Pay End Date:' noline
+  display $pay_end_Dt
+  move 'Y' to $found
+  exit-select
+
+FROM PS_PAY_CALENDAR PAY
+
+WHERE PAY.PAY_CONFIRM_RUN = 'Y'
+  AND PAY.PAY_END_DT = (SELECT MAX(PAY_END_DT)
+		      FROM PS_PAY_CALENDAR
+		     WHERE PAY_END_DT <= $reportdate_ccyy
+		       AND PAY_CONFIRM_RUN = 'Y')
+
+end-select
+
+if $found = 'N'
+   do error-found
+   print 'No Previously confirmed Pay Cycle as of:' (,34)
+   print $reportdate_ccyy ()
+   stop
+end-if
+
+end-procedure
+
+!*********************************************************************
+!Retrieves each employee who participated in Benefit Program and
+!calls necessary procedures to process further. 
+!********************************************************************* 
+
+begin-procedure process-employee-data
+
+move 'N' to $errorfound
+move 'N' to $beninfo_found
+
+begin-select on-error=sql-error-found('process-employee-data')
+JOB.EMPLID
+JOB.EMPL_RCD
+JOB.EFFDT
+JOB.EFFSEQ
+JOB.ELIG_CONFIG1
+JOB.COMPANY
+JOB.PAYGROUP
+!PER.ORIG_HIRE_DT        !Upgrade 8.3 code commented
+PER.NAME
+EMP.HIRE_DT
+!EMP.REHIRE_DT		!GEX-MXT COMMENTED FOR REHIRE DATE LOGIC
+EMP.TERMINATION_DT
+
+
+   move 'Y' to $beninfo_found
+   move 'N' to $skip_employee_processing
+
+   move &JOB.Emplid to $emplid
+   move &JOB.EMPL_RCD to #empl_rcd
+   move &JOB.ELIG_CONFIG1 to $job_elig_config1
+   move &JOB.COMPANY to $company
+   move ' ' to $empl_class
+   
+   ! GEX-MXT 03/24/2008 Fixed for REHIRE DT
+   let $GEXJOB_REH_EMPLID = $emplid
+   let #GEXJOB_REH_EMPLRCD = #EMPL_RCD
+   let $GEXJOB_REH_ASOFDATE = $pay_end_dt
+   do Get-Job-Rehire-Dt
+   ! GEX-MXT 03/24/2008 Fixed for REHIRE DT    
+  
+   #debug9 display '*************************'
+   #debug9 display $emplid
+   #debug9 display 'In transfer evaluation'
+   do evaluate-transfer-classification
+   
+   if RTRIM($empl_class,' ') = ''
+      #debug9 display 'In rehire evaluation'
+      do evaluate-rehire-classification
+   end-if
+
+   if RTRIM($empl_class,' ') = ''
+      #debug9 display 'In hire evaluation'
+      do evaluate-hire-classification
+   end-if
+
+   #debug9 display 'Empl class:' noline
+   #debug9 display $empl_class
+
+   !do evaluate-date-ranges	!AXL 1/10/2000 Moved to Trans/Reh/Hir procs
+
+   if $empl_class = 'T'
+     do print-transfers		!AXL 1/2000 New request per user 
+   end-if
+	
+   !AXL - 1/10/2000 Moved to Trans/Reh/Hir procs - Begin
+   !if $skip_employee_processing = 'N'	
+   !do Match-Service-Hours-Requirements	
+   !end-if
+   !AXL - 1/10/2000 Moved to Trans/Reh/Hir procs - End
+
+   add 1 to #inputtran
+
+FROM PS_JOB JOB,
+     PS_EMPLOYMENT EMP,
+     PS_PERSONAL_DATA PER
+
+WHERE JOB.EMPL_STATUS IN ('A','L','P')
+  AND substr(JOB.ELIG_CONFIG1,1,3) = '000'   !Not eligible for 401K
+  AND JOB.PAYGROUP <> 'IND'
+  AND JOB.EMPLID = EMP.EMPLID 
+  AND JOB.EMPL_RCD = EMP.EMPL_RCD
+  AND JOB.EMPLID = PER.EMPLID
+  AND JOB.EFFDT = (SELECT MAX(EFFDT)
+		   FROM PS_JOB
+		  WHERE EMPLID = JOB.EMPLID
+		    AND EMPL_RCD = JOB.EMPL_RCD
+		    AND EFFDT <= $pay_end_dt)
+  AND JOB.EFFSEQ = (SELECT MAX(EFFSEQ)
+		   FROM PS_JOB
+		  WHERE EMPLID = JOB.EMPLID
+		    AND EMPL_RCD = JOB.EMPL_RCD
+		    AND EFFDT = JOB.EFFDT)
+end-SELECT
+
+if $beninfo_found = 'N'
+   do error-found
+   print 'No Benefit Participation information found' (,34)
+end-if
+
+end-procedure
+
+!*********************************************************************
+!Finds out the employee's classification as Transfer or not
+!*********************************************************************
+
+Begin-Procedure Evaluate-Transfer-Classification
+
+   do get-job-row-in-pay-period
+
+end-procedure
+
+!*********************************************************************
+!Finds out the employee's classification as Rehire or not
+!*********************************************************************
+
+Begin-Procedure Evaluate-Rehire-Classification
+
+!if RTRIM(&EMP.REHIRE_DT,' ') <> ''		!GEX-MXT COMMENTED FOR REHIRE DATE LOGIC IN 9.0
+ IF RTRIM($GEXJOB_REH_REHIRE_DT, ' ') <> ''	!GEX-MXT ADDED FOR REHIRE DATE LOGIC IN 9.0
+  
+   let $action = '(''REH'')'
+
+   do get-current-action-row
+
+   if $action_row_found = 'Y'
+   
+      do find-benefit-program   
+   
+      if $401K_pgm_found = 'Y'
+	 move 'R' to $empl_class
+	 move &BAS2.BENEFIT_PROGRAM to $bp_name
+         !AXL - 1/10/2000 Moved from Main Select - Begin
+         do evaluate-date-ranges	
+         if $skip_employee_processing = 'N'
+            do Match-Service-Hours-Requirements
+         end-if
+         !AXL - 1/10/2000 - End
+      end-if   
+
+   end-if
+
+end-if
+
+!*****************************************************
+
+!do get-job-row-in-pay-period
+
+!if $pay_period_job_found = 'Y'
+
+! let $action = '(''HIR'')'
+
+! do get-current-action-row
+
+! if RTRIM($job_effdt,' ') <> ''
+!    move $job_effdt to $hire_effdt
+
+!    let $action = '(''TER'',''TWP'',''TWB'')'
+
+!    do get-current-action-row
+
+!    if RTRIM($job_effdt,' ') <> ''
+!       move $job_effdt to $term_effdt
+
+!       do convert-to-dtu-date($term_effdt,$term_effdt_dtu)
+!       do convert-to-dtu-date($hire_effdt,$hire_effdt_dtu)
+
+!       do dtu-diff-months($hire_effdt_dtu,$term_effdt_dtu,#diff_months)
+
+!       if #diff_months <= 12
+
+!          if RTRIM(&EMP.REHIRE_DT,' ') <> '' and (&JOB1.ACTION = 'REH')
+
+!             do find-current-benefit-program
+   
+!             if $401k_pgm_found = 'Y'
+!                 move 'R' to $empl_class
+!                 move &BAS.BENEFIT_PROGRAM to $bp_name
+!             end-if
+!          end-if
+!       end-if
+!    end-if
+! end-if
+!end-if
+
+end-procedure
+
+!*********************************************************************
+!Finds out the employee's classification as Hire or not
+!*********************************************************************
+
+Begin-Procedure Evaluate-Hire-Classification
+
+if RTRIM(&EMP.TERMINATION_DT,' ') = '' and 
+   !RTRIM(&EMP.REHIRE_DT,' ') = ''		!GEX-MXT ADDED FOR REHIRE DATE LOGIC IN 9.0
+   RTRIM($GEXJOB_REH_REHIRE_DT,' ') = ''		!GEX-MXT ADDED FOR REHIRE DATE LOGIC IN 9.0
+  
+   let $action = '(''HIR'')'
+
+   do get-current-action-row
+
+   if $action_row_found = 'Y'
+   
+      do find-benefit-program   
+   
+      if $401K_pgm_found = 'Y'
+	 move 'H' to $empl_class
+	 move &BAS2.BENEFIT_PROGRAM to $bp_name
+         !AXL - 1/10/2000 Moved from Main Select - Begin
+         do evaluate-date-ranges
+         if $skip_employee_processing = 'N'
+            do Match-Service-Hours-Requirements
+         end-if
+         !AXL - 1/10/2000 - End
+      end-if   
+
+   end-if
+
+end-if
+
+end-procedure
+
+!*********************************************************************
+!Retrieves most current job row during the last pay period
+!********************************************************************* 
+
+begin-procedure Get-Job-Row-In-Pay-Period
+
+move 'N' to $errorfound
+move 'N' to $pay_period_job_found
+move ' ' to $job_effdt
+let #job_effseq = 0
+
+#debug9 display 'Get-Job-Row-In-Pay-Period'
+
+begin-select on-error=sql-error-found('Get-Job-Row-In-Pay-Period')
+JOB1.EFFDT
+JOB1.EFFSEQ
+JOB1.ACTION
+JOB1.ACTION_DT
+
+   move 'Y' to $pay_period_job_found
+   move &JOB1.EFFDT to $job_effdt
+   move &JOB1.EFFSEQ to #job_effseq
+   
+   do Process-Transfer-Classification	! AXL-added 1/7/2000
+
+FROM PS_JOB JOB1
+
+WHERE JOB1.EMPLID = $emplid
+  AND JOB1.EMPL_RCD = #empl_rcd
+  AND JOB1.ACTION_DT BETWEEN $pay_begin_dt AND $pay_end_dt
+ORDER BY JOB1.EMPLID, JOB1.EMPL_RCD, JOB1.EFFDT, JOB1.EFFSEQ
+
+ !AXL 01/07/2000 Begin
+ !Procedure changed to pick up multiple rows if they exist.
+ 
+ ! AND JOB1.EFFDT = (SELECT MAX(EFFDT)
+ !		   FROM PS_JOB
+ !		  WHERE EMPLID = $emplid
+ !		    AND EMPL_RCD = #empl_rcd
+ !                   AND ACTION_DT >= $pay_begin_dt
+ !                   AND ACTION_DT <= $pay_end_dt)
+ ! AND JOB1.EFFSEQ = (SELECT MAX(EFFSEQ)
+ !		   FROM PS_JOB
+ !		  WHERE EMPLID = $emplid
+ !		    AND EMPL_RCD = #empl_rcd
+ !		    AND EFFDT = JOB1.EFFDT)
+ !AXL 01/07/2000 End
+
+end-SELECT
+
+#debug9 display 'Pay Period found:' noline
+#debug9 display $pay_period_job_found
+
+end-procedure
+
+!*********************************************************************
+!Handles the classification as Transfer more than once in the event 
+!the calling procedure returns more than one JOB row per emplid 
+!Note: the logic in this procedure was taken out of the 
+!Evaluate-Transfer-Classifiaction procedure on 1/7/2000 AXL
+!*********************************************************************
+
+Begin-Procedure Process-Transfer-Classification	
+
+if $pay_period_job_found = 'Y'
+ move $job_effdt to $transfer_dt
+ do find-current-benefit-program
+
+ if $401k_pgm_found = 'Y'
+
+    do find-prev-ben-pgm 
+
+    if (&BAS.BENEFIT_PROGRAM <> &BEN.BENEFIT_PROGRAM) and $prev-ben-pgm-found = 'Y'
+
+   !SXK 04/12/1999 Begin - No need to go to savings_plan to
+   !determine previous program's benefit plan, instead go to
+   !ben_Defn_optn
+   !do retrieve-savings-plan
+
+   !AXL 1/2000 New Trns logic
+    #debug8 display 'Old Ben Pgm: ' noline      !AXL 1/2000 New Trns logic
+    #debug8 display &BEN.BENEFIT_PROGRAM	!AXL 1/2000 New Trns logic
+    let #init = 0
+    let $bp1_array = ' '
+    let $plan1_array = ' '
+    let $prev_bp_match = 'N'
+ 
+       while #init <= #max 
+
+           if (&BEN.BENEFIT_PROGRAM < $bp1_array) and 
+         	(RTRIM($bp1_array,' ') <> '')
+        	break
+	   end-if
+
+	   get  $bp1_array $plan1_array $accum1_array #serv1_hrs_array  -
+	        $byte1_array #months1_1_array #months1_2_array         -
+	   from rules(#init)
+
+	   if &BEN.BENEFIT_PROGRAM = $BP1_array
+              let $prev_bp_match = 'Y'	!AXL 1/2000 New Trns logic
+	      break
+	   end-if
+
+           add 1 to #init
+ 
+       end-while
+
+   !AXL 1/2000 Use debug to show pgm flow
+
+   #debug8 display 'New Plan: ' noline
+   #debug8 display $plan_array
+
+   #debug8 display 'Old Ben Pgm from Array Match/Nomatch: ' noline
+   #debug8 display $bp1_array
+   
+   #debug8 display 'Old Ben Plan from Array Match/Nomatch: ' noline
+   #debug8 display $plan1_array
+   
+   #debug8 display 'Array Row: ' noline
+   #debug8 display #init
+
+   #debug8 display 'Old Ben Pgm in Array? flag: ' noline
+   #debug8 display $prev_bp_match
+
+   !AXL 1/2000 AND condition added to following stmt
+
+       if RTRIM($plan1_array,' ') <> RTRIM($plan_array,' ') and
+          ($prev_bp_match = 'Y')
+
+   !SXK 04/12/1999 End - No need to go to savings_plan to determine
+   !previous program's benefit plan, instead go to ben_Defn_optn
+   
+	  move 'T' to $empl_class
+	  move &BAS.BENEFIT_PROGRAM to $bp_name
+          !AXL - 1/10/2000 Moved from Main Select - Begin
+          do evaluate-date-ranges
+          if $skip_employee_processing = 'N'
+             do Match-Service-Hours-Requirements
+          end-if
+          !AXL - 1/10/2000 - End
+       !AXL 1/2000 New Trns logic - Begin
+       else
+          if $prev_bp_match = 'N'
+             move 'T' to $empl_class
+	     move &BAS.BENEFIT_PROGRAM to $bp_name
+             !AXL - 1/10/2000 Moved from Main Select - Begin
+             do evaluate-date-ranges
+             if $skip_employee_processing = 'N'
+                do Match-Service-Hours-Requirements
+             end-if
+             !AXL - 1/10/2000 - End
+          end-if
+        !AXL 1/2000 New Trns logic - End
+
+       end-if
+
+    end-if
+
+ end-if
+
+end-if
+
+end-procedure
+
+!*********************************************************************
+Begin-Procedure Find-Current-Benefit-Program
+!*********************************************************************
+!Finds out the the employee's current benefit program and evaluates
+!against the array, loaded previously, to find if the current ben
+!program has 401k plan.
+!
+!1/10/2000 AXL Mod to have this procedure called only from Transfer
+!Eval step.  
+
+move 'N' to $401k_pgm_found
+let #init = 0
+
+#debug9 display 'Find-Current-Benefit-Program'
+
+Begin-Select on-error=sql-error-found('Find-Current-Benefit-Program')
+BAS.BENEFIT_PROGRAM
+BAS.EVENT_DT
+
+   #debug9 display 'In the Array'  
+   #debug9 display 'Max:' noline
+   #debug9 display #max
+   #debug9 display 'Benefit Program:' noline
+   #debug9 display &bas.benefit_program
+   let $bp_array = ' '
+   while #init <= #max 
+
+     if (&BAS.BENEFIT_PROGRAM < $bp_array) and 
+	(RTRIM($bp_array,' ') <> '')
+	break
+     end-if
+
+     get  $bp_array $plan_array $accum_array #serv_hrs_array  -
+	  $byte_array #months_1_array #months_2_array         -
+     from rules(#init)
+
+     if &BAS.BENEFIT_PROGRAM = $BP_array
+	move 'Y' to $401K_pgm_found
+	break
+     end-if
+
+     add 1 to #init
+
+   end-while
+
+FROM PS_BAS_PARTIC BAS
+
+WHERE BAS.EMPLID = $emplid
+  AND BAS.EMPL_RCD = #empl_rcd
+  AND BAS.JOB_EFFDT = $job_EFFDT
+  AND BAS.JOB_EFFSEQ = #job_EFFSEQ
+  AND BAS.SCHED_ID   = 'EM'	!AXL - 1/10/2000 Eliminate non EM rows
+
+ !AXL 01/07/2000 Begin
+ !Calling procedure changed to pick up multiple rows if they 
+ !exist.  The max effdt logic replaced by a join by key fields.
+
+ ! AND BAS.JOB_EFFDT = (SELECT MAX(JOB_EFFDT)
+ !			 FROM PS_BAS_PARTIC
+ !			WHERE EMPLID = $emplid
+ !			  AND EMPL_RCD = #empl_rcd
+ !			  AND JOB_EFFDT <= $pay_end_dt)
+ ! AND BAS.JOB_EFFSEQ = (SELECT MAX(JOB_EFFSEQ)
+ !			  FROM PS_BAS_PARTIC
+ ! 			 WHERE EMPLID = $emplid
+ !			   AND EMPL_RCD = #empl_rcd
+ !			   AND JOB_EFFDT = BAS.JOB_EFFDT)
+ ! AND BAS.EVENT_ID = (SELECT MAX(EVENT_ID)
+ !			FROM PS_BAS_PARTIC
+ !		       WHERE EMPLID = $emplid
+ !			 AND EMPL_RCD = #empl_rcd
+ !			 AND JOB_EFFDT = BAS.job_effdt
+ !			 AND JOB_EFFSEQ = BAS.job_effseq)
+ !AXL 01/07/2000 End
+
+end-select
+
+#debug9 display '401k Found:' noline
+#debug9 display $401k_pgm_found
+
+end-procedure
+
+!*********************************************************************
+Begin-Procedure Find-Benefit-Program
+!*********************************************************************
+! Cloned Find-Current-Benefit-Program procedure and re-instated max
+! effdt logic. This branch of logic only used for Re-hire and Hire
+! classifications. AXL 1/10/2000
+
+   move 'N' to $401k_pgm_found
+   let #init = 0
+
+   #debug9 display 'Find-Benefit-Program'
+
+Begin-Select on-error=sql-error-found('Find-Benefit-Program')
+BAS2.BENEFIT_PROGRAM
+BAS2.EVENT_DT
+
+   #debug9 display 'In the Array for New/Re-Hires'  
+   #debug9 display 'Max:' noline
+   #debug9 display #max
+   #debug9 display 'Benefit Program:' noline
+   #debug9 display &bas2.benefit_program
+   let $bp_array = ' '
+   while #init <= #max 
+
+     if (&BAS2.BENEFIT_PROGRAM < $bp_array) and 
+	(RTRIM($bp_array,' ') <> '')
+	break
+     end-if
+
+     get  $bp_array $plan_array $accum_array #serv_hrs_array  -
+	  $byte_array #months_1_array #months_2_array         -
+     from rules(#init)
+
+     if &BAS2.BENEFIT_PROGRAM = $BP_array
+	move 'Y' to $401K_pgm_found
+	break
+     end-if
+
+     add 1 to #init
+
+   end-while
+
+FROM PS_BAS_PARTIC BAS2
+
+WHERE BAS2.EMPLID = $emplid
+  AND BAS2.EMPL_RCD = #empl_rcd
+  AND BAS2.JOB_EFFDT = (SELECT MAX(JOB_EFFDT)
+ 			 FROM PS_BAS_PARTIC
+ 			WHERE EMPLID = $emplid
+ 			  AND EMPL_RCD = #empl_rcd
+ 			  AND JOB_EFFDT <= $pay_end_dt)
+  AND BAS2.JOB_EFFSEQ = (SELECT MAX(JOB_EFFSEQ)
+ 			  FROM PS_BAS_PARTIC
+  			 WHERE EMPLID = $emplid
+ 			   AND EMPL_RCD = #empl_rcd
+ 			   AND JOB_EFFDT = BAS2.JOB_EFFDT)
+  AND BAS2.EVENT_ID = (SELECT MAX(EVENT_ID)
+ 			FROM PS_BAS_PARTIC
+ 		       WHERE EMPLID = $emplid
+ 			 AND EMPL_RCD = #empl_rcd
+ 			 AND JOB_EFFDT = BAS2.job_effdt
+ 			 AND JOB_EFFSEQ = BAS2.job_effseq)
+ 
+end-select
+
+#debug9 display '401k Found:' noline
+#debug9 display $401k_pgm_found
+
+end-procedure
+
+!*********************************************************************
+!Finds out the the employee's benefit program in BEN_PROG_PARTIC
+!as of event date of BAS_PARTIC
+!*********************************************************************
+
+Begin-Procedure Find-prev-ben-pgm
+
+   move 'N' to $prev-ben-pgm-found
+
+Begin-Select on-error=sql-error-found('Find-Prev-Ben-Pgm')
+BEN.BENEFIT_PROGRAM
+
+   let $prev-ben-pgm-found = 'Y'
+  
+FROM PS_BEN_PROG_PARTIC BEN
+
+WHERE BEN.EMPLID = $emplid
+  AND BEN.EMPL_RCD = #empl_rcd
+  AND BEN.EFFDT = (SELECT MAX(EFFDT)
+		     FROM PS_BEN_PROG_PARTIC
+		    WHERE EMPLID = $emplid
+		      AND EMPL_RCD = #empl_rcd
+		      AND EFFDT < &BAS.EVENT_DT)
+
+end-select
+
+end-procedure
+
+!*********************************************************************
+!Retrieves savings plan information for the employee
+!********************************************************************* 
+
+begin-procedure Retrieve-Savings-Plan
+
+begin-select on-error=sql-error-found('Retrieve-Savings-Plan')
+SAV.BENEFIT_PLAN
+
+FROM PS_SAVINGS_PLAN SAV
+
+WHERE SAV.EMPLID = $emplid
+  AND SAV.EMPL_RCD = #empl_rcd
+  AND PLAN_TYPE = '40'
+  AND SAV.EFFDT = (SELECT MAX(EFFDT)
+		   FROM PS_SAVINGS_PLAN 
+		  WHERE EMPLID = $emplid
+		    AND EMPL_RCD = #empl_rcd
+		    AND EFFDT < &BAS.EVENT_DT)
+end-SELECT
+
+end-procedure
+     
+!*********************************************************************
+!Finds out the date ranges to calculate the hours and service months
+!as of the run control date, and able to compare with the benefit rules
+!*********************************************************************
+
+Begin-Procedure Evaluate-Date-Ranges
+
+Evaluate $empl_class
+    when = 'H'
+      let $start_dt = $job_effdt
+      let $end_dt = $pay_end_dt
+	 
+      let $hour_start_dt = $job_effdt
+      let $hour_end_dt = $pay_end_dt
+
+    when = 'R'
+      let $end_Dt_flag = 'N'
+      let $action = '(''TER'',''TWB'',''TWP'')'
+      do get-current-action-row
+
+      if $action_Row_found = 'Y'
+	 #debug9 display 'Term effdt:' noline
+	 #debug9 display $job_effdt
+      
+	 do convert-to-dtu-date($job_effdt,$term_dt_dtu)
+         let $term_dt = $job_effdt
+
+         let $action = '(''HIR'',''REH'')'
+
+         do get-current-action-row-1
+
+         if RTRIM($recent_hire_dt,' ') <> ''
+
+	       #debug9 display 'Recent Hire Dt:' noline
+	       #debug9 display $recent_hire_Dt
+
+	       do convert-to-dtu-date($recent_hire_dt,$hire_dt_dtu)
+
+	       do dtu-diff-months($hire_dt_dtu,$term_Dt_dtu,#diff_months)                        
+
+	       if #diff_months >= 12
+
+                  move 'Y' to $skip_employee_processing
+
+	       else
+
+
+          	 !do convert-to-dtu-date(&EMP.REHIRE_DT,$rehire_Dt_dtu)	!GEX-MXT COMMENTED FOR REHIRE DATE LOGIC IN 9.0
+          	 do convert-to-dtu-date($GEXJOB_REH_REHIRE_DT,$rehire_Dt_dtu)	!GEX-MXT ADDED FOR REHIRE DATE LOGIC IN 9.0
+ 
+	         do dtu-diff-months($term_dt_Dtu,$rehire_Dt_Dtu,#diff_months)
+         
+        	 if #diff_months < 12
+
+                 	  let $start_dt = $recent_hire_Dt
+                 else
+         	    !let $start_dt = &EMP.REHIRE_DT		!GEX-MXT COMMENTED FOR REHIRE DATE LOGIC IN 9.0
+         	    let $start_dt = $GEXJOB_REH_REHIRE_DT		!GEX-MXT COMMENTED FOR REHIRE DATE LOGIC IN 9.0
+                    let $end_dt_flag = 'Y'
+         	 end-if
+ 
+
+	       end-if
+
+          else
+
+	       do error-found
+	       print 'No HIR Row found even though employee was rehired' (,34)
+	       move 'Y' to $skip_employee_processing
+
+
+          end-if
+
+      
+     	 if $skip_employee_processing = 'N'
+
+            if $end_dt_flag = 'Y'
+               let $end_Dt = $pay_end_dt
+            else
+               !let $end_dt = &EMP.REHIRE_DT		!GEX-MXT COMMENTED FOR REHIRE DATE LOGIC IN 9.0
+               LET $END_DT = $GEXJOB_REH_REHIRE_DT	!GEX-MXT ADDED FOR REHIRE DATE LOGIC IN 9.0
+            end-if
+
+	    let $hour_start_dt = $start_dt
+	    do convert-to-dtu-date($hour_Start_dt,$hour_start_Dt_dtu)
+	    do dtu-add-months($hour_start_dt_dtu,12,$hour_end_dt_dtu)
+	    do convert-from-dtu-date($hour_end_dt_dtu,$hour_end_Dt)
+
+	 end-if
+
+      else
+
+	 do error-found
+	 print 'No Termination Row found even though employee was rehired' (,34)
+	 move 'Y' to $skip_employee_processing
+
+      end-if
+
+    when = 'T'
+
+      let $start_dt = &EMP.HIRE_DT
+
+      !if RTRIM(&EMP.REHIRE_DT,' ') <> ''	!GEX-MXT COMMENTED FOR REHIRE DATE LOGIC IN 9.0
+      if RTRIM($GEXJOB_REH_REHIRE_DT,' ') <> ''	!GEX-MXT COMMENTED FOR REHIRE DATE LOGIC IN 9.0
+      
+         let $action = '(''TER'',''TWP'',''TWB'')'
+         do get-current-action-row
+
+         if RTRIM($job_effdt,' ') <> ''
+	    move $job_effdt to $term_effdt
+        	 #debug9 display 'Term effdt:' noline
+   		 #debug9 display $term_effdt
+
+	         let $term_dt = $job_effdt
+
+	         let $action = '(''HIR'',''REH'')'
+	
+	         do get-current-action-row-1
+
+	         if RTRIM($recent_hire_dt,' ') <> ''
+
+		       #debug9 display 'Recent Hire Dt:' noline
+		       #debug9 display $recent_hire_Dt
+
+		       do convert-to-dtu-date($recent_hire_dt,$hire_dt_dtu)
+       		       do convert-to-dtu-date($term_dt,$term_dt_dtu)
+	                do dtu-diff-months($hire_dt_dtu,$term_Dt_dtu,#diff_months)                        
+        	       #debug9 display 'Calc Months between hire and term:' noline
+	               #debug9 display #diff_months
+		       if #diff_months < 12
+
+			 let $action = '(''REH'')'
+			 do get-current-action-row
+
+			 if RTRIM($job_effdt,' ') <> ''
+			    move $job_effdt to $rehire_effdt
+			    #debug9 display 'Rehire effdt:' noline
+			    #debug9 display $rehire_effdt
+
+			    do convert-to-dtu-date($term_effdt,$term_effdt_dtu)
+			    do convert-to-dtu-date($rehire_effdt,$rehire_effdt_dtu)
+
+			    do dtu-diff-months($term_effdt_dtu,$rehire_effdt_dtu,#diff_months)
+
+			    if #diff_months > 12
+			       let $start_dt = $rehire_effdt
+                	    else
+	                       let $start_dt = $recent_hire_dt
+			    end-if
+
+			 end-if
+        	      else
+                	 let $skip_employee_processing = 'Y'
+	              end-if
+                    else
+			!SXK 04/12/1999 Begin
+		       do error-found
+		       print 'No HIR Row found even though employee was rehired' (,34)
+		       move 'Y' to $skip_employee_processing
+			!SXK 04/12/1999 End
+        	    end-if
+              else
+                 !SXK 04/12/1999 Begin
+		 do error-found
+		 print 'No Termination Row found even though employee was rehired' (,34)
+		 move 'Y' to $skip_employee_processing
+		 !SXK 04/12/1999 End
+	      end-if
+      end-if
+!SXK 08/31/1998 Begin
+!       let $end_dt = $pay_end_Dt
+      let $end_dt = $transfer_dt
+!sxk end
+
+      let $hour_end_dt = &BAS.EVENT_DT
+
+      do convert-to-dtu-date($hour_end_dt,$hour_end_Dt_dtu)
+      do dtu-add-months($hour_end_dt_dtu,-12,$hour_start_dt_dtu)
+      do convert-from-dtu-date($hour_start_dt_dtu,$hour_start_dt)  
+
+    when-other
+      move 'Y' to $skip_employee_processing
+
+End-Evaluate
+
+end-procedure
+
+!*********************************************************************
+!Retrieves most current action job row (Action will be provided by
+!the calling procedure)
+!********************************************************************* 
+
+begin-procedure Get-current-action-row
+move 'N' to $action_row_found
+move ' ' to $job_effdt
+let #job_effseq = 0
+
+begin-select on-error=sql-error-found('Get-current-action-row')
+JOB2.EFFDT
+JOB2.EFFSEQ 
+!SXK 08/31/1998 Begin
+JOB2.ACTION_DT
+!SXK 08/31/1998 end
+  
+    move &JOB2.EFFDT to $job_effdt
+    move &JOB2.EFFSEQ to #job_effseq
+!SXK 08/31/1998 Begin
+    move &JOB2.ACTION_DT to $action_dt
+!SXK 08/31/1998 End
+
+    move 'Y' to $action_Row_found
+
+FROM PS_JOB JOB2
+
+WHERE JOB2.EMPLID = $emplid
+  AND JOB2.EMPL_RCD = #empl_rcd
+  AND JOB2.EFFDT = (SELECT MAX(EFFDT)
+		   FROM PS_JOB
+		  WHERE EMPLID = $emplid
+		    AND EMPL_RCD = #empl_rcd
+		    AND ACTION IN [$action]
+		    AND EFFDT <= $pay_end_dt)
+  AND JOB2.EFFSEQ = (SELECT MAX(EFFSEQ)
+		   FROM PS_JOB
+		  WHERE EMPLID = $emplid
+		    AND EMPL_RCD = #empl_rcd
+		    AND EFFDT = JOB2.EFFDT)
+end-SELECT
+
+end-procedure
+
+!*********************************************************************
+!Retrieves most current action job row (Action will be provided by
+!the calling procedure)
+!********************************************************************* 
+
+begin-procedure Get-current-action-row-1
+move 'N' to $action_row_found
+!SXK 04/30/1999 Begin
+let $recent_hire_Dt = ' '
+!SXK 04/30/1999 End
+begin-select on-error=sql-error-found('Get-current-action-row')
+JOB21.EFFDT
+JOB21.EFFSEQ 
+  
+    move &JOB21.EFFDT to $recent_hire_dt
+
+    move 'Y' to $action_Row_found
+
+FROM PS_JOB JOB21
+
+WHERE JOB21.EMPLID = $emplid
+  AND JOB21.EMPL_RCD = #empl_rcd
+  AND JOB21.EFFDT = (SELECT MAX(EFFDT)
+		   FROM PS_JOB
+		  WHERE EMPLID = $emplid
+		    AND EMPL_RCD = #empl_rcd
+		    AND ACTION IN [$action]
+		    AND EFFDT <= $term_dt)
+  AND JOB21.EFFSEQ = (SELECT MAX(EFFSEQ)
+		   FROM PS_JOB
+		  WHERE EMPLID = $emplid
+		    AND EMPL_RCD = #empl_rcd
+		    AND EFFDT = JOB21.EFFDT)
+end-SELECT
+
+end-procedure
+
+
+!*********************************************************************
+!Searches the array, to match the number of hours worked by the employee
+!and service months for employee, with the required hours and months in
+!the rules table.
+!*********************************************************************
+
+Begin-Procedure Match-Service-Hours-Requirements
+
+#debug9 display 'Start Date:' noline
+#debug9 display $start_dt
+#debug9 display 'End Date:' noline
+#debug9 display $end_dt
+#debug9 display 'Hour Start Date:' noline
+#debug9 display $hour_start_dt
+#debug9 display 'Hour End Date:' noline
+#debug9 display $hour_end_Dt
+
+move 'N' to $first_month_Req
+move 'N' to $second_month_req
+
+do convert-to-dtu-date($start_dt,$start_dt_dtu)
+do convert-to-dtu-date($end_dt,$end_dt_dtu)
+
+!SXK 08/31/1998 Need to find if employee meet service months during pay
+!period 
+do dtu-add-days($end_dt_dtu,-7,$range_begin_dt_dtu)   !this gives previous pay end date
+do convert-from-dtu-date($range_begin_dt_dtu,$range_begin_dt)
+do dtu-diff-months($start_dt_dtu,$range_begin_dt_dtu,#diff_months_begin)
+!SXK 08/31/1998 End
+
+do dtu-diff-months($start_Dt_dtu,$end_dt_dtu,#diff_months)
+
+#debug9 display 'Calc Months:' noline
+#debug9 display #diff_months
+#debug9 display 'End Dt - 7 : ' noline
+#debug9 display $range_begin_dt
+#debug9 display 'Diff Months Begin: ' noline
+#debug9 display #diff_months_begin
+#debug9 display 'Months 1 Array:' noline
+#debug9 display #months_1_array
+#debug9 display 'Months 2 Array:' noline
+#debug9 display #months_2_array
+
+
+if #diff_months = #months_2_array and #diff_months_begin < #months_2_array
+   move 'Y' to $second_month_req
+   !SXK 04/27/1999 begin - to get the right job effdt for insert
+   do dtu-add-months($start_dt_dtu,#months_2_array,$effdt_dtu)
+   do convert-from-dtu-date($effdt_dtu,$effdt_dbf)      
+   !SXK 04/27/1999 End
+else
+   if #diff_months = #months_1_array and #diff_months_begin < #months_1_array
+      move 'Y' to $first_month_req
+   !SXK 04/27/1999 begin - to get the right job effdt for insert
+   do dtu-add-months($start_dt_dtu,#months_1_array,$effdt_dtu)
+   do convert-from-dtu-date($effdt_dtu,$effdt_dbf)      
+   !SXK 04/27/1999 End
+
+   end-if
+end-if
+
+!SXK 08/31/1998 If rehire classification, and service months not met
+!during pay period, and met service prior to pay period then need to make
+!sure rehire action happened during pay period
+
+if $first_month_req = 'N' and $second_month_req = 'N' 
+ if $empl_class = 'R'
+   do get-job-row-in-pay-period
+   
+   If $pay_period_job_found = 'Y' and &JOB1.ACTION = 'REH'
+      if #diff_months >= #months_2_array 
+	 move 'Y' to $second_month_req
+         !SXK 04/27/1999 Begin
+         let $effdt_dbf = $end_dt
+         !sxk 04/27/1999 End
+
+      else
+	 if #diff_months >= #months_1_array 
+	    move 'Y' to $first_month_req
+         !SXK 04/27/1999 Begin
+         let $effdt_dbf = $end_dt
+         !sxk 04/27/1999 End
+
+	 end-if
+      end-if
+   else
+      !let $end_dt = $pay_end_Dt  Determined to be incorrect AXL
+
+      #debug9 display 'New Rehire Code to Determine End dt'
+
+      !AXL 1/18/2000 Begin
+      !If being processed as a rehire (and they DO NOT have the REHIRE
+      !action having an action_dt in the range), then the insert date
+      !(provided that they are MEETING EXACTLY 11 or 12 months of service
+      !in this range, and they are meeting the hours) NEEDS TO EQUAL TO
+      !THE MONTH/DAY and CURRENT YEAR of them meeting 11/12 months of 
+      !service. (The same kind of thing as the "hires")
+
+      do convert-to-dtu-date($pay_end_Dt,$end_dt_dtu)
+      do dtu-add-days($end_dt_dtu,-7,$range_begin_dt_dtu)   
+      do convert-from-dtu-date($range_begin_dt_dtu,$range_begin_dt)
+
+      #debug9 display 'Pay End Dt - 7 : ' noline
+      #debug9 display $range_begin_dt
+
+      do dtu-diff-months($start_dt_dtu,$range_begin_dt_dtu,#diff_months_begin_2)
+
+      #debug9 display 'Diff Months Begin 2: ' noline
+      #debug9 display #diff_months_begin_2
+ 
+      do dtu-diff-months($start_Dt_dtu,$end_dt_dtu,#diff_months_2)
+
+      #debug9 display 'Service Months(as of pay end dt)#diff mths 2 :' noline
+      #debug9 display #diff_months_2
+
+      if #diff_months_2 = #months_2_array and #diff_months_begin_2 < #months_2_array
+	 move 'Y' to $second_month_req
+         !SXK 04/27/1999 Begin
+         !let $effdt_dbf = $end_dt
+         !sxk 04/27/1999 End
+         do dtu-add-months($start_dt_dtu,#months_2_array,$effdt_dtu)
+         do convert-from-dtu-date($effdt_dtu,$effdt_dbf)      
+      else
+         if #diff_months_2 = #months_1_array and #diff_months_begin_2 < #months_1_array
+	    move 'Y' to $first_month_req
+         !SXK 04/27/1999 Begin
+         !let $effdt_dbf = $end_dt
+         !sxk 04/27/1999 End
+         do dtu-add-months($start_dt_dtu,#months_1_array,$effdt_dtu)
+         do convert-from-dtu-date($effdt_dtu,$effdt_dbf)      
+	 end-if
+      end-if
+   end-if
+   !AXL 1/18/2000 End
+!SXK 09/01/1998 Begin
+ else
+   if $empl_class = 'T'
+      if #diff_months >= #months_2_array 
+	 move 'Y' to $second_month_req
+         !SXK 04/27/1999 Begin
+         let $effdt_dbf = $end_dt
+         !sxk 04/27/1999 End
+
+      else
+	 if #diff_months >= #months_1_array 
+	    move 'Y' to $first_month_req
+         !SXK 04/27/1999 Begin
+         let $effdt_dbf = $end_dt
+         !sxk 04/27/1999 End
+
+	 end-if
+      end-if
+   end-if
+!SXK end
+ end-if
+end-if
+
+#debug9 display 'Insert Date:' noline
+#debug9 display $effdt_dbf
+!SXK 08/31/1998 End
+
+if ($first_month_req = 'Y') or ($second_month_req = 'Y')
+    do convert-to-dtu-date($hour_start_Dt,$hour_start_dt_dtu)
+    do convert-to-dtu-date($hour_end_dt,$hour_end_dt_Dtu)
+
+!SXK 08/31/1998 Begin    
+!    evaluate $empl_class 
+!        when = 'H'
+!        when = 'R'
+!          do dtu-add-months($hour_end_dt_dtu,-1,$hour_end_dt_dtu)
+!        when-other
+!          do dtu-add-months($hour_end_dt_dtu,1,$hour_end_dt_dtu)
+!    end-evaluate
+!SXK 08/31/1998 end
+	  
+    let $start_yy = substr($hour_start_dt_dtu,1,4)
+    let $end_yy = substr($hour_end_Dt_dtu,1,4)
+    let $start_month = substr($hour_start_dt_dtu,6,2)
+    let $end_month = substr($hour_end_Dt_Dtu,6,2)
+
+    let #start_month = to_number($start_month)
+    let #end_month = to_number($end_month)
+
+
+    do calculate-balance-hours
+
+    #debug9 display 'Serv Hours Array:' noline
+    #debug9 display #serv_hrs_array
+
+    if #mtd_hrs >= #serv_hrs_array
+!SXK 04/27/1999 Begin - commented out
+!       do convert-to-dtu-date($pay_end_dt,$pay_end_dt_dtu)
+!       do dtu-add-days($pay_end_Dt_dtu,1,$effdt_dtu)
+!       do convert-from-dtu-date($effdt_dtu,$effdt_Dbf)
+!SXK 04/27/1999 End
+       if $first_month_req = 'Y'
+	  let $reason = '001'
+       else
+	  let $reason = '002'
+       end-if
+
+       let $elig_config1 = $byte_array||substr($job_elig_config1,4,7)
+       do insert-procedure
+       add 1 to #job_inserts
+    end-if
+       
+end-if
+
+end-procedure
+
+!*********************************************************************
+!Retrieves the balance hours for the employee by the company.
+!********************************************************************* 
+
+begin-procedure calculate-balance-hours
+
+move 'N' to $errorfound
+
+move #start_month to $start_month
+move #end_month to $end_month
+
+#debug9 display 'Start Year:' noline
+#debug9 display $start_yy
+#debug9 display 'End Year:' noline
+#debug9 display $end_yy
+
+#debug9 display 'Start Month:' noline
+#debug9 display #start_month
+#debug9 display 'end Month:' noline
+#debug9 display #end_month
+
+let #mtd_hrs = 0
+
+if $start_yy <> $end_yy
+   let $range = 'AND ERN.BALANCE_YEAR = '||$start_yy||' '||
+		'AND ERN.BALANCE_PERIOD >= '||$start_month||' '
+
+   do calculate-mtd-hrs
+
+   let $range = 'AND ERN.BALANCE_YEAR > '||$start_yy||' '||
+		'AND ERN.BALANCE_YEAR < '||$end_yy||' '
+
+   do calculate-mtd-hrs
+
+   let $start_month = 0
+
+end-if
+
+let $range = 'AND ERN.BALANCE_YEAR = '||$end_yy||' '||
+		'AND ERN.BALANCE_PERIOD <= '||$end_month||' '
+
+do calculate-mtd-hrs
+
+#debug9 display 'MTD Hrs:' noline
+#debug9 display #mtd_hrs
+
+end-procedure
+
+!*********************************************************************
+!Calculates MTD hours for the employees 
+!*********************************************************************
+
+begin-procedure calculate-mtd-hrs
+
+move 'N' to $errorfound
+move 'N' to $found
+
+begin-select on-error=sql-error-found('calculate-mtd-hrs')
+SUM(ERN.HRS_MTD) &mtd_hrs
+  
+ if &mtd_hrs > 0  
+   #debug9 display $range
+   #debug9 display 'Calculate Sum of MTD Hours proc'
+   #debug9 display 'Sum of MTD hours: ' noline
+   #debug9 display &mtd_hrs 
+   add &mtd_hrs to #mtd_hrs
+   move 'Y' to $found
+
+ end-if
+
+FROM PS_EARNINGS_BAL ERN
+
+WHERE ERN.EMPLID = $emplid
+!  AND ERN.COMPANY = $company
+  AND ERN.BALANCE_ID = 'CY'
+! CJH - 02/25/2003 - remove empl_rcd join crtieria - need balances across all jobs
+!  AND ERN.EMPL_RCD = #empl_rcd                        !GBD 08/26/2002 Field Added
+! CJH - 02/25/2003 - end
+  AND ERN.SPCL_BALANCE = 'Y'
+[$range]
+  AND ERN.ERNCD = $accum_array
+  AND ERN.HRS_MTD > 0
+end-SELECT
+
+end-procedure
+
+!********************************************************************
+! Print Audit Report
+!********************************************************************
+begin-procedure Print-Transfers
+ 
+   use-report Report-audit
+
+   print &job.company		(+1,{#col_cmp})
+   print &job.paygroup		(0,{#col_pgp})
+   print $bp_name		(0,{#col_bpn})
+   print &job.emplid		(0,{#col_ssn})  !edit xxx-xx-xxxx !GEX_SEC_REENG 2015-06-24 Vahini Katta
+   print &per.name		(0,{#col_nam})
+   
+end-procedure
+
+#Include 'tranctrl.sqc'  !Common Transaction Control Procedures
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'payrnctl.sqc'  !Select-Parameters
+#Include 'stdapi.sqc'    !Get_Run_Control Procedure
+#Include 'datemath.sqc'  !Does the date-math functions
+#Include 'readxlat.sqc'  !Read xlattable
+#Include 'gexbncf1.sqc'  !
+#include 'gexrehdt.sqc'	 !GEX-MXT 03/24/2008 Fixed for REHIRE DT

@@ -1,0 +1,797 @@
+!***********************************************************************
+!  FGPY022:  PROCESS LEAVE BANK AND TRANSFER                           *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+!                                                                      *
+! This module contains confidential and proprietary information        *
+! of Oracle; it is not to be copied, reproduced, or transmitted        *
+! in any form, by any means, in whole or in part, nor is it to         *
+! be used for any purpose other than that for which it is              *
+! expressly provided under the applicable license agreement.           *
+!                                                                      *
+! Copyright (C) 2006 Oracle. All Rights Reserved.                      *
+!                                                                      *
+!***********************************************************************
+!          $Date:  2006/07/20:03:51:07                                 *
+!       $Release:  HR9                                                 *
+!      $Revision:  101                                                 *
+!                                                                      *
+!***********************************************************************
+#include 'setenv.sqc'    !Set environment
+#include 'setup31.sqc'
+
+begin-report
+
+    do Init-Report
+
+    do Process-Main
+
+    do Stdapi-Term
+
+end-report
+
+!**************************
+begin-procedure Init-Report
+!**************************
+
+  do Init-DateTime
+  do Init-Number
+  do Get-Current-DateTime
+
+  move 'FGPY022' to $ReportID
+  move 'Leave Bank and Transfer Process' to $ReportTitle
+
+  do Stdapi-Init
+
+  if $prcs_process_instance = ''
+    do Ask-As-Of-Date
+  else
+    do Select-Parameters
+    do Get-As-Of-Date
+  end-if
+
+  display 'Processing Leave Bank and Transfers'
+
+end-procedure       !Init-Report
+
+!********************************
+begin-procedure Select-Parameters
+!********************************
+
+  let $process_found = 'N'
+
+BEGIN-SELECT
+
+RUN_CNTL_FG.RUN_ID
+RUN_CNTL_FG.RUN_CNTL_ID
+RUN_CNTL_FG.OPRID
+RUN_CNTL_FG.ASOFDATE
+
+    let $process_found = 'Y'
+
+FROM  PS_GVT_RUN_CNTL RUN_CNTL_FG
+
+WHERE RUN_CNTL_FG.OPRID       = $Prcs_OprID
+  AND RUN_CNTL_FG.RUN_CNTL_ID = $Prcs_Run_Cntl_ID
+
+END-SELECT
+
+End-Procedure  !Select-Parameters
+
+!*****************************
+begin-procedure Get-As-Of-Date
+!*****************************
+
+  let $AsOfDate =  &RUN_CNTL_FG.AsOfDate
+
+  if $AsOfDate = ''
+    move $AsOfToday to $AsOfDate
+  end-if
+
+
+end-procedure  !Get-As-Of-Date
+
+!***************************
+begin-procedure Process-Main
+!***************************
+
+  do Get-Earn-Codes
+  do Process-Approved-Bank
+  do Process-Approved-Request
+  do Process-External-Donations
+
+
+end-procedure       !Process-Main
+
+!*****************************
+begin-procedure Get-Earn-Codes
+!*****************************
+
+  let $earn_type = 'B'
+  do Get-ErnCode
+  let $bank_erncd = &DB.ERNCD
+
+  let $earn_type = 'R'
+  do Get-ErnCode
+  let $recip_erncd = &DB.ERNCD
+
+  let $earn_type = 'E'
+  do Get-ErnCode
+  let $emergency_erncd = &DB.ERNCD
+
+  let $earn_type = 'W'
+  do Get-ErnCode
+  let $withdraw_erncd = &DB.ERNCD
+
+  let $earn_type = 'D'
+  do Get-ErnCode
+  let $add_xfr_erncd = &DB.ERNCD
+
+  ! do Get-Accr-Class-Code
+  ! let $add_xfr_erncd = &ACC.ERNCD
+
+
+end-procedure  !Get-Earn-Codes
+
+
+!*****************************
+begin-procedure Get-ErnCode
+!*****************************
+
+BEGIN-SELECT
+
+DB.ERNCD
+
+FROM PS_EARNINGS_TBL DB
+WHERE DB.EFFDT = (SELECT MAX(A.EFFDT)
+                  FROM PS_EARNINGS_TBL A
+                  WHERE A.ERNCD = DB.ERNCD
+                    AND A.EFFDT <= $AsOfDate)
+  AND DB.EFF_STATUS = 'A'
+  AND DB.GVT_LV_EARN_TYPE = $earn_type
+
+END-SELECT
+
+end-procedure  !Get-Earn-Codes
+
+!**********************************
+begin-procedure Get-Accr-Class-Code
+!**********************************
+
+BEGIN-SELECT
+
+ACC.ERNCD
+
+FROM PS_GVT_ACC_ERNCD ACC, PS_GVT_ERN_ACR_CLS CLS, PS_EARNINGS_TBL EARN
+WHERE ACC.GVT_ERN_ACCR_CLASS = CLS.GVT_ERN_ACCR_CLASS
+  AND ACC.ERNCD = EARN.ERNCD
+  AND ACC.EFFDT = CLS.EFFDT
+  AND CLS.EFF_STATUS = 'A'
+  AND CLS.EFFDT = (SELECT MAX(K.EFFDT)
+                   FROM PS_GVT_ERN_ACR_CLS K
+                   WHERE K.GVT_ERN_ACCR_CLASS = CLS.GVT_ERN_ACCR_CLASS
+                     AND K.EFFDT <= $AsOfDate)
+  AND EARN.EFFDT = (SELECT MAX(M.EFFDT)
+                   FROM PS_EARNINGS_TBL M
+                   WHERE M.ERNCD = EARN.ERNCD
+                     AND M.EFFDT <= $AsOfDate)
+  AND ACC.GVT_HRS_EARN_ADD = 'Y'
+  AND EARN.GVT_LV_EARN_TYPE NOT IN ('B','E','R','W')
+
+END-SELECT
+end-procedure  !Get-Accr-Class-Code
+
+!********************************
+begin-procedure Process-Approved-Bank
+!********************************
+
+BEGIN-SELECT
+
+BNK.EMPLID
+BNK.EMPL_RCD
+BNK.EFFDT
+BNK.GVT_LEAVE_XFR_TYPE
+BNK.GVT_LV_ANNL_CONT
+PRGM.GVT_LEAVE_XFR_PRGM
+
+  move &BNK.EMPLID to $emplid
+  move &BNK.EMPL_RCD to #empl_rcd
+  do Update-Bank-Contribute
+  move 'C' to $with_cont_type
+  move &BNK.GVT_LV_ANNL_CONT to #bank_hrs
+  move &BNK.GVT_LV_ANNL_CONT to #oth_hrs
+  move &BNK.GVT_LEAVE_XFR_TYPE to $bank_id
+  do Insert-Bank-Ledger
+  if &PRGM.GVT_LEAVE_XFR_PRGM = 'B'
+    move $bank_erncd to $erncd
+  else
+    move $emergency_erncd to $erncd
+  end-if
+  do Complete-Inserts
+
+
+FROM PS_GVT_LV_BANK_APP BNK,
+     PS_GVT_XFR_TYP_TBL PRGM
+WHERE BNK.GVT_LV_MEM_STATUS = 'A'
+  AND BNK.EFFDT <= $AsOfDate
+  AND PRGM.GVT_LEAVE_XFR_TYPE = BNK.GVT_LEAVE_XFR_TYPE
+  AND PRGM.EFFDT =
+      (SELECT MAX(I.EFFDT)
+       FROM PS_GVT_XFR_TYP_TBL I
+       WHERE I.GVT_LEAVE_XFR_TYPE = PRGM.GVT_LEAVE_XFR_TYPE
+         AND I.EFFDT <= BNK.EFFDT)
+
+END-SELECT
+
+end-procedure  !Process-Approved-Bank
+
+!*******************************
+begin-procedure Complete-Inserts
+!*******************************
+
+  do Get-Paygroup
+  do Get-Pay-Calendar
+  do Get-Max-Addl-Seq
+  do Check-Addl-Pay-Effdt
+  do Check-Addl-Pay-Erncd
+  do Insert-Addl-Data
+  do update-pay-line
+
+end-procedure  !Complete-Inserts
+
+!***************************************
+begin-procedure Process-Approved-Request
+!***************************************
+
+BEGIN-SELECT
+
+RECIP.EMPLID
+RECIP.EMPL_RCD
+RECIP.GVT_LEAVE_XFR_TYPE
+RECIP.EFFDT
+RECIP.EFFSEQ
+XFR.GVT_LEAVE_XFR_PRGM
+RECIP.GVT_LV_DUR_HOURS
+RECIP.START_DATE
+RECIP.END_DATE
+RECIP.GVT_LV_BNKPRCS_FLG
+
+  SHOW 'REC: ' &RECIP.EMPLID
+
+  if &XFR.GVT_LEAVE_XFR_PRGM = 'V'
+    move 0 to #hrs_donated
+    do Get-Leave-Donor
+    if $donor_found = 'Y'
+      do Process-Transfer-Hrs
+    end-if
+  else
+    if &RECIP.GVT_LV_BNKPRCS_FLG = 'N'
+      do Process-Bank-Hrs
+      do Update-Bank-Request
+    end-if
+  end-if
+
+FROM PS_GVT_LV_REC_APP RECIP, PS_GVT_XFR_TYP_TBL XFR
+WHERE RECIP.GVT_LEAVE_XFR_TYPE = XFR.GVT_LEAVE_XFR_TYPE
+  AND RECIP.GVT_LV_APP_STATUS = 'A'
+  AND $AsOfDate BETWEEN START_DATE AND END_DATE
+  AND XFR.EFFDT = (SELECT MAX(J.EFFDT) FROM PS_GVT_XFR_TYP_TBL J
+                   WHERE J.GVT_LEAVE_XFR_TYPE = XFR.GVT_LEAVE_XFR_TYPE
+                     AND J.EFFDT <= $AsOfDate)
+  AND XFR.EFF_STATUS = 'A'
+
+END-SELECT
+
+end-procedure  !Process-Approved-Request
+
+!*****************************************
+begin-procedure Process-External-Donations
+!*****************************************
+
+  move $recip_erncd to $erncd
+
+BEGIN-SELECT
+
+EXT.EMPLID
+EXT.EMPL_RCD
+EXT.EFFDT
+EXT.GVT_LEAVE_XFR_TYPE
+EXT.GVT_HRS_DONATED
+EXT.SEQUENCE_NBR
+
+  move &EXT.EMPLID to $emplid
+  move &EXT.EMPL_RCD to #empl_rcd
+  move &EXT.GVT_HRS_DONATED to #oth_hrs
+  do Complete-Inserts
+  do Update-External-Donor
+
+FROM PS_GVT_LV_DON_EXT EXT
+WHERE EXT.EFFDT <= $AsOfDate
+  AND EXT.PAY_END_DT IS NULL
+
+END-SELECT
+
+end-procedure  !Process-External-Donations
+
+!******************************
+begin-procedure Get-Leave-Donor
+!******************************
+let $donor_found = 'N'
+
+BEGIN-SELECT
+
+DON.GVT_LV_DON_EMPLID
+DON.GVT_HRS_DONATED
+DON.NATIONAL_ID
+DON.EFFDT
+
+  let #hrs_donated = #hrs_donated + &DON.GVT_HRS_DONATED
+  if not isblank(&DON.GVT_LV_DON_EMPLID)
+    do Withdraw-Donor-Hrs
+  end-if
+  do Update-Donor-Record
+  let $donor_found = 'Y'
+
+FROM PS_GVT_LV_DONOR DON
+WHERE DON.EMPLID = &RECIP.EMPLID
+  AND DON.EMPL_RCD = &RECIP.EMPL_RCD
+  AND DON.GVT_LEAVE_XFR_TYPE = &RECIP.GVT_LEAVE_XFR_TYPE
+  AND DON.EFFSEQ = &RECIP.EFFSEQ
+  AND DON.EFFDT <= &RECIP.END_DATE
+  AND DON.PAY_END_DT IS NULL
+  AND DON.GVT_LV_RESTORED = 'N'
+
+END-SELECT
+
+end-procedure  !Get-Leave-Donor
+
+!*******************************
+begin-procedure Process-Bank-Hrs
+!*******************************
+
+  move &RECIP.GVT_LEAVE_XFR_TYPE to $bank_id
+  move &RECIP.EMPLID to $emplid
+  move &RECIP.EMPL_RCD to #empl_rcd
+  move 'W' to $with_cont_type
+  move &RECIP.GVT_LV_DUR_HOURS to #oth_hrs
+  move &RECIP.GVT_LV_DUR_HOURS to #bank_hrs
+
+  move $withdraw_erncd to $erncd
+
+  do Insert-Bank-Ledger
+  do Complete-Inserts
+
+end-procedure  !Process-Bank-Hrs
+
+!**********************************
+begin-procedure Update-Bank-Request
+!**********************************
+
+BEGIN-SQL
+
+UPDATE PS_GVT_LV_REC_APP
+   SET GVT_LV_BNKPRCS_FLG = 'Y'
+
+WHERE EMPLID = &RECIP.EMPLID
+  AND EMPL_RCD = &RECIP.EMPL_RCD
+  AND GVT_LEAVE_XFR_TYPE = &RECIP.GVT_LEAVE_XFR_TYPE
+  AND EFFDT = &RECIP.EFFDT
+  AND EFFSEQ = &RECIP.EFFSEQ
+
+
+END-SQL
+
+end-procedure  !Update-Bank-Request
+!***********************************
+begin-procedure Process-Transfer-Hrs
+!***********************************
+
+  move &RECIP.EMPLID to $emplid
+  move &RECIP.EMPL_RCD to #empl_rcd
+  move $add_xfr_erncd to $erncd
+  move #hrs_donated to #oth_hrs
+
+  do Complete-Inserts
+
+end-procedure  !Process-Transfer-Hrs
+
+!*********************************
+begin-procedure Withdraw-Donor-Hrs
+!*********************************
+
+  move &DON.GVT_LV_DON_EMPLID to $emplid
+  move 0 to #empl_rcd
+  move $recip_erncd to $erncd
+  move &DON.GVT_HRS_DONATED to #oth_hrs
+
+  do Complete-Inserts
+
+
+end-procedure  !Withdraw-Donor-Hrs
+
+!**********************************
+begin-procedure Update-Donor-Record
+!**********************************
+
+BEGIN-SQL
+
+UPDATE PS_GVT_LV_DONOR
+   SET GVT_HRS_USED = &DON.GVT_HRS_DONATED,
+         PAY_END_DT = &CAL.PAY_END_DT
+
+WHERE EMPLID = &RECIP.EMPLID
+  AND EMPL_RCD = &RECIP.EMPL_RCD
+  AND GVT_LEAVE_XFR_TYPE = &RECIP.GVT_LEAVE_XFR_TYPE
+  AND EFFSEQ = &RECIP.EFFSEQ
+  AND EFFDT = &DON.EFFDT
+  AND NATIONAL_ID = &DON.NATIONAL_ID
+
+END-SQL
+
+end-procedure  !Update-Donor-Record
+
+!**********************************
+begin-procedure Update-External-Donor
+!**********************************
+
+BEGIN-SQL
+
+UPDATE PS_GVT_LV_DON_EXT
+   SET PAY_END_DT = &CAL.PAY_END_DT
+
+WHERE EMPLID = &EXT.EMPLID
+  AND EMPL_RCD = &EXT.EMPL_RCD
+  AND EFFDT = &EXT.EFFDT
+  AND GVT_LEAVE_XFR_TYPE = &EXT.GVT_LEAVE_XFR_TYPE
+  AND SEQUENCE_NBR = &EXT.SEQUENCE_NBR
+
+END-SQL
+
+end-procedure  !Update-External-Donor
+
+!***************************
+begin-procedure Get-Paygroup
+!***************************
+
+BEGIN-SELECT
+
+PG.COMPANY
+PG.PAYGROUP
+
+FROM   PS_JOB PG
+
+WHERE  PG.EMPLID = $emplid
+  AND  PG.EMPL_RCD = #empl_rcd
+  AND  PG.EFFDT =
+       (SELECT MAX(C.EFFDT)
+        FROM   PS_JOB C
+        WHERE  C.EMPLID    = PG.EMPLID
+          AND  C.EMPL_RCD = PG.EMPL_RCD
+          AND  C.EFFDT  <= $AsOfDate)
+  AND  PG.EFFSEQ =
+       (SELECT MAX(D.EFFSEQ)
+        FROM   PS_JOB D
+        WHERE  D.EMPLID    = PG.EMPLID
+          AND  D.EMPL_RCD = PG.EMPL_RCD
+          AND  D.EFFDT     = PG.EFFDT)
+
+END-SELECT
+
+end-procedure  !Get-Paygroup
+
+!*******************************
+begin-procedure Get-Pay-Calendar
+!*******************************
+
+BEGIN-SELECT
+
+CAL.PAY_END_DT
+CAL.PAY_BEGIN_DT
+
+FROM PS_PAY_CALENDAR CAL
+WHERE CAL.PAYGROUP = &PG.PAYGROUP
+  AND CAL.COMPANY = &PG.COMPANY
+  AND CAL.PAY_END_DT =
+       (SELECT MIN(B.PAY_END_DT)
+        FROM PS_PAY_CALENDAR B
+        WHERE B.COMPANY = CAL.COMPANY
+          AND B.PAYGROUP = CAL.PAYGROUP
+          AND B.PAY_END_DT >= $AsOfDate)
+          AND CAL.PAY_CONFIRM_RUN = 'N'
+
+END-SELECT
+
+end-procedure  !Get-Pay-Calendar
+
+!*************************************
+begin-procedure Update-Bank-Contribute
+!*************************************
+
+BEGIN-SQL
+
+UPDATE PS_GVT_LV_BANK_APP
+   SET GVT_LV_MEM_STATUS = 'C'
+
+WHERE EMPLID = &BNK.EMPLID
+  AND EMPL_RCD = &BNK.EMPL_RCD
+  AND EFFDT = &BNK.EFFDT
+  AND GVT_LEAVE_XFR_TYPE = &BNK.GVT_LEAVE_XFR_TYPE
+
+END-SQL
+
+end-procedure  !Update-Bank-Contribute
+
+!*********************************
+begin-procedure Insert-Bank-Ledger
+!*********************************
+
+BEGIN-SQL ON-ERROR=SQL-ERROR
+
+  INSERT INTO PS_GVT_LVBANK_LDGR
+                (GVT_LEAVE_XFR_TYPE
+                ,EMPLID
+                ,EMPL_RCD
+                ,EFFDT
+                ,GVT_LV_WITH_CONTR
+                ,GVT_HRS_USED
+                ,GVT_LV_MEM_STATUS
+                )
+        VALUES  ($bank_id
+                ,$emplid
+                ,#empl_rcd
+                ,$AsOfDate
+                ,$with_cont_type
+                ,#bank_hrs
+                ,'C'
+                )
+
+
+END-SQL
+
+end-procedure  !Insert-Bank-Ledger
+
+!***********************************
+begin-procedure Check-Addl-Pay-Erncd
+!***********************************
+
+let $pay_erncd_flg = 'N'
+
+BEGIN-SELECT
+
+PAYE.EMPLID
+
+  let $pay_erncd_flg = 'Y'
+
+FROM PS_ADDL_PAY_ERNCD PAYE
+WHERE PAYE.EMPLID = $emplid
+  AND PAYE.EMPL_RCD = #empl_rcd
+  AND PAYE.ERNCD = $erncd
+
+END-SELECT
+
+  if $pay_erncd_flg = 'N'
+    do Insert-Addl-Pay-Erncd
+  end-if
+
+end-procedure  !Check-Addl-Pay-Erncd
+
+!***********************************
+begin-procedure Check-Addl-Pay-Effdt
+!***********************************
+
+let $pay_effdt_flg = 'N'
+
+BEGIN-SELECT
+
+PYEFF.EMPLID
+
+  let $pay_effdt_flg = 'Y'
+
+FROM PS_ADDL_PAY_EFFDT PYEFF
+WHERE PYEFF.EMPLID = $emplid
+  AND PYEFF.EMPL_RCD = #empl_rcd
+  AND PYEFF.ERNCD = $erncd
+  AND PYEFF.EFFDT = $AsOfDate
+
+END-SELECT
+
+  if $pay_effdt_flg = 'N'
+    do Insert-Addl-Pay-Effdt
+  end-if
+
+end-procedure  !Check-Addl-Pay-Effdt
+
+!************************************
+begin-procedure Insert-Addl-Pay-Erncd
+!************************************
+
+BEGIN-SQL ON-ERROR=SQL-ERROR
+
+  INSERT INTO PS_ADDL_PAY_ERNCD
+                (EMPLID
+                ,EMPL_RCD
+                ,ERNCD
+                ,RECORD_SOURCE
+                )
+        VALUES  ($emplid
+                ,#empl_rcd
+                ,$erncd
+                ,'O'
+                )
+
+END-SQL
+
+end-procedure  !Insert-Addl-Pay-Erncd
+
+!************************************
+begin-procedure Insert-Addl-Pay-Effdt
+!************************************
+
+BEGIN-SQL ON-ERROR=SQL-ERROR
+
+  INSERT INTO PS_ADDL_PAY_EFFDT
+                (EMPLID
+                ,EMPL_RCD
+                ,ERNCD
+                ,EFFDT
+                ,RECORD_SOURCE
+                )
+        VALUES  ($emplid
+                ,#empl_rcd
+                ,$erncd
+                ,$AsOfDate
+                ,'O'
+                )
+
+END-SQL
+
+end-procedure  !Insert-Addl-Pay-Effdt
+
+!*******************************
+begin-procedure Insert-Addl-Data
+!*******************************
+
+BEGIN-SQL ON-ERROR=SQL-ERROR
+
+  INSERT INTO PS_ADDL_PAY_DATA
+                (EMPLID
+                ,EMPL_RCD
+                ,ERNCD
+                ,EFFDT
+                ,ADDL_SEQ
+                ,DEPTID
+                ,JOBCODE
+                ,POSITION_NBR
+                ,ACCT_CD
+                ,GL_PAY_TYPE
+                ,ADDL_PAY_SHIFT
+                ,OTH_HRS
+                ,HOURLY_RT
+                ,OTH_PAY
+                ,ADDLPAY_REASON
+                ,SEPCHK
+                ,EARNINGS_END_DT
+                ,GOAL_AMT
+                ,GOAL_BAL
+                ,OK_TO_PAY
+                ,DISABLE_DIR_DEP
+                ,PRORATE_ADDL_PAY
+                ,PRORATE_CUI_WEEKS
+                ,PAY_PERIOD1
+                ,PAY_PERIOD2
+                ,PAY_PERIOD3
+                ,PAY_PERIOD4
+                ,PAY_PERIOD5
+                ,STATE
+                ,LOCALITY
+                ,TAX_PERIODS
+                ,TAX_METHOD
+                ,ADDL_PAY_FREQUENCY
+                ,DED_TAKEN
+                ,DED_SUBSET_ID
+                ,DED_TAKEN_GENL
+                ,DED_SUBSET_GENL
+                ,PLAN_TYPE
+                ,BUSINESS_UNIT
+                ,COMP_RATECD
+                ,RECORD_SOURCE
+                )
+        VALUES  ($emplid
+                ,#empl_rcd
+                ,$erncd
+                ,$AsOfDate
+                ,#addl_seq
+                ,' '
+                ,' '
+                ,' '
+                ,' '
+                ,' '
+                ,'J'
+                ,#oth_hrs
+                ,0
+                ,0
+                ,'N'
+                ,0
+                ,&CAL.PAY_END_DT
+                ,0
+                ,0
+                ,'Y'
+                ,'N'
+                ,'N'
+                ,'N'
+                ,'Y'
+                ,'Y'
+                ,'Y'
+                ,'Y'
+                ,'Y'
+                ,' '
+                ,' '
+                ,1
+                ,'A'
+                ,'P'
+                ,'D'
+                ,' '
+                ,'R'
+                ,' '
+                ,' '
+                ,' '
+                ,' '
+                ,'O'
+                )
+
+END-SQL
+
+
+end-procedure  !Insert-Addl-Data
+
+!*******************************
+begin-procedure Get-Max-Addl-Seq
+!*******************************
+
+  move 0 to #addl_seq
+
+BEGIN-SELECT
+
+SEQ.ADDL_SEQ
+
+FROM PS_ADDL_PAY_DATA SEQ
+WHERE SEQ.EMPLID = $emplid
+  AND SEQ.EMPL_RCD = #empl_rcd
+  AND SEQ.ADDL_SEQ = (SELECT MAX(H.ADDL_SEQ)
+                      FROM PS_ADDL_PAY_DATA H
+                      WHERE H.EMPLID = SEQ.EMPLID
+                      AND $AsOfDate BETWEEN H.EFFDT AND H.EARNINGS_END_DT)
+
+END-SELECT
+
+  move &SEQ.ADDL_SEQ to #addl_seq
+  let #addl_seq = #addl_seq + 1
+
+end-procedure  !Get-Max-Addl-Seq
+
+!**********************************
+begin-procedure update-pay-line
+!**********************************
+BEGIN-SQL ON-ERROR=SQL-ERROR
+
+UPDATE PS_PAY_LINE
+   SET JOB_CHANGE ='R'
+
+WHERE EMPLID       = $emplid
+  and CONFIRMED    ='N'
+  and JOB_CHANGE   <>'R'
+  and MANUAL_CHECK ='N'
+
+END-SQL
+
+end-procedure !update-pay-line
+
+
+!**************************************************************
+#include 'askaod.sqc'    !Ask As Of Date input
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'stdapi.sqc'    !Routines to Update Run Status

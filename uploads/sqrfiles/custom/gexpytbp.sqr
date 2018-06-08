@@ -1,0 +1,440 @@
+!***********************************************************************
+!  GEXPYTBP:  TEAM BONUS PROGRAM REPORT -                              *   
+!             Bonus Amounts PAID by employee, by store                 *
+!***********************************************************************
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module is the confidential and proprietary information of       *
+! Giant Eagle, Inc.; it is not to be copied, reproduced, or transmitted*
+! in any form, by any means, in whole or in part, nor is it to be used *
+! for any purpose other than that for which it is expressly provided   *
+! without the written permission of Giant Eagle.                       * 
+!***********************************************************************
+! GEXPYTBP:            This sqr is run after the payroll confirm.      *
+!                      It selects Team Bonus Program (TBP) Bonuses     *
+!                      (erncd=535) on employees paychecks and          *
+!                      prints a report showing bonus amount paid.      *
+!                      gexpytbp report is sorted by deptid, acct_cd    *
+!                      and ee Name and breaks/totals on deptid.        *
+!                                                                      *
+! #Debugx Used:		#debug9 paragraph trace                        *
+!			#debug8 key variable values                    *
+!			#debug7 data returned from sql calls           *
+!                                                                      *
+! SQL Tables:           ps_pay_calendar                                *
+!                       ps_jobcode_tbl                                 *
+!                       ps_pay_earnings                                *
+!                       ps_pay_check                                   *
+!                       ps_pay_oth_earns                               *
+!                       pfs_payroll_send (created by Batch WebApp)     *
+!                                                                      *
+! Written by:		Susan Mahady                                   *
+!                                                                      *
+! Normally Run:		Monthly                                        *
+!                                                                      *
+! Runcntl Parms:	ASOFDATE                                       *
+!***********************************************************************
+!                         MODIFICATION HISTORY                         *
+!***********************************************************************
+! CSR    INITIALS   DATE          DESCRIPTION OF THE CHANGE            *
+!***********************************************************************
+!HR-10348  SCM   03/25/2003  Initial Creation                          *
+!          SCM   08/27/2003  Added Print=HPLASERJET in Declare-        *
+!                            Report section to fix report formatting.  *
+!                            Made sure reportid was on report cover    *
+!                            page so mobius could identify.            *
+!        GEX-AXG  06/09/2007  Upgrade 9.0			       *
+!        VENDTKK  01/28/2009 Added INCLUDE GETPOSNM.SQC to pull        *
+!                  	     JOBTITLE from POSITION_DATA.DESCR field   *
+!			     instead of JOBCODE_TBL.DESCR  	       *	
+!***********************************************************************
+
+#Include 'setenv.sqc'    !Set environment
+#Include 'setup32.sqc'   !Printer and page-size initialization
+
+Begin-Setup
+  Declare-Report TeamBonus-Report
+    Printer-Type=HPLASERJET                           !SCM  08/27/2003                       
+    Layout=Default
+  End-Declare
+
+End-Setup
+
+#define #column1      1
+#define #column2     7
+#define #column3     20
+#define #column4     50
+#define #column5     77
+#define #column6     120
+
+Begin-Heading 8  For-Reports=(TeamBonus-Report)
+#debug9 Show 'Begin-Heading'
+#Include 'stdhdg01.sqc'
+ 
+  Move 'GEXPYTBP'                  To $ReportID
+  Move 'Team Bonus Program Report' To $ReportTitle
+
+  if $Deptid <> $priorDeptid
+    move $Deptid to $priorDeptid
+    do Get-Department-Name  
+  end-if
+
+  Let $X000_temp_out = 'Pay Ending: ' || $pay_end_dt
+  Print $X000_temp_out    (3,1)  
+  Let $X000_temp_out = 'Bonus Period  ' || $pfs.strt_dte
+  Print $X000_temp_out    (3,51)  
+  Let $X000_temp_out =  'thru  ' || $pfs.end_dte 
+  Print $X000_temp_out    (3,84)  
+   
+  Print 'Store: '                     (6,1)
+  Print $Deptid                       (6,15,5)
+  Print $DeptName                     (6,25,30)
+!  Print 'Cents/Hour'                  (6,60,10)
+!  print #Cents_Per_Hour               (6,73,8)   edit 9.9999 
+
+  Print 'Acct'                     (+1,{#column1})
+  Print 'Employee Name'            (+0,{#column3})
+  Print 'SSN'                      (+0,{#column4})
+!  Print 'JobCode'                  (+0,{#column3A})
+  Print 'Job Title'                (+0,{#column5})
+  Print 'Bonus Amount'         (+0,{#column6})
+  
+  Print '-'                    (+1,{#column1},174)   Fill
+  
+End-Heading
+
+
+Begin-Report
+#debug9 Show 'Begin-Report'
+
+  Do Init-DateTime           !datetime.sqc
+  Do Init-Number             !number.sqc
+  Do Get-Current-DateTime    !curdttim.sqc
+  Do Stdapi-Init             !stdapi.sqc
+
+  Do P100-Start
+  
+  Do P200-Main-Process
+ 
+  date-time () HH:MI:SS &timeEnded
+  date-time () MM/DD/YYYY &dateEnded
+  show 'Report Ended at ' &timeEnded ' on ' &dateEnded
+  show ' '                                                              
+ 
+  Do Reset                   !reset.sqc
+  Do Stdapi-Term             !stdapi.sqc
+   
+  Show 'Successful end of report'
+End-Report
+  
+!************************************************
+Begin-Procedure P100-Start
+!************************************************
+#debug9 Show 'P100-Start'
+ 
+  date-time () HH:MI:SS &timeBegan
+  date-time () MM/DD/YYYY &dateBegan
+  show ' '
+  show 'Report Began at ' &timeBegan ' on ' &dateBegan
+  show ' '
+
+  if $prcs_process_instance = ''
+    Do Ask-As-Of-Date
+    Let $X000_WHERE_SELECT_ASOFDATE = $AsOfDate   
+  else
+    Do GEXXX922-Select-Parameters
+    Let $X000_WHERE_SELECT_ASOFDATE = $GEX_RC_PAY.AsOfDate
+    If Rtrim ($GEX_RC_PAY.AsOfDate, ' ') = ''
+      Let $X000_WHERE_SELECT_ASOFDATE = $AsOfToday
+    End-If
+  end-if
+ 
+  Let $AsOfToday_Dt = strtodate($X000_WHERE_SELECT_ASOFDATE, 'DD-MON-YYYY') !used for calculations
+  Do Format-DateTime($X000_WHERE_SELECT_ASOFDATE, $X000_REPORT_HEADING_ASOFDATE, {DEFDATE}, '', '')
+  Show ' '
+  Show '$X000_WHERE_SELECT_ASOFDATE                         = '  $X000_WHERE_SELECT_ASOFDATE
+  Show ' '
+
+  Let $X000_ORDER_BY = 'Store#, Account Code, Employee Name'
+
+  Do P120-Select-TeamBonus-Period
+
+  Do P130-Get-Max-Confirmed-Pay-End
+
+
+!  let $pay_end_dt = '14-June-2003'                  !****temporary for testing                
+!  let $pfs.strt_dte = '01-JUL-2002'          
+!  let $pfs.end_dte  = '31-JUL-2002'
+   show ' ===> using this pay end date:  ' $pay_end_dt                        
+ 
+  Use-Report TeamBonus-Report
+  Move 'GEXPYTBP'                  To $ReportID            !SCM  08/27/2003
+  Move 'Team Bonus Program Report' To $ReportTitle         !SCM  08/27/2003
+  Do P150-Print-Cover-Page
+  Show '$ReportID=' $ReportID
+  Show '$ReportTitle=' $ReportTitle
+ 
+End-Procedure
+
+!Select the Team Bonus financial period begin and end dates for reporting
+!************************************************
+Begin-Procedure P120-Select-TeamBonus-Period
+!************************************************
+#debug9 Show 'P120-Select-TeamBonus-Period'
+
+Begin-Select Loops=1
+pfs.strt_dte
+pfs.end_dte
+
+  show 'pfs.strt_dte:  ' &pfs.strt_dte
+  show 'pfs.end_dte:   ' &pfs.end_dte
+  let $pfs.strt_dte = &pfs.strt_dte
+  let $pfs.end_dte  = &pfs.end_dte
+  
+!Modified for upgrade 9.0 GEX-AXG - Begin
+!from pfs_payroll_send  pfs
+! from PS_PFS_PAYROL_SEND pfs
+from PS_GEX_TEAMBONUS pfs
+ !Modified for upgrade 9.0 GEX-AXG - End
+End-Select
+End-Procedure
+ 
+   
+!  Get the current pay_end_dt thats currently being processed.  
+!*********************************************************************
+Begin-Procedure P130-Get-Max-Confirmed-Pay-End
+!*********************************************************************
+#debug9 Show 'P130-Get-Max-Confirmed-Pay-End'
+ 
+Begin-Select Loops=1
+PC.CHECK_DT
+PC.PAY_END_DT
+PC.PAY_BEGIN_DT  
+
+  Let $pay_end_dt     = &PC.PAY_END_DT
+  Let $pay_begin_dt   = &PC.PAY_BEGIN_DT
+  Let $check_issue_dt = &PC.CHECK_DT
+  Show 'Max Confirmed pay end date:  ' $pay_end_dt
+
+FROM   PS_PAY_CALENDAR PC
+Where  pc.company = 'GEI'
+  and  pc.paygroup = 'RET'  
+  and  pc.pay_end_dt         =
+       (Select Max(pay_end_dt)
+       From   ps_pay_calendar pc2
+       Where  pc2.pay_end_dt <= $X000_WHERE_SELECT_ASOFDATE
+        and   pc2.company = 'GEI'
+        and   pc2.paygroup = 'RET'
+        And   pc2.PAY_CONFIRM_RUN = 'Y')
+  
+End-Select
+End-Procedure
+
+!************************************************
+begin-procedure P150-Print-Cover-Page
+!************************************************
+#debug9 Show 'P150-Print-Cover-Page'
+  Print 'RUN CONTROL INFORMATION FOR THIS REPORT RUN:'            (+5,1)
+  Print '$Prcs_OPRID          = '                                 (+1,5)
+  Print $Prcs_OPRID                                               (0,+2)
+  Print '$PRCS_RUN_CNTL_ID    = '                                 (+1,5)
+  Print $PRCS_RUN_CNTL_ID                                         (0,+2)
+
+  Print 'SELECTION CRITERIA FOR THIS REPORT RUN:'                 (+5,2)
+  Print 'As Of Date : '                                           (+1,5)
+  Print $X000_REPORT_HEADING_ASOFDATE                             (0,+2)
+ 
+  Print 'Current Pay end date: '                                  (+2,5)
+  Print $Pay_end_dt                                               (0,+2)
+
+  Print 'Financial Period Begin: '                                (+2,5)
+  Print $pfs.strt_dte                                             (+0,30)                     
+  Print 'Financial Period End: '                                  (+1,5)
+  Print $pfs.end_dte                                              (+0,30)      
+
+  Print 'SORT ORDER FOR THIS REPORT RUN:'                         (+3,2)
+  Print $X000_ORDER_BY                                            (+1,5)
+
+  Let #PAGE-COUNT = 0
+  New-Page
+End-Procedure
+
+ 
+!  This sql will return the bonus amount and total hours paid 
+!************************************************
+Begin-Procedure P200-Main-Process
+!************************************************
+#debug9 Show 'P200-Main-Process'
+ 
+  Let $Active-Data-Found-Flag = 'N'
+  move 0 to #sum_deptid_teambonus_amt
+  move 0 to #recs-written-TeamBonus-Rpt
+
+Begin-Select
+PE.deptid         ()     On-Break   Level=1
+                                    Print=Never
+                                    After=P250-Dept-Totals
+PE.acct_cd
+PE.jobcode
+PC.emplid
+PC.empl_rcd
+PC.Name
+PE.Position_nbr			!VENDTKK Added   ITG#56786   28-Jan-2009
+sum(POE.oth_pay) &bonus_amt
+
+  Let $Active-Data-Found-Flag = 'Y'
+  let #bonus_amt = &bonus_amt
+  Let $Emplid = &PC.emplid
+  Let $Deptid = &pe.deptid
+  Do Get-Department-Name                 !getdptnm.sqc
+  move &PE.jobcode to $Jobcode
+  Do get-job-title                       !getjobtl.sqc
+  
+  !VENDTKK Begin   ITG#56786   28-Jan-2009
+  Let $Position_Nbr = &PE.Position_nbr
+  Do Get-Position-Title			 !getposnm.sqc
+  	 IF $PosName = '' 
+  		Let $jobtitle = $jobtitle
+	 Else
+ 		Let $jobtitle = $PosName
+	 End-if
+
+  !VENDTKK End   ITG#56786   28-Jan-2009
+  
+  move &PE.acct_cd to $GEXACTCD_ACCT_CD         
+  Do GEXACTCD-Get-Acct-Cd-Info           !gexactcd.sqc  returns $GEXACTCD_DESCRSHORT
+
+  Do P500-Print-TeamBonus-Report
+  Let $Save_Deptid = $Deptid
+
+FROM PS_PAY_CHECK PC,
+     PS_PAY_EARNINGS PE,
+     PS_PAY_OTH_EARNS POE
+WHERE PE.COMPANY        = PC.COMPANY
+    AND PE.PAYGROUP     = PC.PAYGROUP
+    AND PE.PAY_END_DT   = PC.PAY_END_DT
+    AND PE.OFF_CYCLE    = PC.OFF_CYCLE
+    AND PE.PAGE_NUM     = PC.PAGE_NUM
+    AND PE.LINE_NUM     = PC.LINE_NUM
+    AND PE.SEPCHK       = PC.SEPCHK
+    AND POE.COMPANY     = PE.COMPANY
+    AND POE.PAYGROUP    = PE.PAYGROUP
+    AND POE.PAY_END_DT  = PE.PAY_END_DT
+    AND POE.OFF_CYCLE   = PE.OFF_CYCLE
+    AND POE.PAGE_NUM    = PE.PAGE_NUM
+    AND POE.LINE_NUM    = PE.LINE_NUM
+    AND POE.SEPCHK      = PE.SEPCHK
+    AND POE.ADDL_NBR    = PE.ADDL_NBR
+    AND POE.PAY_END_DT  = $pay_end_dt
+    AND POE.ERNCD       = '535'                       !retail Bonus bonus erncd
+
+Group By PE.deptid, PE.acct_cd, PE.jobcode, PC.emplid, PC.empl_rcd, PC.Name ,PE.Position_nbr  !VENDTKK Added   ITG#56786   28-Jan-2009  
+Order By PE.deptid, PE.acct_cd, PC.Name
+
+End-Select
+  
+ If $Active-Data-Found-Flag = 'N'
+    Use-Report TeamBonus-Report
+    Print 'NO DATA SELECTED FOR THIS REPORT RUN'	(25,) Center
+ Else    
+    Do P510-Print-TeamBonus-Rpt-Grand-Tls
+    Do P800-Show-Totals-to-Log
+  End-If
+End-Procedure
+
+
+!******************************************
+Begin-Procedure P250-Dept-Totals
+!******************************************
+#debug9 Show 'P250-Dept-Totals'
+  Use-Report TeamBonus-Report
+  print 'Totals  for  Store: '            (+2,1)
+  print $Save_Deptid                      (+0,+2) 
+  print #sum_deptid_teambonus_amt         (+0,113)  edit $999,999.99
+  print 'Number of Bonuses: '             (+0,130)
+  print #num_bonuses_by_store              (+0,149)  edit 99,999
+  
+  New-Page
+  let #sum_deptid_teambonus_amt      = 0
+  let #num_bonuses_by_store          = 0 
+ 
+End-Procedure
+
+
+!************************************************
+Begin-Procedure P500-Print-TeamBonus-Report
+!************************************************
+#debug9 Show 'P500-Print-TeamBonus-Report'
+
+  Use-Report TeamBonus-Report
+
+  print &pe.acct_cd                   (+1,{#column1})
+  print $GEXACTCD_DESCRSHORT          (+0,{#column2})
+  print &pc.name              	      (+0,{#column3},30)
+  print $Emplid                       (+0,{#column4})   
+  print $JobTitle                     (+0,{#column5},30)         !job description 
+  print #bonus_amt                    (+0,{#column6})   edit $9,999.99
+  
+  add #bonus_amt to #sum_deptid_teambonus_amt
+  add #bonus_amt to #Grand_Total_Bonus_Amt
+  add 1 to #recs-written-TeamBonus-Rpt
+  add 1 to #num_bonuses_by_store
+   
+End-Procedure
+       
+!*******************************************************
+Begin-Procedure P510-Print-TeamBonus-Rpt-Grand-Tls
+!*******************************************************
+#debug9 Show 'P510-Print-TeamBonus-Rpt-Grand-Tls'
+  Use-Report TeamBonus-Report
+  
+  Print '-'                                 (+2,{#column1},174)  Fill
+  Print '*********  Team Bonus Report Grand Totals  *********'   (+1,1)
+  Print 'Grand Total #Detail Bonus Amounts :  '            (+1,1)  
+  Print #recs-written-TeamBonus-Rpt                       (+0,54) edit 9,999,999
+  Print 'Grand Total Bonus Amount:  '                      (+1,1)
+  Print #Grand_Total_Bonus_Amt                            (,+2)   edit $99,999,999.99
+  Print '*********  Team Bonus Report Grand Totals  *********'   (+1,1)
+ 
+End-Procedure
+
+!************************************************
+Begin-Procedure P800-Show-Totals-to-Log
+!************************************************
+#debug9 Show 'P800-Show-Totals-to-Log'
+
+    move #recs-written-TeamBonus-Rpt   to $recs-written-TeamBonus-Rpt     8,888,888
+    move #Grand_Total_Bonus_Amt to $Grand_Total_Bonus_Amt     8,888,888.88       
+    show '**********************************************************************'             
+    show 'Number of Detail Lines Written to Report:      ' $recs-written-TeamBonus-Rpt    
+    show 'Grand Total Team Bonus Amount:                 ' $Grand_Total_Bonus_Amt
+    show '**********************************************************************' 
+ 
+End-Procedure
+   
+begin-procedure P995-SQL-Error-Found($Proc_Name) 
+  display 'SQL Error in ' 
+  display $Proc_Name 
+  display $_sql-error
+  display 'sql-status:' 
+  display #_sql-status 
+!  STOP
+end-procedure
+
+  
+#Include 'gexxx922.sqc'  !Get pay single row run control 
+#Include 'getdptnm.sqc'  !Get-Department-Name routine
+#Include 'askaod.sqc'    !Ask-As-Of-Date routine
+#Include 'rotname3.sqc'  !Routines to rotate name
+#Include 'stdapi.sqc'    !Routines to Update Run Status
+#Include 'curdttim.sqc'  !Get-Current-DateTime Procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'datemath.sqc'  !Routines for date math
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'gexactcd.sqc'  !GEXACTCD-Get-Acct-Cd-Info routine
+#include 'gexaltse.sqc'  !Alter session SQC
+#include 'gexxx951.sqc'  !Get Oracle dbase instance
+#include 'getjobtl.sqc'  !get-job-title
+#Include 'reset.sqc'     !Reset printer Procedure
+#Include 'readxlat.sqc'  !Read-Translate-Table procedure
+#Include 'getposnm.sqc'  !Get-Position-Title  VENDTKK   ITG#56786   28-Jan-2009

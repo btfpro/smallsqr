@@ -1,0 +1,1165 @@
+!***********************************************************************
+! GEXPYOTO: This program calculates one time deductions based on actual*
+!           hours worked for off-cycle paycheck calculations.          *    
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module is the confidential and proprietary information of       *
+! Giant Eagle, Inc.; it is not to be copied, reproduced, or transmitted*
+! in any form, by any means, in whole or in part, nor is it to be used *
+! for any purpose other than that for which it is expressly provided   *
+! without the written permission of Giant Eagle.                       *
+!                                                                      *
+!                                                                      *
+!***********************************************************************
+!***********************************************************************
+!                         MODIFICATION HISTORY                         *
+!***********************************************************************
+!  ID#     INITIALS    DATE           DESCRIPTION OF THE CHANGE        *        
+!***********************************************************************
+!  T.45.0790          CJH       04/21/2001     GEXPYOTO Rewrite        * 
+!                     GBD       06/18/2002     Add Plan Type 1Q to the *
+!                                              list of hard coded plan *
+!                                              types in the procedure  *
+!                                              used to delete one time *
+!                                              deduction rows.         *
+!	GEX-AXG        10/23/2007              Upgrade 9.0 	       * 
+! Surya Sobha	       10/29/2015              Increased the array size*
+!					       for BPinfo array        *	 
+!***********************************************************************
+
+#include 'setenv.sqc' !Set environment
+begin-setup
+
+!#include 'setupdb.sqc'
+#include 'setup32a.sqc'
+
+
+declare-report Report-log
+Printer-Type=HPLASERJET
+   layout=DEFAULT
+end-declare
+
+end-setup
+
+!*********************************************************************
+!Initial processing, retrieving current dates and calls the main 
+!procedure to do the processing.                                     
+!*********************************************************************
+begin-report
+
+  !do Alter-Session   ! Set Session to RULE Optimizer	!GEX-AXG commented for upgrade 9.0 on 10/23/2007
+  use-report Report-log
+  do Init-DateTime
+  do Init-Number
+  do stdapi-init
+  
+  move 'GEXPYOTO' to $ReportID
+  move 'Off-Cycle Payroll Deductions based on Actual Hours' to $ReportTitle
+
+  do Get-Current-DateTime
+  do Report
+
+!GBD 06/18/2002 Begin
+  do Commit-Transaction
+!  do Rollback-Transaction
+!GBD 06/18/2002 End
+
+  date-time () hh:mi:ss &timeEnded
+  display 'Report Ended: ' noline
+  display &timeEnded
+  do stdapi-term
+
+end-report
+
+!*********************************************************************
+!If this Program is being executed through process scheduler, 
+!the run control parameters and calls the main processing procedure.
+!Otherwise, interrogates the user for the run control parameters and 
+!validates them. If the run control parameters are invalid, stops the
+!execution.
+!*********************************************************************
+begin-procedure Report
+  let #InputTran = 0
+  let #j = 1
+  !let #array_size = 300
+  let #array_size = 400 !Surya Sobha - 10292015 - changed from 300 to 400 Case number 1765978
+  display 'Version Modified April 24, 2001'
+  display $AsOfToday
+  let $pay_end_dt = ' '
+  If $prcs_process_instance = ''
+    while RTRIM($pay_end_dt,' ') = ''
+      input $pay_end_dt 'Enter Pay End Date(DD-MON-YYYY)' type=char
+    end-while
+    
+  Else
+    Do GEXXX922-Select-Parameters
+    let $pay_end_dt = $GEX_RC_PAY.ASOFDATE
+    if rtrim($GEX_RC_PAY.ASOFDATE,' ') = ''
+       display 'Pay End Date is required: program is terminated'
+       stop
+    end-if
+  end-if
+
+  CREATE-ARRAY name=BPinfo size=400  !Surya Sobha - 10292015 - changed the array size from 300 to 400 Case number 1765978
+      field=BP:char
+      field=EFFDT:char
+      field=PLAN_TYPE:char
+      field=OPTION_ID:char
+      field=BENEFIT_PLAN:char
+      field=DEDCD:char
+      field=COST_ID:char
+      field=RATE_TYPE:char
+      field=RATE_TBL_ID:char
+      field=ERNCD_SPCL:char
+      field=GEX_RATE_AMT:number
+      field=GEX_WEEK_HRS_CAP:number
+      field=GEX_YEAR_HRS_CAP:number
+
+  do validate-pay-end-dt
+  do load-array
+  display 'Benefit Program Array Load - complete'
+  do edit-pay-calendar
+  
+  date-time () hh:mi:ss &timeProcess
+  display #InputTran 99999 noline
+  display ' Transactions Processed: ' noline
+  display &timeProcess
+
+end-procedure
+
+!************************************************************************
+!*
+!************************************************************************
+begin-procedure Edit-Pay-Calendar
+  move 'N' to $Found_cal
+begin-select 
+
+Y1.COMPANY
+Y1.PAYGROUP
+Y1.PAY_END_DT 
+Y1.pay_begin_dt
+Y1.CHECK_DT
+
+  move 'Y' to $Found_cal
+
+  move &Y1.PAY_END_DT to $pay_end_dt
+  move &Y1.PAY_BEGIN_DT TO $pay_begin_dt
+  move &Y1.company to $company
+  move &y1.paygroup to $paygroup
+  move &Y1.check_dt to $cal_check_dt
+
+  display 'Company / Paygroup : ' noline
+  display $company noline
+  display ' / ' noline
+  display $paygroup
+  display 'Pay End Date: ' noline
+  display $pay_end_dt
+
+  do process-employee-data
+
+  FROM PS_PAY_CALENDAR Y1
+where Y1.RUN_ID > ' '
+  AND Y1.PAY_END_DT = $PAY_END_DT
+end-select
+
+  if $Found_cal = 'N'
+    display 'Error --  Pay Calendar not found or not setup for the Run ID.'
+    move ' ' to $SlctCompany
+  end-if
+
+end-procedure
+
+!*********************************************************************
+!Gets the Pay End Date to process for
+!*********************************************************************
+begin-procedure Validate-Pay-End-dt
+let $found = 'N'
+begin-select 
+
+Z1.PAY_END_DT
+  
+  move 'Y' to $found
+
+FROM PS_PAY_CALENDAR Z1
+where Z1.PAY_CONFIRM_RUN = 'N'
+  and Z1.RUN_ID > ' '
+  AND Z1.PAY_END_DT = $pay_end_dt
+end-select
+if $found = 'N'
+   display 'Off cycle Pay end date (' noline
+   display $pay_end_dt noline
+   display ') has Confirm flags set ' 
+   stop
+end-if
+end-procedure
+
+!*********************************************************************
+!Prints the header information in the report log.
+!*********************************************************************
+begin-heading 8 for-reports=(report-log)
+
+ #Include 'stdhdg01.sqc'
+
+  position (+1)
+  print 'Report Log' () center bold
+
+  position (+2)
+  print 'Trans#' (,1) bold
+  print 'Emplid' (,18) bold
+  print 'Message' (,50) bold
+  print '-' (+1,1,127) fill
+ 
+end-heading
+
+
+!*********************************************************************
+!Prints the footer in the report log
+!*********************************************************************
+
+begin-footing 2 for-reports=(Report-log)
+page-number (1,108) 'Page '  
+last-page () ' of ' '.'
+
+end-footing
+
+!************************************************************************
+Begin-Procedure Load-Array
+
+begin-select on-error=sql-error-found('Load-Benefit-Info')
+/*+ RULE */
+AA1.BENEFIT_PROGRAM
+AA1.EFFDT
+AA3.OPTION_ID
+AA3.BENEFIT_PLAN
+AA3.PLAN_TYPE
+AA3.DEDCD
+AA4.COST_ID
+AA4.RATE_TYPE
+AA4.RATE_TBL_ID
+AA5.ERNCD_SPCL
+AA5.GEX_RATE_AMT
+AA5.GEX_WEEK_HRS_CAP
+AA5.GEX_YEAR_HRS_CAP
+AA5.EFFDT
+
+   move &AA1.BENEFIT_PROGRAM to $BP
+   move &AA1.EFFDT to $effdt
+   move &AA3.OPTION_ID to $option_id
+   move &AA3.BENEFIT_PLAN to $benefit_plan
+   move &AA3.PLAN_TYPE to $plan_type
+   move &AA3.DEDCD to $dedcd
+   move &AA4.COST_ID to $cost_id
+   move &AA4.RATE_TYPE to $rate_type
+   move &AA4.RATE_TBL_ID to $rate_id
+   move &AA5.ERNCD_SPCL to $erncd_spcl
+   move &AA5.GEX_RATE_AMT to #gex_rate_amt
+   move &AA5.GEX_WEEK_HRS_CAP to #in_week_cap
+   move &AA5.GEX_YEAR_HRS_CAP to #in_year_cap
+
+ #debug9 display 'BP / EFFDT : ' noline
+ #debug9 display $BP noline
+ #debug9 display ' / ' noline
+ #debug9 display $effdt
+
+ put $BP $effdt $option_id $benefit_plan $plan_type $dedcd $cost_id -
+     $rate_type $rate_id $erncd_spcl #gex_rate_amt #in_week_cap #in_year_cap into BPinfo(#j)
+
+ let #j = #j + 1
+ 
+from PS_BEN_DEFN_PLAN AA1,
+     PS_BEN_DEFN_OPTN AA3,
+     PS_BEN_DEFN_COST AA4,
+     PS_GEX_FLAT_RATE AA5
+where AA1.EFFDT = (select max(BBB1.effdt) from ps_ben_defn_plan BBB1
+                        where BBB1.benefit_program = AA1.benefit_program and
+                              BBB1.effdt <= &Z1.PAY_END_DT) and
+      AA1.BENEFIT_PROGRAM = AA3.BENEFIT_PROGRAM and
+      AA1.EFFDT = AA3.EFFDT and
+      AA1.PLAN_TYPE = AA3.PLAN_TYPE and
+      AA3.BENEFIT_PROGRAM = AA4.BENEFIT_PROGRAM and
+      AA3.EFFDT = AA4.EFFDT and
+      AA3.PLAN_TYPE = AA4.PLAN_TYPE and
+      AA3.OPTION_ID = AA4.OPTION_ID and
+      AA5.EFFDT = (select max(aaa5.effdt) from ps_gex_flat_rate aaa5
+                          !GEX-AXG Modified for Upgrade 9.0 on 10/23/2007 - Begin
+                          !where aaa5.flat_rate_id = AA5.FLAT_RATE_ID
+                          where aaa5.RATE_TBL_ID = AA5.RATE_TBL_ID
+                          !GEX-AXG Modified for Upgrade 9.0 on 10/23/2007 - End
+                            and aaa5.sequence_number = AA5.SEQUENCE_NUMBER
+                            and aaa5.effdt <= &Z1.PAY_END_DT) and
+!GEX-AXG Modified for Upgrade 9.0 on 10/23/2007 - Begin
+      !AA4.RATE_TBL_ID = AA5.FLAT_RATE_ID and
+      AA4.RATE_TBL_ID = AA5.RATE_TBL_ID and
+!GEX-AXG Modified for Upgrade 9.0 on 10/23/2007 - End
+      AA5.GEX_RATE_AMT <> 0 and
+      AA4.RATE_TYPE = '2' 
+end-SELECT
+end-procedure
+!************************************************************************
+! Select EEs for Pay Period with Pay Lines that have been changed/created
+!************************************************************************
+Begin-Procedure Process-Employee-Data
+
+move 'N' to $errorfound
+move 'N' to $found
+let $first = 'Y'
+begin-SELECT on-error=sql-error-found('Process-Employee-Data')
+/*+ RULE */
+P.COMPANY
+P.PAYGROUP
+P.PAY_END_DT
+P.EMPL_RCD
+P.EMPLID
+P.OFF_CYCLE
+P.PAGE_NUM
+P.LINE_NUM
+P.ADDL_NBR
+P.SEPCHK
+P.EARNS_BEGIN_DT
+P.EARNS_END_DT
+P.PAY_LINE_STATUS
+A.JOB_CHANGE
+
+  #debug9 display 'Emplid/Rcd: ' noline
+  #debug9 display &P.EMPLID noline
+  #debug9 display '/' noline
+  #debug9 display &P.EMPL_RCD
+
+
+ if $first = 'Y'
+    move &P.EMPLID    to $emplid
+    move &P.EMPL_RCD to #empl_rcd
+    move 'N' to $first
+    do Get-Benefit-Info
+ else
+    move &P.EMPL_RCD to #new_rcd
+    if (&P.EMPLID <> $emplid or #new_rcd <> #empl_rcd)
+       move &P.EMPLID    to $emplid
+       move &P.EMPL_RCD to #empl_rcd
+       do Get-Benefit-Info
+    end-if
+ end-if
+
+
+from ps_pay_earnings P
+   , ps_pay_line A
+where P.COMPANY = $company
+ and P.PAYGROUP = $paygroup
+ and P.PAY_END_DT = $pay_end_dt 
+ and P.OFF_CYCLE = 'Y'
+ and (P.PAY_LINE_STATUS in ('I','U','E') OR
+      A.JOB_CHANGE = 'R')
+ and P.OK_TO_PAY = 'Y'
+ and A.Company = P.Company
+ and A.Paygroup = P.Paygroup
+ and A.Pay_End_dt = P.Pay_End_dt
+ and A.Off_cycle = P.Off_cycle
+ and A.PAGE_NUM = P.PAGE_NUM
+ and A.LINE_NUM = P.LINE_NUM
+
+order by P.EMPLID, P.EMPL_RCD
+
+end-SELECT
+
+move #InputTran to #co_count
+display #co_count 99999 noline
+display ' Employees Processed'
+display ' '
+let #co_count = 0
+
+end-procedure
+
+!************************************************************************
+!Retrieves active benefit plan/option/cost for options w/flat rate costs
+!************************************************************************ 
+
+begin-procedure Get-Benefit-Info
+move 'N' to $errorfound
+move 'N' to $plan_found
+
+ add +1 to #InputTran
+ display '-- Process Employee : ' noline
+ display &P.emplid noline
+ display ' / ' noline
+ display &P.empl_rcd noline
+ display ' Start: ' noline
+ date-time () hh:mi:ss &starttime
+ display  &starttime 
+
+ 
+ do delete-from-one-time
+ 
+
+
+begin-select on-error=sql-error-found('Get-Benefit-Info')
+/*+ RULE */
+B2.EMPLID
+B2.EMPL_RCD
+B2.COBRA_EVENT_ID
+B2.PLAN_TYPE
+B2.BENEFIT_NBR
+B2.EFFDT
+B2.BENEFIT_PLAN
+B2.COVERAGE_ELECT
+BPP.EMPLID
+BPP.EMPL_RCD
+BPP.EFFDT
+BPP.BENEFIT_PROGRAM
+
+      #debug9 display 'Processing EE BP/Plan Type/Benefit Plan: ' noline
+      #debug9 display &BPP.BENEFIT_PROGRAM noline
+      #debug9 display '/' noline
+      #debug9 display &B2.PLAN_TYPE noline
+      #debug9 display '/' noline
+      #debug9 display &B2.BENEFIT_PLAN
+
+  let $term_pen = 'N'
+  let $pgm_comp = &BPP.BENEFIT_PROGRAM
+  let $plan_type_comp = &B2.PLAN_TYPE
+  let $ben_plan_comp = &B2.BENEFIT_PLAN
+
+  let $enrolled = 'Y'
+! CJH - 07/17/2000 - if current coverage is terminated, process the EE under the leave/vac logic
+   if &B2.PLAN_TYPE = '1X'
+     if &B2.COVERAGE_ELECT = 'T' 
+        #debug9 display 'Eff Date of T row: ' noline
+        #debug9 display &B2.EFFDT
+       do get-empl-status  ! get empl status to see if EE is on leave
+       let $enrolled = 'N'
+       if $empl_status = 'P'
+           do get-last-row
+  display 'EE currently on-leave, but benefits are terminated...using the following from the E row: ' noline
+  display $pgm_comp noline
+  display '/' noline
+  display $plan_type_comp noline
+  display '/' noline
+  display $ben_plan_comp
+           let $term_pen = 'Y'
+       else
+         goto out      
+       end-if
+     end-if
+  end-if
+
+
+ let #i = 1
+ while 1
+
+  get $BP $effdt $option_id $benefit_plan $plan_type $dedcd $cost_id -
+      $rate_type $rate_id $erncd_spcl #array_gex_rate_amt #array_week_cap -
+      #array_year_cap from BPinfo(#i)
+
+   if ($ben_plan_comp = $benefit_plan) and ($plan_type_comp = $plan_type) and ($pgm_comp = $BP)
+      move 'Y' to $plan_found
+      break 
+   end-if
+
+   let #i = #i + 1
+
+    if #i = #array_size
+      #debug9 display 'EE BP/Plan Type/Benefit Plan not defined as rate*hrs: ' noline
+      #debug9 display &BPP.BENEFIT_PROGRAM noline
+      #debug9 display '/' noline
+      #debug9 display $plan_type_comp noline
+      #debug9 display '/' noline
+      #debug9 display $ben_plan_comp
+      move 'N' to $plan_found
+      break
+   end-if
+ 
+ end-while
+
+ if $plan_found = 'Y'
+  #debug9 display 'Calculating Rate x Hrs Deduction for : ' noline
+  #debug9 display &BPP.BENEFIT_PROGRAM noline
+  #debug9 display '/' noline
+  #debug9 display &B2.PLAN_TYPE noline
+  #debug9 display '/' noline
+  #debug9 display &B2.BENEFIT_PLAN
+
+  display 'plan type: ' noline
+  display $plan_type
+  display 'Coverage elect: ' noline
+  display &B2.COVERAGE_ELECT
+
+
+  do get-empl-pay-lines
+  do Compare-Actual-Hrs
+  do Process-Each-Ded-Class
+ end-if
+
+out:
+
+from PS_HEALTH_BENEFIT B2,
+     PS_BEN_PROG_PARTIC BPP
+where B2.EMPLID = &P.EMPLID and
+      B2.EMPL_RCD = &P.EMPL_RCD and
+      BPP.EMPLID = B2.EMPLID and
+      BPP.EMPL_RCD = B2.EMPL_RCD and
+      BPP.EFFDT = (select max(BPP2.effdt) from ps_ben_prog_partic BPP2
+                    where BPP2.emplid = BPP.emplid and
+                          BPP2.empl_rcd = BPP.empl_rcd and
+                          BPP2.effdt <= &P.EARNS_BEGIN_DT) and 
+!                          BPP2.effdt <= &P.PAY_END_DT) and 
+      B2.EFFDT = (select max(BB2.effdt) from ps_health_benefit BB2
+                        where BB2.emplid = B2.emplid and
+                              BB2.empl_rcd = B2.empl_rcd and
+                              BB2.plan_type = B2.plan_type and
+                              BB2.benefit_nbr = B2.benefit_nbr and
+                              BB2.effdt <= &P.EARNS_BEGIN_DT) and
+!                              BB2.effdt <= &P.PAY_END_DT) and
+      (B2.COVERAGE_ELECT = 'E' or B2.COVERAGE_ELECT = 'T')
+
+end-SELECT
+end-procedure
+!********************************************************************
+begin-procedure get-last-row
+let $enr_found = 'N'
+begin-Select
+GLR.PLAN_TYPE
+GLR.BENEFIT_NBR
+GLR.EFFDT
+GLR.BENEFIT_PLAN
+GLR.COVERAGE_ELECT
+GLRB.BENEFIT_PROGRAM
+
+ let $enr_found = 'Y'
+ let $pgm_comp = &GLRB.BENEFIT_PROGRAM
+ let $plan_type_comp = &GLR.PLAN_TYPE
+ let $ben_plan_comp = &GLR.BENEFIT_PLAN
+ #debug9 display 'E-row pgm/plan type/ben plan: ' noline
+ #debug9 display $pgm_comp noline
+ #debug9 display '/' noline
+ #debug9 display $plan_type_comp noline
+ #debug9 display '/' noline
+ #debug9 display $ben_plan_comp
+
+from ps_health_benefit GLR,
+     ps_ben_prog_partic GLRB
+where GLR.emplid = &B2.emplid and
+      GLR.empl_rcd = &B2.empl_rcd and
+      GLRB.emplid = GLR.emplid and
+      GLRB.empl_rcd = GLR.empl_rcd and
+      GLR.plan_type = &B2.plan_type and
+      GLR.benefit_nbr = &B2.benefit_nbr and
+      GLR.COVERAGE_ELECT = 'E' and
+      GLRB.EFFDT = (select max(GLRB2.effdt) from ps_ben_prog_partic GLRB2
+                    where GLRB2.emplid = &BPP.emplid and
+                          GLRB2.empl_rcd = &BPP.empl_rcd and
+                          GLRB2.effdt < &B2.EFFDT) and 
+      GLR.effdt = (select max(GLR2.effdt) from ps_health_benefit GLR2
+                   where GLR2.emplid = &B2.emplid and
+                         GLR2.empl_rcd = &B2.empl_rcd and
+                         GLR2.plan_type = GLR.plan_type and
+                         GLR2.benefit_nbr = GLR.benefit_nbr and
+                         GLR2.effdt < &B2.EFFDT)      !B2.EFFDT is the max Term row
+
+end-Select
+end-procedure
+!********************************************************************
+Begin-Procedure Get-Empl-Pay-lines
+
+move 'N' to $found
+let #actual_hrs = 0
+let #actual_hrs_all = 0
+
+  do Get-Spcl-Earns  
+
+!SXK 09/09/1998 Begin - Need to use 40 hours for FT and 28 hours for PT
+!employee if employee is on PAid Leave and have no hours logged this week.
+
+ #debug9 display 'Actual Hours before Leave: ' noline
+ #debug9 display #actual_hrs_all
+ if #actual_hrs_all = 0
+! 07/17/2000 - CJH - add $enrolled logic for leave term/vacation
+   if $enrolled = 'Y'
+    if $plan_type = '1X'
+       do get-empl-status
+       #debug9 display $plan_type
+       #debug9 display $full_part_tim
+       if $empl_status = 'P'
+          if $full_part_time = 'F'
+              move 40 to #actual_hrs
+              move 40 to #actual_hrs_all
+          else
+              move 28 to #actual_hrs
+              move 28 to #actual_hrs_all
+          end-if
+       end-if
+    end-if
+   end-if
+! 07/17/2000 - CJH
+! end-if
+
+
+      
+ move #actual_hrs to $actual_hrs
+ move #actual_hrs_all to $actual_hrs_all
+ #debug9 display 'Total Hrs - Vac : ' noline
+ #debug9 display $actual_hrs
+ #debug9 display 'Total Hrs : ' noline
+ #debug9 display $actual_hrs_all
+
+end-if
+
+end-procedure
+
+
+!*********************************************************************
+!Retrieves the weekly earnings of special accumulator ERNCDs for     *
+!the employee - all paylines                                         *
+!*********************************************************************
+
+begin-procedure Get-Spcl-Earns
+
+begin-SELECT
+/*+ RULE */
+O.ERNCD
+O.OTH_HRS
+
+!
+! filter out vacation earnings
+!
+  move 'Y' to $found
+! 07/18/2000 - CJH - begin
+  if $term_pen = 'Y'
+    if (&O.ERNCD = '513' or &O.ERNCD = '515' or &O.ERNCD = '519' or &O.ERNCD = '522'
+        or &O.ERNCD = '523')
+       let #actual_hrs = 0
+       let #actual_hrs_all = &O.OTH_HRS + #actual_hrs_all
+    end-if
+  else
+  if (&O.ERNCD <> '513' and &O.ERNCD <> '515' and &O.ERNCD <> '519' 
+      and &O.ERNCD <> '522' and &O.ERNCD <> '523')
+       let #actual_hrs = &O.OTH_HRS + #actual_hrs
+    end-if
+    let #actual_hrs_all = &O.OTH_HRS + #actual_hrs_all
+  end-if
+! 07/18/2000 - CJH - end
+
+! CJH - 02/15/1999 - begin
+from ps_earnings_spcl S,
+     ps_pay_oth_earns O,
+     ps_pay_earnings P1
+where P1.EMPLID    = &P.EMPLID
+and P1.EMPL_RCD = &P.EMPL_RCD
+and P1.COMPANY = $Company
+and P1.PAYGROUP = $Paygroup
+and P1.PAY_END_DT = $Pay_end_dt
+and P1.PAY_LINE_STATUS <> 'F'
+and P1.OFF_CYCLE = 'Y'
+and P1.COMPANY = O.COMPANY
+and P1.PAYGROUP = O.PAYGROUP
+and P1.PAY_END_DT = O.PAY_END_DT
+and P1.OFF_CYCLE = O.OFF_CYCLE
+and P1.PAGE_NUM = O.PAGE_NUM
+and P1.LINE_NUM = O.LINE_NUM
+and P1.ADDL_NBR = O.ADDL_NBR
+and P1.OK_TO_PAY = 'Y'
+and O.OTH_HRS > 0
+and O.ERNCD = S.ERNCD 
+and S.ERNCD_SPCL = $erncd_spcl
+and S.SPCL_EFFECT = 'A'
+and S.EFFDT = (select max(ss.effdt) from ps_earnings_spcl ss
+                               where ss.erncd_spcl = s.erncd_spcl
+                               and ss.erncd = s.erncd
+                               and ss.spcl_effect = S.spcl_effect
+                               and ss.effdt <= &P.PAY_END_DT)
+end-SELECT
+end-procedure
+
+!*********************************************************************
+!Retrieves Empl status and full part time from PS_JOB
+!*********************************************************************
+
+Begin-Procedure get-empl-status
+
+move ' ' to $empl_status
+move ' ' to $full_part_time
+
+Begin-Select 
+/*+ RULE */
+x1.empl_status
+x1.full_part_time
+
+   move &x1.empl_status to $empl_status
+   move &x1.full_part_time to $full_part_time
+
+from ps_job x1
+where x1.emplid = &P.EMPLID
+  and x1.empl_rcd = &P.EMPL_RCD
+  and x1.effdt = (select max(effdt)
+                    from ps_job
+                   where emplid = &P.EMPLID
+                     and empl_Rcd = &P.EMPL_RCD
+                     and effdt <= &P.PAY_END_DT)
+  and x1.effseq = (select max(effseq)
+                     from ps_job
+                    where emplid = &P.EMPLID
+                      and empl_Rcd = &P.EMPL_RCD
+                      and effdt = x1.effdt)
+end-select
+
+end-procedure
+
+!SXK 09/09/1998 End
+
+!*********************************************************************
+!Compare actual hrs with the defined hrs caps
+!*********************************************************************
+
+begin-procedure Compare-Actual-Hrs
+!*********************************************************************
+!  Weekly cap should compare to all hrs from spcl accum minus any vacation.
+!  Yearly cap should compare to all hrs from spcl accum.
+!  Contribution amt (insert into pay_one_time) should include all hours from 
+!  the spcl accum unless capped by weekly or yearly cap
+!
+! NOTE: 
+! #actual_hrs - accumulator of all earnigs minus vacation '513' or '515'
+! #actual_hrs_all - accumulator of ALL earnings
+!
+!*********************************************************************
+move 0 to #week_cap
+move 0 to #year_cap
+
+move 'N' to $weekly_capped
+ if #array_week_cap <> 0  
+   move #array_week_cap to #week_cap
+   if #week_cap >= #actual_hrs   ! Cap the (weekly hours - Vacation earns)
+      let #update_hrs = #actual_hrs_all
+                        ! if not capped weekly - use all hours
+   else
+      let #update_hrs = #week_cap + (#actual_hrs_all - #actual_hrs)
+                        ! if weekly capped - use cap amt + vacation earns
+      move 'Y' to $weekly_capped
+   end-if
+
+   if #array_year_cap <> 0  
+      move #array_year_cap to #year_cap
+      do Get-Year-Balance
+      if (#ytd_hrs + #actual_hrs_all) > #year_cap
+                          ! Yearly cap of all earnings including vacation earns
+         let #update_hrs = #year_cap - #ytd_hrs
+       else
+         if $weekly_capped = 'N'
+             let #update_hrs = #actual_hrs_all
+                          ! If no yearly cap, update with all hours
+         end-if 
+      end-if
+   end-if
+else
+   let #update_hrs = #actual_hrs_all   !no capping found - update with all earns
+end-if
+ 
+  do prepare-hrs-bal
+
+end-procedure    
+
+!*********************************************************************
+! Retrieve YTD hrs for EMPLID, PLAN_TYPE and BENEFIT_PLAN 
+!*********************************************************************
+
+begin-procedure Get-Year-Balance
+ Let #ytd_hrs = 0
+ do Convert-to-DTU-date($cal_check_dt,$check_dt_DTU)
+ let $chk_year = substr($check_dt_DTU,1,4)
+begin-SELECT
+/*+ RULE */
+sum(h.total_hrs) &tot
+  
+  let  #ytd_hrs =  &tot
+  #debug9 display 'Year Balance Total = ' noline
+  #debug9 display &tot
+
+from ps_gex_hrs_bal h
+
+where h.company = &p.company
+  and h.paygroup = &p.paygroup
+  and &p.emplid = h.emplid
+  and &P.empl_rcd = h.empl_rcd
+  and  h.plan_type = $PLAN_TYPE
+  and  h.benefit_plan = $BENEFIT_PLAN
+  and  TO_CHAR(h.check_dt,'YYYY') = $chk_year
+  and h.check_dt <= $cal_check_dt
+end-SELECT	
+	
+end-procedure
+
+!*********************************************************************
+! Prepare to Insert/Update GEX_HRS_BAL table
+!*********************************************************************
+
+begin-procedure prepare-hrs-bal
+  #debug9 display 'Prepare Hrs Bal'
+!  do Check-hrs-bal
+  #debug9 display 'Update hrs: ' noline
+  #debug9 display #update_hrs
+  #debug9 display 'Actual Hrs: ' noline
+  #debug9 display #actual_hrs
+  let #update_hrs_abs = abs(#update_hrs)
+
+   if #update_hrs_abs > #actual_hrs_abs
+      if $weekly_capped = 'N'
+         if #update_hrs < 0
+            let #vacn_hours = #actual_hrs - #update_hrs
+         else
+            let #vacn_hours = #update_hrs - #actual_hrs
+         end-if      
+      else
+         if #update_hrs < 0
+            let #vacn_hours = #update_hrs + #week_cap
+         else
+            let #vacn_hours = #update_hrs - #week_cap
+         end-if
+      end-if
+   else
+       let #vacn_hours = #actual_hrs_all - #actual_hrs  
+   end-if
+
+
+   if #update_hrs = 0
+      let #vacn_hours = 0
+   end-if 
+	   
+end-procedure
+
+
+!*********************************************************************
+! Check GEX_HRS_BAL for current Pay End Dt EMPLID row
+!*********************************************************************
+begin-procedure Check-hrs-bal
+  move 'N' to $row-found
+begin-SELECT
+/*+ RULE */
+! 04/12/2001 - CJH - add new columns to select */
+Z.COMPANY
+Z.PAYGROUP
+Z.PAY_END_DT
+Z.OFF_CYCLE
+Z.PAGE_NUM
+Z.LINE_NUM
+Z.SEPCHK
+Z.EMPLID
+Z.EMPL_RCD
+Z.REQUEST_DT
+Z.CHECK_DT
+Z.PLAN_TYPE
+Z.BENEFIT_PLAN
+Z.TOTAL_HRS
+Z.VACN_HOURS
+
+  move 'Y' to $row-found
+
+from ps_gex_hrs_bal z
+where Z.COMPANY = &P.COMPANY
+  and Z.PAYGROUP = &P.PAYGROUP
+! CJH - 04/12/2001 - add new columns to join criteria
+  and Z.PAY_END_DT = &P.PAY_END_DT
+  and Z.OFF_CYCLE = &P.OFF_CYCLE 
+  and Z.PAGE_NUM = &P.PAGE_NUM
+  and Z.LINE_NUM = &P.LINE_NUM
+! CJH - 04/12/2001 - end
+  and Z.SEPCHK = &P.SEPCHK
+  and Z.EMPLID = &P.EMPLID
+  and Z.EMPL_RCD = &P.EMPL_RCD
+  and Z.REQUEST_DT = $cal_check_dt
+  and Z.PLAN_TYPE = $PLAN_TYPE
+  and Z.BENEFIT_PLAN = $BENEFIT_PLAN
+  and Z.CHECK_DT = $cal_check_dt
+
+end-SELECT
+
+#debug9 display 'Hrs Bal row found?: ' noline
+#debug9 display $row-found
+end-procedure
+
+!*********************************************************************
+! Prepare One-Time deduction rows
+!*********************************************************************
+begin-procedure Prepare-One-Time-Deduction
+
+ let $found = 'N'
+
+begin-SELECT
+/*+ RULE */
+T.COMPANY
+T.PAYGROUP
+T.PAY_END_DT
+T.OFF_CYCLE
+T.PAGE_NUM
+T.LINE_NUM
+T.ADDL_NBR
+T.SEPCHK
+T.PLAN_TYPE
+T.BENEFIT_PLAN
+T.DEDCD
+T.DED_CLASS
+
+  move 'Y' to $found
+
+from ps_pay_one_time T,
+     ps_pay_earnings PPE
+where ppe.COMPANY    = &P.COMPANY                                         
+  and ppe.PAYGROUP   = &P.PAYGROUP                                        
+  and ppe.PAY_END_DT = &P.PAY_END_DT                                      
+  and ppe.OFF_CYCLE  = &P.OFF_CYCLE 
+! CJH - 05/02/2001
+  and ppe.page_num = &p.page_num
+  and ppe.line_num = &p.line_num
+! CJH - 05/02/2001                                       
+  and ppe.SEPCHK     = &P.SEPCHK                                          
+  and PPE.EMPLID     = &P.EMPLID                                          
+  and PPE.EMPL_RCD  = &P.EMPL_RCD   
+  and ppe.ok_to_pay  = 'Y'                                                
+  and T.COMPANY      = PPE.COMPANY                                        
+  and T.PAYGROUP     = PPE.PAYGROUP                                       
+  and T.PAY_END_DT   = PPE.PAY_END_DT                                     
+  and T.OFF_CYCLE    = PPE.OFF_CYCLE                                      
+  and T.PAGE_NUM        = PPE.PAGE_NUM                                          
+  and T.LINE_NUM        = PPE.LINE_NUM                                          
+  and T.PLAN_TYPE    = $PLAN_TYPE                                         
+  and T.BENEFIT_PLAN = $BENEFIT_PLAN                                      
+  and T.DEDCD        = $DEDCD                                             
+  and T.DED_CLASS    =  &DD.DED_CLASS                                     
+  and T.ONE_TIME_CD  = 'O'           
+end-SELECT
+
+  move #array_gex_rate_amt to #rate
+ #debug9 display 'Rate / Hours: ' noline
+ #debug9 display #rate noline
+ #debug9 display '/' noline
+ #debug9 display #update_hrs
+ let #upd_amt = #update_hrs * #rate
+ #debug9 display 'Ded amt ins/upd to : ' noline
+ #debug9 display #upd_amt noline
+ #debug9 display ' for: ' noline
+ #debug9 display &P.COMPANY noline
+ #debug9 display '/' noline
+ #debug9 display &P.PAYGROUP noline
+ #debug9 display '/' noline
+ #debug9 display &P.PAY_END_DT noline 
+ #debug9 display '/' noline
+ #debug9 display &P.OFF_CYCLE noline
+ #debug9 display '/' noline
+ #debug9 display &P.PAGE_NUM noline
+ #debug9 display '/' noline
+ #debug9 display &P.LINE_NUM noline
+ #debug9 display '/' noline
+ #debug9 display &P.ADDL_NBR noline
+ #debug9 display '/' noline
+ #debug9 display &P.SEPCHK noline
+ #debug9 display '/' noline
+ #debug9 display $PLAN_TYPE noline
+ #debug9 display '/' noline
+ #debug9 display $BENEFIT_PLAN noline
+ #debug9 display '/' noline
+ #debug9 display $DEDCD noline
+ #debug9 display '/' noline
+ #debug9 display &DD.DED_CLASS
+
+
+ if $found = 'Y'
+    #debug9 display 'Update One-Time Deds'
+    do Update-One-Time-Deduction
+ else
+    if #upd_amt <> 0    ! don't insert a row with a zero ded amt
+       #debug9 display 'Insert One-Time Deds'
+       do Insert-One-Time-Deduction
+    end-if
+ end-if
+end-procedure
+
+!*********************************************************************
+! Retrieve DED_CLASS(s) for DEDCD
+!*********************************************************************
+begin-procedure Process-Each-Ded-Class
+
+ #debug9 display 'Process Each Ded Class'
+ let $found = 'N'
+begin-SELECT
+/*+ RULE */
+DD.DED_CLASS
+
+ move 'Y' to $found
+ #debug9 display 'processing one-time for ded_class: ' noline
+ #debug9 display &DD.ded_class
+ do Prepare-One-Time-Deduction
+
+from ps_deduction_class DD
+where DD.PLAN_TYPE = $PLAN_TYPE
+  and DD.DEDCD = $DEDCD
+  and DD.EFFDT = (select max(ddd.effdt) from ps_deduction_class DDD
+                  where dd.plan_type = ddd.plan_type
+                    and dd.dedcd = ddd.dedcd
+                    and ddd.effdt <= &P.PAY_END_DT)
+end-SELECT
+end-procedure
+
+!*********************************************************************
+!Delete One Time Deduction rows for EMPLID/EMPL_RCD
+!*********************************************************************
+begin-procedure delete-from-one-time
+
+ show 'Deleting one-time: ' &P.COMPANY '/' &P.PAYGROUP '/' &P.PAY_END_DT '/' &P.OFF_CYCLE '/' &P.PAGE_NUM '/' &P.LINE_NUM '/' &P.ADDL_NBR '/' &P.SEPCHK
+begin-SQL on-error= sql-error-found('delete-from-one-time')
+/*+ RULE */
+delete from ps_pay_one_time DOT
+where DOT.COMPANY = &P.COMPANY
+  and DOT.PAYGROUP = &P.PAYGROUP
+  and DOT.PAY_END_DT = &P.PAY_END_DT
+  and DOT.OFF_CYCLE = &P.OFF_CYCLE
+  and DOT.PAGE_NUM = &P.PAGE_NUM
+  and DOT.LINE_NUM = &P.LINE_NUM
+  and DOT.SEPCHK = &P.SEPCHK
+!GBD 06/18/2002 Begin
+!  and DOT.PLAN_TYPE in ('1X','1V','1R')
+  and DOT.PLAN_TYPE in ('1X','1V','1R','1Q')
+!GBD 06/18/2002 End
+end-SQL
+end-procedure
+
+
+!*********************************************************************
+!Update One Time Deduction table for EE/Plan Type/Benefit Plan/DEDCD
+!*********************************************************************
+begin-procedure Update-One-Time-Deduction
+begin-SQL on-error=sql-error-found('update-one-time-deduction')
+/*+ RULE */
+update ps_pay_one_time 
+
+set DED_CALC = 'A',
+    DED_RATE_PCT = 0,
+    DED_ADDL_AMT = #upd_amt
+where COMPANY = &P.COMPANY   
+  and PAYGROUP = &P.PAYGROUP
+  and PAY_END_DT = &P.PAY_END_DT
+  and OFF_CYCLE = &P.OFF_CYCLE
+  and PAGE_NUM = &P.PAGE_NUM
+  and LINE_NUM = &P.LINE_NUM
+  and ADDL_NBR = &P.ADDL_NBR
+  and SEPCHK = &P.SEPCHK
+  and PLAN_TYPE = $PLAN_TYPE
+  and BENEFIT_PLAN = $BENEFIT_PLAN
+  and DEDCD = $DEDCD
+  and DED_CLASS = &DD.DED_CLASS   
+  and ONE_TIME_CD = 'O'
+
+end-SQL
+end-procedure
+!*********************************************************************
+!Insert One Time Deduction table for EE/Plan Type/Benefit Plan/DEDCD
+!*********************************************************************
+begin-procedure Insert-One-Time-Deduction
+
+ display 'in insert'
+ display &P.COMPANY
+ display  &P.PAYGROUP
+ display  &P.PAY_END_DT
+ display  &P.OFF_CYCLE
+ display  &P.PAGE_NUM
+ display  &P.LINE_NUM
+ display  &P.ADDL_NBR
+ display  &P.SEPCHK
+ display  $PLAN_TYPE
+ display  $BENEFIT_PLAN
+ display  $DEDCD
+
+begin-SQL on-error=sql-error-found('insert-one-time-deduction')
+/*+ RULE */
+insert into ps_pay_one_time 
+(COMPANY,
+PAYGROUP,
+PAY_END_DT,
+OFF_CYCLE,
+PAGE_NUM,
+LINE_NUM,
+ADDL_NBR,
+SEPCHK,
+PLAN_TYPE,
+BENEFIT_PLAN,
+DEDCD,
+DED_CLASS,
+DED_SLSTX_CLASS,
+ONE_TIME_CD,
+DED_CALC,
+DED_ADDL_AMT,
+DED_RATE_PCT)
+values
+(&P.COMPANY,
+ &P.PAYGROUP,
+ &P.PAY_END_DT,
+ &P.OFF_CYCLE,
+ &P.PAGE_NUM,
+ &P.LINE_NUM,
+ &P.ADDL_NBR,
+ &P.SEPCHK,
+ $PLAN_TYPE,
+ $BENEFIT_PLAN,
+ $DEDCD,
+ &DD.DED_CLASS,
+ 'B',
+ 'O',
+ 'A',
+ #upd_amt,
+ 0)
+end-SQL
+end-procedure
+
+
+!********************************************************************
+!This procedure displays in the error report if there are any sql erros
+!happened in the program
+!********************************************************************
+
+begin-procedure SQL-Error-Found($Proc_Name) 
+  do error-found
+
+  #debug9 display 'SQL Error in ' noline
+  #debug9 display $Proc_Name noline
+  #debug9 display $_sql-error noline
+  #debug9 display 'sql-status: ' noline
+  #debug9 display #_sql-status 
+
+  print 'SQL Error in ' (,34)
+  print $Proc_Name ()  
+  print $_sql-error () 
+  print 'sql-status:' ()
+  print #_sql-status () edit 99999 
+  stop
+
+end-procedure
+
+!*********************************************************************
+!This procedure displays the error message for the records that are in
+!progress
+!*********************************************************************
+
+begin-procedure Error-Found
+  move 'Y' to $ErrorFound
+  use-report report-log
+  do Format-Number(#InputTran, $out, '99999')
+  print $out (+1,1)
+  let $EmplId_1st3 = substr($EmplId,1,3)
+  let $EmplId_mid2 = substr($EmplId,4,2)
+  let $EmplId_last4 = substr($EmplId,6,4)
+ 
+  String $EmplId_1st3 $EmplID_mid2 $EmplId_last4 by '-' into $EmplId11
+
+  print $EmplID11 (,16)
+end-procedure
+
+!**********************************************************************
+#include 'gexaltse.sqc'  ! Alter session SQC
+#include 'gexxx922.sqc'  ! Process Scheduler run control procedure
+#Include 'tranctrl.sqc'  !Common Transaction Control Procedures
+!  #Include 'reset.sqc'  
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'datemath.sqc'  !Date Arithmetic functions
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'payrnctl.sqc'  !Select-Parameters
+#Include 'payinit.sqc'   !Pay init
+#Include 'stdapi.sqc'    !Get_Run_Control Procedure

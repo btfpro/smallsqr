@@ -1,0 +1,480 @@
+!***********************************************************************
+! GEXBNHDT:  This program processes events in event status and determine*
+!            eligibility field value changes based on Hire date and the*
+!            Job row changes that triggered the event.                 *
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module is the confidential and proprietary information of       *
+! Giant Eagle, Inc.; it is not to be copied, reproduced, or transmitted*
+! in any form, by any means, in whole or in part, nor is it to be used *
+! for any purpose other than that for which it is expressly provided   *
+! without the written permission of Giant Eagle.                       *
+!                                                                      *
+!                                                                      *
+!***********************************************************************
+!***********************************************************************
+!                         MODIFICATION HISTORY                         *
+!***********************************************************************
+!  ID#     INITIALS    DATE           DESCRIPTION OF THE CHANGE	       *	
+!***********************************************************************
+!  GBNC009   SXK       10/02/1997     INITIAL CREATION
+!  GBNC009   CJH       02/09/1998     Selection criteria chg
+!  GBNC009   CJH       03/31/1998     Effective-dating fix
+!  GBNC009   SXK       11/09/1998     Added setup32a sqc
+!  GBNC009   CJH       04/02/1999     Modify list of ignored event 
+!                                     classes
+!  GBNC009   SXK       01/25/2000     Added auto processing events as  *
+!					part of 7.5 upgrade            *
+! GEX_SEC_REENG 2015-07-19 Vahini Katta                                *
+! Changes related to gex_emplid_mapp/7 digit emplid                    *
+!***********************************************************************
+
+
+#include 'setenv.sqc' !Set environment
+#include 'setup32.sqc'
+begin-setup
+
+#include 'setupdb.sqc'
+
+end-setup
+
+!*********************************************************************
+!Initial processing, retrieving current dates and calls the main 
+!procedure to do the processing.                                     
+!*********************************************************************
+begin-report
+
+
+  do Init-DateTime
+  do Init-Number
+  do stdapi-init
+  
+  move 'GEXBNHDT' to $ReportID
+  move 'Benefits eligibility based on Hire Date (Report Log)' to $ReportTitle
+  display $ReportTitle
+
+  do Get-Current-DateTime
+  do Report
+  do Commit-Transaction
+  date-time () hh:mi:ss &timeEnded
+  display 'Report Ended: ' noline
+  display &timeEnded
+  do stdapi-term
+
+end-report
+
+!*********************************************************************
+!Calls the main logic paragraph
+!*********************************************************************
+begin-procedure Report
+
+ move 'N' to $Errorfound
+
+date-time () hh:mi:ss &timeBegan
+display 'Report Began: ' noline
+display &timeBegan
+
+ do process-employee-data
+
+ if $sev-error = 'Y'
+    goto report-exit
+ end-if
+  
+Report-Exit:
+
+
+  date-time () hh:mi:ss &timeProcess
+  display #InputTran 99999 noline
+  display ' Transactions Processed: ' noline
+  display &timeProcess
+
+end-procedure
+
+!*********************************************************************
+!Prints the header information in the report log.
+!*********************************************************************
+
+begin-heading 5
+
+ #Include 'stdhdg01.sqc'
+  position (+2)
+  print 'Trans#' (,1) bold
+  print 'Emplid' (,18) bold
+  print 'Message' (,50) bold
+  print '-' (+1,1,167) fill
+ 
+end-heading
+
+
+!*********************************************************************
+!Prints the footer in the report log
+!*********************************************************************
+
+begin-footing 2 
+page-number (1,148) 'Page '  
+last-page () ' of ' '.'
+
+end-footing
+
+!*********************************************************************
+!Selects employees who satisfy the conditions specified in the where  
+!clause and retrieves the elig config1 rules for the benefit program
+!employee is assigned
+!*********************************************************************
+
+Begin-Procedure Process-Employee-Data
+
+move 'N' to $errorfound
+move 'N' to $beninfo_found
+move 'N' to $found
+
+begin-select on-error=sql-error-found('process-employee-data')
+B.EMPLID  &emplid
+B.EMPL_RCD
+B.BENEFIT_PROGRAM
+B.BENEFIT_RCD_NBR
+B.EVENT_ID
+B.SCHED_ID
+B.JOB_EFFDT
+B.JOB_EFFSEQ
+to_char(C.SERVICE_DT, 'YYYY/MM/DD')  &c.service_dt
+D.ELIG_CONFIG1
+
+   move 'Y' to $beninfo_found
+   move &emplid to $emplid
+   display $emplid
+   add 1 to #inputtran
+
+   do process-elig-rules
+   do compare-elig-config1
+
+FROM PS_BAS_PARTIC B,
+     PS_EMPLOYMENT C,
+     PS_JOB D
+
+WHERE B.EMPLID = C.EMPLID	
+  AND B.EMPL_RCD = C.EMPL_RCD
+  AND B.BENEFIT_RCD_NBR = C.BENEFIT_RCD_NBR	
+  AND B.EMPLID = D.EMPLID
+  AND B.EMPL_RCD = D.EMPL_RCD
+  AND B.JOB_EFFDT = D.EFFDT
+  AND B.JOB_EFFSEQ = D.EFFSEQ
+! CJH - 04/02/1999 - begin
+!  AND B.EVENT_CLASS NOT IN ('001','002','BEN','BLC','DE2','DEA','FSC','OE','RET','RWP','TER','TWB','TWP')
+  AND B.EVENT_CLASS NOT IN ('DE2','DEA','OE','RET','RWP','TER','TWB','TWP')
+
+! CJH - 04/02/1999 - end
+!  AND B.BAS_PROCESS_STATUS NOT IN ('AE','AN','AS','PE','FA')
+!  AND B.EVENT_STATUS in ('O','C')
+   AND (
+        (B.BAS_PROCESS_STATUS = 'PR' and B.EVENT_STATUS = 'O')
+   OR   (B.BAS_PROCESS_STATUS = 'AS' and B.EVENT_STATUS = 'O')
+   OR   (B.BAS_PROCESS_STATUS = 'ET' and B.EVENT_STATUS = 'O')
+   OR   (B.BAS_PROCESS_STATUS = 'NT' and B.EVENT_STATUS = 'O')
+  or   ((B.GEX_PROCESS_IND is null or GEX_PROCESS_IND <> 'Y')
+   and   (B.BAS_PROCESS_STATUS = 'FP' and B.EVENT_STATUS = 'C'))
+
+!SXK 02/08/00 No need to do this
+   !SXK 01/25/00 Added these to pickup auto processing events
+!   OR   (B.BAS_PROCESS_STATUS = 'PR' and B.EVENT_STATUS = 'C' and B.PROCESS_IND = 'N')
+!   OR   (B.BAS_PROCESS_STATUS = 'NT' and B.EVENT_STATUS = 'C' and B.PROCESS_IND = 'N')
+!   OR   (B.BAS_PROCESS_STATUS = 'ET' and B.EVENT_STATUS = 'C' and B.PROCESS_IND = 'N')
+!   OR   (B.BAS_PROCESS_STATUS = 'PR' and B.EVENT_STATUS = 'O' and B.PROCESS_IND = 'A')
+!   OR   (B.BAS_PROCESS_STATUS = 'NT' and B.EVENT_STATUS = 'O' and B.PROCESS_IND = 'A')
+!   OR   (B.BAS_PROCESS_STATUS = 'ET' and B.EVENT_STATUS = 'O' and B.PROCESS_IND = 'A')
+   !SXK 01/25/00 End
+       )
+  
+end-SELECT
+
+if $beninfo_found = 'N'
+   do error-found
+   print 'No Benefit Participation information found' (,34)
+end-if
+
+end-procedure
+
+!*********************************************************************
+!Determines the benefits eligibility configuratin byte value for each
+!employee to be able to compare with the existing job table field and
+!updates the necessary tables
+!*********************************************************************
+
+begin-procedure process-elig-rules
+
+move 'N' to $rules_found
+move 'N' to $byte_found
+move 'N' to $errorfound
+let $EE_config1_val = substr(&D.ELIG_CONFIG1,1,3) || '0000000'
+!*** 01/08/98 let $EE_config1_val = &D.ELIG_CONFIG1
+move 'N' to $update-is-done
+
+begin-select 
+F.GEX_SEQ       &seq#
+F.GEX_OPERATOR1
+to_char(F.GEX_CONTRACT_DT1, 'YYYY/MM/DD') &f.gex_contract_dt1
+F.GEX_OPERATOR2
+to_char(F.GEX_CONTRACT_DT2, 'YYYY/MM/DD') &f.gex_contract_dt2
+F.GEX_EC1_BYTE_VAL &byte_val
+
+    move 'Y' to $rules_found
+    do prepare-comparision-string
+    do get-ec1-byte-value
+   
+FROM PS_GEX_CONFG1_RULE F,
+! join for correct effdt row 03/31/98 - CJH
+     PS_BEN_DEFN_PGM FF
+
+WHERE F.BENEFIT_PROGRAM = &B.BENEFIT_PROGRAM
+  AND FF.BENEFIT_PROGRAM = F.BENEFIT_PROGRAM
+  AND FF.EFF_STATUS = 'A'
+  AND FF.EFFDT = F.EFFDT
+  AND FF.EFFDT = (select max(zz.effdt) from ps_ben_defn_pgm zz
+                  where zz.benefit_program = ff.benefit_program
+                  and zz.eff_status = ff.eff_Status
+                  and zz.effdt <= &B.JOB_EFFDT)
+!*******
+! Service Dt SQR only use --> and zz.effdt <= &B.JOB_EFFDT) 
+! All Actual Hours SQRs should use --> and zz.effdt <= $asoftoday)
+!*******
+! join for correct effdt row 03/31/98 - CJH
+end-SELECT
+
+if $rules_found = 'N'
+   do error-found
+!*** 01/07/98 - Add logic to reset CONFIG1 to zeros and reprocess event
+  if substr(&D.ELIG_CONFIG1,4,7) <> '0000000'
+   let $ee_config1_val = substr(&D.ELIG_CONFIG1,1,3) || '0000000'
+   do update-job-config1
+   do update-bas-partic
+  end-if
+   do update-gex-process-ind
+!*** 01/07/98 - Add logic to reset CONFIG1 to zeros and reprocess event
+   print 'No Rules found for benefit program:' (,34)
+   print &B.BENEFIT_PROGRAM ()
+   print ' in GEX_CONFG1_RULE table' ()
+else
+  if $byte_found = 'N'
+     do error-found
+     print 'Eligible Config byte 1 rules not satisfied. SERVICE_DT = ' (,34) 
+     print &c.service_Dt ()
+  end-if
+end-if
+
+end-procedure
+
+!*********************************************************************
+!Prepares the comparision string to use in retrieving the config byte
+!value for the employee
+!*********************************************************************
+
+begin-procedure prepare-comparision-string
+
+unstring &c.service_dt by '/' into $service_yyyy $service_mm $service_dd
+let $service_dt_cmp = $service_yyyy||$service_mm||$service_dd
+
+move &F.gex_CONTRACT_DT1 to $contract_dt1
+unstring $contract_Dt1 by '/' into $contract_dt1_yyyy $contract_dt1_mm $contract_dt1_dd
+let $contract_dt1_cmp = $contract_dt1_yyyy||$contract_dt1_mm||$contract_dt1_dd
+
+move &F.gex_CONTRACT_DT2 to $contract_dt2
+unstring $contract_Dt2 by '/' into $contract_dt2_yyyy $contract_dt2_mm $contract_dt2_dd
+let $contract_dt2_cmp = $contract_dt2_yyyy||$contract_dt2_mm||$contract_dt2_dd
+
+if RTRIM(&F.gex_OPERATOR1,' ') <> ''
+   if RTRIM(&F.gex_OPERATOR2,' ') <> ''
+      let $comp1_def = $service_dt_cmp||' '||&F.gex_OPERATOR1||' '||$contract_dt1_cmp||' AND '||$service_dt_cmp||' '||&F.gex_OPERATOR2||' '||$contract_dt2_cmp
+!     let $comp1_def = ' '||&F.gex_OPERATOR1||' '
+!     let $comp2_Def = ' '||&F.GEX_OPERATOR2||' '
+!     move 'Y' to $op2_exists
+   else
+      let $comp1_def = $service_dt_cmp||' '||&F.gex_OPERATOR1||' '||$contract_dt1_cmp
+!     move 'N' to $op2_exists
+   end-if
+end-if
+
+end-procedure
+
+!*********************************************************************
+!Retrives the rows from the Config1 Rules table to determine the byte
+!value and adjusts the config1 field accordingly
+!*********************************************************************
+
+begin-procedure get-ec1-byte-value
+
+move 'N' to $found
+move 'N' to $errorfound
+
+!display $comp1_Def
+
+begin-select on-error=sql-error-found('get-EC1-byte-value')
+
+'X'
+
+   move 'Y' to $found
+   move &seq# to #seq#
+   let $ee_config1_val = substr($ee_config1_val,1,(#seq# - 1))||&byte_Val||substr($ee_config1_Val,(#seq# + 1),(10 - #seq#))   
+   move 'Y' to $byte_found
+
+FROM PS_GEX_CONFG1_RULE H
+WHERE H.BENEFIT_PROGRAM = &B.BENEFIT_PROGRAM
+  AND H.GEX_SEQ = &seq#
+  AND [$comp1_Def]
+end-select
+
+end-procedure
+
+!*********************************************************************
+!Compares the existing job table config1 field and the calculated field
+!and updates the job table row and bas_partic table if they are not 
+!equal otherwise, updates the gex_process_ind switch in bas_partic table
+!*********************************************************************
+
+begin-procedure compare-elig-config1
+
+move &D.ELIG_CONFIG1 to $elig_config1_job
+
+!  if length(substr($ee_config1_val,4,7)) <= 3
+if length(substr($ee_config1_val,4,7)) = 0
+   let substr($ee_config1_val_nospaces,4,7) = ''
+else
+   let $ee_config1_val_4to7 = substr($ee_config1_val,4,7)
+   let $ee_config1_val_nospaces = rtrim($ee_config1_Val_4to7,' ')
+end-if
+
+!display 'Job Config1 Value:'
+!display $elig_config1_job
+!display 'Pgm Config1 Value:'
+!display $ee_config2_val_nospaces
+
+let $elig_config1_job_4to7 = substr($elig_config1_job,4,7)
+let $elig_config1_job_nospaces = rtrim($elig_config1_job_4to7,' ')
+
+if $ee_config1_val_nospaces = $elig_Config1_job_nospaces
+   do update-gex-process-ind
+else
+   do update-job-config1
+   if $errorfound = 'N'
+      do update-bas-partic
+   end-if
+end-if
+
+end-procedure
+
+!*********************************************************************
+!Updates the gex_process_ind switch in bas_partic table
+!*********************************************************************
+
+begin-procedure update-gex-process-ind
+
+move 'N' to $errorfound
+
+begin-sql on-error=sql-error-found('update-gex-process-ind')
+
+UPDATE PS_BAS_PARTIC I
+   SET I.GEX_PROCESS_IND = 'Y'
+
+WHERE I.SCHED_ID = &B.SCHED_ID
+  AND I.EMPLID = $emplid
+  AND I.EMPL_RCD = &B.EMPL_RCD
+  AND I.BENEFIT_PROGRAM = &B.BENEFIT_PROGRAM
+  AND I.BENEFIT_RCD_NBR = &B.BENEFIT_RCD_NBR
+  AND I.EVENT_ID = &B.EVENT_ID
+  AND I.JOB_EFFDT = &B.JOB_EFFDT
+  AND I.JOB_EFFSEQ = &B.JOB_EFFSEQ
+end-sql
+end-procedure
+
+!*********************************************************************
+!Updates the job table config1 field with the calculated value
+!*********************************************************************
+
+begin-procedure update-job-config1
+
+move 'N' to $errorfound
+
+begin-sql on-error=sql-error-found('update-job-config1')
+
+UPDATE PS_JOB J
+   SET J.ELIG_CONFIG1 = $ee_config1_val
+
+WHERE J.EMPLID = $emplid
+  AND J.EMPL_RCD = &B.EMPL_RCD
+  AND J.EFFDT = &B.JOB_EFFDT
+  AND J.EFFSEQ = &B.JOB_EFFSEQ
+
+end-sql
+end-procedure
+
+!*********************************************************************
+!Updates the bas_partic table 
+!*********************************************************************
+
+begin-procedure update-bas-partic
+
+move 'N' to $errorfound
+
+begin-sql on-error=sql-error-found('update-bas-partic')
+
+UPDATE PS_BAS_PARTIC K
+   SET K.GEX_PROCESS_IND = 'Y',
+       K.EVENT_STATUS = 'O',
+       K.PROCESS_IND = 'A'
+
+WHERE K.SCHED_ID = &B.SCHED_ID
+  AND K.EMPLID = $emplid
+  AND K.EMPL_RCD = &B.EMPL_RCD
+  AND K.BENEFIT_PROGRAM = &B.BENEFIT_PROGRAM
+  AND K.BENEFIT_RCD_NBR = &B.BENEFIT_RCD_NBR
+  AND K.EVENT_ID = &B.EVENT_ID
+  AND K.JOB_EFFDT = &B.JOB_EFFDT
+  AND K.JOB_EFFSEQ = &B.JOB_EFFSEQ
+end-sql
+end-procedure
+
+!********************************************************************
+!This procedure displays in the error report if there are any sql erros
+!happened in the program
+!********************************************************************
+
+begin-procedure SQL-Error-Found($Proc_Name) 
+  do error-found
+  print 'SQL Error in ' (,34)
+  print $Proc_Name ()  
+  print $_sql-error () 
+  print 'sql-status:' ()
+  print #_sql-status () edit 99999 
+
+end-procedure
+
+!*********************************************************************
+!This procedure displays the error message for the records that are in
+!progress
+!*********************************************************************
+
+begin-procedure Error-Found
+  move 'Y' to $ErrorFound
+  do Format-Number(#InputTran, $out, '99999')
+  print $out (+1,1)
+  !GEX_SEC_REENG 2015-04-29 Vahini Katta Begins
+  !let $EmplId_1st3 = substr($EmplId,1,3)
+  !let $EmplId_mid2 = substr($EmplId,4,2)
+  !let $EmplId_last4 = substr($EmplId,6,4)
+ 
+  !String $EmplId_1st3 $EmplID_mid2 $EmplId_last4 by '-' into $EmplId11
+
+  !print $EmplID11 (,16)
+  print $EmplID (,16)
+  !GEX_SEC_REENG 2015-04-29 Vahini Katta Ends
+end-procedure
+
+#Include 'tranctrl.sqc'  !Common Transaction Control Procedures
+!*#Include 'reset.sqc'     !Reset printer procedure
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'payrnctl.sqc'  !Select-Parameters
+#Include 'stdapi.sqc'    !Get_Run_Control Procedure
+#Include 'datemath.sqc'  !Does the date-math functions

@@ -1,0 +1,1127 @@
+!***********************************************************************
+!  PER101CN: Interface-Employment Equity Reporting System(EECRS)       *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+!                                                                      *
+! This module contains confidential and proprietary information        *
+! of Oracle; it is not to be copied, reproduced, or transmitted        *
+! in any form, by any means, in whole or in part, nor is it to         *
+! be used for any purpose other than that for which it is              *
+! expressly provided under the applicable license agreement.           *
+!                                                                      *
+! Copyright (C) 2006 Oracle. All Rights Reserved.                      *
+!                                                                      *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!          $Date:  2006/07/19:15:01:36                                 !
+!       $Release:  HR9                                                 !
+!      $Revision:  101                                                 !
+!                                                                      *
+!***********************************************************************
+!  HIRE  =  New Hires and Rehires                                      *
+!  TERMINATIONS = Resignations, Retirements and Deceased               *
+!  OTHER = Leave of Absences, Laid Off, Suspension and FT Student      *
+!***********************************************************************
+
+
+#include 'setenv.sqc'   !Set environment
+#Include 'setup32.sqc'  !Printer and page-size initialization
+
+begin-report
+  do Init-DateTime
+  do Init-Number
+  do Get-Current-DateTime
+  do Init-Report
+  if $start_error <> 'Y'
+     do Process-Main
+  end-if
+  do Stdapi-Term
+end-report
+
+begin-heading 5
+#Include 'stdhdgtr.sqc'
+
+  print $EmpHd    (+1,5,14)
+  print $EmpNmHd  (0, 20,29)
+  print $DeptHd   (0, 50,14)
+  print $jobHd    (0, 65,14)
+  print $effdtHd  (0, 80,14)
+  print $errorhd1 (0, 95)
+
+end-heading
+
+!********************************************
+begin-procedure Init-Report
+
+  move 'PER101CN' to $ReportID
+  display $ReportID
+  display ' '
+
+  do Stdapi-Init
+  do Get-Calendar-Year-Id
+
+  let #maxJobs = 20
+   !*****************************************************************************
+   !*    Three data files are created - tab delimited -
+   !*    File names are defined by the EMPLOYMENT EQUITY REPORTING SYSTEM
+   !*    1   EMPLOYEE.TXT - employee information (includes temporary emps)
+   !*    2   PROMO.TXT    - promotion information
+   !*    3   TERM.TXT     - temporary employee assignment info
+   !*****************************************************************************
+  open '{IMPORTPREFIX}EMPLOYEE.TXT{IMPORTSUFFIX}' as 1 for-writing record=155
+  open '{IMPORTPREFIX}PROMO.TXT{IMPORTSUFFIX}'    as 2 for-writing record=25
+  open '{IMPORTPREFIX}TERM.TXT{IMPORTSUFFIX}'     as 3 for-writing record=50
+
+  create-array name=job_params size=100
+        field=Action:char
+        field=EffDt:char
+        field=Empl_rcd:number
+        field=Eff_seq:number
+        field=Reg_Temp:char
+        field=Full_Part_Time:char
+        field=Empl_Status:char
+        field=Annual_Rt:number
+        field=Deptid:char
+        field=Jobcode:char
+        field=Location:char
+        field=Bus_Unit:char
+        field=Company:char
+        field=Setid_dept:char
+        field=Setid_jobcode:char
+
+  create-array name=contracts size=100
+        field=ContNum:char
+        field=Effdt:char
+        field=Status:char
+        field=EndDt:char
+
+  create-array name=temp_terms size=100
+        field=Con_Num:char
+        field=Con_startdt:char
+        field=Con_Enddt:char
+        field=Con_error:Char
+
+  if $prcs_process_instance = ''
+     display 'This Program cannot be run outside of the Process Scheduler'
+     let $start_error = 'Y'
+  else
+     let $start_error = 'N'
+    do Select-Parameters
+  end-if
+
+end-procedure
+
+
+!********************************************
+begin-procedure Get-Values
+
+
+end-procedure
+
+
+!**************************************************************************
+!    Process Main procedure
+!**************************************************************************
+begin-procedure Process-Main
+
+  if &RUN_CNTL_HR.EE_REPORT_YEAR  = 0
+    do Format-DateTime($AsofToday, $out, {DEFCMP}, '','')
+    let $year = {ps-substr}($out,1,4)
+    let $year = to_char(to_number($year) -1)
+  else
+    do Format-Number(&RUN_CNTL_HR.EE_REPORT_YEAR, $year, '8888')
+  end-if
+  let #yearnum = to_number($year)
+
+  let $in = $YEAR || '0101'
+  do Format-DateTime($in, $YearBegin, {DEFCMP},'','native')
+  let $in = $YEAR || '1231'
+  do Format-DateTime($in, $YearEnd, {DEFCMP},'','native')
+  do Format-DateTime($YearEnd, $yrendcmp, {DEFCMP},'','')
+  do Format-DateTime($YearBegin, $yrbegcmp, {DEFCMP},'','')
+  let $language_cd = $PRCS_LANGUAGE_CD
+  do INIT_Report_Translation ($ReportID, $language_cd)
+  do Append_report_translation('HR')
+  do Get-Strings
+  do Main-Select-Prcs
+  close 1
+  close 2
+  close 3
+
+end-procedure
+
+
+!**************************************************************************
+begin-procedure Get-Strings
+!**************************************************************************
+
+ let $REPORTTITLE = 'Errors in creation of interface file for employment equity'
+ do Get_Field_Information ('HR','EMPLID',$EmpHd,#DW)
+ do Get_Field_information ('HR','JOBCODE',$JobHd,#DW)
+ do Get_Field_Information ('HR','EMPL_NAME',$EmpNmHd,#DW)
+ do Get_Field_Information ('HR','DEPTID',$DeptHd,#DW)
+ do Get_Field_Information ('HR','EFFDT',$EffdtHd,#DW)
+ let $ERRMSG1 = 'Missing NOC code'
+ let $ERRMSG2 = 'Missing NAICS code'
+ let $ERRMSG3 = 'No contract end date for contract start date'
+ let $ERRMSG4 = 'Missing contract data'
+ let $ERRMSG5 = 'Salary value of $0.00'
+ let $ERRMSG8 = 'Invalid Gender'
+ let $ERRMSG9 = 'Missing Province code'
+ let $Errhd1 = 'Errors'
+ let $Typetxt1 = 'On leave of absense'
+ let $Typetxt2 = 'Suspended or laid off'
+ let $Typetxt3 = 'Terminated or not worked this year'
+ let $Typetxt4 = 'Retired and has not worked this year'
+ let $Typetxt5 = 'Deceased and has not worked this year'
+ let $Typetxt6 = 'Full Time Student'
+ let $Typetxt7 = 'Last date worked is not in reporting year'
+
+end-procedure
+
+!**************************************************************************
+begin-procedure Main-Select-Prcs
+!**************************************************************************
+begin-select
+
+INS.INSTALLED_PAY_NA
+FROM PS_INSTALLATION INS
+end-Select
+                                           ! Loop thru all Companies specified
+let #InitSw1 = 0
+let $table_alias1 = ' AND JOB'
+let $table_alias2 = ' AND C'
+let $companystring = '.COMPANY IN ('
+BEGIN-SELECT
+EE.COMPANY
+  If rtrim(&EE.COMPANY,' ') <> ''
+   if #InitSw1 = 0
+     let $companystring = $companystring ||'''' || &EE.COMPANY || ''''
+     let #InitSw1 = 1
+   else
+     let $companystring = $companystring || ',''' || &EE.COMPANY || ''''
+   end-if
+  end-if
+from PS_RUN_CNTL_EECRS EE
+
+where EE.OPRID = $prcs_oprid
+  and EE.RUN_CNTL_ID = $prcs_run_cntl_id
+end-select
+
+if #initsw1 > 0       ! If no companies entered in run control.
+                      ! Default to all companies
+   let $companystring = $companystring ||') '
+   let $selectcompanies1 = $table_alias1||$companystring
+   let $selectcompanies2 = $table_alias2||$companystring
+else
+   let $selectcompanies1 = ' '
+   let $selectcompanies2 = ' '
+end-if
+
+do Main-Select
+
+end-procedure
+
+
+!**************************************************************************
+!   Main Select Procedure
+!   Determine which employees to include in the data file
+!   Anyone who was Active, Leave, Paid Leave, Suspended at the start of the year
+!       and anyone who had a job action during the year
+!       and is in the selected Company and Canadian Reg Region
+!**************************************************************************
+begin-procedure Main-Select
+
+  let $prior_emp = ' '
+
+begin-SELECT
+JOB.EMPLID
+JOB.EMPL_RCD
+JOB.EMPL_STATUS
+JOB.EFFDT
+JOB.ACTION
+JOB.DEPTID
+JOB.JOBCODE
+JOB.LOCATION
+JOB.COMPANY
+JOB.ANNUAL_RT
+JOB.FULL_PART_TIME
+JOB.REG_TEMP
+JOB.BUSINESS_UNIT
+JOB.SETID_DEPT
+JOB.SETID_JOBCODE
+JOB.EFFSEQ
+JOB.CONTRACT_NUM
+  if &JOB.EMPLID <> $Prior_Emp                  ! only do once for each emp
+    let #jobidx = 0                             ! load all job records for emplid and first !
+                                                ! emplrec# in array
+    put &JOB.Action           &JOB.EffDt
+        &JOB.EMPL_RCD         &JOB.Reg_Temp
+        &JOB.Full_Part_Time   &JOB.Empl_Status
+        &JOB.Annual_Rt        &JOB.Deptid
+        &JOB.Jobcode          &JOB.Location
+        &JOB.BUSINESS_UNIT    &JOB.COMPANY
+        &JOB.SETID_DEPT       &JOB.SETID_JOBCODE
+    into job_params(#jobidx)
+        Action                EffDt
+        Empl_rcd              Reg_Temp
+        Full_Part_Time        Empl_Status
+        Annual_Rt             Deptid
+        Jobcode               Location
+        Bus_Unit              COMPANY
+        Setid_Dept            Setid_Jobcode
+    do Get-last-Job-Record
+    do Get-Personal-Data
+    do Determine-Employee-Type
+    do Determine-Salary
+    do Validate-Data
+    if rtrim($Errortxt,' ') = ''
+      do Write-Employee
+      do Write-Promo-History
+      if $Status = '03' or $Status = '05'
+         do Write-Temp-History
+      end-if
+    end-if
+    do Clear-Data
+    let $Prior_Emp = &JOB.EMPLID
+  end-if
+
+FROM  PS_JOB JOB,
+      PS_REG_REGION_TBL REG
+WHERE JOB.REG_REGION = REG.REG_REGION
+  AND REG.COUNTRY    = 'CAN'
+  [$selectcompanies1]
+  AND ((    JOB.EFFDT = (SELECT MAX(J2.EFFDT)  ! Not terminated at start of year
+                          FROM PS_JOB  J2
+                          WHERE J2.EMPLID      = JOB.EMPLID
+                            AND J2.EMPL_RCD   = JOB.EMPL_RCD
+                            AND J2.EFFDT      <= $YearBegin
+                            [$selectcompanies1]
+                            AND JOB.REG_REGION = REG.REG_REGION
+                            AND REG.COUNTRY    = 'CAN')
+          AND JOB.EFFSEQ = (SELECT MAX(J3.EFFSEQ)
+                            FROM PS_JOB J3
+                            WHERE J3.EMPLID    = JOB.EMPLID
+                            AND J3.EMPL_RCD = JOB.EMPL_RCD
+                            AND J3.EFFDT     = JOB.EFFDT)
+          AND JOB.EMPL_STATUS IN ('A','L','P','S','W')
+        )
+  OR ( JOB.EFFDT >= $YearBegin
+       AND JOB.EFFDT <= $YearEnd       ! were in CAN/Company during the year
+        )                                ! and had a job action but weren't in
+       )                                 ! CAN/Comp at start of the year
+  ORDER BY JOB.EMPLID ASC, JOB.EMPL_RCD ASC, JOB.EFFDT ASC, JOB.EFFSEQ ASC
+
+end-SELECT
+
+end-procedure
+
+
+!**************************************************************************
+!
+!  Get Job Info for current year and sets the main job to the last
+!  row returned (or the row at index 0 if none are returned)
+!**************************************************************************
+begin-procedure Get-last-Job-Record
+
+Begin-Select
+
+C.EMPLID
+C.EFFSEQ
+C.EMPL_RCD
+C.ACTION
+C.EFFDT
+C.REG_TEMP
+C.FULL_PART_TIME
+C.EMPL_STATUS
+C.ANNUAL_RT
+C.DEPTID
+C.JOBCODE
+C.LOCATION
+C.BUSINESS_UNIT
+C.COMPANY
+C.SETID_DEPT
+C.SETID_JOBCODE
+
+  let #jobidx = #jobidx + 1
+  put &C.Action           &C.EffDt
+      &C.EMPL_RCD        &C.Reg_Temp
+      &C.Full_Part_Time   &C.Empl_Status
+      &C.Annual_Rt        &C.Deptid
+      &C.Jobcode          &C.Location
+      &C.BUSINESS_UNIT    &C.COMPANY
+      &C.SETID_DEPT       &C.SETID_JOBCODE
+   into job_params(#jobidx)
+      Action                EffDt
+      Empl_rcd              Reg_Temp
+      Full_Part_Time        Empl_Status
+      Annual_Rt             Deptid
+      Jobcode               Location
+      Bus_Unit              COMPANY
+      Setid_Dept            Setid_Jobcode
+
+FROM PS_JOB C,
+     PS_REG_REGION_TBL REG2
+WHERE C.EMPLID     = &JOB.EMPLID
+  AND C.EMPL_RCD  = &JOB.EMPL_RCD
+  [$selectcompanies2]
+  AND C.REG_REGION = REG2.REG_REGION
+  AND REG2.COUNTRY    = 'CAN'
+  AND C.EFFDT      >= $YearBegin
+  AND C.EFFDT      <= $YearEnd
+ORDER BY C.EMPLID ASC, C.EFFDT ASC, C.EFFSEQ ASC
+end-select
+
+  let #lastjob = #jobidx
+
+  get $Action           from job_params(#lastJob) Action
+  get $Effdt            from job_params(#lastJob) Effdt
+  get $Reg_Temp         from job_params(#lastJob) Reg_Temp
+  get $Full_Part_Time   from job_params(#lastJob) Full_Part_Time
+  get $Empl_Status      from job_params(#lastJob) Empl_Status
+  get #Annual_Rt        from job_params(#lastJob) Annual_Rt
+  get $Deptid           from job_params(#lastJob) Deptid
+  get $JobCode          from job_params(#lastJob) JobCode
+  get $Location         from job_params(#lastJob) Location
+  get $BU               from job_params(#lastJob) Bus_unit
+  get $Company          from job_params(#lastJob) Company
+  get $Setid_dept       from job_params(#lastJob) Setid_dept
+  get $Setid_Jobcode    from job_params(#lastJob) Setid_Jobcode
+
+end-procedure
+
+!**************************************************************************
+! Gets information from PERSONAL_DATA, EMPLOYMENT, DIVERSITY, DISABILITY
+!    LOCATION_TBL, DEPARTMENT_TBL, and JOBCODE_TBL based on the Employees
+!    most recent job record
+begin-procedure Get-Personal-Data
+!**************************************************************************
+
+begin-select
+A.EMPLID
+!*********Begin Name Change Format******
+   !A.NAME
+A.NAME_DISPLAY
+!*********End Name Change Format********
+A.SEX
+A.FT_STUDENT
+DVS.CAN_VISBL_MINORITY
+DVS.CAN_ABORIGINAL
+DSB.DISABLED
+B.EMPL_RCD
+!B.STATE
+B.HIRE_DT
+B.REHIRE_DT
+B.TERMINATION_DT
+B.LAST_DATE_WORKED
+  let $Empnum           = &A.EMPLID
+  let #Emp_rcd          = &B.EMPL_RCD
+!  let $State            = &B.STATE
+  let $Hire_Dt          = &B.HIRE_DT
+  let $ReHire_Dt        = &B.REHIRE_DT
+  let $termination_dt   = &B.TERMINATION_DT
+  let $last_date_worked = &B.LAST_DATE_WORKED
+  let $FT_Student       = &A.FT_STUDENT
+  let $Disabled         = &DSB.DISABLED
+  let $VisMinor         = &DVS.CAN_VISBL_MINORITY
+  let $Aborigin         = &DVS.CAN_ABORIGINAL
+  let $Sex              = &A.Sex
+  !*********Begin Name Change Format******
+    !let $Name             = &A.Name
+  let $Name             = &A.NAME_DISPLAY
+  !*********End Name Change Format********
+
+  do Format-DateTime($Last_date_worked, $lstwrkcmp, {DEFCMP},'','')
+
+FROM  PS_PERSONAL_DT_FST A,
+      PS_EMPLOYMENT    B,
+      PS_DISABILITY DSB,
+      PS_DIVERSITY DVS
+WHERE A.EMPLID    = &JOB.EMPLID
+  AND B.EMPLID    = A.EMPLID
+  AND B.EMPL_RCD = &JOB.EMPL_RCD
+  AND DSB.EMPLID  = A.EMPLID
+  AND DVS.EMPLID  = A.EMPLID
+End-Select
+  do Get-Prv-CMA
+  do Get-NOC-Cd
+  do Get-NAICS-Cd
+
+end-Procedure
+
+!**************************************************************************
+!    Get the Province & CMA
+!**************************************************************************
+begin-procedure Get-Prv-CMA
+
+   let $Province = '98'       !Outside of Canada (default if location not found)
+   let $CMA = ''
+begin-SELECT
+D.CAN_CMA
+E.NUMERIC_CD
+   let $Province = rtrim(&E.Numeric_CD, ' ')
+   if $province = '22'
+     let $province = '11'
+   end-if
+   let $CMA = rtrim(&D.CAN_CMA,' ')
+
+   evaluate $CMA
+   when = '01'
+      break
+   when = '02'
+      break
+   when = '03'
+      break
+   when = '04'
+      break
+   when = '05'
+      break
+   when = '06'
+      break
+   when = '07'
+      break
+   when = '08'
+     break
+   when-other
+      let $CMA = ''
+   end-evaluate
+FROM  PS_LOCATION_TBL D,
+      PS_STATE_NAMES_TBL E
+WHERE $Location = D.LOCATION
+  AND D.STATE   = E.STATE
+  AND D.COUNTRY = E.COUNTRY
+  AND D.COUNTRY = 'CAN'
+AND D.SETID = (SELECT SETID
+                 From PS_SET_CNTRL_GROUP
+                 Where REC_GROUP_ID = 'HR_03'
+                 AND SETCNTRLVALUE = $BU)
+  AND D.EFFDT =
+      (SELECT MAX(EFFDT)
+        FROM PS_LOCATION_TBL
+       WHERE LOCATION = D.LOCATION
+  AND STATE = D.STATE
+  AND COUNTRY = D.COUNTRY
+  AND SETID = D.SETID
+  AND EFFDT  <= $YearEnd)
+
+End-select
+end-procedure
+
+!**************************************************************************
+!    Get National Occupational Code & Seasonal Code
+!**************************************************************************
+begin-procedure Get-NOC-Cd
+
+begin-SELECT
+F.CAN_NOC_CD
+F.SEASONAL
+   let $NOC = rtrim(&F.CAN_NOC_CD, ' ')
+   let $Seasonal = &F.Seasonal
+FROM  PS_JOBCODE_TBL F
+WHERE F.JOBCODE = $Jobcode
+  AND F.SETID = $Setid_jobcode
+  AND F.EFFDT =
+      (SELECT MAX(EFFDT)
+       FROM PS_JOBCODE_TBL
+       WHERE JOBCODE = F.JOBCODE
+  AND SETID = F.SETID
+  AND EFFDT  <= $YearEnd)
+
+end-SELECT
+
+end-procedure
+
+
+!**************************************************************************
+!    Get Standard Industrial Sector Code
+!       Updated December 2004 to retreive NAICS code instead of SIC code.
+!**************************************************************************
+begin-procedure Get-NAICS-Cd
+
+begin-SELECT
+G.CAN_NAICS_CD
+   let $NAICS = rtrim(to_char(&G.CAN_NAICS_CD), ' ')
+FROM PS_DEPT_TBL_CAN G
+WHERE   G.SETID = $Setid_Dept
+        AND G.DEPTID = $Deptid
+        AND G.EFFDT = 
+                (SELECT MAX(EFFDT)
+                 FROM PS_DEPT_TBL
+                 WHERE  SETID = $Setid_Dept
+                AND DEPTID = $Deptid
+                AND EFFDT <= $YearEnd)
+                                
+end-SELECT
+end-procedure
+
+
+!*************************************************
+begin-procedure Determine-Employee-Type
+!**************************************************************************
+!    Determine Employee Type according to EECRS codes
+!**************************************************************************
+!    Regular   & Full_Part_Time = 'F'         then status = (01) Full-Time
+!    Regular   & Full_Part_Time = 'P'         then status = (02) Part-Time
+!    Temporary & Full_Part_Time = 'F' or 'P'  then status = (03) Temporary
+!    Empl_Status = 'L', 'P', 'S'              then status = (04) Other
+!    FT Student  = 'Y'                        then status = (04) Other
+!    if Temporary and worked < 12 weeks       then status = (05) Casual
+!**************************************************************************
+
+
+  if $Reg_Temp = 'R'                     ! Regular, Full Time employee,
+     and ($Full_Part_Time = 'F')
+     and ($Empl_Status <> 'L'             ! Leave
+      or  $Empl_Status <> 'P'             ! Leave with Pay
+      or  $Empl_Status <> 'S' )           ! Suspended
+     move '01' to $Status
+  else
+      if $Reg_Temp = 'R'                 ! Regular, Part Time employee
+      and ($Full_Part_Time <> 'F')
+      and ($Empl_Status <> 'L'             ! Leave
+       or  $Empl_Status <> 'P'             ! Leave with Pay
+       or  $Empl_Status <> 'S' )           ! Suspended
+         move '02' to $Status
+      end-if
+  end-if
+
+  if $Reg_Temp = 'T'                     ! Temporary employee,
+      and ($Empl_Status <> 'L'             ! Leave
+       or  $Empl_Status <> 'P'             ! Leave with Pay
+       or  $Empl_Status <> 'S' )           ! Suspended
+       move '03' to $Status
+  end-if
+  if $Empl_Status     = 'L'              ! Employees on Leaves of Absences,
+     or ($Empl_Status = 'P')             ! Suspended, Laid Off, or Full
+     or ($Empl_Status = 'S')             ! time students
+     or ($FT_Student  = 'Y')
+!**************************************************************************
+! if Employee was retired, terminated or deceased and had not worked the
+! full calendar year, set status to OTHER.  If they were Active and in one
+! of these statuses, it will be determined above.
+!**************************************************************************
+     or ($lstwrkcmp < $YrBegcmp and $lstwrkcmp > ' ')
+
+       move '04' to $Status
+  end-if
+
+  if $Status = '04'
+     move ' ' to $typecomment
+     if $FT_Student = 'Y'
+         move $Typetxt6 to $typecomment ! 'Full Time Student'
+     else
+         evaluate $Empl_Status
+           when = 'L'
+           when = 'P'
+                     move  $TypeTxt1 to $typecomment   ! 'On Leave of Absence'
+                     break
+           when =  'S'
+                     move  $TypeTxt2 to $typecomment   ! 'Suspended or Laid Off'
+                     break
+           when =  'T'
+           when = 'U'
+                     move $TypeTxt3  to $typecomment   ! 'Terminated ..'
+                     break
+           when =  'R'
+           when =  'Q'
+                     move $TypeTxt4 to $typecomment    ! 'Retired  ..'
+                     break
+           when =  'D'
+                     move $TypeTxt5 to $typecomment    !'Deceased ..'
+                     break
+           when-other
+                     move $TypeTxt7 to $typecomment    !'Last date worked ..'
+                     break
+          end-evaluate
+      end-if
+  end-if
+
+  if $Status = '03'
+     do Load-Contract-Data
+     do Check-if-Casual
+  end-if
+
+end-procedure
+
+!**************************************************************************
+begin-procedure Load-Contract-Data
+!**************************************************************************
+
+move -1 to #term_num
+begin-SELECT
+ZZ.CONTRACT_BEGIN_DT
+ZZ.CONTRACT_END_DT
+ZZ.CONTRACT_NUM
+ZZ.CONTRACT_STATUS
+   do Format-DateTime(&ZZ.CONTRACT_END_DT, $Contract_cmp, {DEFCMP},'','')
+   If $Contract_cmp >= $YrBegcmp or $contract_cmp = ''
+      add 1 to #term_num
+      put &ZZ.CONTRACT_NUM
+         &ZZ.CONTRACT_BEGIN_DT
+         &ZZ.CONTRACT_STATUS
+         &ZZ.CONTRACT_END_DT
+      into contracts(#term_num)
+         ContNum
+         EffDt
+         Status
+         EndDt
+   End-if
+FROM PS_CONTRACT_DATA ZZ
+WHERE ZZ.EMPLID = $Empnum
+  AND ZZ.CONTRACT_NUM = &JOB.CONTRACT_NUM
+  AND ZZ.CONTRACT_STATUS <> 'P'
+
+ ORDER by ZZ.CONTRACT_BEGIN_DT ASC
+
+end-SELECT
+
+let #next_cont = 0
+let #term_cnt = 0
+let #J = 0
+if #term_num >= 0
+   While #J <= #term_num
+      get $Con_ID               from contracts(#J) ContNum
+      get $Con_status           from contracts(#J) Status
+      get $Con_eff_dt           from contracts(#J) Effdt
+      get $Con_end_dt           from contracts(#J) EndDt
+      do Format-DateTime($con_eff_dt, $con_eff_cmp, {DEFCMP},'','')
+      do Format-DateTime($con_end_dt, $con_end_cmp, {DEFCMP},'','')
+
+      let $end_dt = $con_end_cmp
+      if $end_dt = ''
+         let $err_flg = 'Y'
+         do Format-DateTime($CON_EFF_DT, $out, {DEFMDY}, '', '')
+         let $errortxt = $ERRMSG3 || ' ' || $out   ! No contract end date
+         do Print-Error
+      else
+         let #next_cont = #J + 1
+         if #next_cont <= #term_num
+            let $more_recs = 'Y'
+            get $next_eff_dt      from contracts(#next_cont) Effdt
+            get $next_end_dt      from contracts(#next_cont) EndDt
+              do Format-DateTime($next_eff_dt, $next_eff_cmp, {DEFCMP},'','')
+            do Format-DateTime($next_end_dt, $next_end_cmp, {DEFCMP},'','')
+         else
+            let $more_recs = 'N'
+         end-if
+
+         while $next_eff_cmp <= $end_dt and $more_recs = 'Y'
+            if $next_end_cmp <> ''
+               if $next_end_cmp >= $end_dt
+                  let $end_dt = $next_end_cmp
+                  let $con_end_dt = $next_end_dt
+               end-if
+               let #J = #J+1
+               let #next_cont = #J +1
+
+               if #next_cont <= #term_num
+                 let $more_recs = 'Y'
+                 get $next_eff_dt from contracts(#next_cont) Effdt
+                 get $next_end_dt from contracts(#next_cont) EndDt
+             do Format-DateTime($next_eff_dt, $next_eff_cmp, {DEFCMP},'','')
+                 do Format-DateTime($next_end_dt, $next_end_cmp, {DEFCMP},'','')
+               else
+                  let $more_recs = 'N'
+                  let #J = #J + 1
+               end-if
+            else
+               let $more_recs = 'N'
+               let #J = #J + 1
+            end-if
+         end-while
+         let #next_cont = 0
+      end-if
+
+      put $Con_ID      !   load the values into the terms array
+          $con_eff_dt    !   this array will be used to calculate
+          $con_end_dt      !   if the emp worked < 12 weeks
+          $err_flg     !   and then to write out the data file
+      into temp_terms(#term_cnt)
+          Con_Num
+          Con_startdt
+          Con_EndDt
+          Con_Error
+
+      let #term_cnt = #term_cnt + 1
+      let $start_dt = ''
+      let $end_dt   = ''
+      let $con_eff_dt = ''
+      let $con_end_dt = ''
+      let $err_flg  = ''
+      let #J = #J + 1
+   end-while
+else                            ! Employee has no Contracts
+   let $errortxt = $ERRMSG4     ! No contract data found for this temp emp
+   do Print-Error
+end-if
+end-Procedure
+
+!**************************************************************************
+begin-Procedure Check-If-Casual
+!**************************************************************************
+
+if #term_cnt > 0                     ! loop thru and add up  amount of work time
+   let #tot_days = 0
+   let #i = 0
+   while #i < #term_cnt
+      get $Con_ID               from temp_terms(#i) Con_NUM
+      get $Cont_st_dt           from temp_terms(#i) Con_startdt
+      get $Cont_end_dt          from temp_terms(#i) Con_enddt
+      get $Con_error_flg        from temp_terms(#i) Con_error
+      do Format-DateTime($cont_st_dt, $cont_st_cmp, {DEFCMP}, '', '')
+      do Format-DateTime($cont_end_dt, $cont_end_cmp, {DEFCMP}, '', '')
+
+      if $cont_st_cmp < $yrbegcmp
+         let $cont_st_cmp = $yrbegcmp
+      end-if
+      if $cont_end_cmp > $yrendcmp
+         let $cont_end_cmp = $yrendcmp
+      end-if
+!      do Format-DateTime($cont_st_dt, $cont_st_dt, {DEFYMD}, '', '')
+!      do Format-DateTime($cont_end_dt, $cont_end_dt, {DEFYMD}, '', '')
+       do Convert-To-DTU-Date($cont_st_dt,$cont_st_dt)
+       do Convert-To-DTU-Date($cont_end_dt,$cont_end_dt)
+
+
+      if $Con_error_Flg <> 'Y'
+         do DTU-Diff-Days($cont_st_dt, $cont_end_dt, #num_days)
+         let #tot_days = #tot_days + #num_days
+      end-if
+      let #i = #i + 1
+   end-while
+   let #num_weeks = (#tot_days / 7)
+   if #num_weeks < 12
+      move '05' to $status
+   end-if
+end-if
+
+end-procedure
+
+!**************************************************************************
+! Determine-Salary
+!  The Salary normally reported would be the JOB.ANNUAL_RT but in some cases
+!  the CAN_TAX_BALANCE.#TRUE_TXGRS_YTD value will be used if using NA Payroll.
+!  These cases are:
+!       For Temporary, OR Laid Off OR Laid Off  or Suspended employees
+!       or with Seasonal Jobcode
+!       or emps who had a type chg (full to part time or Regular to Temp)
+!**************************************************************************
+begin-procedure Determine-Salary
+
+let $Annualize_Salary = 'N'
+if &INS.INSTALLED_PAY_NA = 'N'
+   let $Annualize_Salary = 'Y'
+end-if
+
+let #job = #lastjob
+
+while (#job > -1 and $seasonal = 'N') and ($status <> '03' and $status <> '05')
+  get $r_t               from job_params(#Job) reg_temp
+  get $f_p               from job_params(#Job) full_part_time
+  get $action            from job_params(#Job) Action
+  get $job_effdt         from job_params(#Job) effdt
+  do format-datetime($job_effdt,$job_effdt, {DEFCMP},'','')
+  evaluate $action
+   when = 'HIR'
+      if $job_effdt >= $yrbegcmp
+         let $Annualize_Salary = 'Y'
+         let #job = -1
+      end-if
+      break
+   when = 'REH'
+      if $job_effdt >= $yrbegcmp
+         let $Annualize_Salary = 'Y'
+         let #job = -1
+      end-if
+      break
+   when = 'PRO'
+      if $job_effdt >= $yrbegcmp
+         let $Annualize_Salary = 'Y'
+         let #job = -1
+      end-if
+      break
+   when = 'RFL'
+      if $job_effdt >= $yrbegcmp
+         let #job = #job -1
+         get $empl_stat  from job_params(#Job) empl_status
+         if $empl_stat = 'L'
+            let $Annualize_Salary = 'Y'
+         end-if
+         let #job = -1
+      end-if
+      break
+   when = 'LOA'
+      let #job = -1
+      break
+   when = 'PLA'
+     let #job = -1
+      break
+   when = 'LOF'
+      let #job = -1
+      break
+   when = 'REC'
+     let #job = -1
+      break
+   when = 'SUS'
+      let #job = -1
+      break
+   when-other
+      if #job > 0
+         get $prev_r_t    from job_params(#Job - 1) reg_temp
+         get $prev_f_p    from job_params(#Job - 1) full_part_time
+         if $r_t <> $prev_r_t or $f_p <> $prev_f_p
+            let #job = -1
+         end-if
+      end-if
+      break
+  end-evaluate
+  let #job = #job - 1
+end-while
+
+if $Annualize_Salary = 'N'
+     do Get-YTD-Earns                        ! Get the ytd gross earnings
+     move #True_TxGrs_YTD  to #Salary        ! this figure may include overtime
+  else
+     move #Annual_Rt  to #Salary             ! For others - use Annual Rate
+                                                 ! This does not include Commissions
+  end-if
+end-procedure
+
+
+
+!**************************************************************************
+!    Get YTD Earnings for Temp employees as reported from T4
+!**************************************************************************
+begin-procedure Get-YTD-Earns
+
+let #True_TxGrs_YTD = 0
+begin-SELECT
+Y.PROVINCE
+Y.TXGRS_YTD
+Y.TAX_CLASS_CAN
+Y.BALANCE_YEAR
+Y.EMPLID
+   let #True_TxGrs_YTD = #True_TxGrs_YTD + &Y.TXGRS_YTD
+FROM PS_CAN_TAX_BALANCE Y
+WHERE Y.EMPLID        = $empnum
+  AND Y.COMPANY       = $Company
+  AND Y.BALANCE_YEAR  = #yearnum
+  AND Y.BALANCE_ID    = $Calendar_Year_Id
+  AND (Y.TAX_CLASS_CAN = 'TT4')
+  AND Y.BALANCE_PERIOD  =
+    (SELECT MAX(BALANCE_PERIOD)
+     FROM PS_CAN_TAX_BALANCE Z
+     WHERE Z.EMPLID        = Y.EMPLID
+       AND Z.COMPANY       = Y.COMPANY
+       AND Z.BALANCE_YEAR  = Y.BALANCE_YEAR
+       AND Z.BALANCE_ID    = Y.BALANCE_ID
+       AND Z.PROVINCE      = Y.PROVINCE
+       AND Z.WAGE_LOSS_PLAN = Y.WAGE_LOSS_PLAN
+       AND Z.TAX_CLASS_CAN = Y.TAX_CLASS_CAN)
+end-SELECT
+
+end-procedure
+
+!**************************************************************************
+begin-procedure Validate-Data
+!**************************************************************************
+
+  if rtrim($NOC,' ') = ''
+    let $errortxt = $ERRMSG1     !   ' Missing NOC Code '
+    do Print-Error
+  end-if
+  if rtrim($NAICS,' ') = ''
+    let $errortxt = $ERRMSG2     !   ' Missing NAICS Code '
+    do Print-Error
+  end-if
+  if #salary = 0
+    let $errortxt = $ERRMSG5
+    do print-error
+  end-if
+  if $sex <> 'M' and $sex <> 'F'
+    let $errortxt = $ERRMSG8
+    do print-error
+  end-if
+  if rtrim($province,' ') = ''
+    let $errortxt = $ERRMSG9
+    do print-error
+  end-if
+
+end-procedure
+
+!**************************************************************************
+begin-procedure Write-Employee
+!**************************************************************************
+  do Rotate-Name
+!  move $Prior_Can_Visbl_Minority  to $VisMinor
+
+  ! Make Visible Minority a YES/NO field for EECRS
+  if $VisMinor <> 'N'
+      move 'Y' to $VisMinor
+  end-if
+
+  do Format-DateTime($Termination_Dt, $DateTermi, {DEFYMD}, '', '')
+
+                 !*** For Non Temporary / CASUAL Employees determine Hire Date ******* !
+  if $Status <> '03' and $status <> '05'
+
+    do Format-DateTime($HIRE_DT, $hrdt, {DEFCMP},'','')
+    do Format-DateTime($REHIRE_DT, $rehrdt, {DEFCMP},'','')
+
+    do Format-DateTime($ReHire_Dt, $out, {DEFYMD}, '', '')
+    if $ReHrDt > $HrDt and ($rehrdt <= $yrendcmp)
+      move $out to $DateHired
+    else
+      do Format-DateTime($Hire_Dt, $out, {DEFYMD}, '', '')
+       if $HrDt <= $yrendcmp
+          move $out to $DateHired
+       end-if
+    end-if
+  else
+    let $DateHired = ''
+  end-if
+
+  do Format-Number(#Salary,$Salary, '888888')
+  let $emp = {ps-substr}((rtrim($empnum,' ')),1,9)
+
+
+  let $tab = chr(9)
+
+   write 1 from
+   $emp          $tab
+   $CMA          $tab
+   $Province     $tab
+   $NOC          $tab
+   $NAICS        $tab
+   $Status       $tab
+   $typecomment  $tab
+   $Sex          $tab
+   $LastName     $tab
+   $FirstName    $tab
+   $Salary       $tab
+   $Aborigin     $tab
+   $VisMinor     $tab
+   $Disabled     $tab
+   $DateHired    $tab
+   $DateTermi
+
+end-procedure
+
+!**************************************************************************
+begin-procedure Write-Promo-History
+!**************************************************************************
+
+move 0 to #i
+
+begin-SELECT
+  add 1 to #i
+
+Z.ACTION
+Z.EFFDT
+   do Format-DateTime(&Z.EFFDt, $promo_dt, {DEFYMD}, '', '')
+   do Format-Number(#i, $promo_num, '888')
+
+   write 2 from
+   $emp        $tab
+   $promo_num  $tab
+   $promo_dt
+
+FROM PS_JOB Z
+WHERE Z.EMPLID = $Empnum
+  AND Z.EMPL_RCD = #Emp_rcd
+  AND Z.EFFDT BETWEEN $YearBegin AND $YearEnd
+  AND Z.ACTION  = 'PRO'
+
+ORDER by Z.EFFDT ASC
+
+end-SELECT
+end-procedure
+
+!***************************************************
+begin-procedure Write-Temp-History
+!***************************************************
+
+   let #i = 0
+   let #num = 0
+   while #i < #term_cnt
+     get $Con_st_dt            from temp_terms(#i) Con_startdt
+     get $Con_end_dt           from temp_terms(#i) Con_enddt
+     get $Con_error_flg        from temp_terms(#i) Con_error
+
+     if $Con_error_flg <> 'Y'
+
+         do Format-DateTime($CON_ST_DT,  $c_st_dt, {DEFYMD}, '', '')
+         do Format-DateTime($CON_END_DT, $c_end_dt,  {DEFYMD}, '', '')
+         let #num = #num + 1
+         do Format-Number(#num, $num, '888')
+
+         write 3 from
+           $emp        $tab
+           $num        $tab
+           $c_st_dt    $tab
+           $c_end_dt   $tab
+           $termination_dt
+     end-if
+
+     let #i = #i + 1
+   end-while
+
+end-Procedure
+
+!***************************************************
+begin-procedure Clear-Data
+!***************************************************
+
+   move ' ' to $errortxt
+   move ' ' to $Empnum
+   move ' ' to $Sex
+   move ' ' to $Salary
+   move ' ' to $Status
+   move ' ' to $Aborigin
+   move ' ' to $Disabled
+   move ' ' to $CMA
+   move ' ' to $Province
+   move ''  to $NOC
+   move ''  to $NAICS
+   move ' ' to $VisMinor
+   move ' ' to $DateHired
+   move ' ' to $DateTermi
+   move ' ' to $typecomment
+   move 0   to #Salary
+
+   clear-array name=job_params
+   clear-array name=contracts
+   clear-array name=temp_terms
+
+end-procedure
+
+!***************************************************
+begin-procedure Print-Error
+!***************************************************
+  do Format-DateTime($effdt, $eff, {DEFMDY}, '', '')
+
+  print $Empnum       (+1,5,14)
+  print $Name         (0,20,29)
+  print $deptid       (0,50,14)
+  print $jobcode      (0,65,14)
+  print $effdt        (0,80,14)
+  print $errortxt     (0,95)
+
+end-procedure
+
+!************************************************************************
+#include 'stdapi.sqc'    !Routine to update Run Status
+#include 'hrrnctl1.sqc'  !Get run control parameter values
+!#include 'hrgetval.sqc'  !Get values mask routines
+
+#Include 'rotname3.sqc'  !Get Last Name & First Name for Empl
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'datemath.sqc' !Routines for Date Calculations
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'getbalid.sqc'  !Get-Calendar-Year-Id
+#Include 'sqrtrans.sqc'

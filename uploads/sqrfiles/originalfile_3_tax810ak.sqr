@@ -1,0 +1,791 @@
+
+
+!***********************************************************************
+!  TAX810AK:  Qtrly Wage List - Tape - ALASKA                          *
+!                                                                      *
+!             NOTE: "#IFDEF TAXTEST" in main SELECT is used for        *
+!                   testing this report against DEMO database          *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+!                                                                      *
+! This module contains confidential and proprietary information        *
+! of Oracle; it is not to be copied, reproduced, or transmitted        *
+! in any form, by any means, in whole or in part, nor is it to         *
+! be used for any purpose other than that for which it is              *
+! expressly provided under the applicable license agreement.           *
+!                                                                      *
+! Copyright (C) 2007 Oracle. All Rights Reserved.                      *
+!                                                                      *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!          $Date:  2007/03/01:14:56:19                                 !
+!       $Release:  HR9                                                 !
+!    $Resolution:  698735                                              !
+!                                                                      *
+!***********************************************************************
+
+#include 'setenv.sqc'  !Set environment
+#include 'setup31.sqc' !Printer and page-size initialization
+#include 'usarpt.sqc'  !Get USA variables
+
+begin-report
+  do Init-Report
+  do Process-Main
+
+  close 10
+  close 20
+
+  if $RecordWritten = 'Y'
+    display ''
+    display 'Upon successful conclusion of this program, the following'
+    display 'files will have been created in CSV format for the reporting'
+    display 'of quarterly wage data to the Alaska Department of Labor:'
+    display ''
+    display '{IMPORTPREFIX}TX810AKH  (Headers)'
+    display '{IMPORTPREFIX}TX810AKD  (Details)'
+    display ''
+    display 'Follow instructions from the department for preparing and'
+    display 'submitting the files.'
+    display ''
+  else
+    do Print-Summary-Data('NoData')
+  end-if
+
+  do Stdapi-Term
+end-report
+
+
+begin-procedure Init-Report
+
+  do Init-DateTime
+  do Init-Number
+  do Get-Current-DateTime
+
+  do Stdapi-Init
+  do Get-Calendar-Year-Id
+
+  do Initialization
+  move 'TAX810AK' to $ReportID
+
+  move 'Alaska Quarterly UI Wage Report' to $ReportTitle
+  display ''
+  display 'Creating File for Alaska UI Wage Reporting'
+
+end-procedure
+
+
+begin-procedure Initialization
+
+  #ifdef TAXTEST
+     move 'CA'              to $State
+  #else
+     move 'AK'              to $State
+  #endif
+
+  do Get-Tax-Reporting-Run-Controls
+  move &TX.Balance_Year to $RptYear 9999
+  move &TX.Balance_Qtr  to $RptQtr  9
+  move $PeriodEndDate   to $AsOfDate
+  do Update-As-Of-Date
+
+  display ' '
+  display 'Processing balances for '   noline
+  display $RptQtrYr
+
+  do Select-Parameters
+  do Open-Files
+
+  move ' ' to $Blank
+  move ',' to $Comma
+  move 0   to #Count_F
+  move 'N' to $RecordWritten
+
+end-procedure
+
+
+begin-procedure Open-Files
+
+  move 'CSV' to $FileExtension
+
+#ifdef OS400
+  let $FileID1 = 'TX810AKH' || '(D' || $FileExtension || ')'
+  let $FileID2 = 'TX810AKD' || '(D' || $FileExtension || ')'
+#else
+  #ifdef MVS
+    let $FileID1 = 'TX810AKH'
+    let $FileID2 = 'TX810AKD'
+  #else
+    let $FileID1 = 'TX810AKH.' || $FileExtension
+    let $FileID2 = 'TX810AKD.' || $FileExtension
+  #endif
+#endif
+
+  let $FileID1 = '{IMPORTPREFIX}' || $FileID1
+  let $FileID2 = '{IMPORTPREFIX}' || $FileID2
+
+#ifdef MVS
+  open $FileID1 as 10 for-writing record=76:fixed_nolf
+  open $FileID2 as 20 for-writing record=118:fixed_nolf
+#else
+  open $FileID1 as 10 for-writing record=76:fixed
+  open $FileID2 as 20 for-writing record=118:fixed
+#endif
+
+end-procedure
+
+
+begin-procedure Process-Main
+
+begin-SELECT
+TEMP_SSN_MASK
+FROM PS_INSTALLATION
+end-SELECT
+
+begin-SELECT
+A.COMPANY
+A.DESCR
+A.ADDRESS1
+A.CITY
+A.STATE
+A.POSTAL
+
+      move &A.Company to $Company
+      move &A.Descr   to $CompanyName
+
+      move '' to $priorEmplID
+      do Read-Employee-Data
+
+FROM  PS_COMPANY_TBL A
+WHERE A.EFF_STATUS = 'A'
+  AND A.TAX_REPORT_TYPE = '2'
+  AND A.EFFDT =
+  (SELECT MAX(EFFDT)
+     FROM PS_COMPANY_TBL
+    WHERE  COMPANY = A.COMPANY
+      AND  EFFDT  <= $AsOfDate)
+ORDER BY COMPANY
+end-SELECT
+
+   if #Count_F > 0
+      do Print-File-Tot
+   end-if
+
+end-procedure
+
+
+begin-procedure Read-Employee-Data
+
+  move 0 to #Count_S
+
+begin-SELECT
+C.COMPANY    () on-break print=never before=Before-Company
+                                     after=After-Company
+C.EMPLID
+C.NLGRS_QTD
+C.TXGRS_QTD
+D.LAST_NAME
+D.FIRST_NAME
+D.MIDDLE_NAME
+D1.NATIONAL_ID
+
+        if &C.NlGrs_QTD > 0
+           do Get-Job-Data
+           do Process-Employee
+        else
+           do Print-Summary-Data('NegWage')
+        end-if
+
+FROM  PS_TAX_BALANCE C, PS_PERSON_NAME D, PS_PERS_NID D1
+WHERE C.COMPANY           = &A.Company
+  AND D.EMPLID            = C.EMPLID
+  AND D.EMPLID            = D1.EMPLID
+  AND D1.COUNTRY          = {NID_COUNTRY}
+  AND D1.NATIONAL_ID_TYPE = $PAYROLL_NID_TYPE
+  AND C.TAX_CLASS         = 'U'
+  AND C.BALANCE_ID        = $Calendar_Year_Id
+  AND C.BALANCE_YEAR      = &TX.Balance_Year
+  AND C.BALANCE_QTR       = &TX.Balance_Qtr
+
+#ifdef TAXTEST
+   AND C.STATE            = 'CA'
+#else
+   AND C.STATE            = 'AK'
+#endif
+
+  AND C.LOCALITY          = ' '
+  AND C.BALANCE_PERIOD    =
+     (SELECT MAX(BALANCE_PERIOD)
+        FROM   PS_TAX_BALANCE
+       WHERE  EMPLID        = C.EMPLID
+         AND  COMPANY       = C.COMPANY
+         AND  BALANCE_ID    = C.BALANCE_ID
+         AND  BALANCE_YEAR  = C.BALANCE_YEAR
+         AND  BALANCE_QTR   = C.BALANCE_QTR
+         AND  STATE         = C.STATE
+         AND  LOCALITY      = C.LOCALITY
+         AND  TAX_CLASS     = C.TAX_CLASS)
+         AND C.NLGRS_QTD <> 0
+ORDER BY D1.NATIONAL_ID
+end-SELECT
+
+  if #Count_S = 0
+     do Company-Run-Control
+
+     if $ZeroReport = 'Y'
+        move 0 to #CompanyEXGross
+        move 0 to #Co_NlGrs_QTD
+        move 0 to #Co_TxGrs_QTD
+        move 0 to #Co_ExGrs_QTD
+        do Get-State-Tax-Info
+        do Write-Header-Record
+        do Print-Company-Tot
+        new-page
+     end-if
+  end-if
+
+end-procedure
+
+
+begin-procedure Get-Job-Data
+  move ' ' to $US_SOC_CD                ! Standard Occupational Code
+begin-SELECT
+P.JOBCODE
+P.TAX_LOCATION_CD
+P.SETID_JOBCODE
+
+  move &P.JobCode to $JobCode
+  move &P.SETID_JOBCODE to $SETID_JobCode
+  do Get-US_SOC_CD
+  if rtrim(&P.Tax_Location_Cd, ' ') <> $priorTaxLocation
+    do Get-Area-Code
+  end-if
+  let $priorTaxLocation = rtrim(&P.Tax_Location_Cd, ' ')
+
+FROM  PS_JOB P
+     WHERE  P.EMPLID  = &C.EmplID
+       AND  P.COMPANY = $Company
+       AND  P.JOB_INDICATOR = 'P'
+       AND  P.EFFDT  = (SELECT MAX(EFFDT)
+            FROM PS_JOB P1
+            WHERE  P1.EMPLID = P.EMPLID
+              AND  P1.COMPANY   = P.COMPANY
+              AND  P1.JOB_INDICATOR = P.JOB_INDICATOR
+              AND  P1.EFFDT  <= $AsOfDate)
+       AND  P.EFFSEQ  = (SELECT MAX(EFFSEQ)
+            FROM PS_JOB P2
+            WHERE P2.EMPLID    = P.EMPLID
+              AND P2.COMPANY   = P.COMPANY
+              AND P2.JOB_INDICATOR = P.JOB_INDICATOR
+              AND P2.EFFDT     = P.EFFDT)
+end-SELECT
+end-procedure
+
+begin-procedure Get-US_SOC_CD
+begin-SELECT
+J.US_SOC_CD
+
+  let $US_SOC_CD = rtrim(&J.US_SOC_CD, ' ')
+  if $US_SOC_CD = ''
+     move ' ' to $US_SOC_CD
+  end-if
+
+FROM  PS_JOBCODE_TBL J
+WHERE J.SETID = $SETID_JobCode
+  AND J.JOBCODE = $JobCode
+  AND J.EFFDT = (SELECT MAX(EFFDT)
+     FROM PS_JOBCODE_TBL
+     WHERE  SETID = J.SETID
+       AND  JOBCODE = J.JOBCODE
+       AND  EFFDT  <= $AsOfDate)
+end-SELECT
+end-procedure
+
+
+begin-procedure Get-Area-Code
+
+  move ' ' to $AreaCd
+
+begin-SELECT
+L.AK_AREA_CD
+
+  let $AreaCd = rtrim(&L.AK_Area_Cd, ' ')
+  if $AreaCd = ''
+     move ' ' to $AreaCd
+  end-if
+
+FROM  PS_TAX_LOCATION1 L
+WHERE L.TAX_LOCATION_CD = &P.Tax_Location_Cd
+end-SELECT
+
+end-procedure
+
+
+begin-procedure Process-Employee
+
+  move &D1.NATIONAL_ID to $S123 xxx       !isolate first 3 digits
+
+  if $S123 = &Temp_SSN_Mask or RTRIM(&D1.NATIONAL_ID, ' ') = ''
+    move '000000000'         to $SSN
+  else
+    move &D1.NATIONAL_ID     to $SSN
+  end-if
+  let $SSN = {ps-substr}($SSN,1,9)
+
+  let $LastName = rtrim(&D.LAST_NAME, ' ')
+  if length($LastName) > 25
+     let $LastName = {ps-substr}($LastName,1,25)
+  end-if
+
+  let $FirstName = rtrim(&D.FIRST_NAME, ' ')
+  if length($FirstName) > 15
+     let $FirstName = {ps-substr}($FirstName,1,15)
+  end-if
+
+  let $MidInitial = {ps-substr}(&D.MIDDLE_NAME,1,1)
+  uppercase $FirstName
+  uppercase $LastName
+  uppercase $MidInitial
+
+  if instr($FirstName,',',1) <> 0    or
+        instr($LastName,',',1) <> 0  or
+        $MidInitial = ','
+     display ' '
+     display '*** Invalid comma in the Name ***'
+     display '****** Processing stopped *******'
+     display 'Emplid ' noline
+     display &C.EMPLID
+     stop
+  end-if
+
+!  move 0   to #Hourly_Rt
+
+!begin-select
+!J2.EMPL_TYPE
+!J2.HOURLY_RT
+
+!     move &J2.HOURLY_RT to #Hourly_Rt
+
+!FROM PS_JOB J2
+!WHERE J2.EMPLID   = &C.EmplID
+!  AND J2.COMPANY  = $Company
+!  AND J2.EMPL_RCD     =
+!        (SELECT MAX(EMPL_RCD)
+!           FROM PS_JOB
+!          WHERE EMPLID    = J2.EMPLID
+!            AND COMPANY   = J2.COMPANY
+!            AND EFFDT    <= $AsOfDate)
+!  AND J2.EFFDT    =
+!        (SELECT MAX(EFFDT)
+!           FROM PS_JOB
+!          WHERE EMPLID    = J2.EMPLID
+!            AND EMPL_RCD  = J2.EMPL_RCD
+!            AND COMPANY   = J2.COMPANY
+!            AND EFFDT    <= $AsOfDate)
+!  AND J2.EFFSEQ   =
+!        (SELECT MAX(EFFSEQ)
+!           FROM PS_JOB
+!          WHERE EMPLID    = J2.EMPLID
+!            AND EMPL_RCD  = J2.EMPL_RCD
+!            AND COMPANY   = J2.COMPANY
+!            AND EFFDT     = J2.EFFDT)
+!
+!end-select
+
+  do  Write-Detail-Record
+
+end-procedure
+
+
+begin-procedure Before-Company
+
+  do Get-Company-Data
+  do Get-State-Tax-Info
+
+  if $Prcs_Process_Instance = ''
+      do Employer-Prompts
+  else
+      do Company-Run-Control
+  end-if
+
+  do Get-Header-Rec-Data
+
+  if  &EmplCount > 0
+      move &CompanyNLGross to #CompanyNLGross
+      move &CompanyTXGross to #CompanyTXGross
+      let #CompanyEXGross  = #CompanyNLGross - #CompanyTXGross
+
+      do  Write-Header-Record
+  end-if
+
+end-procedure
+
+
+begin-procedure Get-State-Tax-Info
+
+  move 'AK' to $State
+  do Get-State-Tax-Data             !Employer ID
+
+  if RTRIM(&Employer_ID_SUT,' ') = ''
+    display '*** State Unemployment ID missing in Company State Tax Table ***'
+    display '*********************** Processing stopped *********************'
+    display 'Company ' noline
+    display $Company
+    stop
+  end-if
+
+  let  $ER_ID_SUT_Rtrim = rtrim (&Employer_ID_SUT, ' ')
+  let  #MaxLength = length($ER_ID_SUT_Rtrim)
+
+  if #MaxLength > 8
+     display ' '
+     display '*** WARNING ****'
+     display '  State Unemployment ID in Co State Tax Table greater than 8 positions  '
+     display '  Company: '  noline
+     display   $Company     noline
+     display ', State Unemployment Employer ID: '  noline
+     display  $ER_ID_SUT_Rtrim
+  end-if
+
+  move $ER_ID_SUT_Rtrim to $StateEIN 09999999
+
+end-procedure
+
+
+begin-procedure After-Company
+
+  if  &EmplCount > 0
+      move &EmplCount      to #Count_S        ! reformat to numeric for accumulating
+      add  #Count_S        to #Count_F
+
+      move #CompanyNLGross to #Co_NlGrs_QTD   ! No Limit Gross QTD
+      add  #CompanyNLGross to #Tot_NlGrs_QTD
+      move #CompanyTXGross to #Co_TxGrs_QTD   ! Taxable Gross QTD
+      add  #CompanyTXGross to #Tot_TxGrs_QTD
+      move #CompanyEXGross to #Co_ExGrs_QTD   ! Excess Wages QTD
+      add  #CompanyEXGross to #Tot_ExGrs_QTD
+
+      do  Print-Company-Tot                   ! Print Summary Report
+      new-page
+  end-if
+
+end-procedure
+
+
+begin-procedure  Get-Header-Rec-Data
+begin-SELECT
+
+COUNT(*)  &EmplCount
+
+#ifdef DB2ALL
+DECIMAL(SUM(H1.NLGRS_QTD),15,3)  &CompanyNLGross
+DECIMAL(SUM(H1.TXGRS_QTD),15,3)  &CompanyTXGross
+#else
+SUM(H1.NLGRS_QTD)  &CompanyNLGross
+SUM(H1.TXGRS_QTD)  &CompanyTXGross
+#endif
+
+FROM  PS_TAX_BALANCE H1
+WHERE H1.COMPANY           = &A.Company
+  AND H1.TAX_CLASS         = 'U'
+  AND H1.BALANCE_ID        = $Calendar_Year_Id
+  AND H1.BALANCE_YEAR      = &TX.Balance_Year
+  AND H1.BALANCE_QTR       = &TX.Balance_Qtr
+
+#ifdef TAXTEST
+   AND H1.STATE             = 'CA'
+#else
+   AND H1.STATE             = 'AK'
+#endif
+
+  AND H1.LOCALITY          = ' '
+  AND H1.BALANCE_PERIOD    =
+        (SELECT MAX(BALANCE_PERIOD)
+           FROM   PS_TAX_BALANCE
+          WHERE  EMPLID        = H1.EMPLID
+            AND  COMPANY       = H1.COMPANY
+            AND  BALANCE_ID    = H1.BALANCE_ID
+            AND  BALANCE_YEAR  = H1.BALANCE_YEAR
+            AND  BALANCE_QTR   = H1.BALANCE_QTR
+            AND  STATE         = H1.STATE
+            AND  LOCALITY      = H1.LOCALITY
+            AND  TAX_CLASS     = H1.TAX_CLASS)
+  AND  H1.NLGRS_QTD > 0
+GROUP BY H1.COMPANY, H1.STATE
+
+end-SELECT
+end-procedure
+
+
+begin-procedure Write-Header-Record
+
+  let  $CoExGrs = EDIT(#CompanyEXGross,'09999999.99')
+
+  let $OutputF = $StateEIN || ',' || $RptYear || ',' || $RptQtr ||
+                 ',' || $ZeroReport || ',' || $Reported || ',' ||
+                 $CoExGrs || ',           ,' || $RemitAmt || ',' ||
+                 $Month1Count || ',' || $Month2Count || ',' ||
+                 $Month3Count
+  write 10 from $OutputF
+
+! write 10 from    $StateEIN:8       1-  8  Employer Account number
+!                     $Comma:1       9
+!                   $RptYear:4      10- 13  Year
+!                     $Comma:1      14
+!            &TX.Balance_Qtr:1      15      Quarter
+!                     $Comma:1      16
+!                $ZeroReport:1      17      Zero Report indicator
+!                     $Comma:1      18
+!                  $Reported:1      19      Wages reported indicator
+!                     $Comma:1      20
+!                   $CoExGrs:11     21- 31  Excess Wages
+!                     $Comma:1      32
+!                     $Blank:11     33- 43  Blank - not used
+!                     $Comma:1      44
+!                  $RemitAmt:11     45- 55  Remit Amount
+!                     $Comma:1      56
+!               $Month1Count:6      57- 62  Employee count - Month 1
+!                     $Comma:1      63
+!               $Month2Count:6      64- 69  Employee count - Month 2
+!                     $Comma:1      70
+!               $Month3Count:6      71- 76  Employee count - Month 3
+
+  add 1    to #Count_E
+  move 'Y' to $RecordWritten
+
+end-procedure
+
+
+begin-procedure Write-Detail-Record
+
+  move &C.NlGrs_QTD to #NLGrs_QTD
+  let $NLGrs_QTD = EDIT(#NLGrs_QTD,'09999999.99')
+
+  let $OutputF = $StateEIN || ',' || $RptYear || ',' || $RptQtr ||
+                 ',' || $SSN || ',' || $LastName || ',' ||
+                 $FirstName || ',' || $MidInitial || ',' ||
+                 $NLGrs_QTD || ', ,                    ,' ||
+                 $US_SOC_CD || ',' || $AreaCd
+  write 20 from $OutputF
+
+! write 20 from    $StateEIN:8       1-  8  Employer Account number
+!                     $Comma:1       9
+!                   $RptYear:4      10- 13  Year
+!                     $Comma:1      14
+!            &TX.Balance_Qtr:1      15      Quarter
+!                     $Comma:1      16
+!                       $SSN:9      17- 25  Social Security Number
+!                     $Comma:1      26
+!                  $LastName:25     27- 51  Last name or spaces
+!                     $Comma:1      52
+!                 $FirstName:15     53- 67  First name or spaces
+!                     $Comma:1      68
+!                $MidInitial:1      69      Middle Initial or spaces
+!                     $Comma:1      70
+!                 $NLGrs_QTD:11     71- 81  Reportable Wage Amount
+!                     $Comma:1      82
+!                     $Blank:1      83      Project Code - blank - not used
+!                     $Comma:1      84
+!                     $Blank:20     85-104  Hourly rate - blank - not used
+!                     $Comma:1     105
+!                 $US_SOC_CD:10    106-115  Occupational Code (SOC)
+!                     $Comma:1     116
+!                    $AreaCd:2     117-118  Geographic Code
+
+end-procedure
+
+
+begin-procedure Employer-Prompts
+
+  display ' '
+  display 'Enter quarterly data for ' noline
+  display $Company noline
+  display ':'
+  display '(Numbers should not include commas)'
+  input $RemitAmt       '   Remit Amount                         '
+  input $Month1Count    '   Month 1 employee count               '
+  input $Month2Count    '   Month 2 employee count               '
+  input $Month3Count    '   Month 3 employee count               '
+  input $ZeroReport     '   Zero Report? Y/N                     '
+  input $Reported       '   Wages reported to other states? Y/N  '
+
+  move $RemitAmt        to #RemitAmt
+  move $Month1Count     to #Month1Count
+  move $Month2Count     to #Month2Count
+  move $Month3Count     to #Month3Count
+
+  let  $RemitAmt        = EDIT(#RemitAmt,'09999999.99')
+  move #Month1Count     to $Month1Count     888888
+  move #Month2Count     to $Month2Count     888888
+  move #Month3Count     to $Month3Count     888888
+
+end-procedure
+
+
+begin-procedure Company-Run-Control
+
+  move 0   to #RemitAmt
+  move 0   to #Month1Count
+  move 0   to #Month2Count
+  move 0   to #Month3Count
+  move 'N' to $ZeroReport
+  move 'N' to $Reported
+
+begin-select
+
+AK.REMITT_AMT
+AK.MONTH1_COUNT6
+AK.MONTH2_COUNT6
+AK.MONTH3_COUNT6
+AK.ZERO_REPORT
+AK.REPORTED_FLAG
+
+  move &AK.REMITT_AMT    to #RemitAmt
+  move &AK.MONTH1_COUNT6 to #Month1Count
+  move &AK.MONTH2_COUNT6 to #Month2Count
+  move &AK.MONTH3_COUNT6 to #Month3Count
+  move &AK.ZERO_REPORT   to $ZeroReport
+  move &AK.REPORTED_FLAG to $Reported
+
+FROM PS_RC_TAX810AK AK
+
+WHERE AK.OPRID       = $Prcs_OprID
+  AND AK.RUN_CNTL_ID = $Prcs_Run_Cntl_ID
+  AND AK.COMPANY     = &A.Company
+
+end-SELECT
+
+  let  $RemitAmt         = EDIT(#RemitAmt,'09999999.99')
+  move #Month1Count      to $Month1Count     888888
+  move #Month2Count      to $Month2Count     888888
+  move #Month3Count      to $Month3Count     888888
+
+end-procedure
+
+
+begin-procedure Update-As-Of-Date
+begin-SQL
+UPDATE PSASOFDATE SET ASOFDATE=$ASOFDATE
+end-SQL
+end-procedure
+
+
+begin-procedure Print-Company-Tot
+
+  if $Company <> $LastCompany
+    move $Company     to $LastCompany
+    move $CompanyName to $LastCompanyName
+  end-if
+
+
+  if #Neg_TxGrs_QTD <> 0 or #Neg_NlGrs_QTD <> 0
+    print '** Total **'      (+2,1,14)
+    print #Neg_TxGrs_QTD     (0,16) edit 99,999,999.99mi
+    print #Neg_NlGrs_QTD     (0,34) edit 99,999,999.99mi
+
+    move 0 to #Neg_TxGrs_QTD
+    move 0 to #Neg_NlGrs_QTD
+  end-if
+
+
+  print '**** Company Total ****'              (+3,1)
+  print 'No Limit Gross QTD '                  (+2,1,26)
+  print #Co_NlGrs_QTD                           (,28)   edit 999,999,999.99mi
+
+  if #Co_TxGrs_QTD <> 0
+     print 'Taxable Gross QTD '                (+2,1,26)
+     print #Co_TxGrs_QTD                        (,28)   edit 999,999,999.99mi
+  end-if
+
+  if #Co_ExGrs_QTD <> 0
+     print 'Excess Gross QTD   '               (+2,1,26)
+     print #Co_ExGrs_QTD                        (,28)   edit 999,999,999.99mi
+  end-if
+
+  print 'Employees Reported'                   (+2,1,29)
+  print #Count_S                                (,31)   edit 999,999,999
+
+  if #RemitAmt <> 0
+     print 'Remit Amount '                     (+2,1,26)
+     print #RemitAmt                            (,28)   edit 999,999,999.99mi
+  end-if
+
+  if #Month1Count <> 0
+     print 'Month 1 Count '                    (+2,1,33)
+     print #Month1Count                         (,35)   edit 999,999
+  end-if
+
+  if #Month2Count <> 0
+     print 'Month 2 Count '                    (+2,1,33)
+     print #Month2Count                         (,35)   edit 999,999
+  end-if
+
+  if #Month3Count <> 0
+     print 'Month 3 Count '                    (+2,1,33)
+     print #Month3Count                         (,35)   edit 999,999
+  end-if
+
+  if $ZeroReport <> ''
+     print 'Zero Report? '                     (+2,1,39)
+     print $ZeroReport                          (,41)
+  end-if
+
+  if $Reported <> ''
+     print 'Wages Reported To Other States? '  (+2,1,39)
+     print $Reported                            (,41)
+  end-if
+
+end-procedure
+
+
+begin-procedure Print-File-Tot
+
+  move '' to $LastCompany
+  move '' to $LastCompanyName
+
+
+  print '**** File Total ****'     (+3,1)
+  print 'No Limit Gross QTD '      (+2,1,26)
+  print #Tot_NlGrs_QTD              (,28)   edit 999,999,999.99mi
+
+  if #Tot_TxGrs_QTD <> 0
+    print 'Taxable Gross QTD  '    (+2,1,26)
+    print #Tot_TxGrs_QTD            (,28)   edit 999,999,999.99mi
+  end-if
+
+  if #Tot_ExGrs_QTD <> 0
+    print 'Excess Gross QTD   '    (+2,1,26)
+    print #Tot_ExGrs_QTD            (,28)   edit 999,999,999.99mi
+  end-if
+
+  print 'Employees Reported'       (+2,1,29)
+  print #Count_F                    (,31)   edit 999,999,999
+
+  if #Count_E <> 0
+    print 'Employers Reported'     (+2,1,29)
+    print #Count_E                  (,31)   edit 999,999,999
+  end-if
+
+  print 'Output File(s):  '        (+2,1)
+
+  let $FileID = '{IMPORTPREFIX}' || 'TX810AKH'
+  print $FileID                    (+1,10)
+  let $FileID = '{IMPORTPREFIX}' || 'TX810AKD'
+  print $FileID                    (+1,10)
+
+end-procedure
+
+
+#Include 'taxrnctl.sqc'  !Get-Tax-Reporting-Run-Controls procedure
+#Include 'getcodta.sqc'  !Get-Company-Data procedure
+#Include 'getstdta.sqc'  !Get-State-Tax-Data procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'rptsmmry.sqc'  !Print-Summary-Data procedure
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'getbalid.sqc'  !Get-Calendar-Year-Id
+#Include 'stdapi.sqc'    !Update Process API
+#Include 'txrnctl1.sqc'  !Process Scheduler Run Controls

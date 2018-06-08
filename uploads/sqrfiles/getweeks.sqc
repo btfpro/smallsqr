@@ -1,0 +1,532 @@
+!***********************************************************************
+!  GetWeeks:  Get Weeks                                                *
+!                                                                      *
+!          Two arrays must be declared in the calling procedure        *
+!                                                                      *
+!          1) Array used to 'mark' whether a week was worked           *
+!                                                                      *
+!             name=QtrWeeks size=1  field=WeekWorked:char:15           *
+!                                                                      *
+!          2) Array used to track wages earned on each day of qtr      *
+!                                                                      *
+!             name=QtrDays  size=10 field=PayGroup:char:1              *
+!                                   field=WkSched:char:1               *
+!                                   field=WeekDay:number:100           *
+!                                   field=Week#:number:100             *
+!                                   field=WorkDay:char:100             *
+!                                   field=Wages:number:100             *
+!                                                                      *
+!             WEEKDAY stores 'number' of day of week (Sunday = 1)      *
+!             WEEK# tracks week of quarter the days falls in           *
+!             WORKDAY indicates whether day is workday based on work   *
+!                 schedule                                             *
+!             WAGES is wages earned on day based on wages earned in    *
+!                 pay period divided by work days in pay period        *
+!                                                                      *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+!                                                                      *
+! This module contains confidential and proprietary information        *
+! of Oracle; it is not to be copied, reproduced, or transmitted        *
+! in any form, by any means, in whole or in part, nor is it to         *
+! be used for any purpose other than that for which it is              *
+! expressly provided under the applicable license agreement.           *
+!                                                                      *
+! Copyright (C) 2006 Oracle. All Rights Reserved.                      *
+!                                                                      *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!          $Date:  2006/07/20:04:15:20                                 
+!       $Release:  HR9                                                 
+!      $Revision:  101                                                 
+!***********************************************************************
+
+begin-procedure Get-Weeks
+
+  do Get-Calendar-Year-Id
+  do Process-Weeks
+  do Check-for-Weeks-Worked
+  do Get-EE-Weeks
+
+end-procedure
+
+begin-procedure Process-Weeks
+
+  move 0  to #i_Max
+  move '' to $Paygroups_This_EE
+  if $Reload_PayGroups = 'Y'             !execute when array is full
+    move 0 to #i
+    while #i <= #QtrDays_Max
+      put ' ' into QtrDays(#i) PayGroup(0)
+      add 1 to #i
+    end-while
+    move 0  to #QtrDays_Max
+    move '' to $PriorPayGroup
+    move '' to $Reload_PayGroups
+  end-if
+
+begin-select
+A.COMPANY
+A.PAYGROUP
+A1.BALANCE_YEAR
+A1.BALANCE_PERIOD
+A.PAY_END_DT
+B.EMPLID
+B.OFF_CYCLE
+B.PAGE_NUM
+B.LINE_NUM
+B.SEPCHK
+
+#ifdef DEBUG
+  print  'Performing Process Weeks '  (+2,1)
+  print  '   PayGroup  '              (+1,1)
+  print     &A.PayGroup                 ()
+  print  '  $EmplID    '              ()
+  print     $EmplID                   ()
+  print  '  Pay_End_Dt '              ()
+  print  &A.Pay_End_Dt                ()
+#endif
+
+  if INSTR($PayGroups_This_EE, &A.Paygroup, 1) = 0
+    if $PayGroups_This_EE = ''
+      move &A.PayGroup to $PayGroups_This_EE
+    else
+      let $PayGroups_This_EE = $PayGroups_This_EE || '*' || &A.Paygroup
+    end-if
+  end-if
+                             !Store schedules for paygroups as encountered
+  if &A.PayGroup <> $PriorPayGroup
+    move 0 to #QtrDays_Idx
+                             !Search array to find loaded pay group
+    WHILE #QtrDays_Idx <= #QtrDays_Max
+      GET $PayGroup from QTRDAYS(#QTRDAYS_IDX) PAYGROUP(0)
+      if $PayGroup = &A.PayGroup               !Pay group already loaded
+        break
+      else
+        if #QtrDays_Idx = #QtrDays_Max         !Load new pay group
+          PUT &A.PayGroup INTO QTRDAYS(#QTRDAYS_IDX) PAYGROUP(0)
+          do Get-Work-Schedule
+          do Load-Qtr-Days
+          add 1 to #QtrDays_Max
+#ifdef DEBUG
+          print  '  QtrDays_Max '              ()
+          print    #QtrDays_Max                ()
+#endif
+          if #QtrDays_Max > 7
+            move 'Y' to $Reload_PayGroups     !array full - start load over
+          end-if
+          break
+        else
+          add 1 to #QtrDays_Idx
+        end-if
+      end-if
+    END-WHILE
+    move &A.PayGroup to $PriorPayGroup
+  end-if
+
+  do Get-Pay-Earnings
+
+FROM  PS_PAY_CALENDAR A, PS_PAY_CAL_BAL_ID A1, PS_PAY_CHECK B
+WHERE A.COMPANY = A1.COMPANY AND A.PAYGROUP = A1.PAYGROUP
+  AND A.PAY_END_DT = A1.PAY_END_DT AND A1.BALANCE_ID = $Calendar_Year_Id
+  AND B.EMPLID          = $EmplID
+  AND B.COMPANY         = $Company
+  AND A.PAY_BEGIN_DT   <= $SlctEarnsEndDate
+  AND A.PAY_END_DT     >= $SlctEarnsBeginDate
+  AND B.COMPANY         = A.COMPANY
+  AND B.PAYGROUP        = A.PAYGROUP
+  AND B.PAY_END_DT      = A.PAY_END_DT
+  AND B.PAYCHECK_NBR         <> 0
+  AND B.PAYCHECK_STATUS IN ('F','R','A')
+ORDER BY A.PAY_END_DT
+end-SELECT
+end-procedure
+
+begin-procedure Get-Pay-Earnings
+#ifdef DEBUG
+  print 'Performing Get-Pay-Earnings ' (+2,1)
+#endif
+
+begin-SELECT
+                   !#i_Min is array element at which to start load of
+                   !earnings for a pay period
+
+                   !#i_Max is array element at which to end load of
+                   !earnings for a pay period
+
+                   !#EarnPeriodDays is the number of days in the earnings
+                   !period
+C.EARNS_BEGIN_DT
+C.EARNS_END_DT
+C.ADDL_NBR
+C.REG_HRLY_EARNS
+C.OT_HRLY_EARNS
+C.REG_EARNS
+
+  move '1' to $Year4
+  move '-' to $DDelimiter
+  do Format-DateTime(&C.Earns_Begin_Dt,$C.Earns_Begin_Dt,{DEFYMD},'','')
+
+  move '1' to $Year4
+  move '-' to $DDelimiter
+  do Format-DateTime(&C.Earns_End_Dt,$C.Earns_End_Dt,{DEFYMD},'','')
+
+#ifdef DEBUG
+  print '$C.Earns_Begin_Dt ' (+1,1)
+  print $C.Earns_Begin_Dt    (,+2)
+  print '$C.Earns_End_Dt '   (+1,1)
+  print $C.Earns_End_Dt      (,+2)
+#endif
+
+  do DTU-Diff-Days($C.Earns_Begin_Dt, $C.Earns_End_Dt, #EarnPeriodDays)
+  add 1 to #EarnPeriodDays
+  do DTU-Diff-Days($QtrBeginDate, $C.Earns_Begin_Dt, #i_Min)
+  let #temp_Max = #i_Min + #EarnPeriodDays + #QtrBeginWeekday - 1
+
+  if #temp_Max > 99
+    move 99 to #temp_Max
+  end-if
+
+  if #temp_Max > #i_Max
+    move #temp_Max to #i_Max
+  end-if
+
+  if #i_Min < 0
+    move 1 to #i_Min
+    let #EarnsBeginWeekday = 1
+  else
+    do DTU-DayOfWeek#($C.Earns_Begin_Dt,#EarnsBeginWeekday)
+    let #i_Min = #i_Min + #QtrBeginWeekday
+  end-if
+
+  do Get-Other-Pay
+
+  let #Earnings =  &C.REG_HRLY_EARNS + &C.OT_HRLY_EARNS + &C.REG_EARNS + #OTH_EARNS
+
+#ifdef DEBUG
+  print  '   #i_Min  '  (+2,1)
+  print      #i_Min     ()
+  print  '   #Earnings  '   ()
+  print      #Earnings      ()
+  print  '   #EarnPeriodDays  ' ()
+  print      #EarnPeriodDays    ()
+  print  '   #temp_Max  ' ()
+  print      #temp_Max    ()
+#endif
+
+  if #Earnings > 0
+    do Load-Earnings
+  end-if
+
+FROM  PS_PAY_EARNINGS C
+WHERE C.COMPANY    = &A.Company
+  AND C.PAYGROUP   = &A.PayGroup
+  AND C.PAY_END_DT = &A.Pay_End_Dt
+  AND C.OFF_CYCLE  = &B.Off_Cycle
+  AND C.PAGE_NUM   = &B.PAGE_NUM
+  AND C.LINE_NUM   = &B.LINE_NUM
+  AND C.SEPCHK     = &B.SepChk
+  AND C.STATE      = $STATE
+ORDER BY C.ADDL_NBR
+end-SELECT
+end-procedure
+
+begin-procedure Get-Other-Pay
+
+  move 0 to #OTH_EARNS
+begin-SELECT
+
+O.OTH_EARNS
+
+  let #OTH_EARNS = #OTH_EARNS + &O.OTH_EARNS
+
+FROM  PS_PAY_OTH_EARNS O
+WHERE O.COMPANY    = &A.Company
+  AND O.PAYGROUP   = &A.PayGroup
+  AND O.PAY_END_DT = &A.Pay_End_Dt
+  AND O.OFF_CYCLE  = &B.Off_Cycle
+  AND O.PAGE_NUM   = &B.Page_Num
+  AND O.LINE_NUM   = &B.Line_Num
+  AND O.SEPCHK     = &B.SepChk
+  AND O.ADDL_NBR   = &C.ADDL_NBR
+end-SELECT
+end-procedure
+
+begin-procedure Get-Work-Schedule
+begin-SELECT
+
+PT.WORK_SCHEDULE
+
+  PUT &PT.Work_Schedule INTO QTRDAYS(#QTRDAYS_IDX) WKSCHED(0)
+
+FROM  PS_PAYGROUP_TBL PT
+WHERE PT.COMPANY         = &A.Company
+  AND PT.PAYGROUP        = &A.PayGroup
+  AND PT.EFFDT           =
+      (SELECT MAX(EFFDT)
+         FROM PS_PAYGROUP_TBL
+        WHERE COMPANY    = PT.COMPANY
+          AND PAYGROUP   = PT.PAYGROUP
+          AND EFF_STATUS = 'A'
+          AND EFFDT     <= &A.Pay_End_Dt)
+end-SELECT
+end-procedure
+
+begin-procedure Load-Earnings
+  get $WkSched from QtrDays(#QtrDays_Idx) WkSched(0)
+  let #Weekday = #EarnsBeginWeekday
+
+#ifdef DEBUG
+  print 'Performing Load-Earnings ' (+2,1)
+  print '$WkSched ' (+1,3)
+  print  $WkSched   (,+3)
+  print '   #Weekday ' ()
+  print     #Weekday   ()  edit 99
+#endif
+
+  move 0 to #WorkDaysInPayPeriod
+  move 1 to #i
+  while #i <= #EarnPeriodDays
+    let $WorkDay = {ps-substr}($WkSched,#Weekday,1)
+    if $WorkDay = 'Y'
+      add 1 to #WorkDaysInPayPeriod
+    end-if
+    add 1 to #i
+    if #Weekday <> 7
+      add 1 to #Weekday
+    else
+      move 1 to #Weekday
+    end-if
+  end-while
+
+#ifdef DEBUG
+  print '  #WorkdaysInPayPeriod  ' (+1,1)
+  print    #WorkdaysInPayPeriod    () edit 99
+#endif
+
+  if #WorkDaysInPayPeriod > 0
+    let #WagesPerDay = #Earnings / #WorkDaysInPayPeriod
+    let #i = #i_Min
+
+#ifdef DEBUG
+    print ' #WagesPerDay  ' ()
+    print   #WagesPerDay    ()  edit 99999.99
+    print ' #i (#i_Min 1)  ' ()
+    print   #i               ()
+#endif
+
+    while #i <= #temp_Max
+      get $WorkDay from QtrDays(#QtrDays_Idx) Workday(#i)
+      if $WorkDay = 'Y'
+        array-add #WagesPerDay to QtrDays(#QtrDays_Idx) Wages(#i)
+      end-if
+      add 1 to #i
+    end-while
+  end-if
+end-procedure
+
+begin-procedure Check-for-Weeks-Worked
+  move 0 to #WagesForWeek
+
+#ifdef DEBUG
+  print 'Performing Check-for-Weeks'  (+2,1)
+  print 'Starting Loop' (+1,1)
+  print ' #qtrbeginweekday ' (+1,1)
+  print   #qtrbeginweekday  (,+2)
+  print ' #qtrendweekday ' (,+2)
+  print   #qtrendweekday   (,+2)
+#endif
+
+  move 1 to #i
+
+  while #i < #i_Max
+
+    move 0 to #j
+    move 0 to #Wages
+
+    while #j < #QtrDays_Max
+      get #WeekDay #Week# #TempWages
+        from QtrDays(#j) WeekDay(#i) Week#(#i) Wages(#i)
+      add #TempWages to #Wages
+
+#ifdef DEBUG
+    print '#i ' (+1,1)
+    print  #i    () edit 999
+    print ' #j '  ()
+    print  #j    () edit 9
+    print  ' #WkDay '    ()
+    print    #WeekDay        () edit 99
+    print  ' #Wk#  '    ()
+    print    #Week#          () edit 99
+    print  ' #Tmp '    ()
+    print    #TempWages          () edit 9999.99
+    print  ' #Wages '    ()
+    print    #Wages          () edit 9999.99
+#endif
+      add 1 to #j
+    end-while
+
+    if #Week# <> 0
+      if #WeekDay = 1
+        move #Wages to #WagesForWeek
+      else
+        add  #Wages to #WagesForWeek
+      end-if
+
+#ifdef DEBUG
+      print ' #WagesForWk  '  ()
+      print    #WagesForWeek      () edit 9999.99
+#endif
+
+      if (#StateMinimum = 0 and #WagesForWeek > 0) or
+         (#StateMinimum > 0 and #WagesForWeek >= #StateMinimum)
+        if (#Week# = 1 and #QtrBeginWeekDay < 5)
+          or (#Week# = 14 and #QtrEndWeekDay > 3)
+          or (#Week# > 1 and #Week# < 14)
+            put 'X' into QtrWeeks(0) WeekWorked(#Week#)
+        end-if
+        move 0 to #WagesForWeek
+        let #i = #i - #WeekDay + 8
+      else
+        add 1 to #i
+      end-if
+    else
+      add 1 to #i
+    end-if
+  end-while
+end-procedure
+
+begin-procedure Get-EE-Weeks
+#ifdef DEBUG
+  print 'Performing Get-EE-Weeks'  (+2,1)
+#endif
+
+  move 0 to #WeeksWorked
+  move 1 to #i
+  while #i < 15
+    get $WeekWorked from QtrWeeks(0) WeekWorked(#i)
+
+#ifdef DEBUG
+    print '#i' (+1,1)
+    print  #i  (,4) edit 99
+    print '$WeekWorked' (,8)
+    print  $WeekWorked  (,+2)
+#endif
+
+    if $WeekWorked = 'X'
+      add 1 to #WeeksWorked
+    end-if
+    add 1 to #i
+  end-while
+
+#ifdef DEBUG
+    do Show-Table
+#endif
+
+  move 1 to #i                              !Reset weeks process arrays
+  while #i < 15
+    put ' ' into QtrWeeks(0) WeekWorked(#i)
+    add 1 to #i
+  end-while
+
+  move 0 to #j
+  while #j < #QtrDays_Max
+    get $PayGroup from QtrDays(#j) PayGroup
+    if INSTR($PayGroups_This_EE, $PayGroup, 1) <> 0
+      move 1 to #i
+      while #i <= #i_Max
+        put 0 into QtrDays(#j) Wages(#i)
+        add 1 to #i
+      end-while
+    end-if
+    add 1 to #j
+  end-while
+end-procedure
+
+begin-procedure Load-Qtr-Days
+#ifdef DEBUG
+  print '***** Load Qtr Days *****' (+1,1)
+#endif
+
+  move 1 to #i
+  move 1 to #j
+  move 1 to #Week#
+
+#ifdef DEBUG
+  print '  #Week# ' (+1,1)
+  print #Week#      (,+3) edit 99
+  print '      Loop'    (+1,1)
+#endif
+
+  do DTU-Diff-Days($EarnsBeginDate, $EarnsEndDate, #DaysToProcess)
+  add 1 to #DaysToProcess
+
+  while #i <= #DaysToProcess
+    let $WorkDay = {ps-substr}(&PT.Work_Schedule,#j,1)
+    put #j #Week# $WorkDay
+      into QtrDays(#QtrDays_Idx) WeekDay(#i) Week#(#i) WorkDay(#i)
+
+#ifdef DEBUG
+    print '#i ' (+1,5)
+    print  #i   (,10) edit 999
+    print '#Week# '   (,+5)
+    print #Week#      (,+5) edit 99
+    print 'Workday'   (,+5)
+    print $Workday    (,+5)
+#endif
+
+    add 1 to #i
+    if #j = 7
+      move 1 to #j
+      add  1 to #Week#
+    else
+      add  1 to #j
+    end-if
+  end-while
+                !Reset Day of Week counter to previous day
+  if #j = 1
+    move 7 to #j
+  else
+    subtract 1 from #j
+  end-if
+end-procedure
+
+begin-procedure Show-Table
+  print 'Show Table'  (+2,1)
+  print ' #QtrDays_Max ' (+2,1)
+  print   #QtrDays_Max   (,+2)
+  print ' #i_Max ' (,+2)
+  print   #i_Max   (,+2)
+  move 0 to #i
+
+  while #i < #i_Max
+
+    move 0 to #j
+
+    while #j < #QtrDays_Max
+      get #WeekDay #Week# $WorkDay #Wages
+        from QtrDays(#j) WeekDay(#i) Week#(#i) WorkDay(#i) Wages(#i)
+    print '#i ' (+1,1)
+    print  #i    () edit 999
+    print ' #j '  ()
+    print  #j    () edit 9
+    print  ' #WkDay '    ()
+    print    #WeekDay        () edit 99
+    print  ' #Wk#  '    ()
+    print    #Week#          () edit 99
+    print  ' #WkD '    ()
+    print    $WorkDay        ()
+    print  ' #Wages '    ()
+    print    #Wages          () edit 9999.99
+      add 1 to #j
+    end-while
+
+      add 1 to #i
+  end-while
+end-procedure
+
+#Include 'getbalid.sqc'   !Get-Calendar-Year-Id

@@ -1,0 +1,1896 @@
+!********************************************************************** 
+! SQR Name:           adpqout.sqc  
+! SQR Descr:          ADP Tax Service Transporter 
+! Created by:         drmonroe 
+! Create date:        03/04/2010 
+! Last modified by:   drmonroe
+! Last modified date: 01/18/2013
+!*********************************************************************** 
+!  ----------------------------------------------------------------------  !
+!  adpqout.sqc - header / config file for ADP Tax & Financial Services     !
+!               Tax Extract                                                !
+!                                                                          !
+!     Author: Dan Monroe  (dan.monroe@adp.com / cis_peoplesoft@adp.com     !
+!     Date:   April 2004                                                   !
+!                                                                          !
+!  This is invoked by the Quarterly SQR's provided by ADP invoked by adp303!
+
+!   Mar 15, 2007           SKIP_COMPANY_HEADER added for BAE
+!   Mar 27, 2007
+!   *** Toll Brothers performance enhancement
+!     TF_PBZQ_x tables to have a CHAR(600) instead of LONG(600) to restore performance.
+!     cut time from 60 to 20 minutes.  must edit SQL, as app designer doesn't allow CHAR(600)
+!     ODBC database.. no commit, using $sqr-database
+!
+!   Dec 18, 2007           debugging
+!   Jan  4, 2008           get-c fix, also TF_PBZQOUT_C must be a key 
+!   Jun 16, 2009           split up so that we can run if only the TF_PBZPOUT_D table exists
+!   Sep 04, 2009           ADP_TAX_PERIODIC_CHECK_DATE, PAY_END_DT will be in TF_PBZPOUT_D table
+!   Sep 22, 2009           UPDATE_STATISTICS, HHS1 testing for speed
+!   Sep 24, 2009           moved call to get FEIN to adp303.sqc's get header for speed
+!   Nov 09. 2009           {NOLOCK_SQL} added to multiple queries for speed
+!   Feb 09, 2009           ADP Canada fix
+!   Mar 24, 2010           SKIP_TEMP_TABLE_CLEANUP added for GE01
+!                          SUBTOTAL_ADP_COMPID_EXTRACT added for GE01
+!   Feb 15, 2011           Added PSD field onto end of W record      
+!   Mar 17, 2011           NO PSD code yet
+!   Aug 12, 2011           Q3 specs include PSD codes out to position 528
+!   Oct 25, 2011           for tuning of quarterly in Oracle
+!                                #define TRUNCATE_TEMP_TABLES
+!                                #define ANALYZE_TEMP_TABLES
+!   Oct 26, 2011           positions 501 - 528 not coming out of out-w rec routine.. fixed
+!   Feb 29, 2012           PS_ACT_32_CLEAR_COUNTER
+!   Mar  6, 2012           RHI: USE_SECONDARY_PERIODIC_SORT_TBL    PS_{Client_Table_Prefix}PBZPOUT_P{Client_Table_Suffix}  !for the 'PLSxxxxx' RUN_ID's
+!   Mar 12, 2012           RHI: create periodic excel file during adp303.sqc init so file always gets created
+!   ********************************** V1Q2012 **************************************************
+!   Mar 20, 2012           add TF_RES_TAXCODE to TF_PBZQOUT_W table as a key to handle the PA data
+!   Sep 11, 2012           avoid dups for Philly if multi residents in balances for Philly work taxcodes, new string to PS_TF_PBZQOUT_W, TF_RES_TAXCODE 
+!   Jan 18, 2013           Add PAYABLE_COUNT key field for TGP1  #define PAYABLE_COUNT_ENABLED
+!   Nov 30, 2015           new W record length is 629 not 528 as before
+!   Aug 15, 2016           new W record length is 639 not 629 as before
+!   Oct  3, 2016           MASTER_TAX_HEADER - move here so periodic can have all the tax headers
+!   Nov 17, 2016           for the new W rec length of 656 for Q4_2016
+! --------------------------------------------------------------------------------------------
+
+#define        adpqout_version     ADPQOUT.Nov 17, 2016
+
+#define Q4_2016
+
+
+!#define debug_canada
+
+#define USE_PRIMARY_PERIODIC_SORT_TBL      PS_{Client_Table_Prefix}PBZPOUT_D{Client_Table_Suffix}
+
+#define ADPQOUT_TEST_EMPLID 07008736
+
+#ifdef TEST_EMPLID
+  #define debug_adpqout
+  #define debug_excel
+  #ifdef CANADA_TOO
+   #define debug_canada
+   #ifdef SPLIT_FEDERAL
+    #define debug_split
+   #endif
+  #endif
+#endif
+
+#ifdef ADP_TAX_PERIODIC_CHECK_DATE
+ #define PAY_END_DT_IN_PBZPOUT_D           ! add this anytime we start having dup problems...value will by $payline_pay_end_dt
+#endif
+
+#if {SITE_ID} = 'HHS1'                     ! HHS1 runs both pbzper.sqr and pbzpercd.sqr so the PAY_END_DT is always in the TF_PBZPOUT_D table
+ #define PAY_END_DT_IN_PBZPOUT_D           
+#endif
+
+#if {SITE_ID} = 'UHG1'                     ! UHG1 runs both pbzper.sqr and pbzpercd.sqr so the PAY_END_DT is always in the TF_PBZPOUT_D table
+ #define PAY_END_DT_IN_PBZPOUT_D           
+#endif
+
+#if {SITE_ID} = 'TGP1'                     ! TGP1 
+  #define PAYABLE_COUNT_ENABLED
+#endif
+
+#if {SITE_ID} = 'HWL1'   !if Ky local tax, AND this is a KJDA Company, stick "K in 14th char of taxcode
+  #define KJDA_PS_DELIVERED
+#endif
+
+#if {PeopleSoft_Version} < '8'
+  #define COMPANYID_FIELD {Client_Field_Prefix}COMPANYID{Client_Field_Suffix}
+#else
+  #define COMPANYID_FIELD COMPANYID
+#endif
+
+
+! ----------------------------- periodic specific --------------------------
+
+#ifdef ADP_TAX_PERIODIC
+
+begin-procedure Log-D-rec-data    !PBZPOUT_D  - keys {COMPANYID_FIELD}/$Current_out_Extract_CompID, PBZQOUT_SRT
+
+  if #init-pbzpout = 0
+     do Init-Pbzpout
+     add 1 to #init-pbzpout
+  end-if
+  
+
+ let $Current_out_Extract_CompID = rtrim($Extract_CompID,' ')
+
+ let $Company_cd = ' ' 
+ #ifdef SUBTOTAL_FEIN_EXTRACT
+    let $Company = $Current_out_Extract_CompID
+    move $payline_pay_end_dt to $AsofDate
+    LET $CO_FOUND = 'N'
+    do get-company-data
+    if rtrim($CO_FOUND,' ') = 'Y'
+       move &CT.FEDERAL_EIN to $Current_out_Extract_CompID 099999999
+    end-if
+    let $Company_cd = $Company 
+ #endif
+ 
+ #ifdef SUBTOTAL_ADP_COMPID_EXTRACT
+   let $Company_cd = $Current_Company 
+   !show 'adpqout.sqc:  Log-D-rec-data (SUBTOTAL_ADP_COMPID_EXTRACT):  Current_out_Extract_CompID = ' $Current_out_Extract_CompID ', Company_cd = ' $company_cd
+ #endif
+ 
+ #ifdef SUBTOTAL_BUSINESS_UNIT_EXTRACT
+    let $Company_cd = $Current_Company 
+ #endif
+ 
+ let $log_error = 'Log-D-rec-data'
+ 
+  #if {SITE_ID} = 'TCN1'
+    let $s = substr($pout_str,1,200)  ! due to max of 250 chars for a key. this might be for all MVS clients
+  #else
+    let $s = substr($pout_str,1,227)  ! changed from 17 to 227 for full check (Banta, automated Periodic)
+  #endif
+  
+  let $CkDt_Mo           = substr($TaxBalance_Check_Dt_DTU,6,2)
+  let $CkDt_Day          = substr($TaxBalance_Check_Dt_DTU,9,2)
+  let $CkDt_Yr           = substr($TaxBalance_Check_Dt_DTU,1,4)
+  let $liabdt_DTU = $CkDt_Yr || $CkDt_Mo || $CkDt_Day
+
+ if $TaxBalance_Canada <> 'Y'
+   let $TaxBalance_Wage_loss_plan = ' '
+ end-if
+ 
+ #ifdef PAYABLE_COUNT_ENABLED
+   let #PAYABLE_COUNT = #PAYABLE_COUNT + 1
+ #endif
+ 
+begin-sql on-error=Log-error
+
+       #ifdef MVS              
+         INSERT INTO \$pbzpout_tbl\
+       #else
+         INSERT INTO  [$pbzpout_tbl]
+       #endif
+             ( {COMPANYID_FIELD},
+               #ifdef PAYABLE_COUNT_ENABLED
+               PAYABLE_COUNT,
+               #endif
+               COMPANY,
+               PAYGROUP,
+               #ifdef CANADA_TOO
+               CAN,
+               #endif
+               #ifdef PAY_END_DT_IN_PBZPOUT_D        
+               PAY_END_DT,
+               #endif
+               {Client_Field_Prefix}LIABDT_DTU{Client_Field_Suffix},
+               {Client_Field_Prefix}PBZPOUT_SRT{Client_Field_Suffix},
+               #ifdef SPLIT_FEDERAL
+               WAGE_LOSS_PLAN,
+               #endif
+               {Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix} )
+      VALUES ( $Current_out_Extract_CompID,
+               #ifdef PAYABLE_COUNT_ENABLED
+               #PAYABLE_COUNT,
+               #endif
+               $Company_cd,
+               $Payline_paygroup,
+               #ifdef CANADA_TOO
+               $TaxBalance_Canada,
+               #endif
+               #ifdef PAY_END_DT_IN_PBZPOUT_D        
+               $payline_pay_end_dt,
+               #endif
+               $liabdt_DTU,
+               $s,
+               #ifdef SPLIT_FEDERAL
+               $TaxBalance_Wage_loss_plan,
+               #endif
+               $pout_str)
+
+end-sql
+
+    add 1 to #Total_PBZQOUT_D_Count
+
+end-procedure
+
+
+
+begin-procedure Output-Pbzper     !called before "F" record is written
+
+  !Process all PBZQOUT_D recs
+  !  and at Company break, outputting totals from the _T rec
+  !------------------------------------------------------------------------------------------
+
+ 
+  move '' to $Existing_company
+  move '' to $Existing_paygroup
+  move '' to $Existing_liabdt
+  MOVE '' to $Canada_tax
+  move '' to $existing_taxcode
+  
+  if #Total_PBZQOUT_D_Count > 0
+
+  do Get-Current-DateTime
+  show 'Output-pbzper...Starting  ---->  ' $AsOfNow
+   
+begin-select
+PD.{COMPANYID_FIELD}
+PD.PAYGROUP
+#ifdef CANADA_TOO
+PD.CAN
+#ifdef SPLIT_FEDERAL
+PD.WAGE_LOSS_PLAN
+#endif
+#endif
+PD.{Client_Field_Prefix}LIABDT_DTU{Client_Field_Suffix}
+PD.{Client_Field_Prefix}PBZPOUT_SRT{Client_Field_Suffix}
+PD.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix}
+
+     #ifdef CANADA_TOO
+       let $Canada_tax = rtrim (&PD.CAN,' ')  ! Y or N
+       #ifdef SPLIT_FEDERAL
+        let $Wage_Loss_Plan  =  rtrim(&PD.WAGE_LOSS_PLAN,' ')
+       #else
+        let $Wage_Loss_Plan  =  ''
+       #endif
+     #endif
+
+      #ifdef debug_canada
+       if $Canada_tax = 'Y'
+        show 'Processing next D rec...'
+        show ' PD.{COMPANYID_FIELD} = ' &PD.{COMPANYID_FIELD}
+        show ' PD.PAYGROUP = ' &PD.PAYGROUP
+        show ' PD.CAN = ' &PD.CAN
+        #ifdef SPLIT_FEDERAL
+        show ' PD.WAGE_LOSS_PLAN = ' &PD.WAGE_LOSS_PLAN
+        #endif
+        show ' PD.{Client_Field_Prefix}LIABDT_DTU{Client_Field_Suffix} = ' &PD.{Client_Field_Prefix}LIABDT_DTU{Client_Field_Suffix}
+        show ' PD.{Client_Field_Prefix}PBZPOUT_SRT{Client_Field_Suffix} = ' &PD.{Client_Field_Prefix}PBZPOUT_SRT{Client_Field_Suffix}
+       end-if     
+      #endif
+
+    
+     if rtrim($Existing_company,' ') = ''
+       let $Existing_company  = rtrim(&PD.{COMPANYID_FIELD},' ')
+       let $Existing_paygroup = rtrim(&PD.PAYGROUP,' ')
+       let $Existing_liabdt   = rtrim(&PD.{Client_Field_Prefix}LIABDT_DTU{Client_Field_Suffix},' ')
+       #ifdef MASTER_TAX_HEADER
+             let $Extract_CompID = $Existing_company
+             let $liab_dt_DTU = &PD.{Client_Field_Prefix}LIABDT_DTU{Client_Field_Suffix}
+             move $AsOfToday to $AsOfDate
+             show 'adpqout, writing WRITE-PAYROLL-HEADER-MASTER-TAX ' $Extract_CompID ' ' $liab_dt_DTU ' as of ' $AsOfDate
+             do WRITE-PAYROLL-HEADER-MASTER-TAX
+             do MT-Write-Company-Tax-Records-From-Sort-Table
+	     do WRITE-PAYROLL-TRAILER             
+       #endif
+
+       #ifdef CANADA_TOO
+         if $Canada_tax = 'Y'
+           let $write_it = 't'
+           do write-h-canada   !in adpcanad.sqc
+         else
+           do write-h
+         end-if
+       #else
+         do write-h
+       #endif
+
+     else
+       if rtrim($Existing_company,' ') <> rtrim(&PD.{COMPANYID_FIELD},' ')
+
+         #ifdef CANADA_TOO
+           if $Canada_tax = 'Y'
+              let $write_it = 'f'
+              do write-t-canada   !in adpcanad.sqc        
+           else
+             do write-t
+           end-if
+         #else
+           do write-t
+         #endif
+
+         let $Existing_company  = rtrim(&PD.{COMPANYID_FIELD},' ')
+         let $Existing_paygroup = rtrim(&PD.PAYGROUP,' ')   !added 11/21/05 for The Gap
+         let $Existing_liabdt   = rtrim(&PD.{Client_Field_Prefix}LIABDT_DTU{Client_Field_Suffix},' ')
+         
+         #ifdef MASTER_TAX_HEADER
+             let $Extract_CompID = $Existing_company
+             let $liab_dt_DTU = &PD.{Client_Field_Prefix}LIABDT_DTU{Client_Field_Suffix}
+             move $AsOfToday to $AsOfDate
+             show 'adpqout, writing WRITE-PAYROLL-HEADER-MASTER-TAX ' $Extract_CompID ' ' $liab_dt_DTU ' as of ' $AsOfDate
+             do WRITE-PAYROLL-HEADER-MASTER-TAX
+             do MT-Write-Company-Tax-Records-From-Sort-Table
+	     do WRITE-PAYROLL-TRAILER             
+         #endif
+         
+         #ifdef CANADA_TOO
+           if $Canada_tax = 'Y'
+              let $write_it = 'f'
+              do write-h-canada   !in adpcanad.sqc        
+           else
+             do write-h
+           end-if
+         #else
+           do write-h
+         #endif
+       else
+         if rtrim($Existing_liabdt,' ') <> rtrim(&PD.{Client_Field_Prefix}LIABDT_DTU{Client_Field_Suffix},' ')
+           #ifdef CANADA_TOO
+             if $Canada_tax = 'Y'
+                let $write_it = 'f'
+                do write-t-canada   !in adpcanad.sqc        
+             else
+               do write-t
+             end-if
+           #else
+             do write-t
+           #endif
+
+           let $Existing_liabdt =  rtrim(&PD.{Client_Field_Prefix}LIABDT_DTU{Client_Field_Suffix},' ')
+
+           #ifdef MASTER_TAX_HEADER
+             let $Extract_CompID = $Existing_company
+             let $liab_dt_DTU = &PD.{Client_Field_Prefix}LIABDT_DTU{Client_Field_Suffix}
+             move $AsOfToday to $AsOfDate
+             show 'adpqout, writing WRITE-PAYROLL-HEADER-MASTER-TAX ' $Extract_CompID ' ' $liab_dt_DTU ' as of ' $AsOfDate
+             do WRITE-PAYROLL-HEADER-MASTER-TAX
+             do MT-Write-Company-Tax-Records-From-Sort-Table
+	     do WRITE-PAYROLL-TRAILER             
+           #endif
+
+           #ifdef CANADA_TOO
+             if $Canada_tax = 'Y'
+               let $write_it = 'f'
+               do write-h-canada   !in adpcanad.sqc        
+             else
+               do write-h
+             end-if
+           #else
+             do write-h
+           #endif
+
+         end-if
+       end-if
+     end-if
+
+     #ifdef KJDA
+        do update-taxcode-with-kjda-flag
+     #endif
+
+     #ifdef KJDA_PS_DELIVERED
+        do update-taxcode-with-kjda-flag
+     #endif
+
+    do parse-and-compare-output-d-rec
+    
+    #ifdef MVS              
+      FROM \$pbzpout_tbl\ PD
+    #else
+      FROM [$pbzpout_tbl] PD
+    #endif
+
+   #ifndef PAYGROUP_ROLLUP
+
+    ORDER BY PD.{COMPANYID_FIELD}, PD.PAYGROUP,
+     PD.{Client_Field_Prefix}LIABDT_DTU{Client_Field_Suffix},
+     PD.{Client_Field_Prefix}PBZPOUT_SRT{Client_Field_Suffix}
+   
+   #else
+    ORDER BY PD.{COMPANYID_FIELD}, PD.{Client_Field_Prefix}LIABDT_DTU{Client_Field_Suffix},
+             PD.{Client_Field_Prefix}PBZPOUT_SRT{Client_Field_Suffix}
+   
+   #endif
+
+end-select
+
+     #ifdef CANADA_TOO
+       if $Canada_tax = 'Y' 
+         let $write_it = 't'
+         do write-t-canada   !in adpcanad.sqc        
+       else
+         if #company_trailer_reccnt > 0
+           do write-t
+         end-if
+       end-if
+     #else
+       if #company_trailer_reccnt > 0
+         do write-t
+       end-if
+     #endif
+
+  end-if
+
+  do Get-Current-DateTime
+  show 'Output-pbzper...complete  ----> Status: D-Rec Count... ' #d_rec_total ' ' $AsOfNow
+  
+  #ifdef EXCEL_FIXED_PERIODIC_FILENAME
+    do periodic-excel-close
+  #endif
+  
+end-procedure
+
+#ifdef MASTER_TAX_HEADER
+begin-procedure MT-Write-Company-Tax-Records-From-Sort-Table  !$Extract_CompID  $liab_dt_DTU $Existing_paygroup
+
+  show 'MT-Write-Company-Tax-Records-From-Sort-Table ' $Extract_CompID ' '  $liab_dt_DTU ' '  $Existing_paygroup
+  let #MT_TAX_CUR_hash = 0
+  
+begin-select
+PDMT.{Client_Field_Prefix}PBZPOUT_SRT{Client_Field_Suffix}
+PDMT.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix}
+
+       let $existing_taxcode_MT_Hdr = substr(&PDMT.{Client_Field_Prefix}PBZPOUT_SRT{Client_Field_Suffix},3,15)
+       let #cur_MT_Hdr = substr(&PDMT.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},18,15)
+       let #cur_MT_Hdr = #cur_MT_Hdr / 100
+       if substr(&PD.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},33,1) = '-'
+          let #cur_MT_Hdr = 0 - #cur_MT_Hdr
+       end-if
+
+       let $MT_STATE     = substr($existing_taxcode_MT_Hdr,1, 2)
+       let $MT_TAX_CLASS = substr($existing_taxcode_MT_Hdr,3, 1)
+       let $MT_LOCALITY  = substr($existing_taxcode_MT_Hdr,4,12)
+       let #MT_TAX_CUR =   #cur_MT_Hdr
+       do WRITE-COMPANY-TAX  !$MT_STATE $MT_TAX_CLASS $MT_LOCALITY #MT_TAX_CUR 
+       add #MT_TAX_CUR to #MT_TAX_CUR_hash
+       
+    #ifdef MVS              
+      FROM \$pbzpout_tbl\ PDMT
+    #else
+      FROM [$pbzpout_tbl] PDMT
+    #endif
+
+        WHERE PDMT.{COMPANYID_FIELD}                                    = $Extract_CompID
+          AND PDMT.{Client_Field_Prefix}LIABDT_DTU{Client_Field_Suffix} = $liab_dt_DTU 
+          #ifndef PAYGROUP_ROLLUP
+          AND PDMT.PAYGROUP                                             = $Existing_paygroup
+          #endif
+          
+          #ifndef PAYGROUP_ROLLUP
+            ORDER BY PDMT.{COMPANYID_FIELD}, 
+              PDMT.PAYGROUP,
+              PDMT.{Client_Field_Prefix}LIABDT_DTU{Client_Field_Suffix},
+              PDMT.{Client_Field_Prefix}PBZPOUT_SRT{Client_Field_Suffix}
+          #else
+            ORDER BY PDMT.{COMPANYID_FIELD}, 
+              PDMT.{Client_Field_Prefix}LIABDT_DTU{Client_Field_Suffix},
+              PDMT.{Client_Field_Prefix}PBZPOUT_SRT{Client_Field_Suffix}
+          #endif
+
+end-select
+
+  show 'MT-Write-Company-Tax-Records-From-Sort-Table complete Total taxes on header records = ' #MT_TAX_CUR_hash edit 999,999,999,999.99
+
+end-procedure
+#endif
+
+begin-procedure retrieve-canada-data
+
+     let $d_taxcode        = substr(&PD.{Client_Field_Prefix}PBZPOUT_SRT{Client_Field_Suffix},3,15)
+     let $existing_taxcode = substr(&PD.{Client_Field_Prefix}PBZPOUT_SRT{Client_Field_Suffix},3,15)
+     let #cur = substr(&PD.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},18,15)
+     let #cur = #cur / 100
+     if substr(&PD.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},33,1) = '-'
+        let #cur = 0 - #cur
+     end-if
+
+     let #txgrs = substr(&PD.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},34,15)
+     let #txgrs = #txgrs / 100
+     if substr(&PD.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},49,1) = '-'
+        let #txgrs = 0 - #txgrs
+     end-if
+
+     let #nlgrs = substr(&PD.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},50,15)
+     let #nlgrs = #nlgrs / 100
+     if substr(&PD.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},65,1) = '-'
+         let #nlgrs = 0 - #nlgrs
+     end-if
+
+     let #gross = substr(&PD.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},66,15)
+     let #gross = #gross / 100
+     if substr(&PD.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},81,1) = '-'
+         let #gross = 0 - #gross
+     end-if
+
+end-procedure
+
+begin-procedure parse-and-compare-output-d-rec  !this needs to make sure it's not the same taxcode/liabdt/company as before
+                                                !if it is...save/update/set write-d-record to 'f'
+   #ifdef CANADA_TOO
+    if $Canada_tax = 'Y'
+      do retrieve-canada-data
+      do write-d-tax                        !in adpcanad.sqc        
+
+      #ifdef EXCEL_FIXED_PERIODIC_FILENAME
+       let $tc    = $existing_taxcode
+       do periodic-excel-write
+      #endif
+
+      goto done-parse
+    end-if
+   #endif
+ 
+   let $new_taxcode = substr(&PD.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},3,15)
+
+   if $new_taxcode = $existing_taxcode or $existing_taxcode = ''
+       do retrieve-data-values
+   else
+     do output-data-rec-buffer
+     do retrieve-data-values
+   end-if
+   
+   add #cur       to #cur_buffer
+   add #txgrs     to #txgrs_buffer
+   add #nlgrs     to #nlgrs_buffer
+   add #gross     to #gross_buffer
+   
+   add #qtd       to #qtd_buffer
+   add #txgrs_qtd to #txgrs_qtd_buffer
+   add #nlgrs_qtd to #nlgrs_qtd_buffer
+   add #gross_qtd to #gross_qtd_buffer
+   
+   add #ytd       to #ytd_buffer
+   add #txgrs_ytd to #txgrs_ytd_buffer
+   add #nlgrs_ytd to #nlgrs_ytd_buffer
+   add #gross_ytd to #gross_ytd_buffer
+   
+   add #ass_count    to #ass_count_buffer
+   add #female_count to #female_count_buffer
+   add #male_count   to #male_count_buffer
+ 
+done-parse:
+
+end-procedure
+
+
+begin-procedure build-s-string
+
+
+        let #T = #Cur_buffer * 100
+        do Format-Number(#t,$Cur,         '999999999999999mi')
+        let #T = #Txgrs_buffer * 100
+        do Format-Number(#t,$Txgrs,       '999999999999999mi')
+        let #T  = #Nlgrs_buffer * 100
+        do Format-Number(#t,$Nlgrs,       '999999999999999mi')
+        let #T = #gross_buffer * 100  
+        do Format-Number(#t,$Gross,       '999999999999999mi')
+     
+        let #T = #Qtd_buffer * 100
+        do Format-Number(#t,$Qtd,         '999999999999999mi')
+        let #T = #Txgrs_Qtd_buffer * 100
+        do Format-Number(#t,$Txgrs_Qtd,   '999999999999999mi')
+        let #T  = #Nlgrs_Qtd_buffer * 100
+        do Format-Number(#t,$Nlgrs_Qtd,   '999999999999999mi')
+        let #T = #gross_Qtd_buffer * 100
+        do Format-Number(#t,$Gross_Qtd,   '999999999999999mi')
+
+        let #T = #Ytd_buffer * 100
+        do Format-Number(#t,$Ytd,          '999999999999999mi')
+        let #T = #Txgrs_Ytd_buffer * 100
+        do Format-Number(#t,$Txgrs_Ytd,    '999999999999999mi')
+        let #T  = #Nlgrs_Ytd_buffer * 100
+        do Format-Number(#t,$Nlgrs_Ytd,    '999999999999999mi')
+        let #T = #gross_ytd_buffer * 100
+        do Format-Number(#t,$Gross_Ytd,    '999999999999999mi')
+
+        do Format-Number(#ass_Count_buffer,$ass_Count,       '999999')
+        do Format-Number(#Female_Count_buffer,$Female_Count, '99999')
+        do Format-Number(#Male_Count_buffer,$Male_Count,     '99999')
+
+
+       #ifdef PS_ACT_32_CLEAR_COUNTER
+         if substr($existing_taxcode,1,3) = 'PAH' and substr($existing_taxcode,14,1) <> ' '
+           let $existing_taxcode = substr($existing_taxcode,1,13) || ' ' || substr($existing_taxcode,15,1)
+         end-if
+       #endif
+     
+       let $s = 'D ' || $existing_taxcode || $Cur || $Txgrs || $Nlgrs || $Gross -
+                      || $Qtd || $txgrs_Qtd || $Nlgrs_Qtd || $Gross_Qtd           -
+                      || $Ytd || $txgrs_Ytd || $Nlgrs_Ytd || $Gross_Ytd           -
+                      || $ass_Count || $Female_Count || $Male_Count
+
+end-procedure
+
+begin-procedure output-data-rec-buffer
+
+     do build-s-string
+     Write 1 from $s:227
+     add 1 to #d_rec_total
+     #ifdef EXCEL_FIXED_PERIODIC_FILENAME
+       let $tc    = $existing_taxcode
+       let #cur   = #cur_buffer
+       let #txgrs = #txgrs_buffer
+       let #nlgrs = #nlgrs_buffer
+       do periodic-excel-write
+     #endif
+
+     Add #cur_buffer to #Company_trailer_Total_Tax
+     Add #cur_buffer to #Hash_cur_Total_Tax
+     add 1 to #company_trailer_reccnt
+     add 1 to #reccnt
+     
+     let #cur_buffer       = 0
+     let #txgrs_buffer     = 0
+     let #nlgrs_buffer     = 0
+     let #gross_buffer     = 0
+     let #qtd_buffer       = 0
+     let #txgrs_qtd_buffer = 0
+     let #nlgrs_qtd_buffer = 0
+     let #gross_qtd_buffer = 0
+     let #ytd_buffer       = 0
+     let #txgrs_ytd_buffer = 0
+     let #nlgrs_ytd_buffer = 0
+     let #gross_ytd_buffer = 0
+     let #ass_count_buffer    = 0
+     let #female_count_buffer = 0
+     let #male_count_buffer   = 0 
+     
+   
+end-procedure
+
+
+begin-procedure retrieve-data-values
+
+     let $d_taxcode        = substr(&PD.{Client_Field_Prefix}PBZPOUT_SRT{Client_Field_Suffix},3,15)
+     let $existing_taxcode = substr(&PD.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},3,15)
+!cur       
+     let #cur = substr(&PD.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},18,15)
+     let #cur = #cur / 100
+     if substr(&PD.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},33,1) = '-'
+        let #cur = 0 - #cur
+     end-if
+
+     let #txgrs = substr(&PD.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},34,15)
+     let #txgrs = #txgrs / 100
+     if substr(&PD.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},49,1) = '-'
+        let #txgrs = 0 - #txgrs
+     end-if
+
+     let #nlgrs = substr(&PD.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},50,15)
+     let #nlgrs = #nlgrs / 100
+     if substr(&PD.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},65,1) = '-'
+         let #nlgrs = 0 - #nlgrs
+     end-if
+
+     let #gross = substr(&PD.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},66,15)
+     let #gross = #gross / 100
+     if substr(&PD.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},81,1) = '-'
+         let #gross = 0 - #gross
+     end-if
+
+    
+!qtd       
+     let #qtd = substr(&PD.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},82,15)
+     let #qtd = #qtd / 100
+     if substr(&PD.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},97,1) = '-'
+        let #qtd = 0 - #qtd
+     end-if
+
+     let #txgrs_qtd = substr(&PD.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},98,15)
+     let #txgrs_qtd = #txgrs_qtd / 100
+     if substr(&PD.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},113,1) = '-'
+        let #txgrs_qtd = 0 - #txgrs_qtd
+     end-if
+
+     let #nlgrs_qtd = substr(&PD.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},114,15)
+     let #nlgrs_qtd = #nlgrs_qtd / 100
+     if substr(&PD.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},129,1) = '-'
+         let #nlgrs_qtd = 0 - #nlgrs_qtd
+     end-if
+
+     let #gross_qtd = substr(&PD.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},130,15)
+     let #gross_qtd = #gross_qtd / 100
+     if substr(&PD.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},145,1) = '-'
+         let #gross_qtd = 0 - #gross_qtd
+     end-if
+     
+     
+!ytd       
+     let #ytd = substr(&PD.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},146,15)
+     let #ytd = #ytd / 100
+     if substr(&PD.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},161,1) = '-'
+        let #ytd = 0 - #ytd
+     end-if
+
+     let #txgrs_ytd = substr(&PD.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},162,15)
+     let #txgrs_ytd = #txgrs_ytd / 100
+     if substr(&PD.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},177,1) = '-'
+        let #txgrs_ytd = 0 - #txgrs_ytd
+     end-if
+
+     let #nlgrs_ytd = substr(&PD.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},178,15)
+     let #nlgrs_ytd = #nlgrs_ytd / 100
+     if substr(&PD.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},193,1) = '-'
+         let #nlgrs_ytd = 0 - #nlgrs_ytd
+     end-if
+
+     let #gross_ytd = substr(&PD.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},194,15)
+     let #gross_ytd = #gross_ytd / 100
+     if substr(&PD.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},209,1) = '-'
+         let #gross_ytd = 0 - #gross_ytd
+     end-if
+     
+     let #ass_count    = substr(&PD.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},210,6)
+     let #female_count = substr(&PD.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},216,5)
+     let #male_count   = substr(&PD.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},221,5)
+   
+end-procedure
+
+
+#ifdef KJDA
+
+begin-procedure update-taxcode-with-kjda-flag
+
+    let $st = &PD.{Client_Field_Prefix}PBZPOUT_SRT{Client_Field_Suffix}
+    if (substr($st,6,1) <> ' ') and (substr($st,3,2) = 'KY')
+      do check_kjda_per
+      if rtrim($kjda_company,' ') = 't'
+        let $stmp = substr(&PD.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},1,15) || 'K' ||
+                    substr(&PD.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},17,length($s))
+        let $s = rtrim($stmp,' ')
+      end-if
+    end-if
+
+end-procedure
+
+#endif
+
+#ifdef KJDA_PS_DELIVERED
+
+begin-procedure update-taxcode-with-kjda-flag
+
+    let $st = &PD.{Client_Field_Prefix}PBZPOUT_SRT{Client_Field_Suffix}
+    if (substr($st,6,1) <> ' ') and (substr($st,3,2) = 'KY')
+      do check_kjda_per
+      if rtrim($kjda_company,' ') = 't'
+        let $stmp = substr(&PD.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},1,15) || 'K' ||
+                    substr(&PD.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},17,length($s))
+        let $s = rtrim($stmp,' ')
+      end-if
+    end-if
+
+end-procedure
+
+#endif
+
+
+
+#ifdef KJDA_PS_DELIVERED
+
+begin-procedure check_kjda_per
+
+    let $kjda_company = ''
+    !show 'Periodic check: KJDA_company ? '
+
+begin-select loops=1
+PDKJDA.{Client_Field_Prefix}PBZPOUT_SRT{Client_Field_Suffix}
+
+   let $kjda_company = 't'
+   !show 'Found kjda code, sort string: ' &PDKJDA.{Client_Field_Prefix}PBZPOUT_SRT{Client_Field_Suffix}
+
+    #ifdef MVS              
+      FROM \$pbzpout_tbl\ PDKJDA
+    #else
+      FROM [$pbzpout_tbl] PDKJDA
+    #endif
+
+   WHERE PDKJDA.{COMPANYID_FIELD} = &PD.{COMPANYID_FIELD}
+    AND (PDKJDA.{Client_Field_Prefix}PBZPOUT_SRT{Client_Field_Suffix} = 'D KYHJDAF-KY     '
+     OR PDKJDA.{Client_Field_Prefix}PBZPOUT_SRT{Client_Field_Suffix}  = 'D KYHKYJDA48000  '
+     OR PDKJDA.{Client_Field_Prefix}PBZPOUT_SRT{Client_Field_Suffix}  = 'D KYHKYJDA48000 Y'
+     OR PDKJDA.{Client_Field_Prefix}PBZPOUT_SRT{Client_Field_Suffix}  = 'D KYHJDAFLOC     '
+     OR PDKJDA.{Client_Field_Prefix}PBZPOUT_SRT{Client_Field_Suffix}  = 'D KYHJDAFLOC    Y')
+
+end-select
+
+  !show 'KJDA_company ' $kjda_company
+
+end-procedure
+
+#endif
+
+#ifdef KJDA
+
+begin-procedure check_kjda_per
+
+    let $kjda_company = 'f'
+
+    let $KJDA_KY_Credit = 'D KYH' || '{KJDA_KY}'
+    let $KJDA_KY_Credit = rpad($KJDA_KY_Credit,17,' ')
+    let $KJDA_JC_Credit = 'D KYH' || '{KJDA_JC}'
+    let $KJDA_JC_Credit = rpad($KJDA_JC_Credit,17,' ')
+    let $KJDA_JT_Credit = 'D KYH' || '{KJDA_JT}'
+    let $KJDA_JT_Credit = rpad($KJDA_JT_Credit,17,' ')
+
+    !let $KJDA_JC_Credit_RES = 'D KYH' || '{KJDA_JC}'
+    !let $KJDA_JC_Credit_RES = rpad($KJDA_JC_Credit,16,' ') || 'Y'
+    !let $KJDA_JT_Credit_RES = 'D KYH' || '{KJDA_JT}'
+    !let $KJDA_JT_Credit_RES = rpad($KJDA_JT_Credit,16,' ') || 'Y'
+
+    !reworked via Yum 7/1/05
+    let $KJDA_JC_Credit_RES = 'D KYH' || '{KJDA_JC}'                     
+    let $KJDA_JC_Credit_RES = rpad($KJDA_JC_Credit,15,' ') || 'Y'        
+    let $KJDA_JT_Credit_RES = 'D KYH' || '{KJDA_JT}'                     
+    let $KJDA_JT_Credit_RES = rpad($KJDA_JT_Credit,15,' ') || 'Y'        
+    let $KJDA_JC_Credit_RES = substr($KJDA_JC_Credit_RES,1,16) || 'Y'    
+    let $KJDA_JT_Credit_RES = substr($KJDA_JT_Credit_RES,1,16) || 'Y'    
+                                                                     
+#ifdef debug_adpqout                                                 
+    show 'Periodic check, KJDA_company ? '                           
+    show '  $KJDA_KY_Credit              ' $KJDA_KY_Credit           
+    show '  $KJDA_JC_Credit              ' $KJDA_JC_Credit           
+    show '  $KJDA_JT_Credit              ' $KJDA_JT_Credit           
+#endif                                                               
+                                 
+                                 
+                                 
+                                 
+    #ifdef debug_adpqout
+      ! show 'Periodic check, KJDA_company ? '
+      ! show '  $KJDA_KY_Credit              ' $KJDA_KY_Credit
+      ! show '  $KJDA_JC_Credit              ' $KJDA_JC_Credit
+      ! show '  $KJDA_JT_Credit              ' $KJDA_JT_Credit
+    #endif
+
+
+    #define debug_d_rec_output  !6/24/05 added
+
+    #ifdef debug_d_rec_output
+    
+     show 'check_kjda_per, KJDA_company   ' &PD.{COMPANYID_FIELD}
+     show '  Orig Sort string             ' &PD.{Client_Field_Prefix}PBZPOUT_SRT{Client_Field_Suffix}  
+     show '  Orig Paygroup                ' &PD.PAYGROUP
+     show '  Orig LiabDt_DTU              ' &PD.{Client_Field_Prefix}LIABDT_DTU{Client_Field_Suffix}
+     show '  $KJDA_KY_Credit              ' $KJDA_KY_Credit
+     show '  $KJDA_JC_Credit              ' $KJDA_JC_Credit
+     show '  $KJDA_JT_Credit              ' $KJDA_JT_Credit
+     show '  $KJDA_JC_Credit_res          ' $KJDA_JC_Credit_res
+     show '  $KJDA_JT_Credit_res          ' $KJDA_JT_Credit_res
+
+    #endif
+    
+
+begin-select loops=1
+PDKJDA.{Client_Field_Prefix}PBZPOUT_SRT{Client_Field_Suffix}
+
+    let $kjda_company = 't'
+
+    #ifdef MVS              
+      FROM \$pbzpout_tbl\ PDKJDA
+    #else
+      FROM [$pbzpout_tbl] PDKJDA
+    #endif
+    
+   WHERE PDKJDA.{COMPANYID_FIELD} = &PD.{COMPANYID_FIELD}
+    AND ( PDKJDA.{Client_Field_Prefix}PBZPOUT_SRT{Client_Field_Suffix} = $KJDA_KY_Credit
+      OR  PDKJDA.{Client_Field_Prefix}PBZPOUT_SRT{Client_Field_Suffix} = $KJDA_JC_Credit
+      OR  PDKJDA.{Client_Field_Prefix}PBZPOUT_SRT{Client_Field_Suffix} = $KJDA_JT_Credit
+      OR  PDKJDA.{Client_Field_Prefix}PBZPOUT_SRT{Client_Field_Suffix} = $KJDA_JC_Credit_RES
+      OR  PDKJDA.{Client_Field_Prefix}PBZPOUT_SRT{Client_Field_Suffix} = $KJDA_JT_Credit_RES )
+
+end-select
+
+  !show 'KJDA_company ' $kjda_company
+
+end-procedure
+
+#endif  !KJDA
+
+#endif  !ADP_TAX_PERIODIC
+
+! -------------------------------- quarterly ---------------------------------
+
+
+#ifdef ADP_TAX_QUARTERLY
+
+begin-procedure Log-E-rec-data    !PBZQOUT_E  - keys {COMPANYID_FIELD}/$Current_out_Extract_CompID, EMPLID/$Current_Emplid
+
+ let $Current_out_Extract_CompID = rtrim($Extract_CompID,' ')
+ let $log_error = 'Log-E-rec-data: ' || $Current_out_Extract_CompID || ',' || $Current_Emplid || ',' || substr($qout_str,1,25) 
+
+ let $Company_cd = ' '
+ #ifdef SUBTOTAL_FEIN_EXTRACT
+   move $Current_out_Extract_FEIN to $Current_out_Extract_CompID
+   let $Company_cd = $Company 
+ #endif
+
+ #ifdef SUBTOTAL_ADP_COMPID_EXTRACT
+   let $Company_cd = $Company 
+ #endif
+
+ #ifdef SUBTOTAL_BUSINESS_UNIT_EXTRACT
+   let $Company_cd = $Company 
+ #endif
+ 
+ let $ss = substr($qout_str,1,80)
+ if $SelectEmplid <> ''
+   show 'Log-E-rec-data: emplid ' $Current_Emplid ', Current_out_Extract_CompID ' $Current_out_Extract_CompID
+ else  
+  #ifdef ADPQOUT_TEST_EMPLID
+   if rtrim($Current_Emplid,' ') = '{ADPQOUT_TEST_EMPLID}'
+    show 'Log-E-rec-data: ADPQOUT_TEST_EMPLID: ' $Current_Emplid ', Current_out_Extract_CompID ' $Current_out_Extract_CompID ' ' $ss
+   end-if
+  #endif 
+ end-if
+ 
+begin-sql on-error=Log-Warning
+
+ INSERT INTO PS_{Client_Table_Prefix}PBZQOUT_E{Client_Table_Suffix}
+             ( {COMPANYID_FIELD},
+               COMPANY,
+               EMPLID,
+               {Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix} )
+      VALUES ( $Current_out_Extract_CompID,
+               $Company_cd,
+               $Current_Emplid,
+               $qout_str)
+
+end-sql
+
+    add 1 to #Total_PBZQOUT_E_Count
+    #ifdef debug_e_rec
+      show 'logged E rec ... count ' #Total_PBZQOUT_E_Count
+    #endif
+
+    if mod(#Total_PBZQOUT_E_Count, 1000) = 0  !3/22/06
+      #ifndef MVS
+
+       #if {SITE_ID} = 'HHS1'  !they are ODBC                                         
+        show 'HHS1: Committing... E record count = ' #Total_PBZQOUT_E_Count
+        begin-sql
+          commit
+        end-sql
+       #else
+       
+        if $sqr-database <> 'ODBC'
+          show 'Committing... E record count = ' #Total_PBZQOUT_E_Count
+          do Commit-Transaction                  !3/22/06, doesn't work for SQL-Server, if $sqr-database <> 'ODBC'
+        end-if
+       #endif
+       
+      #else
+       show 'E record count = ' #Total_PBZQOUT_E_Count
+      #endif
+      
+    end-if                                    !3/22/06
+
+end-procedure
+
+begin-procedure Log-W-rec-data    !PBZQOUT_W  - keys {COMPANYID_FIELD}/$Current_out_Extract_CompID, EMPLID/$Current_Emplid,
+                                  !                 PBZQOUT_QSRT/$qout_str,2,15 TF_RES_TAXCODE/$qout_str 503-508 or 514-228, (taxcode sort)
+ 
+ let $Current_out_Extract_CompID = rtrim($Extract_CompID,' ')
+ let $s = substr($qout_str,2,15)   !8/30/05 errors otherwise if ee has BOTH res and non-res for same locality
+
+ !3/20/2012 to handle same Locality with differing PSD/PA Locals
+ !---------------------------------------------------------------
+ let $PA_res_PSD_qout = substr($qout_str,503, 6)
+ let $PA_res_LOC_qout = substr($qout_str,514,15)
+
+ let $PA_res_qout = 'n/a'
+ if rtrim($PA_res_LOC_qout,' ') <> ''
+   let $PA_res_qout = rtrim($PA_res_LOC_qout,' ')
+ end-if
+ if rtrim($PA_res_PSD_qout,' ') <> ''
+   let $PA_res_qout = rtrim($PA_res_PSD_qout,' ')
+ end-if
+
+ !9/11/2012 - avoid dups            -----------------------------
+ if $PA_res_qout = 'n/a'
+   add 1 to #na_counter
+   do Format-Number(#na_counter, $na_counter, '0999999999')
+   let $PA_res_qout = $PA_res_qout || '-' || $na_counter
+ end-if
+ !---------------------------------------------------------------
+ 
+ let $Company_cd = ' '
+ !let $Company_cd = $Current_Company  !8/6/2012
+ 
+ #ifdef SUBTOTAL_FEIN_EXTRACT
+   move $Current_out_Extract_FEIN to $Current_out_Extract_CompID
+   let $Company_cd = $Current_Company  !8/2/12 change from $Company 
+ #endif
+
+ #ifdef SUBTOTAL_ADP_COMPID_EXTRACT
+   let $Company_cd = $Current_Company  !8/2/12 change from $Company 
+ #endif
+
+ #ifdef SUBTOTAL_BUSINESS_UNIT_EXTRACT
+   let $Company_cd = $Current_Company 
+ #endif
+ 
+ let $log_error = 'Log-W-rec-data: inserting data: ' || $Current_out_Extract_CompID || ' ' || $Company_cd || ' ' || $Current_Emplid || ' ' || $s || $PA_res_qout
+ let $ss = substr($qout_str,1,80)
+
+ if $SelectEmplid <> ''
+   show $log_error 
+ else  
+  #ifdef ADPQOUT_TEST_EMPLID
+   if rtrim($Current_Emplid,' ') = '{ADPQOUT_TEST_EMPLID}'
+     show 'Log-W-rec-data: ADPQOUT_TEST_EMPLID: ' $log_error 
+   end-if
+  #endif
+ end-if
+ 
+ 
+begin-sql on-error=Log-error
+ INSERT INTO PS_{Client_Table_Prefix}PBZQOUT_W{Client_Table_Suffix} 
+             ( {COMPANYID_FIELD},
+               COMPANY,
+               EMPLID,
+               {Client_Field_Prefix}PBZQOUT_SRT{Client_Field_Suffix},
+               {Client_Field_Prefix}RES_TAXCODE{Client_Field_Suffix},
+               {Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix} )
+      VALUES ( $Current_out_Extract_CompID,
+               $Company_cd,
+               $Current_Emplid,
+               $s,
+               $PA_res_qout,
+               $qout_str)
+
+end-sql
+
+    add 1 to #Total_PBZQOUT_W_Count
+
+end-procedure
+
+
+
+begin-procedure Log-B-rec-data    !PBZQOUT_B  - keys {COMPANYID_FIELD}/$Current_out_Extract_CompID, EMPLID/$Current_Emplid,
+                                  !                 PBZQOUT_STR/$qout_str
+
+ let $Current_out_Extract_CompID = rtrim($Extract_CompID,' ')
+ !let $s = substr($qout_str,1,15)
+ let $s = substr($qout_str,1,7) || substr($qout_str,34,2)  ! 34-35 takes care of STATE and BOX99 count.. we need it!
+
+ let $Company_cd = ' '
+ #ifdef SUBTOTAL_FEIN_EXTRACT
+   move $Current_out_Extract_FEIN to $Current_out_Extract_CompID
+   let $Company_cd = $Company 
+ #endif
+
+ #ifdef SUBTOTAL_ADP_COMPID_EXTRACT
+   let $Company_cd = $Current_Company 
+ #endif
+
+ #ifdef SUBTOTAL_BUSINESS_UNIT_EXTRACT
+   let $Company_cd = $Current_Company 
+ #endif
+ 
+ move #Total_PBZQOUT_B_Count to $Total_PBZQOUT_B_Count 099999
+ let $log_error = 'Log-B-rec-data: ' || $Total_PBZQOUT_B_Count || ' ' || $Current_out_Extract_CompID || ' ' 
+                                     || $Current_Emplid        || ' ' || $Company_cd || ' ' || $s || ' ' || $qout_str
+
+ if $SelectEmplid <> ''
+   show $log_error 
+ end-if
+
+begin-sql on-error=Log-Error
+ INSERT INTO PS_{Client_Table_Prefix}PBZQOUT_B{Client_Table_Suffix}
+             ( {COMPANYID_FIELD},
+               COMPANY,
+               EMPLID,
+               {Client_Field_Prefix}PBZQOUT_SRT{Client_Field_Suffix},
+               {Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix} )
+      VALUES ( $Current_out_Extract_CompID,
+               $Company_cd,
+               $Current_Emplid,
+               $s,    !sort by US74, US99, or US12,....
+               $qout_str)
+
+end-sql
+
+    add 1 to #Total_PBZQOUT_B_Count
+
+
+
+end-procedure
+
+#ifdef PROCESS_1099s
+
+begin-procedure Log-C-rec-data    !PBZQOUT_C  - keys {COMPANYID_FIELD}, EMPLID, FIELD_CODE
+
+ let $Current_out_Extract_CompID = rtrim($Extract_CompID,' ')
+ let $log_error = 'Log-C-rec-data: ' || $s
+
+ let $Company_cd = ' '
+ #ifdef SUBTOTAL_FEIN_EXTRACT
+   move $Current_out_Extract_FEIN to $Current_out_Extract_CompID
+   let $Company_cd = $Company 
+ #endif
+
+ #ifdef SUBTOTAL_ADP_COMPID_EXTRACT
+   let $Company_cd = $Company 
+ #endif
+ 
+ #ifdef SUBTOTAL_BUSINESS_UNIT_EXTRACT
+   let $Company_cd = $Company 
+ #endif
+ 
+ !6/13/06, note 39th char coming from adp1099.sqc is an 'E' if it should be preceded by an employee record
+ do Format-Number(#Total_PBZQOUT_C_Count,$Total_PBZQOUT_C_Count, '99999')
+ let $new_qout_str = substr($Total_PBZQOUT_C_Count,1,5) || substr($qout_str,1,33) || substr($qout_str,39,1) 
+
+ if $SelectEmplid <> ''
+   show 'In Log-C-rec-data     qout_str : ' $qout_str
+   show 'In Log-C-rec-data new_qout_str : ' $new_qout_str
+ end-if
+ 
+ begin-sql on-error=Log-warning  !changed from log-error, due to dup errors for emplids w/mult distributions 
+ INSERT INTO PS_{Client_Table_Prefix}PBZQOUT_C{Client_Table_Suffix}
+             ( {COMPANYID_FIELD},
+               COMPANY,
+               EMPLID,
+               {Client_Field_Prefix}PBZQOUT_CRT{Client_Field_Suffix} )    !all 39 chars
+      VALUES ( $Current_out_Extract_CompID,
+               $Company_cd,
+               $Current_Emplid,
+               $new_qout_str)
+    
+    
+end-sql
+
+    add 1 to #Total_PBZQOUT_C_Count
+
+end-procedure
+
+
+begin-procedure get-C
+ 
+ let #c_dist_cnt = 0
+
+    
+begin-select
+QC.{Client_Field_Prefix}PBZQOUT_CRT{Client_Field_Suffix}
+
+      !dump C rec to file
+      add 1 to #company_trailer_reccnt
+      add 1 to #reccnt
+      let $s = substr(&QC.{Client_Field_Prefix}PBZQOUT_CRT{Client_Field_Suffix},6,33) || '      ' 
+      let $erec_indicator = substr(&QC.{Client_Field_Prefix}PBZQOUT_CRT{Client_Field_Suffix},39,1)
+    
+      if $erec_indicator = 'E'                  !last char in incoming string is an E if we need an E-rec first
+            Write 1 from $e_string:411   !6/13/16 change
+            add 1 to #company_trailer_reccnt
+            add 1 to #reccnt
+      end-if
+    
+      if $SelectEmplid <> ''
+        show 'In get-C-rec-data            s : ' $s
+      end-if
+ 
+      Write 1 from  $s:39
+
+   FROM PS_{Client_Table_Prefix}PBZQOUT_C{Client_Table_Suffix} QC  {NOLOCK_SQL}
+
+   WHERE QC.{COMPANYID_FIELD} = &QE.{COMPANYID_FIELD}
+    AND  QC.EMPLID  = &QE.EMPLID
+   
+end-select
+
+end-procedure
+
+#endif
+
+!--------------------------------------------------------------------------------------------
+
+begin-procedure Output-Pbzqtr     !called before "F" record is written
+
+  !Process all PBZQOUT_E recs, for each _E employee record, pulling in the W, B and C records,
+  !  and at Company break, outputting totals from the _T rec
+  !------------------------------------------------------------------------------------------
+
+ #ifdef UPDATE_STATISTICS
+  do compute-nstatistics     
+ #endif
+ 
+ #ifndef MVS
+  if rtrim($sqr-database,' ') <> 'ODBC'
+   do Commit-Transaction
+  end-if
+ #endif
+ 
+ move '' to $Existing_company
+
+ 
+ if #Total_PBZQOUT_E_Count > 0
+
+begin-select
+QE.{COMPANYID_FIELD}
+QE.EMPLID
+QE.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix}
+
+     #ifdef TEST_EMPLID
+       show 'New employee.. E Rec ' &QE.EMPLID
+     #endif
+
+     if rtrim($Existing_company,' ') = ''
+       let $Existing_company = rtrim(&QE.{COMPANYID_FIELD},' ')
+       do write-h
+     else
+       if rtrim($Existing_company,' ') <> rtrim(&QE.{COMPANYID_FIELD},' ')
+
+         #ifdef EXCEL_FIXED_QUARTERLY_FILENAME
+          do quarterly-excel-totals
+         #endif
+ 
+         #ifdef SKIP_COMPANY_HEADER
+           if rtrim(&QE.{COMPANYID_FIELD},' ') <> rtrim('{SKIP_COMPANY_HEADER}',' ')
+             do write-t
+             let $Existing_company = rtrim(&QE.{COMPANYID_FIELD},' ')
+             do write-h
+           end-if          
+         #else
+           do write-t
+           let $Existing_company = rtrim(&QE.{COMPANYID_FIELD},' ')
+           do write-h
+         #endif
+       end-if
+     end-if
+
+
+     !dump E rec to file
+      let $s = rtrim(&QE.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},' ')
+      move $s to $e_string
+
+      Write 1 from $s:411
+      add 1 to #company_trailer_reccnt
+      add 1 to #reccnt
+
+      add 1 to #e_rec_total
+      if mod(#e_rec_total,5000) = 0
+       do Get-Current-DateTime
+       display '----> Status: E-Rec Count... ' noline
+       display #e_rec_total                    noline
+       display '  --> '                        noline
+       display $AsOfNow
+      end-if
+
+      let $existing_emplid = rtrim(&QE.EMPLID,' ')
+      do get-w
+
+      if rtrim($adp_w2_records,' ') = 't'
+       do get-b
+       #ifdef Process_1099s
+         do get-c
+       #endif
+      end-if
+
+   FROM PS_{Client_Table_Prefix}PBZQOUT_E{Client_Table_Suffix} QE  {NOLOCK_SQL}
+   ORDER BY QE.{COMPANYID_FIELD}, QE.EMPLID
+
+end-select
+
+     if #company_trailer_reccnt > 0
+       #ifdef EXCEL_FIXED_QUARTERLY_FILENAME
+        do quarterly-excel-totals
+       #endif
+       do write-t
+     end-if
+
+  end-if
+  
+  #ifdef EXCEL_FIXED_QUARTERLY_FILENAME
+    do quarterly-excel-close
+  #endif
+  
+end-procedure
+
+#ifdef KJDA_PS_DELIVERED
+
+begin-procedure check_kjda_qtr
+
+    let $kjda_company = ''
+    !show 'Quarterly check, KJDA_company ? '
+
+    !Look for: "WKYHJDAF-KY    ", "WKYHJDAF-KY   Y", "WKYHKYJDA48000 ", "WKYHJDAFLOC    ",  "WKYHJDAFLOC   Y"
+    !If found, flag ALL KY locals with K in taxcode position 14
+    !eg. WKYHJDAFLOC    Y   --> WKYHJDAFLOC   KY   (position 15 of the string)
+    !--------------------------------------------------------------------
+
+begin-select loops=1
+QWKJDA.{Client_Field_Prefix}PBZQOUT_SRT{Client_Field_Suffix}
+
+   let $kjda_company = 't'
+   show 'Found kjda code, sort string: ' &QWKJDA.{Client_Field_Prefix}PBZQOUT_SRT{Client_Field_Suffix}
+
+   FROM PS_{Client_Table_Prefix}PBZQOUT_W{Client_Table_Suffix} QWKJDA  {NOLOCK_SQL}
+   WHERE QWKJDA.{COMPANYID_FIELD} = &QE.{COMPANYID_FIELD}
+    AND ( QWKJDA.{Client_Field_Prefix}PBZQOUT_SRT{Client_Field_Suffix} = 'WKYHJDAF-KY    '   !Common KJDA taxcode
+     OR   QWKJDA.{Client_Field_Prefix}PBZQOUT_SRT{Client_Field_Suffix} = 'WKYHJDAFLOC    ' ) !Added 5/31/05
+
+
+end-select
+
+  !show 'KJDA_company ' $kjda_company
+
+
+end-procedure
+
+#endif
+
+
+#ifdef KJDA
+
+begin-procedure check_kjda_qtr
+
+    let $kjda_company = ''
+    #ifdef debug_kjda
+      show 'Quarterly check, KJDA_company ? '
+    #endif
+    
+    let $KJDA_KY_Credit = 'WKYH' || '{KJDA_KY}'
+    let $KJDA_KY_Credit = rpad($KJDA_KY_Credit,15,' ')
+    let $KJDA_JC_Credit = 'WKYH' || '{KJDA_JC}'
+    let $KJDA_JC_Credit = rpad($KJDA_JC_Credit,15,' ')
+    let $KJDA_JT_Credit = 'WKYH' || '{KJDA_JT}'
+    let $KJDA_JT_Credit = rpad($KJDA_JT_Credit,15,' ')
+    let $KJDA_JC_Credit_RES = 'WKYH' || '{KJDA_JC}'
+    let $KJDA_JC_Credit_RES = rpad($KJDA_JC_Credit,14,' ') || 'Y'
+    let $KJDA_JT_Credit_RES = 'WKYH' || '{KJDA_JT}'
+    let $KJDA_JT_Credit_RES = rpad($KJDA_JT_Credit,14,' ') || 'Y'
+
+begin-select loops=1
+QWKJDA.{Client_Field_Prefix}PBZQOUT_SRT{Client_Field_Suffix}
+
+   let $kjda_company = 't'
+   !show 'Found kjda code, sort string: ' &QWKJDA.{Client_Field_Prefix}PBZQOUT_SRT{Client_Field_Suffix}
+
+   FROM PS_{Client_Table_Prefix}PBZQOUT_W{Client_Table_Suffix} QWKJDA  {NOLOCK_SQL}
+   WHERE QWKJDA.{COMPANYID_FIELD} = &QE.{COMPANYID_FIELD}
+    AND ( QWKJDA.{Client_Field_Prefix}PBZQOUT_SRT{Client_Field_Suffix} = $KJDA_KY_Credit
+      OR  QWKJDA.{Client_Field_Prefix}PBZQOUT_SRT{Client_Field_Suffix} = $KJDA_JC_Credit
+      OR  QWKJDA.{Client_Field_Prefix}PBZQOUT_SRT{Client_Field_Suffix} = $KJDA_JT_Credit
+      OR  QWKJDA.{Client_Field_Prefix}PBZQOUT_SRT{Client_Field_Suffix} = $KJDA_JC_Credit_RES
+      OR  QWKJDA.{Client_Field_Prefix}PBZQOUT_SRT{Client_Field_Suffix} = $KJDA_JT_Credit_RES )
+
+end-select
+
+  #ifdef debug_kjda
+    show 'KJDA_company = ' $kjda_company
+  #endif
+  
+end-procedure
+
+#endif
+
+
+begin-procedure get-w
+
+begin-select
+QW.{Client_Field_Prefix}PBZQOUT_SRT{Client_Field_Suffix}
+QW.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix}
+
+      !dump W rec to file
+
+      let #qtd = substr(&QW.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},27,15)
+      let #qtd = #qtd / 100
+      if substr(&QW.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},42,1) = '-'
+        let #qtd = 0 - #qtd
+      end-if
+
+      Add #qtd to #Company_trailer_Total_Tax
+      Add #qtd to #hash_qtd_Total_Tax
+
+      let $s = rtrim(&QW.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},' ')
+
+      if rtrim($kjda_company,' ') = 't'
+         let $st = &QW.{Client_Field_Prefix}PBZQOUT_SRT{Client_Field_Suffix}
+         !Look for any KY local tax, sticking a 'K' in 14th position
+         if (substr($st,5,1) <> ' ') and (substr($st,2,2) = 'KY')
+           let $stmp = substr(&QW.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},1,14) || 'K' ||
+                    substr(&QW.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},16,length($s))
+           let $s = rtrim($stmp,' ')
+         end-if
+      end-if
+
+      add 1 to #company_trailer_reccnt
+      add 1 to #reccnt
+
+      #ifdef Q4_2016
+         Write 1 from  $s:656      !Indiana location added 630-639 Q3, 2016, Q4 up to 656
+      #else             
+         #ifdef Q4_2015
+            Write 1 from  $s:629   !Job Title   - Client defined Job Title for this employee  W 550-629  Q4, 2015
+         #else
+            Write 1 from  $s:528   !Res PSD on end of record 528 - Q3, 2011 specs
+         #endif      
+      #endif
+      
+      
+      #ifdef EXCEL_FIXED_QUARTERLY_FILENAME
+
+        let #qtd = substr(&QW.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},27,15)
+        let #qtd = #qtd / 100
+        if substr(&QW.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},42,1) = '-'
+          let #qtd = 0 - #qtd
+     
+          #ifdef debug_excel
+            show 'negative qtd tax ' #qtd
+          #endif
+
+        end-if
+
+        let #nlgrs_qtd = substr(&QW.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},59,15)
+        let #nlgrs_qtd = #nlgrs_qtd / 100
+        if substr(&QW.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},74,1) = '-'
+          let #nlgrs_qtd = 0 - #nlgrs_qtd
+        end-if
+
+        let #txgrs_qtd = substr(&QW.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},75,15)
+        let #txgrs_qtd = #txgrs_qtd / 100
+        if substr(&QW.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},90,1) = '-'
+          let #txgrs_qtd = 0 - #txgrs_qtd
+        end-if
+
+        !YTD
+   
+        let #ytd = substr(&QW.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},187,15)
+        let #ytd = #ytd / 100
+        if substr(&QW.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},202,1) = '-'
+          let #ytd = 0 - #ytd
+        end-if
+
+        let #nlgrs_ytd = substr(&QW.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},219,15)
+        let #nlgrs_ytd = #nlgrs_ytd / 100
+        if substr(&QW.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},234,1) = '-'
+          let #nlgrs_ytd = 0 - #nlgrs_ytd
+        end-if
+
+        let #txgrs_ytd = substr(&QW.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},235,15)
+        let #txgrs_ytd = #txgrs_ytd / 100
+        if substr(&QW.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},250,1) = '-'
+          let #txgrs_ytd = 0 - #txgrs_ytd
+        end-if
+
+         let $tc = substr(&QW.{Client_Field_Prefix}PBZQOUT_SRT{Client_Field_Suffix},1,15)
+         do quarterly-excel-totals-update
+   
+      #endif
+     
+     
+
+   FROM PS_{Client_Table_Prefix}PBZQOUT_W{Client_Table_Suffix} QW  {NOLOCK_SQL}
+
+   WHERE QW.{COMPANYID_FIELD} = &QE.{COMPANYID_FIELD}
+    AND  QW.EMPLID  = &QE.EMPLID
+
+   ORDER BY QW.{Client_Field_Prefix}PBZQOUT_SRT{Client_Field_Suffix}
+
+end-select
+
+end-procedure
+
+
+begin-procedure get-B
+
+
+begin-select
+QB.{Client_Field_Prefix}PBZQOUT_SRT{Client_Field_Suffix}
+QB.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix}
+
+
+      !dump B rec to file
+      add 1 to #company_trailer_reccnt
+      add 1 to #reccnt
+
+      let $s = rtrim(&QB.{Client_Field_Prefix}PBZQOUT_STR{Client_Field_Suffix},' ')
+      Write 1 from  $s:110
+
+   FROM PS_{Client_Table_Prefix}PBZQOUT_B{Client_Table_Suffix} QB  {NOLOCK_SQL}
+
+   WHERE QB.{COMPANYID_FIELD} = &QE.{COMPANYID_FIELD}
+    AND  QB.EMPLID  = &QE.EMPLID
+
+   ORDER BY QB.{Client_Field_Prefix}PBZQOUT_SRT{Client_Field_Suffix}
+
+end-select
+
+end-procedure
+
+#endif           ! end of ADP_TAX_QUARTERLY
+
+
+
+! ---------------- common routines -------------------------
+
+begin-procedure delete-Pbzqout
+
+#ifdef ADP_TAX_QUARTERLY
+ 
+ let $tbl = 'PS_{Client_Table_Prefix}PBZQOUT_E{Client_Table_Suffix}'
+
+begin-sql on-error=delete-error
+ #ifdef TRUNCATE_TEMP_TABLES
+ TRUNCATE TABLE PS_{Client_Table_Prefix}PBZQOUT_E{Client_Table_Suffix};		
+ #else
+ DELETE FROM PS_{Client_Table_Prefix}PBZQOUT_E{Client_Table_Suffix};
+ #endif
+end-sql
+
+ #ifndef MVS
+  if rtrim($sqr-database,' ') <> 'ODBC'
+   do Commit-Transaction
+  end-if
+ #endif
+
+ let $tbl = 'PS_{Client_Table_Prefix}PBZQOUT_W{Client_Table_Suffix}'
+
+begin-sql on-error=delete-error
+ #ifdef TRUNCATE_TEMP_TABLES
+ TRUNCATE TABLE PS_{Client_Table_Prefix}PBZQOUT_W{Client_Table_Suffix};		
+ #else
+ DELETE FROM PS_{Client_Table_Prefix}PBZQOUT_W{Client_Table_Suffix};
+ #endif
+end-sql
+
+ #ifndef MVS
+  if rtrim($sqr-database,' ') <> 'ODBC'
+   do Commit-Transaction
+  end-if
+ #endif
+
+ let $tbl = 'PS_{Client_Table_Prefix}PBZQOUT_B{Client_Table_Suffix}'
+
+begin-sql on-error=delete-error
+ #ifdef TRUNCATE_TEMP_TABLES
+ TRUNCATE TABLE PS_{Client_Table_Prefix}PBZQOUT_B{Client_Table_Suffix};		
+ #else
+ DELETE FROM PS_{Client_Table_Prefix}PBZQOUT_B{Client_Table_Suffix};
+ #endif
+end-sql
+
+ #ifndef MVS
+  if rtrim($sqr-database,' ') <> 'ODBC'
+   do Commit-Transaction
+  end-if
+ #endif
+
+#ifdef PROCESS_1099s
+
+ let $tbl = 'PS_{Client_Table_Prefix}PBZQOUT_C{Client_Table_Suffix}'
+
+begin-sql on-error=delete-error
+ #ifdef TRUNCATE_TEMP_TABLES
+ TRUNCATE TABLE PS_{Client_Table_Prefix}PBZQOUT_C{Client_Table_Suffix};		
+ #else
+ DELETE FROM PS_{Client_Table_Prefix}PBZQOUT_C{Client_Table_Suffix};
+ #endif
+end-sql
+
+ #ifndef MVS
+  if rtrim($sqr-database,' ') <> 'ODBC'
+   do Commit-Transaction
+  end-if
+ #endif
+
+#endif
+
+ show 'Pbzqout Initialization Complete (Temp tables Deleted or Truncated).'
+#endif
+ 
+end-procedure
+
+
+begin-procedure Cleanup-Pbzqout
+  #ifdef ADP_TAX_QUARTERLY          ! 2/8/10 don't cleanup the PS_TF_PBZPOUT_D table for periodic for debugging
+    #ifndef SKIP_TEMP_TABLE_CLEANUP
+      do delete-pbzqout
+    #else
+      show 'Cleanup-Pbzqout: no cleanup requested (SKIP_TEMP_TABLE_CLEANUP).. review TF_PBZQOUT_x Tables'
+    #endif
+  #endif
+
+end-procedure
+
+
+begin-procedure Init-Pbzqout  !called from adp303.sqc for both periodic and quarterly
+
+   !Delete all rows in PBZQOUT_x tables
+
+ show ''
+ show 'Pbzqout . Include file: adpqout version: {adpqout_version}'
+
+ do delete-pbzqout
+
+ #ifdef ADP_TAX_QUARTERLY
+   #ifdef EXCEL_FIXED_QUARTERLY_FILENAME
+     show 'creating excel file.'
+     do quarterly-excel-output
+   #endif
+ #endif
+
+ #ifdef ADP_TAX_PERIODIC
+  #ifdef EXCEL_FIXED_PERIODIC_FILENAME
+    show 'Init-pbzpout: creating excel file.'
+    do periodic-excel-output
+  #endif
+ #endif
+ 
+end-procedure
+
+#ifdef ADP_TAX_PERIODIC
+begin-procedure Init-Pbzpout
+
+  show 'Init-Pbzpout'
+
+  let $pbzpout_tbl = '{USE_PRIMARY_PERIODIC_SORT_TBL}'
+  #ifdef USE_SECONDARY_PERIODIC_SORT_TBL
+    if substr($RUNID,1,3) = '{USE_SECONDARY_PERIODIC_SORT_TBL_CODE}'
+      let  $pbzpout_tbl = '{USE_SECONDARY_PERIODIC_SORT_TBL}'
+    end-if
+  #endif
+  let $tbl = $pbzpout_tbl
+
+  show 'Init-Pbzpout: $RUNID ' $RUNID ', removing records from Table: ' $pbzpout_tbl
+  
+begin-sql on-error=delete-error
+ #ifdef TRUNCATE_TEMP_TABLES
+       #ifdef MVS              
+         TRUNCATE TABLE  \$pbzpout_tbl\;
+       #else
+         TRUNCATE TABLE  [$pbzpout_tbl];
+       #endif
+ #else
+       #ifdef MVS              
+         DELETE FROM  \$pbzpout_tbl\;
+       #else
+         DELETE FROM  [$pbzpout_tbl];
+       #endif
+ #endif
+end-sql
+
+ #ifndef MVS
+  if rtrim($sqr-database,' ') <> 'ODBC'
+   do Commit-Transaction
+  end-if
+ #endif
+
+ show 'Init-Pbzpout: Initialization Complete (Temp tables Deleted or Truncated).'
+  
+end-procedure
+#endif
+
+begin-procedure delete-error
+ show 'Delete-error: ' $tbl
+end-procedure
+
+begin-procedure Log-error
+
+
+  if substr($log_error,1,5) = 'Log-B'
+   if substr($qout_str,1,6) = 'B US99'   !this is for ee's who have no tax balance adjustments
+      ! show 'Log B warning on US99 record' !and have the fein level reporting turned on...
+       goto log_warning_only
+   end-if
+  end-if
+
+  show 'adpqout insert error ' $log_error
+  show '             status: ' #sql-status
+  show 'sql errror : ' 	       $sql-error
+ if substr($log_error,1,5) = 'Log-D'
+ 
+   let $errs = substr($pout_str,1,80)
+   show 'Logging D rec... ' 
+   show '    CompanyID    ' $Current_out_Extract_CompID
+   #ifdef PAYABLE_COUNT_ENABLED
+   show '   PAYABLE_COUNT ' #PAYABLE_COUNT edit 999999999
+   #endif
+   show '    Paygroup.... ' $Payline_paygroup
+   show '    Company..... ' $Company_cd
+   #ifdef PAY_END_DT_IN_PBZPOUT_D        
+   show '    Pay_End_Dt.. ' $payline_pay_end_dt
+   #endif
+   #ifdef CANADA_TOO
+   show '    Canada(Y/N). ' $TaxBalance_Canada
+   #endif
+   #ifdef SPLIT_FEDERAL
+   show '    Wage loss... ' $TaxBalance_Wage_loss_plan
+   #endif
+   show '    LiabDt...... ' $liabdt_DTU
+   show '    sortstring.. ' $s
+   show '    string...... ' $errs
+   show '    table        ' $pbzpout_tbl
+   show  '   recs written ' #Total_PBZQOUT_D_Count
+   
+   show 'Dumping TaxBalances...'
+   show '---------------------------------------'
+
+   let #L = 1
+   while #L <= #LAST_TAXBALANCE_CNT
+
+    get $TEST_ST                    -
+        $TEST_LOCALITY              -
+        $TEST_TAX_CLASS             -
+       from TAXBALANCE(#L)         -
+             TaxBalance_State       -
+             TaxBalance_Locality    -
+             TaxBalance_Tax_Class
+
+      show 'Error, Dumping TaxBalances...'
+      show '-----------------------------'
+
+      show 'TaxBal Cnt= ' #L
+      show 'State     = ' $TEST_ST
+      show 'TaxClass  = ' $TEST_Tax_Class
+      show 'Locality  = ' $TEST_Locality
+      show ''
+
+     add 1 to #L
+   end-while
+
+ end-if
+
+    show 'ERROR:   Fatal table insert: commiting transactions for debugging & stopping program.'
+    
+    #ifndef MVS
+     if rtrim($sqr-database,' ') <> 'ODBC'
+      show 'Committing...'
+      do Commit-Transaction
+     end-if
+    #endif
+    stop
+
+log_warning_only:
+
+end-procedure
+
+
+begin-procedure Log-warning
+     if $SelectEmplid <> ''
+       show 'adpqout: Log-warning: Insert Warning: ' $log_error
+     end-if
+end-procedure
+
+
+begin-procedure write-h
+
+  !H rec
+  move '' to $CompanyName
+  if length($Existing_company) <= 3
+   let $company = substr($Existing_company,1,3)
+   do get-company-data
+  end-if
+
+  #ifdef ADP_TAX_QUARTERLY
+    let $liabdt = ''
+  #else
+    let $liabdt = rtrim($Existing_liabdt,' ')
+  #endif
+
+  show ' Writing Header Record for Company ID   ' $Existing_company ', Company Name ' $CompanyName ', Liab date ' $Liabdt
+
+  add 1 to #reccnt
+  add 1 to #company_trailer_reccnt
+
+  Write 1 from           'H':1
+                      $blank:1
+           $Existing_company:14
+                     $liabdt:8
+                      $blank:3
+                      $blank:3
+                $CompanyName:50    !from 'get-company-data'
+                         'N':1
+
+
+   let $KJDA_company = ''
+
+   #ifdef KJDA
+     #ifdef ADP_TAX_QUARTERLY
+      do check_kjda_qtr
+     #endif
+   #endif
+   #ifdef KJDA_PS_DELIVERED
+     #ifdef ADP_TAX_QUARTERLY
+      do check_kjda_qtr
+     #endif
+   #endif
+
+   let $reset_data_values = 't'
+
+end-procedure
+
+
+begin-procedure write-t
+
+   #ifdef ADP_TAX_PERIODIC
+      do output-data-rec-buffer
+      let $existing_taxcode = ''
+   #endif
+
+   !T rec
+   add 1 to #reccnt
+   add 1 to #Company_trailer_reccnt
+
+   let #T = #Company_trailer_Total_Tax * 100
+   do Format-Number(#T,$taxes, '999999999999999mi')
+   do Format-Number(#Company_trailer_reccnt,$reccnt, '999999999999')
+
+   Write 1 from    'T':1
+                $blank:1
+               $reccnt:12
+                $blank:2
+                $taxes:16
+
+   let #company_trailer_reccnt = 0
+   let #Company_trailer_Total_Tax = 0
+
+end-procedure
+
+#ifdef UPDATE_STATISTICS
+begin-procedure compute-nstatistics     
+
+ do Get-Current-DateTime
+ SHOW 'start compute-nstatistics ' $AsOfNow
+ #ifdef ANALYZE_TEMP_TABLES
+  show 'ANALYZE_TEMP_TABLES enabled'
+ #else
+  show 'UPDATE STATISTICS enabled'
+ #endif
+ 
+ begin-SQL
+ COMMIT
+ end-sql
+
+ begin-SQL
+  #ifdef ANALYZE_TEMP_TABLES
+  ANALYZE table PS_{Client_Table_Prefix}PBZQOUT_E{Client_Table_Suffix} compute statistics;	
+  #else
+  UPDATE STATISTICS PS_{Client_Table_Prefix}PBZQOUT_E{Client_Table_Suffix}
+  #endif
+ end-sql
+ 
+ begin-SQL
+  #ifdef ANALYZE_TEMP_TABLES
+  ANALYZE table PS_{Client_Table_Prefix}PBZQOUT_W{Client_Table_Suffix} compute statistics;	
+  #else
+  UPDATE STATISTICS PS_{Client_Table_Prefix}PBZQOUT_W{Client_Table_Suffix}
+  #endif
+ end-sql
+ 
+ begin-SQL
+  #ifdef ANALYZE_TEMP_TABLES
+  ANALYZE table PS_{Client_Table_Prefix}PBZQOUT_B{Client_Table_Suffix} compute statistics;	
+  #else
+  UPDATE STATISTICS PS_{Client_Table_Prefix}PBZQOUT_B{Client_Table_Suffix}
+  #endif
+ end-sql
+ 
+ #ifdef PROCESS_1099s
+  begin-SQL
+  #ifdef ANALYZE_TEMP_TABLES
+  ANALYZE table PS_{Client_Table_Prefix}PBZQOUT_C{Client_Table_Suffix} compute statistics;	
+  #else
+  UPDATE STATISTICS PS_{Client_Table_Prefix}PBZQOUT_C{Client_Table_Suffix}
+  #endif
+  end-sql
+ #endif
+ 
+ do Get-Current-DateTime
+ SHOW 'stop compute-nstatistics ' $AsOfNow
+
+end-procedure
+#endif
+
+
+!4/27/06
+#ifdef EXCEL_FIXED_PERIODIC_FILENAME
+ #include 'adpexcel.sqc'
+#else
+ #ifdef EXCEL_FIXED_QUARTERLY_FILENAME
+  #include 'adpexcel.sqc'
+ #endif
+#endif

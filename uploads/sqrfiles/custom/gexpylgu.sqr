@@ -1,0 +1,345 @@
+!************************************************************************
+! GEXPYLGU: Process Flag in PS_GEX_LEGAL_AID indicates if employee's 
+!legal aid deduction is taken out or not. GEXPYLGL program update/insert 
+!PS_GENL_DEDUCTION table based on the information in GEX_LEGAL_AID. 
+!During this process we could update the process flag in GEX_LEGAL_AID 
+!to indicate that deduction is being taken. But, there would be a problem 
+!if some reason in pay calculation process these deductions are not taken 
+!out. In this case the process flag in GEX_LEGAL_AID table inform 
+!incorrect information.
+!To avoid this it is better to wait until pay cycle is confirmed and 
+!update the process flag.
+!************************************************************************
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module is the confidential and proprietary information of       *
+! Giant Eagle, Inc.; it is not to be copied, reproduced, or transmitted*
+! in any form, by any means, in whole or in part, nor is it to be used *
+! for any purpose other than that for which it is expressly provided   *
+! without the written permission of Giant Eagle.                       *
+!                                                                      *
+!                                                                      *
+!***********************************************************************
+!                         MODIFICATION HISTORY                         *
+!***********************************************************************
+!  ID#     INITIALS    DATE           DESCRIPTION OF THE CHANGE        *        
+!***********************************************************************
+!GPYC026A    SXK        10/05/1998   INITIAL CREATION                  *
+!                                                                      *
+!GPYC026A    SXK        12/17/1998   Added code to look at MTD         *
+!                                    deduction to find who got picked  *
+!                                    up for LEGAL deduction            *
+!                                                                      *
+!	     SXK        02/22/1999   Modified to look at earnings_bal  *
+!				     to find who got paid legal        *
+!                                    benefits                          *
+!                                                                      *
+!            JNB        08/09/1999   Changed switch $found to          *
+!                                    $found_a from the main select.    *
+!                                    This is necessary as at the end   *
+!                                    of the program $found was set to  *
+!                                    'N' and triggered the error msg   * 
+!                                                                      * 
+!	     SXK	11/10/1999   Modified to remove join with      *
+!				     earnings_bal and made it an       *
+!                                    exist condition                   *
+!                                                                      *
+!            AXL        12/20/2000   Modified to recognize employees   *
+!                                    with 2 or more rows in Legal      *
+!                                    Aid tbl that were being missed    *
+!                                                                      *
+!            SCM        9/18/2001    Modified to ensure that if an     *
+!                                    ee transferred to another co and  *
+!                                    that co did not have legal aid    *
+!                                    the deduction would not be marked *  
+!                                    as processed on the old company.  *
+!                                                                      *
+!            GBD        02/18/2003   Added Empl_Rcd to exists statement*
+!                                    for Earnings_Bal data.            *
+! GEX_SEC_REENG 2016-09-14 Vahini Katta                                 
+! Changes related to gex_emplid_mapp/7 digit emplid                     
+!***********************************************************************
+
+#include 'setenv.sqc' !Set environment
+#Include 'setup02.sqc'
+
+begin-report
+
+  do Init-DateTime
+  do Init-Number
+  do stdapi-init
+  move 'GEXPYLGU' to $ReportID
+  move 'Employee Legal Dues Process Flag Update' to $ReportTitle
+  display $ReportTitle
+
+  do Get-Current-DateTime
+
+  let $reportdate_mm = substr($reportdate,1,2)
+  let $reportdate_dd = substr($reportdate,4,2)
+  let $reportdate_yy = substr($reportdate,7,2)
+  do MakeYear4Digits ($reportdate_yy)
+  let $reportdate_ccyy = $reportdate_yy||'-'||$reportdate_mm||'-'||$reportdate_dd
+  do Convert-From-DTU-Date($reportdate_ccyy, $reportdate_dbf)
+  move $reportdate_dbf to $rnctl_date
+  do report
+
+  do Commit-Transaction
+  do stdapi-term
+  !*do Reset
+!**********************************************************************************
+end-report
+
+!************************************************************************
+
+begin-procedure Report
+
+ move 'N' to $Errorfound
+ move 'N' to $cal_error
+ let #inputtran = 0
+ let #recs_updated = 0
+ do select-pay-calendar 
+!   if $found = 'Y'
+!     do process-employee-data
+!   end-if
+
+!   display #comp_count noline
+!   display ' Employees Processed'
+
+
+Report-Exit:
+
+  date-time () hh:mi:ss &timeProcess
+  display #recs_updated 99999 noline
+  display ' General Deductions Updated'
+  display #InputTran 99999 noline
+  display ' Total Employees Processed'
+!  display &timeProcess
+
+end-procedure
+
+! begin-heading 6 for-reports=(report-log)
+begin-heading 6 
+
+ move 'Employee Legal Dues Process Flag Update - Report Log' to $ReportTitle
+ #Include 'stdhdg01.sqc'
+
+  position (+2)
+  print 'Trans#' (,1) bold
+  print 'Emplid' (,18) bold
+  print 'Message' (,50) bold
+  print '-' (+1,1,176) fill
+ 
+end-heading
+
+!******************************************************************
+!This procedure selects pay calendar details
+!******************************************************************
+
+begin-procedure select-pay-calendar
+
+let $found_a  = 'N'      !JNB 08/09/1999
+begin-select on-error=sql-error-found('Select-Pay-Calendar')
+A1.COMPANY
+A1.PAYGROUP
+A1.PAY_END_DT
+A1.CHECK_DT
+   move &A1.PAY_END_DT to $pay_end_dt
+   move &A1.CHECK_DT to $check_dt
+   do convert-to-dtu-date($check_dt,$check_dt_dtu)
+   let #asofmonth = substr($check_dt_dtu,6,2)
+   evaluate #asofmonth
+      when <= 3
+         let #asofqtr = 1
+         break
+      when <= 6
+         let #asofqtr = 2
+         break
+      when <= 9
+         let #asofqtr = 3
+         break
+      when <= 12
+         let #asofqtr = 4
+   end-evaluate
+   let $asofyear = substr($check_dt_dtu,1,4)
+   move 'Y' to $found_a        !JNB 08/09/1999
+   ! display 'AsofMonth:' noline
+   ! display #asofmonth
+   ! display 'AsofYear:' noline
+   ! display $asofyear
+   ! display 'AsofQtr:' noline
+   ! display #asofqtr
+!SXK 11/10/1999 Begin
+   if (rtrim(&a1.COMPANY,' ') <> rtrim($company,' '))
+      move &a1.COMPANY to $company
+      move &a1.paygroup to $paygroup
+      display $company
+      display $paygroup
+
+      do process-employee-data
+      display #recs_updated
+      display '--------'
+   end-if
+!SXK 11/10/1999 End
+
+FROM PS_PAY_CALENDAR A1
+WHERE A1.PAY_END_DT = (SELECT MAX(PAY_END_DT)
+			 FROM PS_PAY_CALENDAR
+			WHERE PAY_END_DT <= $AsOfToday
+                          AND PAY_CONFIRM_RUN = 'Y')
+!SXK 11/10/1999 Begin
+and exists (select 'yyy' from ps_gex_legal_Aid
+		where company = a1.company)
+order by a1.company,a1.paygroup
+!SXK 11/10/1999 End
+end-select
+display 'Pay End Dt = ' noline
+display $pay_end_dt
+
+if $found_a  = 'N'      !JNB 08/09/1999
+   do error-found
+   print 'No confirmed pay cycle as of ' (,34)
+   print $AsOfToday ()
+end-if
+end-procedure
+
+!******************************************************************
+!This procedure processes employees with legal deductions
+!******************************************************************
+
+begin-procedure process-employee-data
+
+ move 'N' to $found
+
+ do select-employees1
+
+end-procedure
+
+!*********************************************************************
+
+begin-procedure select-employees1
+
+move 'N' to $found
+
+begin-select on-error=sql-error-found('Select-Employees1')
+E2.EMPLID
+   move &E2.EMPLID to $emplid
+
+   move 'Y' to $found
+   ! display 'Emplid:' noline
+   ! display $emplid
+!   do update-ded-end-dt1
+   do update-process-flag
+
+   add 1 to #inputtran
+!SXK 12/17/1998 Begin
+!SXK 11/10/1999 Begin - Removed join with earnings_bal
+!	and made it an exists condition
+FROM PS_GEX_LEGAL_AID E2
+WHERE E2.COMPANY = $company                        
+AND   E2.EFFDT <= (select max(effdt)                               
+		     from ps_gex_legal_aid
+		    where emplid = e2.emplid
+		    and effdt <= $reportdate_dbf)
+  AND EXISTS (select 'xxx' from ps_earnings_bal e1
+		where e1.emplid = e2.emplid
+!		and e1.company = $company          !SCM 9/18/2001 ee that transferred-commented
+		AND E1.GRS_MTD > 0
+		AND E1.ERNCD = '525'
+		AND E1.BALANCE_ID = 'CY'
+		AND E1.BALANCE_YEAR = $AsOfyear
+		AND E1.BALANCE_QTR = #asofqtr
+		AND E1.BALANCE_PERIOD = #asofmonth
+                AND E1.EMPL_RCD = E2.EMPL_RCD)     !GBD 02/18/2003
+
+end-select
+end-procedure
+!*********************************************************************
+!begin-procedure update-ded-end-dt1
+
+!begin-sql on-error=sql-error-found('Update-Ded-End-Dt1')
+!UPDATE PS_GENL_DEDUCTION D
+!   SET D.DEDUCTION_END_DT = $pay_end_Dt
+
+!WHERE D.EMPLID = $emplid
+!  AND D.EMPL_RCD = #empl_rcd
+!  AND D.GOAL_AMT = D.GOAL_BAL
+!SXK 12/17/1998 End
+!  AND D.EFFDT = &E.EFFDT
+!  AND D.DEDUCTION_END_DT IS NULL
+!  AND D.DEDCD = 'LEGAL'
+!end-sql
+
+!end-procedure
+!*********************************************************************
+begin-procedure update-process-flag
+
+begin-sql on-error=sql-error-found('Update-Process-Flag')
+UPDATE PS_GEX_LEGAL_AID D
+   SET D.GEX_PROCESS_IND = 'Y'
+
+WHERE D.EMPLID = $emplid
+  AND D.COMPANY = $company                              !SCM 9/18/2001 ee that transferred
+  AND D.GEX_PROCESS_IND = 'N'
+  AND D.EFFDT = (select max(effdt)
+   		   from ps_gex_legal_aid
+		where emplid = $emplid
+		and empl_rcd = d.empl_rcd
+            !AXL 12/20/2000 Employees with 2 rows being missed - Begin
+                and deptid    = d.DEPTID
+	    !AXL 12/20/2000 Employees with 2 rows being missed - End
+                and company  =  d.company               !SCM 9/18/2001 ee that transferred
+		and effdt <= $reportdate_dbf)
+end-sql
+add #sql-count to #recs_updated
+end-procedure
+
+!********************************************************************
+!This procedure displays in the error report if there are any sql erros
+!happened in the program
+!********************************************************************
+
+begin-procedure SQL-Error-Found($Proc_Name) 
+  do error-found
+  print 'SQL Error in ' (,21)
+  print $Proc_Name (,35)  
+  print $_sql-error (+1,1) 
+  print 'sql-status:' (+1,1)
+  print #_sql-status () edit 99999 
+  show $emplid $DEPTID $company $paygroup noline
+  display ' : SQL error ' noline
+  display #_sql-status
+
+end-procedure
+
+!*********************************************************************
+!This procedure displays the error message for the records that are in
+!progress
+!*********************************************************************
+
+begin-procedure Error-Found
+  move 'Y' to $ErrorFound
+  do Format-Number(#InputTran, $out, '99999')
+  print $out (+1,1)
+  move &E2.EMPLID to $emplid
+  ! GEX_SEC_REENG 2016-09-14 Vahini Katta Begins 
+  !let $EmplId_1st3 = substr($EmplId,1,3)
+  !let $EmplId_mid2 = substr($EmplId,4,2)
+  !let $EmplId_last4 = substr($EmplId,6,4)
+ 
+  !String $EmplId_1st3 $EmplID_mid2 $EmplId_last4 by '-' into $EmplId11
+
+ ! print $EmplID11 (,16)
+  print $EmplId (,16)
+  ! GEX_SEC_REENG 2016-09-14 Vahini Katta Ends
+end-procedure
+
+#Include 'tranctrl.sqc'  !Common Transaction Control Procedures
+!*#Include 'reset.sqc'     !Reset printer procedure
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'payrnctl.sqc'  !Select-Parameters
+#Include 'stdapi.sqc'    !Get_Run_Control Procedure
+#Include 'datemath.sqc'  !Does the date-math functions

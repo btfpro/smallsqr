@@ -1,0 +1,497 @@
+!***********************************************************************
+! FGPY020:  Military Deposit Interest                                  *
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module contains confidential and proprietary information        *
+! of Oracle; it is not to be copied, reproduced, or transmitted        *
+! in any form, by any means, in whole or in part, nor is it to         *
+! be used for any purpose other than that for which it is              *
+! expressly provided under the applicable license agreement.           *
+!                                                                      *
+! Copyright (C) 2007 Oracle. All Rights Reserved.                      *
+!
+!----------------------------------------------------------------------
+!
+!          $Date:  2007/03/02:13:38:40                        
+!       $Release:  HR9                                        
+!    $Resolution:  698735                                     
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+!  $Date    :: 2/28/2001  8:34A$                                     *
+!                                                                      *
+!***********************************************************************
+! Revisions Made:  CRM     05/03/2001
+!  >>> Commented out call to DEL-SVCTRN and deleted procedure
+!  >>> Procedure update-iad:  Added call to convert date to native format
+!          then use that date to insert back into database
+! >>>  Procedure GET-IAD:  got rid of If statement inside of select statement
+!          and replaced it with a where clause
+! >>>  Procedure Cal-int:  Uncommnted out call to update-iad
+!          Also changed the sign on the assignment of #End-bal variable to a "="
+! >>>  Procedure get-int-for-first-and-sec-year:  Addded another select statement
+!         with EFFDT logic to look up first and second year interest dates
+! >>> Procedure UPDATE-GEN-DED:  Added DEDCD and EMPL_RCD to where clause of update statment
+!         Changed update statement to increment the GENL_DEDUCTION.GOAL_AMOUNT by the interest
+!           Instead of updating it with end balance
+! >>>  Procedure: GET-PAY-DATES:  Added where clause to only pick up Employees that have outstanding
+!        balances and the account are open.     GVT_TRANS_TYPE = 'A'
+!>>>  Change the record structure of PS_GVT_SVCTRN_TBL.  GVT_SVC_TRANS_NBR is now the last key on the record.
+!       We will now increment a variable so if there are two different types of accounts being accrues we
+!        will no longer get a duplicate error message
+!>>>  We will only call UPDATE-GEN-DED if the account is open (GVT_STATUS_ACCT = '1')
+!>>> Procedure: GET-IAD  -- Added two more criteria to where clause SEQ_NO and EMPL_RCD
+!>>>> Procedure: Process-main:  Added join to PS_GVT_SVCDEP_TBL so the interest accruall date would be
+!                      be open in this cursor.  We will no longer call get-iad.  Minimizing the number of SQL statements to DB.
+!               Moved the call to CAL-INT into process-main.  This was located in get-iad.
+!>>>> Procedure:  Cal-Interest:   Completely recoded the way in which the "Weighted avg" of two different
+!                             interest rates are handle.  It was not taking the EFFDT of Military Interest table into account
+!                             It was hard coded with jan, 1
+!>>>>> Changed the date that is inserted into GVT_SVCTRN_TBL.TRANS_DT to be the last confirmed payroll end date
+!             for employees paygroup.
+!
+!>>>>> 5/22/01 -CRM
+!      -- Added two more where clause criteria to the update statement on PS_GVT_SVCDEP_TBL
+!      -- Deleted several commented out procedures and lines of code
+!      -- Added to more columns that will be updated on PS_GENL_DEDUCTION:  LAST_ACTION & LAST_UPDATE_DATE
+! ----------------------------------------
+!>>>> 5/28/01 - CRM
+!      -- ADD RUN_ID to the selection from PS_PAY_CALENDAR in procedure GET-EMPLOYEE-LEVEL-PAY-END-DATE
+!      -- Split out the subquery in UPDATE-GEN-DED.  Some platforms cannot have a subquery with the same table that
+!         is being updated
+!
+!*******************************************************
+#include 'setenv.sqc' !Set environment
+
+Begin-Setup
+  #Include 'ptpsp125.sqc'
+End-Setup
+
+begin-program
+
+  do Init-DateTime
+  do Init-Number
+  do Get-Current-DateTime
+  do Init-Report
+  do Process-Main
+  do StdAPI-Term
+
+end-program
+
+
+!********************************************
+begin-procedure Init-Report
+!********************************************
+
+  move ' ' to $ReportID
+  move ' ' to $ReportTitle
+  display $ReportTitle
+  display ' '
+
+  do StdAPI-Init
+
+  if $prcs_process_instance = ''
+    do Ask-Values
+  else
+    do Get-Values
+  end-if
+
+end-procedure
+
+
+!********************************************
+begin-procedure Ask-Values
+!********************************************
+
+    input $run_id        'Enter run id'
+
+end-procedure
+
+!********************************************
+begin-procedure Get-Values
+!********************************************
+
+BEGIN-SELECT
+Z1.RUN_ID
+Z1.ASOFDATE
+Z1.OPRID
+Z1.RUN_CNTL_ID
+
+  Let $RUN_ID           = &Z1.RUN_ID
+  Let $INPUT_DATE       = &Z1.ASOFDATE
+
+
+FROM PS_GVT_RUN_CNTL Z1
+WHERE Z1.OPRID       = $prcs_oprid
+AND   Z1.RUN_CNTL_ID = $prcs_run_cntl_id
+END-SELECT
+
+end-procedure
+
+!********************************************
+begin-procedure update-iad
+!********************************************
+
+
+   !CRM Added this conversion call
+   do Convert-From-DTU-Date($dtu_date_out1, $IAD-Plus-one-Year-native)
+BEGIN-SQL
+   !  CRM Changed the variabled that was going into GVT_MILDEP_IAD
+UPDATE PS_GVT_SVCDEP_TBL SET GVT_MILDEP_IAD = $IAD-Plus-one-Year-native
+WHERE EMPLID = $EMPLID
+AND   EMPL_RCD = &A.EMPL_RCD
+AND   SEQ_NO = &A.SEQ_NO
+END-SQL
+END-PROCEDURE
+
+
+!********************************************
+begin-procedure Process-Main
+!********************************************
+
+
+
+DO GET-PAY-DATES
+! CRM:  added  AND A.END_BAL > 0 to stop
+!  This will only pick up people that have outstanding balances
+
+LET $LAST_EMPLID = ' '
+LET #TRANS_NBR = 30
+
+BEGIN-SELECT
+A.EMPLID
+A.END_BAL
+A.BEGIN_BAL
+A.EMPL_RCD
+A.SEQ_NO
+A.GVT_SVC_TRANS_NBR
+B1.GVT_MILDEP_IAD
+B1.GVT_STATUS_ACCT
+
+    let $EMPLID =  rtrim(&A.EMPLID,' ')
+    MOVE &A.END_BAL TO #PREV_END_BAL
+    MOVE &A.BEGIN_BAL TO #PREV_BEGIN_BAL
+    MOVE &A.EMPL_RCD TO #EMPL_RCD
+    MOVE &A.SEQ_NO TO #SEQ_NO
+    MOVE &B1.GVT_MILDEP_IAD TO $MILDEP_IAD
+
+
+        LET #TRANS_NBR = #TRANS_NBR + 1
+
+
+     !DO GET-IAD
+     DO CAL-INT
+FROM PS_GVT_SVCTRN_TBL A, PS_GVT_SVCDEP_TBL B1
+WHERE A.TRANS_DT = (SELECT MAX(A1.TRANS_DT)
+                         FROM PS_GVT_SVCTRN_TBL A1
+                         WHERE A1.EMPLID = A.EMPLID
+                         AND   A1.EMPL_RCD = A.EMPL_RCD
+                         AND   A1.SEQ_NO = A.SEQ_NO
+                         AND   A1.TRANS_DT <= $PAY_END_DT)
+
+AND A.EMPLID = B1.EMPLID
+AND A.EMPL_RCD = B1.EMPL_RCD
+AND A.SEQ_NO = B1.SEQ_NO
+AND A.END_BAL > 0
+AND B1.GVT_MILDEP_IAD BETWEEN $PAY_BEGIN_DT AND $PAY_END_DT
+
+ORDER BY A.EMPLID
+END-SELECT
+
+
+end-procedure
+
+!********************************************
+begin-procedure GET-PAY-DATES
+!********************************************
+BEGIN-SELECT
+C.PAY_BEGIN_DT
+C.PAY_END_DT
+   MOVE &C.PAY_BEGIN_DT TO $PAY_BEGIN_DT
+   MOVE &C.PAY_END_DT TO $PAY_END_DT
+
+FROM PS_PAY_CALENDAR C
+WHERE C.RUN_ID = $RUN_ID
+END-SELECT
+END-PROCEDURE
+
+
+!********************************************
+begin-procedure CAL-INT
+!********************************************
+
+   DO Convert-To-DTU-Date($MILDEP_IAD, $DTU_MILDEP_IAD)
+   ! dtu_mildep_iad is the days of interest
+
+   DO dtu-add-years($DTU_MILDEP_IAD, -1, $dtu_date_out)
+   ! subtract one year from the days of interest
+
+   let $IAD-Less-one-Year = $dtu_date_out
+
+   DO dtu-add-years($DTU_MILDEP_IAD, 1, $dtu_date_out1)
+    !add a year to dtu_mildep_iad
+   DO Convert-From-DTU-Date($dtu_date_out, $date_out)
+    ! set $date_out = the dtu_date + 1 year in date format
+
+   DO Convert-From-DTU-Date($dtu_date_out1, $date_out1)
+    ! set $date_out1 = the $dte_date - 1 year in date format
+
+
+      do get-int-for-first-and-sec-year
+
+      do cal-interest
+
+   let #int_value = (#PREV_END_BAL*#tot_int)/100
+
+
+   LET #BEGIN_BAL = #PREV_END_BAL
+   LET #END_BAL   = #BEGIN_BAL + #int_value
+   ! CRM Trans_dt will be the last confirmed payroll end date for employees paygroup.
+   LET $GVT_TRANS_TYPE = 'I'
+
+   DO INSERT-SVCTRN-TBL
+   do get-dedcd
+   IF RTRIM(&B1.GVT_STATUS_ACCT,' ') = '1'
+       DO UPDATE-GEN-DED
+   END-IF
+
+
+   ! CRM Uncommented out this call
+   DO update-iad
+
+END-PROCEDURE
+
+!********************************************
+begin-procedure get-int-for-first-and-sec-year
+!********************************************
+
+! CRM Added two select statements and added EFFDT logic to look up
+!  interest rate.
+
+!  This first Select Statement will get the
+! the Miltary Deposit Interest Rate that is effective
+! on the current employees interest Accrual Date
+begin-select
+X.GVT_MIL_DEP_INTRST
+X.EFFDT
+    MOVE &X.GVT_MIL_DEP_INTRST TO #GVT_MIL_DEP_INTRST
+    MOVE &X.EFFDT TO $EFFDT
+
+
+
+        MOVE #GVT_MIL_DEP_INTRST TO #FIRST_INTRST
+        MOVE &X.EFFDT TO $FIRST_YR_EFFDT1
+
+FROM PS_GVT_MIL_INTRST X
+ WHERE X.EFFDT = (SELECT MAX(XX.EFFDT)
+                         FROM PS_GVT_MIL_INTRST XX
+                         WHERE XX.EFFDT <= &B1.GVT_MILDEP_IAD)
+
+
+end-select
+
+
+! This second select will get the interest rate that is effective for the
+! Interest Accrual Date (IAD) minus one year
+
+  ! this will convert the date back into the native format
+  do Convert-From-DTU-Date($IAD-Less-one-Year, $IAD-Less-one-Year-native)
+
+begin-select
+XXX.GVT_MIL_DEP_INTRST
+XXX.EFFDT
+
+    MOVE &XXX.GVT_MIL_DEP_INTRST TO #GVT_MIL_DEP_INTRST
+    MOVE &XXX.EFFDT TO $EFFDT
+    MOVE #GVT_MIL_DEP_INTRST TO #SEC_INTRST
+    MOVE &XXX.EFFDT TO $SEC_YR_EFFDT
+
+FROM PS_GVT_MIL_INTRST XXX
+ WHERE XXX.EFFDT = (SELECT MAX(XXX2.EFFDT)
+                         FROM PS_GVT_MIL_INTRST XXX2
+                         WHERE XXX2.EFFDT <= $IAD-Less-one-Year-native)
+
+end-select
+
+
+end-procedure
+
+
+!********************************************
+begin-procedure get-dedcd
+!********************************************
+
+
+begin-select
+DD.DEDCD
+   MOVE &DD.DEDCD TO $DEDCD
+FROM PS_DEDUCTION_TBL DD
+WHERE DD.EFFDT =
+   (SELECT MAX(A_ED.EFFDT) FROM PS_DEDUCTION_TBL A_ED
+    WHERE DD.PLAN_TYPE = A_ED.PLAN_TYPE
+    AND DD.DEDCD = A_ED.DEDCD
+     AND A_ED.EFFDT <= $ASOFTODAY)
+     AND DD.GVT_REPORTING_CD = 'MD'
+     AND DD.GVT_DIST_DEST = 'R'
+     AND DD.PLAN_TYPE = '00'
+end-select
+
+end-procedure
+
+
+!********************************************
+begin-procedure UPDATE-GEN-DED
+!********************************************
+
+
+BEGIN-SELECT
+UP.EFFDT
+  MOVE &UP.EFFDT TO $UP_EFFDT
+
+FROM PS_GENL_DEDUCTION UP
+WHERE UP.EMPLID = $EMPLID
+AND   UP.EFFDT = (SELECT MAX(EFFDT)
+                       FROM PS_GENL_DEDUCTION UP1
+                         WHERE UP1.EMPLID = UP.EMPLID
+                         AND   UP1.DEDCD     = UP.DEDCD
+                         AND   UP1.EFFDT <= $ASOFTODAY)
+AND UP.DEDCD = $DEDCD
+END-SELECT
+
+
+BEGIN-SQL
+UPDATE PS_GENL_DEDUCTION
+SET GOAL_AMT = GOAL_AMT + #int_value,
+     LAST_ACTION = 'C',
+    LAST_UPDATE_DATE = $ASOFTODAY
+WHERE EMPLID = $EMPLID
+AND   EFFDT = $UP_EFFDT
+AND DEDCD = $DEDCD
+END-SQL
+
+
+END-PROCEDURE
+
+
+
+!********************************************
+begin-procedure cal-interest
+!********************************************
+
+
+
+   ! CRM Added this new date logic.  Doing Date comparisons based on
+   ! the effdt of the interest date and the IAD
+
+  let  #days_in_first_intrst = 0
+  let #one_year_check  = 0
+  let #days_in_sec_intrst = 0
+
+   DO Convert-To-DTU-Date($FIRST_YR_EFFDT1,$FIRST_YR_EFFDT)
+   ! Get the difference between the interest accrual date and the effdt of interest rate
+   DO dtu-diff-days($FIRST_YR_EFFDT, $DTU_MILDEP_IAD, #days_in_first_intrst)
+   ! if it is over 365 days
+   if #days_in_first_intrst >= 365
+           let #tot_int = #FIRST_INTRST
+
+    else
+
+        LET #FIRST_INT = (#days_in_first_intrst/365) * #FIRST_INTRST
+
+        !Check to make sure we don't exceed 365 days.  because of inconsistant EFFDTs
+        let #one_year_check = 365 - #days_in_first_intrst
+        ! days in second interest period = (EFFDT from Second Year Interest) less (IAD) less (one year)
+
+       DO dtu-diff-days($IAD-Less-one-Year, $FIRST_YR_EFFDT, #days_in_sec_intrst)
+
+        if #days_in_sec_intrst > #one_year_check
+             ! enforcing  #days_in_sec_intrst + #days_in_first_intrst = 365
+               let  #days_in_sec_intrst = #one_year_check
+         end-if
+
+         LET #SEC_INT = (#days_in_sec_intrst/365) * #SEC_INTRST
+
+         let #tot_int = #FIRST_INT + #SEC_INT
+
+
+   end-if
+
+end-procedure
+
+!********************************************
+begin-procedure cal-interest1
+!********************************************
+
+
+   let #tot_int = #global_interest
+
+end-procedure
+
+!********************************************
+begin-procedure INSERT-SVCTRN-TBL
+!********************************************
+
+     DO GET-EMPLOYEE-LEVEL-PAY-END-DATE
+
+BEGIN-SQL
+
+INSERT INTO PS_GVT_SVCTRN_TBL
+(EMPLID, EMPL_RCD, SEQ_NO, TRANS_DT,GVT_SVC_TRANS_NBR, GVT_TRANS_TYPE,
+BEGIN_BAL, END_BAL, TRANS_AMT,INTEREST_RATE, DESCR50)
+VALUES
+($EMPLID,#EMPL_RCD,#SEQ_NO,$TRANS_DT,#TRANS_NBR, $GVT_TRANS_TYPE,
+#BEGIN_BAL,#END_BAL,#int_value,#tot_int,' ')
+END-SQL
+
+END-PROCEDURE
+
+!*****************************************
+BEGIN-PROCEDURE GET-EMPLOYEE-LEVEL-PAY-END-DATE
+!*****************************************
+
+ LET $PAYCAL_ROWS_RETURNED = 'N'
+BEGIN-SELECT
+JOB.PAYGROUP
+PAY_CAL.PAY_END_DT
+
+     LET $PAYCAL_ROWS_RETURNED = 'Y'
+      LET $TRANS_DT = &PAY_CAL.PAY_END_DT
+
+  FROM PS_JOB JOB, PS_PAY_CALENDAR PAY_CAL
+  WHERE
+
+     JOB.EFFDT =
+        (SELECT MAX(A_ED.EFFDT) FROM PS_JOB A_ED
+        WHERE JOB.EMPLID = A_ED.EMPLID
+          AND JOB.EMPL_RCD = A_ED.EMPL_RCD
+          AND A_ED.EFFDT <= $ASOFTODAY)
+    AND JOB.EFFSEQ =
+        (SELECT MAX(A_ES.EFFSEQ) FROM PS_JOB A_ES
+        WHERE JOB.EMPLID = A_ES.EMPLID
+          AND JOB.EMPL_RCD = A_ES.EMPL_RCD
+          AND JOB.EFFDT = A_ES.EFFDT)
+     AND PAY_CAL.COMPANY = JOB.COMPANY
+     AND PAY_CAL.PAYGROUP = JOB.PAYGROUP
+     AND JOB.EMPLID = $EMPLID
+     AND JOB.EMPL_RCD = #EMPL_RCD
+     AND PAY_CAL.PAY_CONFIRM_RUN = 'Y'
+     AND PAY_CAL.GVT_RITS_RUN = 'Y'
+     AND PAY_CAL.RUN_ID = $Run_Id
+     END-SELECT
+
+     IF $PAYCAL_ROWS_RETURNED = 'N'
+          MOVE $ASOFTODAY TO $TRANS_DT
+     END-IF
+END-PROCEDURE !
+
+!****************************************************************
+#Include 'reset.sqc'     !Reset printer procedure
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#include 'datemath.sqc'
+#Include 'stdapi.sqc'    !Update Process API
+#Include 'bnrunctl.sqc'  !Get application run control parameters
+#Include 'bngetval.sqc'  !Get BEN values mask routines

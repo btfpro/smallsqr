@@ -1,0 +1,1568 @@
+!***********************************************************************
+! Name: OHS501UK.SQR                                                   *
+!***********************************************************************
+!                                                                      *
+! Confidentiality Information:                                         *
+!                                                                      *
+!                                                                      *
+! This module contains confidential and proprietary information        *
+! of Oracle; it is not to be copied, reproduced, or transmitted        *
+! in any form, by any means, in whole or in part, nor is it to         *
+! be used for any purpose other than that for which it is              *
+! expressly provided under the applicable license agreement.           *
+!                                                                      *
+! Copyright (C) 2007 Oracle. All Rights Reserved.                      *
+!                                                                      *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!          $Date:  2007/09/02:20:58:26                                 
+!       $Release:  HR9                                                 
+!    $Resolution:  689848                                              
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+! Description: Populate RIDDOR F2508 Report working tables.            *
+! This is a UK-specific process which populates the working tables     *
+! OHS501UK_TMP1 and OHS501UK_TMP2. These tables are then used by       *
+! Crystal Reports processes OHS001 and OHS002.                         *
+!                                                                      *
+!                                                                      *
+!***********************************************************************
+
+
+
+#include 'setenv.sqc'    ! Set environment
+#include 'setup31.sqc'   ! Report orientation
+#include 'stdapi.sqc'    ! Update process request API
+#include 'askftd.sqc'    ! From-Thru date
+#Include 'reset.sqc'     ! Reset printer procedure
+#include 'datetime.sqc'  ! Routines for date and time formatting
+#include 'timemath.sqc'  ! Time arithmetic procedures
+#include 'curdttim.sqc'  ! Get-Current-DateTime procedure
+#include 'number.sqc'    ! Routines to format numbers
+
+#include 'ohsrnctl.sqc'  ! Get run control parameter values
+#include 'ohsget.sqc'    ! Get values mask routines
+#include 'ohsutil.sqc'   ! Health & Safety utility functions
+#include 'ohs501uk.sqc'  ! Look-up functions
+#Include 'getprimj.sqc'  ! Routines for selecting EE's primary job
+
+
+#define SPACE      ' '
+#define DO_CODE    'O'
+#define C_INCIDENT   1
+#define C_DATE      11
+#define C_ID        23
+#define C_NAME      36
+#define C_BODYPART  65
+#define C_INJURY   105
+
+!------------------------------------------------------------------------
+! Start Report
+!------------------------------------------------------------------------
+begin-report
+   do Init-DateTime
+   do Init-Number
+   do Get-Current-DateTime
+   do Init-Report
+   do Process-Main
+   do Reset
+   do Stdapi-Term
+end-report
+
+
+!------------------------------------------------------------------------
+! Page heading
+!------------------------------------------------------------------------
+begin-heading 5
+
+   print $ReportID        (+1,1,34)
+   print $ReportTitle     (0,{C_NAME})
+
+   print 'Incident'       (+2,{C_INCIDENT},9)
+   print 'Date'           (0, {C_DATE},11)
+   print 'ID'             (0, {C_ID},12)
+   print 'Name'           (0, {C_NAME},28)
+   print 'Body Parts'     (0, {C_BODYPART},39)
+   print 'Injuries'       (0, {C_INJURY}
+   print '--------'       (+1,{C_INCIDENT},9)
+   print '----'           (0, {C_DATE},11)
+   print '--'             (0, {C_ID},12)
+   print '----'           (0, {C_NAME},28)
+   print '----------'     (0, {C_BODYPART},39)
+   print '--------'       (0, {C_INJURY}
+
+end-heading
+
+!------------------------------------------------------------------------
+! Report initialization
+!------------------------------------------------------------------------
+begin-procedure Init-Report
+
+   move 'RIDDOR (UK)'           to $ReportID
+   move 'Reportable Incidents ' to $ReportTitle
+
+   do Stdapi-Init
+
+   if $prcs_process_instance = ''
+      do Ask-From-Thru-Date
+   else
+      do Select-Parameters
+   end-if
+
+end-procedure
+
+! Called by Select-Parameters
+begin-procedure Get-Values
+   !let $LanguageCode = $PRCS_LANGUAGE_CD
+   let $LanguageCode = 'ENG'
+   do Get-From-Thru-Date
+end-procedure
+
+!-----------------------------------------------------------------------
+! Main processing
+!-----------------------------------------------------------------------
+begin-procedure Process-Main
+
+   let $Platform = {SPACE}
+   do ohsGetPlatformName($Platform)
+   string 'Reporting from' &RUN_CNTL_OHS.FROMDATE 'to' &RUN_CNTL_OHS.THRUDATE by ' ' into $Period
+
+   display 'Process      : ' NOLINE
+   display $ReportID         NOLINE
+   display ' '               NOLINE
+   display $ReportTitle
+   display 'Platform     : ' NOLINE
+   display $Platform
+   display 'Report Date  : ' NOLINE
+   display $ReportDate
+   display 'Language     : ' NOLINE
+   display $LanguageCode
+   display 'Base TimeZone: ' NOLINE
+   display $BSE_TIMEZONE
+   display $Period
+   display ' '
+
+   if isblank(&RUN_CNTL_OHS.REPORT_EMPLID)
+      display 'ERROR: No employee id given - SQR aborting.'
+   else
+      do DeleteWorkRecords        ! Clear out temporary tables
+      do GetBaseDetails           ! Get operator and company details
+      do ProcessEmplidDetails     ! Populate temp table for employees
+      do ProcessNonEmplidDetails  ! Populate temp table for non-employees
+      do ProcessDangOccDetails    ! Populate temp table for dangerous occurrences
+   end-if
+
+end-procedure
+
+!**************************************************************************************************
+
+!-----------------------------------------------------------------------
+! Delete all records from existing work tables
+!-----------------------------------------------------------------------
+begin-procedure DeleteWorkRecords
+
+   if isblank(&RUN_CNTL_OHS.Incident_Nbr)
+      ! choose incidents occurring between dates given...
+      let $UserChoice = ' INCIDENT_DT >= ''' || &RUN_CNTL_OHS.FROMDATE || ''' AND' || -
+                        ' INCIDENT_DT <= ''' || &RUN_CNTL_OHS.THRUDATE || ''''
+   else
+      ! use the incident given...
+      let $UserChoice = 'INCIDENT_NBR = ''' || &RUN_CNTL_OHS.INCIDENT_NBR || ''''
+end-if
+let $sql-statement = 'OHS501UK.SQR,DeleteWorkRecords,DELETE,PS_OHS501UK_TMP1'
+BEGIN-SQL ON-ERROR=SQL-Error
+   DELETE FROM PS_OHS501UK_TMP1
+END-SQL
+let $sql-statement = 'OHS501UK.SQR,DeleteWorkRecords,DELETE,PS_OHS501UK_TMP2'
+BEGIN-SQL ON-ERROR=SQL-Error
+   DELETE FROM PS_OHS501UK_TMP2
+END-SQL
+
+end-procedure
+
+
+!-----------------------------------------------------------------------
+! Obtain basic report information
+!-----------------------------------------------------------------------
+
+! Operator details 1 - 3 (operid passed in)...
+begin-procedure GetBaseDetails
+
+   display 'Operator Details...'
+
+do Get-Primary-Job(&RUN_CNTL_OHS.REPORT_EMPLID, '', #report_emplrcd)
+
+BEGIN-SELECT
+B.NAME_PREFIX
+B.NAME
+   let $OperName = rtrim(&B.NAME,{SPACE})
+   do ohsUnFormatName($OperName,$OperName)
+   let $OperName = rtrim(&B.NAME_PREFIX,{SPACE}) || {SPACE} || $OperName
+!A.SETID          &OperLocSetID
+A.BUSINESS_TITLE &OperJobTitle
+!A.COUNTRY_CODE
+!A.PHONE
+!   if (&A.COUNTRY_CODE <> {SPACE})
+!      let $OperPhone = rtrim(&A.COUNTRY_CODE,{SPACE}) || {SPACE} || rtrim(&A.PHONE,{SPACE})
+!   else
+!      let $OperPhone = &A.PHONE
+!   end-if
+   let $Emplid = &RUN_CNTL_OHS.REPORT_EMPLID
+   do Get-Phone-Data
+   if ($CountryCode <> {SPACE})
+      let $OperPhone = rtrim($CountryCode,{SPACE}) || {SPACE} || rtrim($Phone,{SPACE})
+   else
+      let $OperPhone = $Phone
+   end-if
+   display 'Name  : ' NOLINE
+   display $OperName
+   display 'Job   : ' NOLINE
+   display &OperJobTitle
+   display 'Phone : ' NOLINE
+   display $OperPhone
+
+   FROM   PS_EMPLOYMENT A, PS_PERSONAL_DT_FST B
+   WHERE  A.EMPL_RCD = #report_emplrcd
+   AND    A.EMPLID    = &RUN_CNTL_OHS.REPORT_EMPLID
+   AND
+  A.EMPLID    = B.EMPLID
+END-SELECT
+
+   display ' '
+   display 'Organization Details...'
+
+! Organisation details 4 - 6...
+BEGIN-SELECT
+B.DESCR          &OrgName
+B.ADDRESS1       &OrgAddress1
+B.ADDRESS2       &OrgAddress2
+B.ADDRESS3       &OrgAddress3
+B.ADDRESS4       &OrgAddress4
+B.CITY           &OrgCity
+B.COUNTY         &OrgCounty
+B.STATE          &OrgState
+B.POSTAL         &OrgZip
+  let $OrgZip=&OrgZip
+B.COUNTRY        &OrgCountry
+B.BUSINESS_DESCR &OrgBusinessDescr
+   let $OrgBusinessDescr = nvl(&OrgBusinessDescr,{SPACE})
+   if not isblank($OrgBusinessDescr)
+      display 'Business Description: ' NOLINE
+      display $OrgBusinessDescr
+   else
+      display 'No business description'
+   end-if
+   FROM   PS_CURRENT_JOB A, PS_COMPANY_TBL B
+   WHERE  A.EMPL_RCD = #report_emplrcd
+   AND    A.EMPLID = &RUN_CNTL_OHS.REPORT_EMPLID
+   AND    A.COMPANY = B.COMPANY
+   AND    B.EFFDT = (SELECT MAX(Z.EFFDT)
+                          FROM   PS_COMPANY_TBL Z
+                          WHERE  Z.COMPANY = A.COMPANY
+                          AND    Z.EFFDT <= $AsOfToday)
+END-SELECT
+
+   ! Validate contents in case no organisation details are brought back...
+   let $OrgName          = nvl(&OrgName,          {SPACE})
+   let $OrgAddress1      = nvl(&OrgAddress1,      {SPACE})
+   let $OrgAddress2      = nvl(&OrgAddress2,      {SPACE})
+   let $OrgAddress3      = nvl(&OrgAddress3,      {SPACE})
+   let $OrgAddress4      = nvl(&OrgAddress4,      {SPACE})
+   let $OrgCity          = nvl(&OrgCity,          {SPACE})
+   let $OrgCounty        = nvl(&OrgCounty,        {SPACE})
+   let $OrgState         = nvl(&OrgState,         {SPACE})
+   let $OrgZip           = nvl($OrgZip,           {SPACE})
+   let $OrgCountry       = nvl(&OrgCountry,       {SPACE})
+   let $OrgBusinessDescr = nvl(&OrgBusinessDescr, {SPACE})
+
+   do ohsGetStateName(&OrgCountry,&OrgState,$OrgStateName)
+   do ohsGetCountryName(&OrgCountry,$OrgCountryName)
+   display $OrgStateName
+   display $OrgCountryName
+   display ' '
+
+end-procedure
+
+
+!-----------------------------------------------------------------------
+! Process dangerous occurrences
+!-----------------------------------------------------------------------
+begin-procedure ProcessDangOccDetails
+
+   show 'In procedure: ProcessDangOccDetails'
+
+   if isblank(&RUN_CNTL_OHS.INCIDENT_NBR)
+      ! choose incidents occurring between dates given...
+      let $UserChoice = 'DA.INCIDENT_NBR IN ' || -
+                        '(SELECT I.INCIDENT_NBR FROM PS_INCIDENT_DATA I ' || -
+                        ' WHERE  I.INCIDENT_DT >= ''' || &RUN_CNTL_OHS.FROMDATE || '''' || -
+                        '   AND I.INCIDENT_DT <= '''  || &RUN_CNTL_OHS.THRUDATE || ''')'
+   else
+      ! use the incident given...
+      let $UserChoice = 'DA.INCIDENT_NBR = ''' || &RUN_CNTL_OHS.INCIDENT_NBR || ''''
+   end-if
+
+   print 'Dangerous Occurrences' (+2,1)
+   print '---------------------' (+1,1,9)
+
+BEGIN-SELECT
+DA.INCIDENT_NBR       &Inc_Nbr
+   print &Inc_Nbr       (+1,{C_INCIDENT})
+DA.INCIDENT_TYPE      &Inc_Type
+DA.INCIDENT_DT        &Inc_Dt
+!   do ohsMakeUKDateString(&Inc_Dt,$Inc_Dt)
+   let $Inc_Dt = &Inc_Dt
+   show '$Inc_Dt: ' $Inc_Dt
+DA.HS_TIMEZONE1       &Hs_TimeZone1
+   let $TimeZone = rtrim(&Hs_TimeZone1,{SPACE})
+{DATETIMEOUT-PREFIX}DA.INCIDENT_TIME{DATETIMEOUT-SUFFIX}      &Inc_Time
+   let $In_DateTime = '1900/01/01 ' ||'8' || ':' ||'00' || ':' || '00'              
+   if $TimeZone <> ''
+       #ifdef DB2ALL
+
+         ! DB2 stores time fields without a date part at the start
+         ! FormatGlobalTime expects a native datetime, so for DB2 we need to create a datetime using an arbitary date
+         ! let $In_DateTime = '1900/01/01 ' || substr($Inc_DateTime, 1, 2) || ':' || substr($Inc_DateTime, 4, 2) || ':' || substr($Inc_DateTime, 7, 2)
+       let $In_DateTime = '1900/01/01 ' ||'8' || ':' ||'00' || ':' || '00'  
+       do Format-DateTime($In_DateTime, $Out_DateTime, {DEFYMD},'time','native')
+      #else
+         let $Out_DateTime = $Inc_DateTime
+      #endif
+      do FormatGlobalTime($Out_DateTime, $BSE_TIMEZONE, $TimeZone, $Inc_DateTime)
+   end-if
+   let $Inc_Time = $Inc_DateTime
+   show 'Before call to Convert_Time_24hr - $Inc_Time: ' $Inc_Time
+   do Convert_Time_24hr($Inc_Time,$Inc_Time)
+   if ($Inc_Time = '00:00:00') or ($Inc_Time = '')
+      let $Inc_Time = '-'
+   end-if
+   show 'After call to Convert_Time_24hr - $Inc_Time: ' $Inc_Time
+
+DA.ADDRESS1           &IncAddress1
+DA.ADDRESS2           &IncAddress2
+DA.ADDRESS3           &IncAddress3
+DA.ADDRESS4           &IncAddress4
+DA.CITY               &IncCity
+DA.COUNTY             &IncCounty
+DA.STATE              &IncState
+DA.POSTAL             &IncZip
+   let $IncZip=&IncZip
+DA.COUNTRY            &IncCountry
+DA.LOCATION           &IncLocation
+DA.LOCATION_NAME      &IncLocationName
+DA.EMPLOYER_PREMISES  &IncEmployerPremises
+DA.PUBLIC_PLACE_SW_UK &IncPublicPlace
+DA.LOCAL_AUTHORITY_UK &IncLocalAuthority
+DA.DANGER_OCC_CD      &IncDangOcc_Cd
+DA.EXACT_LOCATION     &IncExactLocation
+DA.DESCRLONG          &IncDescrLong
+
+   let $Incident_Nbr = &Inc_Nbr
+
+   let $Print_Dt = substr($Inc_Dt, 1, {C_DATE})
+   print $Print_Dt     (0,{C_DATE})
+
+! Workaround - Informix cannot insert long fields via SQR
+#ifdef INFORMIX
+   let $Comment1 = ''
+   let $Comment2 = ''
+#else
+   let $Comment1 = nvl(&IncDescrLong, {SPACE})
+   let $Comment2 = {SPACE}
+#endif
+
+   let $IncidentLocation = nvl(&IncLocationName,{SPACE})
+
+   do ohsGetStateName(&IncCountry, &IncState, $IncStateName)
+   do ohsGetCountryName(&IncCountry, $IncCountryName)
+
+   do InsertDangerOccWorkRecord
+
+   FROM   PS_INCIDENT_DATA DA
+   WHERE  INCIDENT_TYPE = {DO_CODE}
+   AND    [$UserChoice]
+END-SELECT
+
+end-procedure
+
+
+!-----------------------------------------------------------------------
+! Insert dangerous occurrence record into work table
+!-----------------------------------------------------------------------
+begin-procedure InsertDangerOccWorkRecord
+let $sql-statement = 'OHS501UK.SQR,InsertDangerOccWorkRecord,INSERT,PS_OHS501UK_TMP1'
+
+  show 'In procedure: InsertDangerOccWordRecord'
+  show '$Inc_dt: ' $Inc_dt ' - $Inc_Time: ' $Inc_Time
+
+#ifdef INFORMIX
+BEGIN-SQL ON-ERROR=SQL-Error
+   INSERT INTO PS_OHS501UK_TMP1
+   (INCIDENT_NBR, EMPLID, NON_EMPLOYEE_ID, RP_NAME, RP_JOBTITLE, RP_PHONE, ORG_NAME, ADDRESS1, ADDRESS2, ADDRESS3,
+    ADDRESS4, CITY, COUNTY, STATE_DESCR1, POSTAL, COUNTRY_DESCR1, BUSINESS_DESCR, INCIDENT_DT, INCIDENT_TM_CHAR,
+    EMPLOYER_PREMISES, PUBLIC_PLACE_SW_UK, LOCATION, LOCATION_NAME, LOCAL_AUTHORITY_UK, ADDRESS1_OTHER, ADDRESS2_OTHER,
+    ADDRESS3_OTHER, ADDRESS4_OTHER, CITY_OTHER, COUNTY_OTHER, STATE_DESCR2, POSTAL_OTHER, COUNTRY_DESCR2, EXACT_LOCATION)
+   VALUES
+   (
+      $Incident_Nbr,
+      ' ',
+      ' ',
+      $OperName,
+      &OperJobTitle,
+      $OperPhone,
+      $OrgName,
+      $OrgAddress1, $OrgAddress2, $OrgAddress3, $OrgAddress4,
+      $OrgCity, $OrgCounty, $OrgStateName, $OrgZip, $OrgCountryName,
+      $OrgBusinessDescr,
+      $Inc_dt,
+      $Inc_Time,
+      &IncEmployerPremises,
+      &IncPublicPlace,
+      &IncLocation,
+      $IncidentLocation,
+      &IncLocalAuthority,
+      &IncAddress1, &IncAddress2, &IncAddress3, &IncAddress4,
+      &IncCity, &IncCounty, $IncStateName, $IncZip, $IncCountryName,
+      &IncExactLocation
+   )
+END-SQL
+#else
+BEGIN-SQL ON-ERROR=SQL-Error
+   INSERT INTO PS_OHS501UK_TMP1
+   (INCIDENT_NBR, EMPLID, NON_EMPLOYEE_ID, RP_NAME, RP_JOBTITLE, RP_PHONE, ORG_NAME, ADDRESS1, ADDRESS2, ADDRESS3,
+    ADDRESS4, CITY, COUNTY, STATE_DESCR1, POSTAL, COUNTRY_DESCR1, BUSINESS_DESCR, INCIDENT_DT, INCIDENT_TM_CHAR,
+    EMPLOYER_PREMISES, PUBLIC_PLACE_SW_UK, LOCATION, LOCATION_NAME, LOCAL_AUTHORITY_UK, ADDRESS1_OTHER, ADDRESS2_OTHER,
+    ADDRESS3_OTHER, ADDRESS4_OTHER, CITY_OTHER, COUNTY_OTHER, STATE_DESCR2, POSTAL_OTHER, COUNTRY_DESCR2, EXACT_LOCATION,
+    COMMENTS)
+   VALUES
+   (
+      $Incident_Nbr,
+      ' ',
+      ' ',
+      $OperName,
+      &OperJobTitle,
+      $OperPhone,
+      $OrgName,
+      $OrgAddress1, $OrgAddress2, $OrgAddress3, $OrgAddress4,
+      $OrgCity, $OrgCounty, $OrgStateName, $OrgZip, $OrgCountryName,
+      $OrgBusinessDescr,
+      $Inc_dt,
+      $Inc_Time,
+      &IncEmployerPremises,
+      &IncPublicPlace,
+      &IncLocation,
+      $IncidentLocation,
+      &IncLocalAuthority,
+      &IncAddress1, &IncAddress2, &IncAddress3, &IncAddress4,
+      &IncCity, &IncCounty, $IncStateName, $IncZip, $IncCountryName,
+      &IncExactLocation,
+      $Comment1
+   )
+END-SQL
+#endif
+
+let $sql-statement = 'OHS501UK.SQR,InsertDangerOccWorkRecord,INSERT,PS_OHS501UK_TMP2'
+
+#ifdef INFORMIX
+BEGIN-SQL ON-ERROR=SQL-Error
+   INSERT INTO PS_OHS501UK_TMP2
+  (INCIDENT_NBR, EMPLID, NON_EMPLOYEE_ID, INCIDENT_DT, NAME, ADDRESS1, ADDRESS2, ADDRESS3, ADDRESS4, CITY, COUNTY,
+   STATE_DESCR1, POSTAL, COUNTRY_DESCR1, PHONE, BIRTHDATE, SEX, JOBTITLE, SCHEME_TYPE_CD_UK, EXT_SCHEME_DESCR,
+   SELF_EMPL_SW_UK, MEM_PUBLIC_SW_UK, EMPLOYER, INJURIES, BODY_PARTS, INCIDENT_TYPE, FATALITY_SW, AWAY_FROM_WORKDAYS,
+   HOSPITAL_SW, UNCONSCIOUS_SW, RESUSCITATION_SW, HOSPITAL_24_SW_UK, ACCIDENT_TYPE_CD, FALL_HEIGHT_UK, DANGER_OCC_CD,
+   OCC_ILLNESS_CD, DESCR50, OCC_ILL_DIAG_DT_UK, PHYSICIAN_NAME, MEDICAL_FAC_NAME, ADDRESS1_OTHER, ADDRESS2_OTHER,
+   ADDRESS3_OTHER, ADDRESS4_OTHER, CITY_OTHER, COUNTY_OTHER, STATE_DESCR2, POSTAL_OTHER, COUNTRY_DESCR2)
+   VALUES
+   (
+      $Incident_Nbr,
+      {SPACE},          {SPACE},
+      &INC_DT,
+      {SPACE},          {SPACE},          {SPACE},          {SPACE},
+      {SPACE},          {SPACE},          {SPACE},          {SPACE},
+      {SPACE},          {SPACE},          {SPACE},
+      &INC_DT,
+      {SPACE},          {SPACE},          {SPACE},          {SPACE},
+      {SPACE},          {SPACE},          {SPACE},          {SPACE},
+      {SPACE},
+      {DO_CODE},
+      {SPACE},
+      0,
+      {SPACE},          {SPACE},          {SPACE},          {SPACE},
+      {SPACE},
+      0,
+      &IncDangocc_Cd,
+      {SPACE},          {SPACE},
+      &INC_DT,
+      {SPACE},          {SPACE},          {SPACE},          {SPACE},
+      {SPACE},          {SPACE},          {SPACE},          {SPACE},
+      {SPACE},          {SPACE},          {SPACE}
+   )
+end-SQL
+#else
+BEGIN-SQL ON-ERROR=SQL-Error
+   INSERT INTO PS_OHS501UK_TMP2
+  (INCIDENT_NBR, EMPLID, NON_EMPLOYEE_ID, INCIDENT_DT, NAME, ADDRESS1, ADDRESS2, ADDRESS3, ADDRESS4, CITY, COUNTY,
+   STATE_DESCR1, POSTAL, COUNTRY_DESCR1, PHONE, BIRTHDATE, SEX, JOBTITLE, SCHEME_TYPE_CD_UK, EXT_SCHEME_DESCR,
+   SELF_EMPL_SW_UK, MEM_PUBLIC_SW_UK, EMPLOYER, INJURIES, BODY_PARTS, INCIDENT_TYPE, FATALITY_SW, AWAY_FROM_WORKDAYS,
+   HOSPITAL_SW, UNCONSCIOUS_SW, RESUSCITATION_SW, HOSPITAL_24_SW_UK, ACCIDENT_TYPE_CD, FALL_HEIGHT_UK, DANGER_OCC_CD,
+   OCC_ILLNESS_CD, DESCR50, OCC_ILL_DIAG_DT_UK, PHYSICIAN_NAME, MEDICAL_FAC_NAME, ADDRESS1_OTHER, ADDRESS2_OTHER,
+   ADDRESS3_OTHER, ADDRESS4_OTHER, CITY_OTHER, COUNTY_OTHER, STATE_DESCR2, POSTAL_OTHER, COUNTRY_DESCR2, COMMENTS)
+   VALUES
+   (
+      $Incident_Nbr,
+      {SPACE},          {SPACE},
+      &INC_DT,
+      {SPACE},          {SPACE},          {SPACE},          {SPACE},
+      {SPACE},          {SPACE},          {SPACE},          {SPACE},
+      {SPACE},          {SPACE},          {SPACE},
+      &INC_DT,
+      {SPACE},          {SPACE},          {SPACE},          {SPACE},
+      {SPACE},          {SPACE},          {SPACE},          {SPACE},
+      {SPACE},
+      {DO_CODE},
+      {SPACE},
+      0,
+      {SPACE},          {SPACE},          {SPACE},          {SPACE},
+      {SPACE},
+      0,
+      &IncDangocc_Cd,
+      {SPACE},          {SPACE},
+      &INC_DT,
+      {SPACE},          {SPACE},          {SPACE},          {SPACE},
+      {SPACE},          {SPACE},          {SPACE},          {SPACE},
+      {SPACE},          {SPACE},          {SPACE},
+      $Comment2
+   )
+end-SQL
+#endif
+
+#ifdef INFORMIX
+  if &IncDescrLong > ' '
+     do Update_Long_DO
+  end-if
+#endif
+
+end-procedure
+
+!-------------------------------------------------------
+! Update_Long_DO - to get long field for Informix
+!-------------------------------------------------------
+begin-procedure UPDATE_Long_DO
+let $sql-statement = 'OHS501UK.SQR,Update_Long_DO,Update,OHS501UK_TMP1'
+Begin-SQL ON-ERROR=SQL-ERROR
+UPDATE PS_OHS501UK_TMP1
+SET  COMMENTS  = ( SELECT DESCRLONG FROM PS_INCIDENT_DATA
+                   WHERE INCIDENT_NBR = $Incident_Nbr )
+WHERE INCIDENT_NBR = $Incident_nbr
+ AND  EMPLID = ' '
+ AND  NON_EMPLOYEE_ID = ' '
+END-SQL
+
+End-Procedure
+
+
+!-----------------------------------------------------------------------
+! Process employee information
+!-----------------------------------------------------------------------
+begin-procedure ProcessEmplidDetails
+
+   show 'In procedure: ProcesEmplidDetails '
+
+   if isblank(&RUN_CNTL_OHS.INCIDENT_NBR)
+      ! choose incidents occurring between dates given...
+      let $UserChoice = 'A.INCIDENT_NBR IN ' || -
+                        '(SELECT I.INCIDENT_NBR FROM PS_INCIDENT_DATA I ' || -
+                        ' WHERE  I.INCIDENT_DT >= ''' || &RUN_CNTL_OHS.FROMDATE || '''' || -
+                        '   AND I.INCIDENT_DT <= '''  || &RUN_CNTL_OHS.THRUDATE || ''')'
+   else
+      ! use the incident given...
+      let $UserChoice = 'A.INCIDENT_NBR = ''' || &RUN_CNTL_OHS.INCIDENT_NBR || ''''
+   end-if
+
+   print 'Employees' (+1,1)
+   print '---------' (+1,1)
+
+! Employees involved in incidents...
+BEGIN-SELECT
+A.EMPLID             &EmplID
+   move &EMPLID to $Emplid
+A.EMPL_RCD           &EmplRcd#
+A.INCIDENT_NBR       &EmplInc_Nbr
+   print &EmplInc_Nbr       (+1,{C_INCIDENT},21)
+   print &EmplID            (0, {C_ID},12)
+B.INCIDENT_TYPE      &EmplInc_Type
+B.REG_REGION         &EmplRegRegion
+P.NAME_PREFIX
+P.NAME
+   let $EmplName = rtrim(&P.NAME,{SPACE})
+   do ohsUnFormatName($EmplName, $EmplName)
+   let $EmplName = rtrim(&P.NAME_PREFIX,{SPACE}) || ' ' || $EmplName
+   print $EmplName          (0,{C_NAME})
+P1.ADDRESS1           &EmplAddress1
+P1.ADDRESS2           &EmplAddress2
+P1.ADDRESS3           &EmplAddress3
+P1.ADDRESS4           &EmplAddress4
+P1.CITY               &EmplCity
+P1.COUNTY             &EmplCounty
+P1.STATE              &EmplState
+P1.POSTAL             &EmplZip
+  let $EmplZip= &EmplZip
+
+P1.COUNTRY            &EmplCountry
+   do ohsGetStateName(&EmplCountry, &EmplState, $EmplStateName)
+   do ohsGetCountryName(&EmplCountry, $EmplCountryName)
+
+   do Get-Phone-Data
+   show '$Phone ' $Phone              
+   if ($CountryCode <> ' ')
+      let $EmplPhone = rtrim($CountryCode,{SPACE}) || ' ' || rtrim($PHONE,{SPACE})
+     show '$EmplPhone ' $EmplPhone 
+   else
+      let $EmplPhone = $Phone
+   end-if
+P.BIRTHDATE          &EmplBirthdate
+   display $EmplName
+P.SEX                &EmplSex
+E.BUSINESS_TITLE     &EmplJobTitle
+B.INCIDENT_DT        &EmplInc_Dt
+!   do ohsMakeUKDateString(&EmplInc_Dt,$EmplInc_Dt)
+   let $EmplInc_Dt = &EmplInc_Dt
+   show '&EmplInc_Dt: ' &EmplInc_Dt
+B.HS_TIMEZONE1       &EmplHs_TimeZone1
+
+   let $EmplTimeZone = rtrim(&EmplHs_TimeZone1,{SPACE})
+{DATETIMEOUT-PREFIX}B.INCIDENT_TIME{DATETIMEOUT-SUFFIX}      &EmplInc_Time
+   let $EmplInc_DateTime = &EmplInc_Time
+   ! let $Inc_DateTime = '1900/01/01 10:10:10' 
+   let $In_DateTime = '1900/01/01 ' ||'8' || ':' ||'00' || ':' || '00'
+      if $EmplTimeZone <> ''
+      #ifdef DB2ALL
+         ! DB2 stores time fields without a date part at the start
+         ! FormatGlobalTime expects a native datetime, so for DB2 we need to create a datetime using an arbitary date
+         ! let $In_DateTime = '1900/01/01 ' || substr($EmplInc_DateTime, 1, 2) || ':' || substr($EmplInc_DateTime, 4, 2) || ':' || substr($EmplInc_DateTime, 7, 2)
+           let $In_DateTime = '1900/01/01 ' ||'8' || ':' ||'00' || ':' || '00'
+          ! let $In_DateTime = '1900/01/01 10:10:10'             
+        do Format-DateTime($In_DateTime, $Out_DateTime, {DEFYMD},'time','native')
+      #else
+         let $Out_DateTime = $EmplInc_DateTime
+      #endif
+      do FormatGlobalTime($Out_DateTime, $BSE_TIMEZONE, $EmplTimeZone, $EmplInc_DateTime)
+   end-if
+   let $EmplInc_Time = $EmplInc_DateTime
+   show 'Before call to Convert_Time_24hr - $EmplInc_Time: ' $EmplInc_Time
+   do Convert_Time_24hr($EmplInc_Time,$EmplInc_Time)
+   if ($EmplInc_Time = '00:00:00') or ($EmplInc_Time = '')
+      let $EmplInc_Time = '-'
+   end-if
+   let $Print_Dt = substr($EmplInc_Dt, 1, {C_DATE})
+   print $Print_Dt    (0,{C_DATE})
+   show 'After call to Convert_Time_24hr - $EmplInc_Time: ' $EmplInc_Time
+
+B.ADDRESS1           &EmplIncAddress1
+B.ADDRESS2           &EmplIncAddress2
+B.ADDRESS3           &EmplIncAddress3
+B.ADDRESS4           &EmplIncAddress4
+B.CITY               &EmplIncCity
+B.COUNTY             &EmplIncCounty
+B.STATE              &EmplIncState
+B.POSTAL             &EmplIncZip
+ let $EmplIncZip=&EmplIncZip
+B.COUNTRY            &EmplIncCountry
+   do ohsGetStateName(&EmplIncCountry, &EmplIncState, $EmplIncStateName)
+   do ohsGetCountryName(&EmplIncCountry, $EmplIncCountryName)
+B.LOCATION           &EmplIncLocation_Cd
+B.LOCATION_NAME      &EmplIncLocation
+B.EMPLOYER_PREMISES  &EmplIncEmployerPremises
+B.PUBLIC_PLACE_SW_UK &EmplIncPublicPlace
+B.LOCAL_AUTHORITY_UK &EmplIncLocalAuthority
+B.EXACT_LOCATION     &EmplIncExactLocation
+A.AWAY_FROM_WORKDAYS &EmplAwayFromWorkdays
+A.FATALITY_SW        &EmplFatality
+A.UNCONSCIOUS_SW     &EmplUnconscious
+A.RESUSCITATION_SW   &EmplResuscitation
+A.HOSPITAL_24_SW_UK  &EmplHospital24
+A.HOSPITAL_SW        &EmplHospital
+A.FALL_HEIGHT_UK     &EmplFallHeight
+A.OCC_ILLNESS_CD     &EmplDisease_Cd
+A.OCC_ILL_DIAG_DT_UK &EmplDiagnosis_Dt
+B.DESCRLONG          &EmplIncComments
+A.COMMENTS           &EmplComments
+
+! Workaround - Informix cannot insert long fields via SQR
+#ifdef INFORMIX
+   let $Comment1       = ''
+   let $Comment2       = ''
+#else
+   let $Comment1       = nvl(&EmplIncComments, {SPACE})
+   let $Comment2       = nvl(&EmplComments,    {SPACE})
+#endif
+
+
+   ! Non-employee stuff...
+   let $NonEmplID      = {SPACE}
+   let $SelfEmployed   = 'N'
+   let $MemberOfPublic = 'N'
+   let $NEEmployer     = {SPACE}
+   let $EmplDangocc_Cd = {SPACE}
+
+   ! Lookups...
+   let $EmplID               = &EmplID
+   let #EmplRcdNbr           = &EmplRcd#
+   let $EmplJobTitle         = &EmplJobTitle
+
+   let $IncidentLocation     = &EmplIncLocation
+
+   let $EmplExtSchemeDescr   = {SPACE}
+   let $EmplExtSchemeType_Cd = {SPACE}
+   do GetUKExternalScheme($EmplID, #EmplRcdNbr, $ExtSchemeType_Cd, $ExtSchemeDescr)
+
+   let $EmplDiseaseName = ' '
+   do GetDiseaseName(&EmplRegRegion, &EmplDisease_Cd, $EmplDiseaseName)
+
+   !let $BodyPartList = ' '
+   do GetBodyPartList(&EmplID, &EmplRcd#, {SPACE}, &EmplInc_Nbr, &EmplRegRegion, $BodyPartList)
+   print $BodyPartList          (0,{C_BODYPART},39)
+
+   !let $InjuryList = ' '
+   do GetInjuryList(&EmplID, &EmplRcd#, {SPACE}, &EmplInc_Nbr, &EmplRegRegion, $InjuryList)
+   print $InjuryList            (0,{C_INJURY})
+
+   let $EmplAccidentType = ' '
+   do GetAccidentType(&EmplID, &EmplRcd#, {SPACE}, &EmplInc_Nbr, $EmplAccidentType)
+
+   let $Incident_Nbr  = &EmplInc_Nbr
+   let $PhysicianName = {SPACE}
+
+   let $MDEmplID      = &EmplID
+   let #MDEmplRcdNbr  = &EmplRcd#
+   let $MDNonEmplID   = {SPACE}
+   let $MDIncNbr      = &EmplInc_Nbr
+   do GetMedicalDetails
+
+   ! Insert a record into the reporting table...
+   do InsertEmployeeWorkRecord
+
+FROM   PS_INJURY_ILL    A,
+       PS_INCIDENT_DATA B,
+       PS_PERSONAL_DT_FST P,
+       PS_PERSON_ADDRESS P1,
+       PS_EMPLOYMENT    E
+WHERE  A.REPORTABLE_CASE = 'Y'
+AND    A.EMPLID <> {SPACE}
+AND    A.INCIDENT_NBR    = B.INCIDENT_NBR
+AND    A.EMPLID          = P.EMPLID
+AND    A.EMPLID          = E.EMPLID
+AND    A.EMPLID          = P1.EMPLID
+AND    E.EMPLID          = P1.EMPLID
+AND    P.EMPLID          = P1.EMPLID
+AND    A.EMPL_RCD        = E.EMPL_RCD
+AND    P1.ADDRESS_TYPE   = 'HOME'
+AND    [$UserChoice]
+
+END-SELECT
+
+end-procedure
+
+
+!-----------------------------------------------------------------------
+! Insert employee record into work table
+!-----------------------------------------------------------------------
+begin-procedure InsertEmployeeWorkRecord
+let $sql-statement = 'OHS501UK.SQR,InsertEmployeeWorkRecord,INSERT,PS_OHS501UK_TMP1'
+
+  show 'In procedure: InsertEmployeeWorkRecord'
+  show '&EMPLINC_DT: ' &EMPLINC_DT ' - $EmplInc_Time: ' $EmplInc_Time
+
+#ifdef INFORMIX
+BEGIN-SQL ON-ERROR=SQL-Error
+
+   INSERT INTO PS_OHS501UK_TMP1
+   (INCIDENT_NBR, EMPLID, NON_EMPLOYEE_ID, RP_NAME, RP_JOBTITLE, RP_PHONE, ORG_NAME, ADDRESS1, ADDRESS2, ADDRESS3,
+    ADDRESS4, CITY, COUNTY, STATE_DESCR1, POSTAL, COUNTRY_DESCR1, BUSINESS_DESCR, INCIDENT_DT, INCIDENT_TM_CHAR,
+    EMPLOYER_PREMISES, PUBLIC_PLACE_SW_UK, LOCATION, LOCATION_NAME, LOCAL_AUTHORITY_UK, ADDRESS1_OTHER, ADDRESS2_OTHER,
+    ADDRESS3_OTHER, ADDRESS4_OTHER, CITY_OTHER, COUNTY_OTHER, STATE_DESCR2, POSTAL_OTHER, COUNTRY_DESCR2, EXACT_LOCATION)
+   VALUES
+   (
+      &EmplInc_Nbr,
+      $EmplID,
+      $NonEmplID,
+      $OperName,
+      &OperJobTitle,
+      $OperPhone,
+      $OrgName,
+      $OrgAddress1,$OrgAddress2, $OrgAddress3, $OrgAddress4,
+      $OrgCity, $OrgCounty, $OrgStateName, $OrgZip, $OrgCountryName,
+      $OrgBusinessDescr,
+      &EMPLINC_DT,
+      $EmplInc_Time,
+      &EmplIncEmployerPremises,
+      &EmplIncPublicPlace,
+      &EmplIncLocation_Cd,
+      $IncidentLocation,
+      &EmplIncLocalAuthority,
+      &EmplIncAddress1, &EmplIncAddress2, &EmplIncAddress3, &EmplIncAddress4,
+      &EmplIncCity, &EmplIncCounty, $EmplIncStateName,
+      $EmplIncZip, $EmplIncCountryName,
+      &EmplIncExactLocation
+   )
+
+END-SQL
+#else
+BEGIN-SQL ON-ERROR=SQL-Error
+
+   INSERT INTO PS_OHS501UK_TMP1
+   (INCIDENT_NBR, EMPLID, NON_EMPLOYEE_ID, RP_NAME, RP_JOBTITLE, RP_PHONE, ORG_NAME, ADDRESS1, ADDRESS2, ADDRESS3,
+    ADDRESS4, CITY, COUNTY, STATE_DESCR1, POSTAL, COUNTRY_DESCR1, BUSINESS_DESCR, INCIDENT_DT, INCIDENT_TM_CHAR,
+    EMPLOYER_PREMISES, PUBLIC_PLACE_SW_UK, LOCATION, LOCATION_NAME, LOCAL_AUTHORITY_UK, ADDRESS1_OTHER, ADDRESS2_OTHER,
+    ADDRESS3_OTHER, ADDRESS4_OTHER, CITY_OTHER, COUNTY_OTHER, STATE_DESCR2, POSTAL_OTHER, COUNTRY_DESCR2, EXACT_LOCATION,
+    COMMENTS)
+   VALUES
+   (
+      &EmplInc_Nbr,
+      $EmplID,
+      $NonEmplID,
+      $OperName,
+      &OperJobTitle,
+      $OperPhone,
+      $OrgName,
+      $OrgAddress1,$OrgAddress2, $OrgAddress3, $OrgAddress4,
+      $OrgCity, $OrgCounty, $OrgStateName, $OrgZip, $OrgCountryName,
+      $OrgBusinessDescr,
+      &EMPLINC_DT,
+      $EmplInc_Time,
+      &EmplIncEmployerPremises,
+      &EmplIncPublicPlace,
+      &EmplIncLocation_Cd,
+      $IncidentLocation,
+      &EmplIncLocalAuthority,
+      &EmplIncAddress1, &EmplIncAddress2, &EmplIncAddress3, &EmplIncAddress4,
+      &EmplIncCity, &EmplIncCounty, $EmplIncStateName,
+      $EmplIncZip, $EmplIncCountryName,
+      &EmplIncExactLocation,
+      $Comment1
+   )
+
+END-SQL
+#endif
+
+let $sql-statement = 'OHS501UK.SQR,InsertEmployeeWorkRecord,INSERT,PS_OHS501UK_TMP2'
+
+#ifdef INFORMIX
+BEGIN-SQL ON-ERROR=SQL-Error
+
+   INSERT INTO PS_OHS501UK_TMP2
+  (INCIDENT_NBR, EMPLID, NON_EMPLOYEE_ID, INCIDENT_DT, NAME, ADDRESS1, ADDRESS2, ADDRESS3, ADDRESS4, CITY, COUNTY,
+   STATE_DESCR1, POSTAL, COUNTRY_DESCR1, PHONE, BIRTHDATE, SEX, JOBTITLE, SCHEME_TYPE_CD_UK, EXT_SCHEME_DESCR,
+   SELF_EMPL_SW_UK, MEM_PUBLIC_SW_UK, EMPLOYER, INJURIES, BODY_PARTS, INCIDENT_TYPE, FATALITY_SW, AWAY_FROM_WORKDAYS,
+   HOSPITAL_SW, UNCONSCIOUS_SW, RESUSCITATION_SW, HOSPITAL_24_SW_UK, ACCIDENT_TYPE_CD, FALL_HEIGHT_UK, DANGER_OCC_CD,
+   OCC_ILLNESS_CD, DESCR50, OCC_ILL_DIAG_DT_UK, PHYSICIAN_NAME, MEDICAL_FAC_NAME, ADDRESS1_OTHER, ADDRESS2_OTHER,
+   ADDRESS3_OTHER, ADDRESS4_OTHER, CITY_OTHER, COUNTY_OTHER, STATE_DESCR2, POSTAL_OTHER, COUNTRY_DESCR2)
+   VALUES
+   (
+      &EmplInc_Nbr,
+      $EmplID,
+      $NonEmplID,
+      &EMPLINC_DT,
+      $EmplName,
+      &EmplAddress1, &EmplAddress2, &EmplAddress3, &EmplAddress4,
+      &EmplCity, &EmplCounty, $EmplStateName, $EmplZip, $EmplCountryName,
+      $EmplPhone,
+      &EMPLBIRTHDATE,
+      &EmplSex,
+      $EmplJobTitle,
+      $ExtSchemeType_Cd,
+      $ExtSchemeDescr,
+      $SelfEmployed,
+      $MemberOfPublic,
+      $NEEmployer,
+      $InjuryList,
+      $BodyPartList,
+      &EmplInc_Type,
+      &EmplFatality,
+      &EmplAwayFromWorkdays,
+      &EmplHospital,
+      &EmplUnconscious,
+      &EmplResuscitation,
+      &EmplHospital24,
+      $EmplAccidentType,
+      &EmplFallHeight,
+      $EmplDangocc_Cd,
+      &EmplDisease_Cd,
+      $EmplDiseaseName,
+      &EMPLDIAGNOSIS_DT,
+      $PhysicianName,
+      $HospitalName,
+      $HospitalAddress1, $HospitalAddress2, $HospitalAddress3, $HospitalAddress4,
+      $HospitalCity, $HospitalCounty, $HospitalStateName, $HospitalZip, $HospitalCountryName
+   )
+
+END-SQL
+#else
+BEGIN-SQL ON-ERROR=SQL-Error
+
+   INSERT INTO PS_OHS501UK_TMP2
+  (INCIDENT_NBR, EMPLID, NON_EMPLOYEE_ID, INCIDENT_DT, NAME, ADDRESS1, ADDRESS2, ADDRESS3, ADDRESS4, CITY, COUNTY,
+   STATE_DESCR1, POSTAL, COUNTRY_DESCR1, PHONE, BIRTHDATE, SEX, JOBTITLE, SCHEME_TYPE_CD_UK, EXT_SCHEME_DESCR,
+   SELF_EMPL_SW_UK, MEM_PUBLIC_SW_UK, EMPLOYER, INJURIES, BODY_PARTS, INCIDENT_TYPE, FATALITY_SW, AWAY_FROM_WORKDAYS,
+   HOSPITAL_SW, UNCONSCIOUS_SW, RESUSCITATION_SW, HOSPITAL_24_SW_UK, ACCIDENT_TYPE_CD, FALL_HEIGHT_UK, DANGER_OCC_CD,
+   OCC_ILLNESS_CD, DESCR50, OCC_ILL_DIAG_DT_UK, PHYSICIAN_NAME, MEDICAL_FAC_NAME, ADDRESS1_OTHER, ADDRESS2_OTHER,
+   ADDRESS3_OTHER, ADDRESS4_OTHER, CITY_OTHER, COUNTY_OTHER, STATE_DESCR2, POSTAL_OTHER, COUNTRY_DESCR2, COMMENTS)
+   VALUES
+   (
+      &EmplInc_Nbr,
+      $EmplID,
+      $NonEmplID,
+      &EMPLINC_DT,
+      $EmplName,
+      &EmplAddress1, &EmplAddress2, &EmplAddress3, &EmplAddress4,
+      &EmplCity, &EmplCounty, $EmplStateName, $EmplZip, $EmplCountryName,
+      $EmplPhone,
+      &EMPLBIRTHDATE,
+      &EmplSex,
+      $EmplJobTitle,
+      $ExtSchemeType_Cd,
+      $ExtSchemeDescr,
+      $SelfEmployed,
+      $MemberOfPublic,
+      $NEEmployer,
+      $InjuryList,
+      $BodyPartList,
+      &EmplInc_Type,
+      &EmplFatality,
+      &EmplAwayFromWorkdays,
+      &EmplHospital,
+      &EmplUnconscious,
+      &EmplResuscitation,
+      &EmplHospital24,
+      $EmplAccidentType,
+      &EmplFallHeight,
+      $EmplDangocc_Cd,
+      &EmplDisease_Cd,
+      $EmplDiseaseName,
+      &EMPLDIAGNOSIS_DT,
+      $PhysicianName,
+      $HospitalName,
+      $HospitalAddress1, $HospitalAddress2, $HospitalAddress3, $HospitalAddress4,
+      $HospitalCity, $HospitalCounty, $HospitalStateName, $HospitalZip, $HospitalCountryName,
+      $Comment2
+   )
+
+END-SQL
+#endif
+
+#ifdef INFORMIX
+  if &EmplIncComments > ' '
+     do Update_Long_emp1
+  end-if
+  if &EmplComments    > ' '
+     do Update_Long_emp2
+  end-if
+#endif
+
+end-procedure
+
+!-------------------------------------------------------
+! Update_Long_EMP1 - to get long field for Informix
+!-------------------------------------------------------
+begin-procedure UPDATE_Long_EMP1
+let $sql-statement = 'OHS501UK.SQR,Update_Long_EMP1,Update,OHS501UK_TMP1'
+Begin-SQL ON-ERROR=SQL-ERROR
+UPDATE PS_OHS501UK_TMP1
+SET  COMMENTS  = ( SELECT DESCRLONG FROM PS_INCIDENT_DATA
+                   WHERE INCIDENT_NBR = &EmplInc_Nbr )
+WHERE INCIDENT_NBR = &EmplInc_Nbr
+  AND EMPLID       = $EmplID
+  AND NON_EMPLOYEE_ID = $NonEmplID
+END-SQL
+
+End-Procedure
+
+!-------------------------------------------------------
+! Update_Long_EMP2 - to get long field for Informix
+!-------------------------------------------------------
+begin-procedure UPDATE_Long_EMP2
+let $sql-statement = 'OHS501UK.SQR,Update_Long_EMP2,Update,OHS501UK_TMP2'
+Begin-SQL ON-ERROR=SQL-ERROR
+UPDATE PS_OHS501UK_TMP2
+SET  COMMENTS  = ( SELECT COMMENTS FROM PS_INJURY_ILL
+                   WHERE INCIDENT_NBR = &EmplInc_Nbr
+                     AND EMPLID = &EMPLID )
+WHERE INCIDENT_NBR = &EmplInc_Nbr
+  AND EMPLID       = $EmplID
+  AND NON_EMPLOYEE_ID = $NonEmplID
+END-SQL
+
+End-Procedure
+
+
+!-----------------------------------------------------------------------
+! Process non-employee information
+!-----------------------------------------------------------------------
+begin-procedure ProcessNonEmplidDetails
+
+   if isblank(&RUN_CNTL_OHS.INCIDENT_NBR)
+      ! choose incidents occurring between dates given...
+      let $UserChoice = 'NA.INCIDENT_NBR IN ' || -
+                        '(SELECT I.INCIDENT_NBR FROM PS_INCIDENT_DATA I' || -
+                        ' WHERE  I.INCIDENT_DT >= ''' || &RUN_CNTL_OHS.FROMDATE || '''' || -
+                        ' AND    I.INCIDENT_DT <= ''' || &RUN_CNTL_OHS.THRUDATE || ''')'
+   else
+      ! use the incident given...
+      let $UserChoice = 'NA.INCIDENT_NBR = ''' || &RUN_CNTL_OHS.INCIDENT_NBR || ''''
+   end-if
+
+   print 'Non-Employees' (+2,1)
+   print '-------------' (+1,1)
+
+BEGIN-SELECT
+NA.NON_EMPLOYEE_ID   &NonEmplID
+   move &NonEmplID to  $NonEmplID
+NA.INCIDENT_NBR      &NonEmplInc_Nbr
+   print &NonEmplInc_Nbr       (+1,{C_INCIDENT},21)
+   print &NonEmplID            (0, {C_ID},12)
+NB.INCIDENT_TYPE     &NonEmplInc_Type
+NP.NAME_PREFIX
+NP.NAME
+   let $NonEmplName = rtrim(&NP.NAME,{SPACE})
+   do ohsUnFormatName($NonEmplName,$NonEmplName)
+   let $NonEmplName = rtrim(&NP.NAME_PREFIX,{SPACE}) || ' ' || rtrim($NonEmplName,{SPACE})
+   print $NonEmplName          (0,{C_NAME})
+NP.ADDRESS1          &NonEmplAddress1
+NP.ADDRESS2          &NonEmplAddress2
+NP.ADDRESS3          &NonEmplAddress3
+NP.ADDRESS4          &NonEmplAddress4
+NP.CITY              &NonEmplCity
+NP.COUNTY            &NonEmplCounty
+NP.STATE             &NonEmplState
+NP.POSTAL            &NonEmplZip
+ let $NonEmplZip=&NonEmplZip
+NP.COUNTRY           &NonEmplCountry
+   do ohsGetStateName(&NonEmplCountry, &NonEmplState, $NonEmplStateName)
+   do ohsGetCountryName(&NonEmplCountry, $NonEmplCountryName)
+   do Get-Phone-Data-NonEmployee
+         if ($CountryCode1 <> ' ')
+      let $NonEmplPhone = rtrim($CountryCode1,{SPACE}) || ' ' || rtrim($PHONE1,{SPACE})
+   else
+      let $NonEmplPhone = $Phone1
+   end-if
+
+! NNP.COUNTRY_CODE
+! NNP.PHONE
+!   if (&NNP.COUNTRY_CODE <> {SPACE})
+!      let $NonEmplPhone = rtrim(&NNP.COUNTRY_CODE,{SPACE}) || {SPACE} || rtrim(&NNP.PHONE,{SPACE})
+!   else
+!      let $NonEmplPhone = &NNP.PHONE
+!   end-if
+!   let $NonEmplPhone = {SPACE}
+NP.BIRTHDATE         &NonEmplBirthdate
+NP.SEX               &NonEmplSex
+NP.BUSINESS_TITLE    &NonEmplBusinessTitle
+NP.EMPLOYER          &NonEmplEmployer
+NB.INCIDENT_DT       &NonEmplInc_Dt
+!   do ohsMakeUKDateString(&NonEmplInc_Dt,$NonEmplInc_Dt)
+   let $NonEmplInc_Dt = &NonEmplInc_Dt
+   show '$NonEmplInc_Dt: ' $NonEmplInc_Dt
+NB.HS_TIMEZONE1      &NonEmplHs_TimeZone1
+   let $NonEmplTimeZone = rtrim(&NonEmplHs_TimeZone1,{SPACE})
+{DATETIMEOUT-PREFIX}NB.INCIDENT_TIME{DATETIMEOUT-SUFFIX}      &NonEmplInc_Time
+   let $NonEmplInc_DateTime = &NonEmplInc_Time
+  !  let $Inc_DateTime = '1900/01/01 10:10:10' 
+   let $In_DateTime = '1900/01/01 ' ||'8' || ':' ||'00' || ':' || '00'  
+   if $NonEmplTimeZone <> ''
+      #ifdef DB2ALL
+         ! DB2 stores time fields without a date part at the start
+         ! FormatGlobalTime expects a native datetime, so for DB2 we need to create a datetime using an arbitary date
+        ! let $In_DateTime = '1900/01/01 ' || substr($NonEmplInc_DateTime, 1, 2) || ':' || substr($NonEmplInc_DateTime, 4, 2) || ':' || substr($NonEmplInc_DateTime, 7, 2)
+       let $In_DateTime = '1900/01/01 ' ||'8' || ':' ||'00' || ':' || '00'  
+       do Format-DateTime($In_DateTime, $Out_DateTime, {DEFYMD},'time','native')
+      #else
+         let $Out_DateTime = $NonEmplInc_DateTime
+      #endif
+      do FormatGlobalTime($Out_DateTime, $BSE_TIMEZONE, $NonEmplTimeZone, $NonEmplInc_DateTime)
+   end-if
+   let $NonEmplInc_Time = $NonEmplInc_DateTime
+  ! let $Inc_DateTime = '1900/01/01 10:10:10' 
+   show 'Before call to Convert_Time_24hr - $NonEmplInc_Time: ' $NonEmplInc_Time
+   do Convert_Time_24hr($NonEmplInc_Time,$NonEmplInc_Time)
+   if ($NonEmplInc_Time = '00:00:00') or ($NonEmplInc_Time = '')
+      let $NonEmplInc_Time = '-'
+   end-if
+   let $Print_Dt = substr($NonEmplInc_Dt, 1, {C_DATE})
+   print $Print_Dt    (0,{C_DATE})
+
+   show 'After call to Convert_Time_24hr - $NonEmplInc_Time: ' $NonEmplInc_Time
+
+NB.REG_REGION        &NonEmplRegRegion
+NB.ADDRESS1          &NonEmplIncAddress1
+NB.ADDRESS2          &NonEmplIncAddress2
+NB.ADDRESS3          &NonEmplIncAddress3
+NB.ADDRESS4          &NonEmplIncAddress4
+NB.CITY              &NonEmplIncCity
+NB.COUNTY            &NonEmplIncCounty
+NB.STATE             &NonEmplIncState
+NB.POSTAL            &NonEmplIncZip
+  let $NonEmplIncZip=&NonEmplIncZip
+NB.COUNTRY           &NonEmplIncCountry
+   do ohsGetStateName(&NonEmplIncCountry,&NonEmplIncState,$NonEmplIncStateName)
+   do ohsGetCountryName(&NonEmplIncCountry, $NonEmplIncCountryName)
+NB.LOCATION          &NonEmplIncLocation_Cd
+NB.LOCATION_NAME     &NonEmplIncLocation
+NB.EMPLOYER_PREMISES &NonEmplIncEmployerPremises
+NB.PUBLIC_PLACE_SW_UK &NonEmplIncPublicPlace
+NB.LOCAL_AUTHORITY_UK &NonEmplIncLocalAuthority
+NB.EXACT_LOCATION    &NonEmplIncExactLocation
+NA.MEM_PUBLIC_SW_UK  &NonEmplMOP
+NA.SELF_EMPL_SW_UK   &NonEmplSelfEmployed
+NA.AWAY_FROM_WORKDAYS &NonEmplAwayFromWorkdays
+NA.FATALITY_SW       &NonEmplFatality
+NA.HOSPITAL_SW       &NonEmplHospital
+NA.UNCONSCIOUS_SW    &NonEmplUnconscious
+NA.RESUSCITATION_SW  &NonEmplResuscitation
+NA.HOSPITAL_24_SW_UK &NonEmplHospital24
+NA.FALL_HEIGHT_UK    &NonEmplFallHeight
+NA.OCC_ILLNESS_CD    &NonEmplDisease_Cd
+NA.OCC_ILL_DIAG_DT_UK &NonEmplDiagnosis_Dt
+NB.DESCRLONG         &NonEmplIncComments
+NA.COMMENTS          &NonEmplComments
+
+! Workaround - Informix cannot insert long fields via SQR
+#ifdef INFORMIX
+   let $Comment1          = ''
+   let $Comment2          = ''
+#else
+   let $Comment1          = nvl(&NonEmplIncComments, {SPACE})
+   let $Comment2          = nvl(&NonEmplComments,    {SPACE})
+#endif
+
+   let $NonEmplID         = &NonEmplID
+
+   ! Employee stuff...
+   let $EmplID            = {SPACE}
+   let #EmplRcdNbr        = 0
+   let $EmplJobTitle      = {SPACE}
+   let $ExtSchemeDescr    = {SPACE}
+   let $ExtSchemeType_Cd  = {SPACE}
+   let $NonEmplDangocc_Cd = {SPACE}
+
+   ! Lookups...
+   let $IncidentLocation = &NonEmplIncLocation
+
+   let $EmplDiseaseName = ' '
+   do GetDiseaseName(&NonEmplRegRegion, &NonEmplDisease_Cd, $NonEmplDiseaseName)
+
+   let $BodyPartList = ' '
+   do GetBodyPartList($EmplID, #EmplRcdNbr, $NonEmplID, &NonEmplInc_Nbr, &NonEmplRegRegion, $BodyPartList)
+   print $BodyPartList          (0,{C_BODYPART},39)
+
+   let $InjuryList = ' '
+   do GetInjuryList($EmplID, #EmplRcdNbr, $NonEmplID, &NonEmplInc_Nbr, &NonEmplRegRegion, $InjuryList)
+   print $InjuryList            (0,{C_INJURY})
+
+   let $NonEmplAccidentType = ' '
+   do GetAccidentType($EmplID, #EmplRcdNbr, $NonEmplID, &NonEmplInc_Nbr, $NonEmplAccidentType)
+
+   let $Incident_Nbr  = &NonEmplInc_Nbr
+   let $PhysicianName = {SPACE}
+
+   let $MDEmplID      = $EmplID
+   let #MDEmplRcdNbr  = #EmplRcdNbr
+   let $MDNonEmplID   = $NonEmplID
+   let $MDIncNbr      = &NonEmplInc_Nbr
+   do GetMedicalDetails
+
+   ! Insert a record into the reporting table...
+   do InsertNonEmployeeWorkRecord
+
+FROM PS_INJURY_ILL      NA,
+     PS_INCIDENT_DATA   NB,
+     PS_NE_PERSONAL_DTA NP
+   !   PS_NE_PERS_PHONE   NNP
+WHERE  NA.REPORTABLE_CASE = 'Y'
+AND    NA.NON_EMPLOYEE_ID <> {SPACE}
+AND    NA.INCIDENT_NBR    = NB.INCIDENT_NBR
+AND    NA.NON_EMPLOYEE_ID = NP.NON_EMPLOYEE_ID
+ ! AND    NP.NON_EMPLOYEE_ID = NNP.NON_EMPLOYEE_ID
+ ! AND    NNP.PHONE_TYPE = 'HOME'
+   AND    [$UserChoice]
+
+END-SELECT
+
+end-procedure
+
+
+!-----------------------------------------------------------------------
+! Insert non-employee record into work table
+!-----------------------------------------------------------------------
+begin-procedure InsertNonEmployeeWorkRecord
+
+  show 'In procedure: InsertDangerOccWordRecord'
+  show '&NONEMPLINC_DT: ' &NONEMPLINC_DT ' - $NonEmplInc_Time: ' $NonEmplInc_Time
+
+#ifdef INFORMIX
+BEGIN-SQL ON-ERROR=SQL-Error
+
+   INSERT INTO PS_OHS501UK_TMP1
+   (INCIDENT_NBR, EMPLID, NON_EMPLOYEE_ID, RP_NAME, RP_JOBTITLE, RP_PHONE, ORG_NAME, ADDRESS1, ADDRESS2, ADDRESS3,
+    ADDRESS4, CITY, COUNTY, STATE_DESCR1, POSTAL, COUNTRY_DESCR1, BUSINESS_DESCR, INCIDENT_DT, INCIDENT_TM_CHAR,
+    EMPLOYER_PREMISES, PUBLIC_PLACE_SW_UK, LOCATION, LOCATION_NAME, LOCAL_AUTHORITY_UK, ADDRESS1_OTHER, ADDRESS2_OTHER,
+    ADDRESS3_OTHER, ADDRESS4_OTHER, CITY_OTHER, COUNTY_OTHER, STATE_DESCR2, POSTAL_OTHER, COUNTRY_DESCR2, EXACT_LOCATION)
+   VALUES
+   (
+      &NonEmplInc_Nbr,
+      $EmplID,
+      $NonEmplID,
+      $OperName,
+      &OperJobTitle,
+      $OperPhone,
+      $OrgName,
+      $OrgAddress1, $OrgAddress2, $OrgAddress3, $OrgAddress4,
+      $OrgCity, $OrgCounty, $OrgStateName, $OrgZip, $OrgCountryName,
+      $OrgBusinessDescr,
+      &NONEMPLINC_DT,
+      $NonEmplInc_Time,
+      &NonEmplIncEmployerPremises,
+      &NonEmplIncPublicPlace,
+      &NonEmplIncLocation_Cd,
+      $IncidentLocation,
+      &NonEmplIncLocalAuthority,
+      &NonEmplIncAddress1, &NonEmplIncAddress2, &NonEmplIncAddress3, &NonEmplIncAddress4,
+      &NonEmplIncCity, &NonEmplIncCounty, $NonEmplIncStateName,
+      $NonEmplIncZip, $NonEmplIncCountryName,
+      &NonEmplIncExactLocation
+   )
+
+END-SQL
+#else
+BEGIN-SQL ON-ERROR=SQL-Error
+
+   INSERT INTO PS_OHS501UK_TMP1
+   (INCIDENT_NBR, EMPLID, NON_EMPLOYEE_ID, RP_NAME, RP_JOBTITLE, RP_PHONE, ORG_NAME, ADDRESS1, ADDRESS2, ADDRESS3,
+    ADDRESS4, CITY, COUNTY, STATE_DESCR1, POSTAL, COUNTRY_DESCR1, BUSINESS_DESCR, INCIDENT_DT, INCIDENT_TM_CHAR,
+    EMPLOYER_PREMISES, PUBLIC_PLACE_SW_UK, LOCATION, LOCATION_NAME, LOCAL_AUTHORITY_UK, ADDRESS1_OTHER, ADDRESS2_OTHER,
+    ADDRESS3_OTHER, ADDRESS4_OTHER, CITY_OTHER, COUNTY_OTHER, STATE_DESCR2, POSTAL_OTHER, COUNTRY_DESCR2, EXACT_LOCATION,
+    COMMENTS)
+   VALUES
+   (
+      &NonEmplInc_Nbr,
+      $EmplID,
+      $NonEmplID,
+      $OperName,
+      &OperJobTitle,
+      $OperPhone,
+      $OrgName,
+      $OrgAddress1, $OrgAddress2, $OrgAddress3, $OrgAddress4,
+      $OrgCity, $OrgCounty, $OrgStateName, $OrgZip, $OrgCountryName,
+      $OrgBusinessDescr,
+      &NONEMPLINC_DT,
+      $NonEmplInc_Time,
+      &NonEmplIncEmployerPremises,
+      &NonEmplIncPublicPlace,
+      &NonEmplIncLocation_Cd,
+      $IncidentLocation,
+      &NonEmplIncLocalAuthority,
+      &NonEmplIncAddress1, &NonEmplIncAddress2, &NonEmplIncAddress3, &NonEmplIncAddress4,
+      &NonEmplIncCity, &NonEmplIncCounty, $NonEmplIncStateName,
+      $NonEmplIncZip, $NonEmplIncCountryName,
+      &NonEmplIncExactLocation,
+      $Comment1
+   )
+
+END-SQL
+#endif
+
+#ifdef INFORMIX
+BEGIN-SQL ON-ERROR=SQL-Error
+
+   INSERT INTO PS_OHS501UK_TMP2
+  (INCIDENT_NBR, EMPLID, NON_EMPLOYEE_ID, INCIDENT_DT, NAME, ADDRESS1, ADDRESS2, ADDRESS3, ADDRESS4, CITY, COUNTY,
+   STATE_DESCR1, POSTAL, COUNTRY_DESCR1, PHONE, BIRTHDATE, SEX, JOBTITLE, SCHEME_TYPE_CD_UK, EXT_SCHEME_DESCR,
+   SELF_EMPL_SW_UK, MEM_PUBLIC_SW_UK, EMPLOYER, INJURIES, BODY_PARTS, INCIDENT_TYPE, FATALITY_SW, AWAY_FROM_WORKDAYS,
+   HOSPITAL_SW, UNCONSCIOUS_SW, RESUSCITATION_SW, HOSPITAL_24_SW_UK, ACCIDENT_TYPE_CD, FALL_HEIGHT_UK, DANGER_OCC_CD,
+   OCC_ILLNESS_CD, DESCR50, OCC_ILL_DIAG_DT_UK, PHYSICIAN_NAME, MEDICAL_FAC_NAME, ADDRESS1_OTHER, ADDRESS2_OTHER,
+   ADDRESS3_OTHER, ADDRESS4_OTHER, CITY_OTHER, COUNTY_OTHER, STATE_DESCR2, POSTAL_OTHER, COUNTRY_DESCR2)
+   VALUES
+   (
+      &NonEmplInc_Nbr,
+      $EmplID,
+      $NonEmplID,
+      &NONEMPLINC_DT,
+      $NonEmplName,
+      &NonEmplAddress1, &NonEmplAddress2, &NonEmplAddress3, &NonEmplAddress4,
+      &NonEmplCity, &NonEmplCounty, $NonEmplStateName, $NonEmplZip, $NonEmplCountryName,
+      $NonEmplPhone,
+      &NONEMPLBIRTHDATE,
+      &NonEmplSex,
+      $EmplJobTitle,
+      $ExtSchemeType_Cd,
+      $ExtSchemeDescr,
+      &NonEmplSelfEmployed,
+      &NonEmplMOP,
+      &NonEmplEmployer,
+      $InjuryList,
+      $BodyPartList,
+      &NonEmplInc_Type,
+      &NonEmplFatality,
+      &NonEmplAwayFromWorkdays,
+      &NonEmplHospital24,
+      &NonEmplUnconscious,
+      &NonEmplResuscitation,
+      &NonEmplHospital24,
+      $NonEmplAccidentType,
+      &NonEmplFallHeight,
+      $NonEmplDangocc_Cd,
+      &NonEmplDisease_Cd,
+      $NonEmplDiseaseName,
+      &NONEMPLDIAGNOSIS_DT,
+      $PhysicianName,
+      $HospitalName,
+      $HospitalAddress1, $HospitalAddress2, $HospitalAddress3, $HospitalAddress4,
+      $HospitalCity, $HospitalCounty, $HospitalStateName, $HospitalZip, $HospitalCountryName
+   )
+
+END-SQL
+#else
+BEGIN-SQL ON-ERROR=SQL-Error
+
+   INSERT INTO PS_OHS501UK_TMP2
+  (INCIDENT_NBR, EMPLID, NON_EMPLOYEE_ID, INCIDENT_DT, NAME, ADDRESS1, ADDRESS2, ADDRESS3, ADDRESS4, CITY, COUNTY,
+   STATE_DESCR1, POSTAL, COUNTRY_DESCR1, PHONE, BIRTHDATE, SEX, JOBTITLE, SCHEME_TYPE_CD_UK, EXT_SCHEME_DESCR,
+   SELF_EMPL_SW_UK, MEM_PUBLIC_SW_UK, EMPLOYER, INJURIES, BODY_PARTS, INCIDENT_TYPE, FATALITY_SW, AWAY_FROM_WORKDAYS,
+   HOSPITAL_SW, UNCONSCIOUS_SW, RESUSCITATION_SW, HOSPITAL_24_SW_UK, ACCIDENT_TYPE_CD, FALL_HEIGHT_UK, DANGER_OCC_CD,
+   OCC_ILLNESS_CD, DESCR50, OCC_ILL_DIAG_DT_UK, PHYSICIAN_NAME, MEDICAL_FAC_NAME, ADDRESS1_OTHER, ADDRESS2_OTHER,
+   ADDRESS3_OTHER, ADDRESS4_OTHER, CITY_OTHER, COUNTY_OTHER, STATE_DESCR2, POSTAL_OTHER, COUNTRY_DESCR2, COMMENTS)
+   VALUES
+   (
+      &NonEmplInc_Nbr,
+      $EmplID,
+      $NonEmplID,
+      &NONEMPLINC_DT,
+      $NonEmplName,
+      &NonEmplAddress1, &NonEmplAddress2, &NonEmplAddress3, &NonEmplAddress4,
+      &NonEmplCity, &NonEmplCounty, $NonEmplStateName, $NonEmplZip, $NonEmplCountryName,
+      $NonEmplPhone,
+      &NONEMPLBIRTHDATE,
+      &NonEmplSex,
+      $EmplJobTitle,
+      $ExtSchemeType_Cd,
+      $ExtSchemeDescr,
+      &NonEmplSelfEmployed,
+      &NonEmplMOP,
+      &NonEmplEmployer,
+      $InjuryList,
+      $BodyPartList,
+      &NonEmplInc_Type,
+      &NonEmplFatality,
+      &NonEmplAwayFromWorkdays,
+      &NonEmplHospital24,
+      &NonEmplUnconscious,
+      &NonEmplResuscitation,
+      &NonEmplHospital24,
+      $NonEmplAccidentType,
+      &NonEmplFallHeight,
+      $NonEmplDangocc_Cd,
+      &NonEmplDisease_Cd,
+      $NonEmplDiseaseName,
+      &NONEMPLDIAGNOSIS_DT,
+      $PhysicianName,
+      $HospitalName,
+      $HospitalAddress1, $HospitalAddress2, $HospitalAddress3, $HospitalAddress4,
+      $HospitalCity, $HospitalCounty, $HospitalStateName, $HospitalZip, $HospitalCountryName,
+      $Comment2
+   )
+
+END-SQL
+#endif
+
+#ifdef INFORMIX
+  if &NonEmplIncComments > ' '
+     do Update_Long_emp1
+  end-if
+  if &NonEmplComments > ' '
+     do Update_Long_emp2
+  end-if
+#endif
+
+end-procedure
+
+
+!-------------------------------------------------------
+! Update_Long_NON1 - to get long field for Informix
+!-------------------------------------------------------
+begin-procedure UPDATE_Long_NON1
+let $sql-statement = 'OHS501UK.SQR,Update_Long_NON1,Update,OHS501UK_TMP1'
+Begin-SQL ON-ERROR=SQL-ERROR
+UPDATE PS_OHS501UK_TMP1
+SET  COMMENTS  = ( SELECT DESCRLONG FROM PS_INCIDENT_DATA
+                   WHERE INCIDENT_NBR = &EmplInc_Nbr )
+WHERE INCIDENT_NBR = &EmplInc_Nbr
+  AND EMPLID       = $EmplID
+  AND NON_EMPLOYEE_ID = $NonEmplID
+END-SQL
+
+End-Procedure
+
+!-------------------------------------------------------
+! Update_Long_NON2 - to get long field for Informix
+!-------------------------------------------------------
+begin-procedure UPDATE_Long_NON2
+let $sql-statement = 'OHS501UK.SQR,Update_Long_NON2,Update,OHS501UK_TMP2'
+Begin-SQL ON-ERROR=SQL-ERROR
+UPDATE PS_OHS501UK_TMP2
+SET  COMMENTS  = ( SELECT COMMENTS FROM PS_INJURY_ILL
+                   WHERE INCIDENT_NBR = &EmplInc_Nbr
+                     AND NON_EMPLOYEE_ID = &NonEmplid )
+WHERE INCIDENT_NBR = &EmplInc_Nbr
+  AND EMPLID       = $EmplID
+  AND NON_EMPLOYEE_ID = $NonEmplID
+END-SQL
+
+End-Procedure
+!**************************************************************************************************
+
+
+!-----------------------------------------------------------------------
+! Get medical information
+!-----------------------------------------------------------------------
+begin-procedure GetMedicalDetails
+
+   ! 'Care Type' is a key field on this table, not specified below.
+   ! Amongst other things, it can be 'O' (ongoing) or 'E' (emergency).
+   ! If a physisian id exists, the address will be that of the physisican,
+   ! otherwise it will be the last care address.
+
+BEGIN-SELECT
+A.PHYSICIAN_ID
+A.PHYSICIAN_NAME
+A.HOSPITAL
+A.ADDRESS1
+A.ADDRESS2
+A.ADDRESS3
+A.ADDRESS4
+A.CITY
+A.COUNTY
+A.STATE
+A.POSTAL
+   let $HospitalZip=&A.Postal
+A.COUNTRY
+   if not isblank(&A.PHYSICIAN_ID)
+      do GetPhysicianDetails(&A.PHYSICIAN_ID)
+      exit-select
+   end-if
+FROM  PS_INJURY_ILL_ADDR A
+WHERE A.EMPLID          = $MDEmplID
+  AND A.EMPL_RCD        = #MDEmplRcdNbr
+  AND A.NON_EMPLOYEE_ID = $MDNonEmplID
+  AND A.INCIDENT_NBR    = $MDIncNbr
+END-SELECT
+
+   if isblank($PysicianName)
+      ! No physician was found, so use the care address on the last row...
+      let $PhysicianName    = nvl(&A.PHYSICIAN_NAME, {SPACE})
+      let $HospitalName     = nvl(&A.HOSPITAL,       {SPACE})
+      let $HospitalAddress1 = nvl(&A.ADDRESS1,       {SPACE})
+      let $HospitalAddress2 = nvl(&A.ADDRESS2,       {SPACE})
+      let $HospitalAddress3 = nvl(&A.ADDRESS3,       {SPACE})
+      let $HospitalAddress4 = nvl(&A.ADDRESS4,       {SPACE})
+      let $HospitalCity     = nvl(&A.CITY,           {SPACE})
+      let $HospitalCounty   = nvl(&A.COUNTY,         {SPACE})
+      let $HospitalState    = nvl(&A.STATE,          {SPACE})
+      let $HospitalZip      = nvl($HospitalZip,         {SPACE})
+      let $HospitalCountry  = nvl(&A.COUNTRY,        {SPACE})
+      do ohsGetStateName($HospitalCountry, $HospitalState, $HospitalStateName)
+      do ohsGetCountryName($HospitalCountry, $HospitalCountryName)
+   end-if
+
+end-procedure
+
+
+!-----------------------------------------------------------------------
+! Physician Information
+!-----------------------------------------------------------------------
+begin-procedure GetPhysicianDetails($PhyID)
+
+BEGIN-SELECT
+A.NAME
+A.ADDRESS1
+A.ADDRESS2
+A.ADDRESS3
+A.ADDRESS4
+A.CITY
+A.COUNTY
+A.STATE
+A.POSTAL
+   let $Hospitalzip=&A.POSTAL
+A.COUNTRY
+FROM PS_NE_PERSONAL_DTA A
+WHERE NON_EMPLOYEE_ID = $PhyID
+  AND PHYSICIAN_SW    = 'Y'
+END-SELECT
+
+   let $PhysicianName    = nvl(&A.NAME,           {SPACE})
+   let $HospitalAddress1 = nvl(&A.ADDRESS1,       {SPACE})
+   let $HospitalAddress2 = nvl(&A.ADDRESS2,       {SPACE})
+   let $HospitalAddress3 = nvl(&A.ADDRESS3,       {SPACE})
+   let $HospitalAddress4 = nvl(&A.ADDRESS4,       {SPACE})
+   let $HospitalCity     = nvl(&A.CITY,           {SPACE})
+   let $HospitalCounty   = nvl(&A.COUNTY,         {SPACE})
+   let $HospitalState    = nvl(&A.STATE,          {SPACE})
+   let $HospitalZip      = nvl($HospitalZip,         {SPACE})
+   let $HospitalCountry  = nvl(&A.COUNTRY,        {SPACE})
+   let $HospitalName     = {SPACE}
+   do ohsGetStateName($HospitalCountry, $HospitalState, $HospitalStateName)
+   do ohsGetCountryName($HospitalCountry, $HospitalCountryName)
+
+end-procedure
+
+
+!****************************************!
+begin-procedure Get-Phone-Data
+!****************************************!
+
+  if rtrim($Emplid,' ') = ''
+    move '' to $Phone
+    move '' to $CountryCode
+    goto GetPhoneExit
+  end-if
+
+begin-SELECT
+PP.COUNTRY_CODE
+PP.PHONE
+FROM  PS_PERSONAL_PHONE PP
+WHERE PP.EMPLID = $Emplid
+  AND PP.PHONE_TYPE = 'HOME'
+end-SELECT
+
+     let $Phone       = rtrim(&PP.Phone,' ')
+     let $CountryCode = rtrim(&PP.COUNTRY_CODE,' ')
+show '$Phone ' $Phone              
+GetPhoneExit:
+
+end-procedure
+
+
+!********************************************!
+ begin-procedure Get-Phone-Data-NonEmployee
+!********************************************!
+
+if rtrim($NonEmplID,' ') = ''
+    move '' to $Phone1
+    move '' to $CountryCode1
+    goto GetPhoneExit
+  end-if
+begin-SELECT
+GG.COUNTRY_CODE
+GG.PHONE
+FROM  PS_NE_PERS_PHONE GG
+WHERE GG.NON_EMPLOYEE_ID = $NonEmplID
+  AND GG.PHONE_TYPE = 'HOME'
+end-SELECT
+
+     let $Phone1       = rtrim(&GG.Phone,' ')
+     let $CountryCode1 = rtrim(&GG.COUNTRY_CODE,' ')
+show '$Phone1'  $Phone1     
+GetPhoneExit:
+end-procedure
+
+

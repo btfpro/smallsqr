@@ -1,0 +1,675 @@
+!***********************************************************************
+!  TAX810CT:  Qtrly Wage List - Tape/Diskette - CONNECTICUT            *
+!                                                                      *
+!             NOTE: "#IFDEF TAXTEST" in main SELECT is used for        *
+!                   testing this report against DEMO database          *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+!   This module contains confidential and proprietary information      *
+!   of Oracle; it is not to be copied, reproduced, or transmitted      *
+!   in any form, by any means, in whole or in part, nor is it to       *
+!   be used for any purpose other than that for which it is            *
+!   expressly provided under the applicable license agreement.         *
+!                                                                      *
+!   Copyright (C) 2008 Oracle. All Rights Reserved.                    *
+!***********************************************************************
+!                                                                      *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+!          $Date:  2008/06/19:15:02:41                                 !
+!       $Release:  HR9                                                 !
+!    $Resolution:  741871                                              !
+!                                                                      *
+!***********************************************************************
+
+#include 'setenv.sqc' !Set environment
+#include 'setup31.sqc' !Printer and page-size initialization
+#include 'usarpt.sqc'  ! NID_COUNTRY defined
+
+begin-report
+  do Init-Report
+
+! These variables are used by rptsmmry.sqc
+  Let $Prnt_CoTxGrs = 'Y'
+  Let $Prnt_CoExGrs = 'Y'
+
+  do Process-Main
+
+  close 10
+  if $ExceptionFound = 'Y'
+    display ' '
+    display '**** Negative wages found for one or more employees ****'
+    display ' '
+  end-if
+  if $RecordWritten = 'Y'
+    display ''
+    display 'Upon successful conclusion of this program, the following file will be'
+    display 'created:'
+    display ''
+    display 'TAX810CT contains 275-character records in the format required'
+    display 'for electronic submission to the Connecticut Department of Labor.'
+    display ''
+    display 'Follow instructions from the department for preparing and submitting'
+    display 'the file electronically.'
+    display ''
+    display 'Note that bulk filers must be registered as a filing agent.  The'
+    display 'program creates one file for all employer account numbers.'
+    display ''
+  else
+    do Print-Summary-Data('NoData')
+  end-if
+
+  do Stdapi-Term
+
+end-report
+
+begin-procedure Init-Report
+  move 'TAX810CT' to $ReportID
+
+  do Init-DateTime
+  do Init-Number
+  do Get-Current-DateTime
+  do Get-Calendar-Year-Id
+  do Stdapi-Init
+  do Initialization
+
+  if $FileType = 'T'
+    move 'Connecticut  Quarterly UI Wage Report - Tape' to $ReportTitle
+    display ''
+    display 'Creating Tape File for Connecticut UI Wage Reporting'
+  else
+    move 'Connecticut Quarterly UI Wage Report' to $ReportTitle
+    display ''
+    display 'Creating File for Connecticut UI Wage Reporting'
+  end-if
+end-procedure
+
+
+begin-procedure Initialization
+#ifdef TAXTEST
+  move 'CA'              to $State
+#else
+  move 'CT'              to $State
+#endif
+
+  let $Remove_Blanks_From_Surname = 'Y'
+  do Get-Tax-Reporting-Run-Controls
+  move &TX.Balance_Year to $RptYear 9999
+  move $RptYear          to $RptYear ~~xx
+  move $PeriodEndDate    to $AsOfDate
+
+  display ' '
+  display 'Processing balances for '   noline
+  display $RptQtrYr
+
+  move 275 to #RecordLength
+  add 2 to #RecordLength
+
+  if $PRCS_Process_Instance = ''
+     do Prompts
+  else
+     do Select-Parameters
+     do Convert-Parameters
+  end-if
+
+  do Evaluate-File-Type
+  do Calculate-Diskette-Capacity
+  do Open-File
+end-procedure
+
+begin-procedure Open-File
+
+if $FileType = 'D'
+   move 0 to #RecordCount
+   if #FileExtension <> 0
+      close 10
+   end-if
+   add 1 to #FileExtension
+   move #FileExtension to $FileExtension 099
+#ifdef OS400
+   let $FileExtension = '(D' || $FileExtension || ')'
+   let $FileID = '{IMPORTPREFIX}' || 'TAX810CT' || $FileExtension
+#else
+   let $FileID = '{IMPORTPREFIX}' || 'TAX810CT.' || $FileExtension
+#endif
+   open $FileID as 10 for-writing record=275:fixed
+else
+   open '{IMPORTPREFIX}TAX810CT{IMPORTSUFFIX}' as 10 for-writing record=275:fixed
+end-if
+
+end-procedure
+
+
+begin-procedure Process-Main
+begin-SELECT
+TEMP_SSN_MASK
+FROM PS_INSTALLATION
+end-SELECT
+
+begin-SELECT
+A.COMPANY
+A.DESCR
+A.FEDERAL_EIN
+A.ADDRESS1
+A.CITY
+A.STATE
+A.POSTAL
+A.COUNTRY
+
+  move &A.Company to $Company
+
+  move '' to $priorEmplID
+  do Read-Employee-Data
+
+FROM  PS_COMPANY_TBL A
+WHERE A.EFF_STATUS = 'A'
+  AND A.TAX_REPORT_TYPE = '2'
+  AND A.EFFDT =
+  (SELECT MAX(EFFDT)
+     FROM PS_COMPANY_TBL
+     WHERE  COMPANY = A.COMPANY
+       AND  EFFDT  <= $AsOfDate)
+ORDER BY COMPANY
+end-SELECT
+  if #Count_F > 0
+    do Print-Summary-Data('FileTotal')
+  end-if
+end-procedure
+
+begin-procedure Read-Employee-Data
+begin-SELECT
+C.COMPANY    () on-break print=never before=Before-Company
+                                     AFTER=AFTER-COMPANY
+C.EMPLID
+C.STATE
+C.TXGRS_QTD
+C.NLGRS_QTD
+D1.NATIONAL_ID
+D.NAME
+
+   Do Get-Empl-Address (&C.EMPLID,'HOME', $AddressFound)
+
+   Let $COUNTRY  = $GETADDR_Country
+   let $ADDRESS1 = $GETADDR_Address1
+   let $ADDRESS2 = $GETADDR_Address2
+   let $CITY = $GETADDR_CITY
+   let $STATE =$GETADDR_STATE
+   let $POSTAL = $GETADDR_POSTAL
+   let $COUNTY = $GETADDR_COUNTY
+
+  if &C.NlGrs_QTD > 0
+    do Process-Employee
+  else
+    do Print-Summary-Data('NegWage')
+  end-if
+
+FROM  PS_TAX_BALANCE C, PS_NAMES D, PS_PERS_NID D1
+WHERE C.COMPANY       = $Company
+  AND D.EMPLID        = C.EMPLID
+  AND C.TAX_CLASS     = 'U'
+  AND C.BALANCE_ID    = $Calendar_Year_Id
+  AND C.BALANCE_YEAR  = &TX.Balance_Year
+  AND C.BALANCE_QTR   = &TX.Balance_Qtr
+#ifdef TAXTEST
+  AND C.STATE         = 'CA'
+#else
+  AND C.STATE         = 'CT'
+#endif
+  AND C.LOCALITY      = ' '
+  AND C.BALANCE_PERIOD  =
+      (SELECT MAX(BALANCE_PERIOD)
+       FROM   PS_TAX_BALANCE
+       WHERE  EMPLID        = C.EMPLID
+         AND  COMPANY       = C.COMPANY
+         AND  BALANCE_ID    = C.BALANCE_ID
+         AND  BALANCE_YEAR  = C.BALANCE_YEAR
+         AND  BALANCE_QTR   = C.BALANCE_QTR
+         AND  STATE         = C.STATE
+         AND  LOCALITY      = C.LOCALITY
+         AND  TAX_CLASS     = C.TAX_CLASS)
+  AND D.EMPLID            = D1.EMPLID
+  AND D.NAME_TYPE = 'PRI'
+  AND D.EFFDT =
+      (SELECT MAX(DX.EFFDT)
+       FROM   PS_NAMES DX
+       WHERE  DX.EMPLID    = D.EMPLID
+         AND  DX.NAME_TYPE = D.NAME_TYPE
+         AND  DX.EFFDT    <= $AsOfDate)
+  AND D1.COUNTRY          = {NID_Country}
+  AND D1.NATIONAL_ID_TYPE = $Payroll_NID_Type
+ORDER BY D1.NATIONAL_ID
+end-SELECT
+end-procedure
+
+begin-procedure Process-Employee
+  move &D1.NATIONAL_ID to $S123 xxx       !isolate first 3 digits
+  if $S123 = &Temp_SSN_Mask or RTRIM(&D1.NATIONAL_ID, ' ') = ''
+    move '000000000'   to $NATIONAL_ID
+  else
+    move &D1.NATIONAL_ID        to $NATIONAL_ID
+  end-if
+  move &D.Name         to $Name
+  uppercase $Name
+  do Rotate-Name
+  do Rotate-Name-For-Mag-Media
+
+  move &C.NlGrs_QTD to #NlGrs_QTD
+  add #NlGrs_QTD to #Co_NlGrs_QTD
+  multiply 100 times #NlGrs_QTD
+  if $Reimbursable_ER = 'Y'
+     move 0            to #TxGrs_QTD
+  else
+     move &C.TxGrs_QTD to #TxGrs_QTD
+  end-if
+  add #TxGrs_QTD to #Co_TxGrs_QTD
+  multiply 100 times #TxGrs_QTD
+
+  let #max_amt_NLG = 999999999
+  let #max_amt_TXG = 999999999
+  let #NlGrs_orig = #NlGrs_QTD
+  let #TxGrs_orig = #TxGrs_QTD
+  add 1 to #Count_S
+  let $done1 = 'N'
+  let $done2 = 'N'
+  while $done1 <> 'Y' or $done2 <> 'Y'
+    do split-s-record (#NlGrs_orig,#NlGrs_QTD,#max_amt_NLG,$done1)
+    do split-s-record (#TxGrs_orig,#TxGrs_QTD,#max_amt_TXG,$done2)
+    do Format-Number(#NlGrs_QTD,  $NlGrs_QTD,  '099999999')
+    do Format-Number(#TxGrs_QTD,  $TxGrs_QTD,  '099999999')
+    do write-s-record
+    add 1 to #Count_R
+  end-while
+end-procedure
+
+
+begin-procedure Before-Company
+  do Get-Company-Data
+#ifdef TAXTEST
+  move 'CA' to $State
+#else
+  move 'CT' to $State
+#endif
+  do Get-State-Tax-Data             !Employer ID
+  if RTRIM(&Employer_ID_SUT,' ') = ''
+    display '*** State Unemployment ID missing in Company State Tax Table ***'
+    display '*********************** Processing stopped *********************'
+    display 'Company ' noline
+    display $Company
+    stop
+  end-if
+
+  let $StateEIN = EDIT(RTRIM(&Employer_ID_SUT,' '),'0999999')
+
+  if $Prcs_Process_Instance  =  ''
+     do Employer-Prompts
+  else
+     do Company-Run-Control
+  end-if
+
+  do Write-E-Record
+end-procedure
+
+begin-procedure After-Company
+  if #Count_S > 0
+     if $Reimbursable_ER = 'Y'
+        move 0 to #Co_ExGrs_QTD
+     else
+        let #Co_ExGrs_QTD = #Co_NlGrs_QTD - #Co_TxGrs_QTD
+     end-if
+
+    do Print-Summary-Data('CoTotal')
+
+    add #Co_NlGrs_QTD to #Tot_NlGrs_QTD
+    add #Co_TxGrs_QTD to #Tot_TxGrs_QTD
+    add #Co_ExGrs_QTD to #Tot_ExGrs_QTD
+    add #Count_S to #Count_F
+    add #Count_R to #Count_R_Total
+
+    do Write-F-Record
+
+    move 0 to #Co_NlGrs_QTD
+    move 0 to #Co_TxGrs_QTD
+    move 0 to #Co_ExGrs_QTD
+    move 0 to #Count_S
+    move 0 to #Count_R
+    new-page
+  end-if
+end-procedure
+
+begin-procedure Write-E-Record
+  move &A.Federal_EIN  to $FedEIN 099999999
+  move &A.Descr        to $ErName
+  move &A.Address1      to $ErAddress
+  move &A.City         to $City
+  let $StateCd = rtrim(&A.State, ' ')
+  move &A.Postal       to $Zip
+  move $Zip            to $ZipExtsn ~~~~~~xxxx
+  if instr($Zip,'-',6) = 0
+  and $ZipExtsn <> '    '
+   let $Zip = substr($Zip,1,5) || '-' || substr($Zip,6,4)
+  end-if
+  move $Zip            to $ZipExtsn ~~~~~xxxxx
+
+  uppercase $ErName
+  uppercase $ErAddress
+  uppercase $City
+
+  If $Filetype = 'T'
+     move '25' to $Blocking_Fact
+  else
+     move '00' to $Blocking_Fact
+  end-if
+
+  if $FileType = 'D'
+    if #RecordCount >= #MaxRecordsPerDiskette
+       do Open-File
+    end-if
+
+    write 10 from 'E':1
+         $QtrEndMonth:2
+             $RptYear:2
+              $FedEIN:9
+                  $Sp:9
+              $ErName:50
+           $ErAddress:40
+               $City:25
+             $StateCd:10
+            $ZipExtsn:5
+                 $Zip:5
+                  'S':1
+  &TX.Employment_Type:1
+       $Blocking_Fact:2
+                  $Sp:6
+                 '09':2
+                  $Sp:5
+            $StateEIN:7
+                  $Sp:93
+  else
+
+    write 10 from 'E':1
+         $QtrEndMonth:2
+             $RptYear:2
+              $FedEIN:9
+                  $Sp:9
+              $ErName:50
+           $ErAddress:40
+               $City:25
+             $StateCd:10
+            $ZipExtsn:5
+                 $Zip:5
+                  'S':1
+  &TX.Employment_Type:1
+       $Blocking_Fact:2
+                  $Sp:6
+                 '09':2
+                  $Sp:5
+            $StateEIN:7
+                  $Sp:93
+  end-if
+
+  move 'Y' to $RecordWritten
+  add 1 to #RecordCount
+end-procedure
+
+begin-procedure Write-S-Record
+
+  let #c = INSTR($LastName,',',1)
+
+  if #c > 0
+   let $SrecName = SUBSTR($LastName,1,LENGTH($LastName) - 1) || ' ' || $FirstName
+  else
+   let $SrecName = $LastName || ' ' || $FirstName
+  end-if
+
+  move $Address1      to $EmpAddress
+  move $City         to $EmpCity
+  let $EmpStateCd = rtrim($State, ' ')
+  move $Postal       to $EmpZip
+  move $EmpZip         to $EmpZipExtsn ~~~~~~xxxx
+
+  if instr($EmpZip,'-',6) = 0
+  and $EmpZipExtsn <> '    '
+    let $EmpZip = substr($EmpZip,1,5) || '-' || substr($EmpZip,6,4)
+  end-if
+  move $EmpZip         to $EmpZipExtsn ~~~~~xxxxx
+  do Format-Number(#NlGrs_QTD,  $NlGrs_QTD,  '099999999')
+  do Format-Number(#TxGrs_QTD, $TxGrs_QTD, '099999999')
+
+  uppercase $EmpAddress
+  uppercase $EmpCity
+
+  if $FileType = 'D'
+    if #RecordCount >= #MaxRecordsPerDiskette
+       do Open-File
+    end-if
+
+    write 10 from 'S':1
+         $NATIONAL_ID:9
+            $SrecName:27
+          $EmpAddress:40
+             $EmpCity:25
+          $EmpStateCd:10
+         $EmpZipExtsn:5
+              $EmpZip:5
+                  $Sp:1
+                 '09':2
+                  $Sp:6
+           $NlGrs_QTD:9
+           $TxGrs_QTD:9
+                  $Sp:126
+  else
+
+    write 10 from 'S':1
+         $NATIONAL_ID:9
+            $SrecName:27
+          $EmpAddress:40
+             $EmpCity:25
+          $EmpStateCd:10
+         $EmpZipExtsn:5
+              $EmpZip:5
+                  $Sp:1
+                 '09':2
+                  $Sp:6
+           $NlGrs_QTD:9
+           $TxGrs_QTD:9
+                  $Sp:126
+
+  end-if
+
+  add 1 to #Count_F_CT
+  add #NlGrs_QTD to #F_Gross
+  add #TxGrs_QTD to #F_TxGrs
+
+  move '' to $NlGrs_QTD
+  move 0  to #NlGrs_QTD
+  move '' to $TxGrs_QTD
+  move 0  to #TxGrs_QTD
+
+  add 1 to #RecordCount
+end-procedure
+
+begin-procedure Write-F-Record
+  move #Count_F_CT to $Count_F_CT 0999999
+  move #F_Gross    to $F_Gross    0999999999999999
+  move #F_TxGrs    to $F_TxGrs    0999999999999999
+  let #F_ExGrs = #F_Gross - #F_TxGrs
+  if $Reimbursable_ER = 'Y'
+     move 0 to $F_ExGrs           0999999999999999
+     move 0 to $RemittAmt         0999999999999999
+  else
+     move #F_ExGrs to $F_ExGrs    0999999999999999
+  end-if
+
+  if $FileType = 'D'
+    if #RecordCount >= #MaxRecordsPerDiskette
+       do Open-File
+    end-if
+
+   write 10 from 'F':1
+         $Count_F_CT:7
+                 $Sp:1
+            $F_TxGrs:16
+                 $Sp:1
+            $F_ExGrs:16
+                 $Sp:1
+            $F_Gross:16
+                 $Sp:1
+          $RemittAmt:11
+                 $Sp:1
+        $Month1Count:5
+                 $Sp:1
+        $Month2Count:5
+                 $Sp:1
+        $Month3Count:5
+                 $Sp:186
+  else
+
+   write 10 from 'F':1
+         $Count_F_CT:7
+                 $Sp:1
+            $F_TxGrs:16
+                 $Sp:1
+            $F_ExGrs:16
+                 $Sp:1
+            $F_Gross:16
+                 $Sp:1
+          $RemittAmt:11
+                 $Sp:1
+        $Month1Count:5
+                 $Sp:1
+        $Month2Count:5
+                 $Sp:1
+        $Month3Count:5
+                 $Sp:186
+
+  end-if
+
+  move 0 to #Count_F_CT
+  move 0 to #F_Gross
+  move 0 to #F_TxGrs
+
+  add 1 to #RecordCount
+end-procedure
+
+begin-procedure Convert-Parameters
+
+  move $RC_QTR_UI.Reporting_Medium to $FileType
+  move $RC_QTR_UI.Diskette_Type   to $DisketteType
+  move $RC_QTR_UI.Reimbursable_ER to $Reimbursable_ER
+end-procedure
+
+begin-procedure Evaluate-File-Type
+
+  evaluate $FileType
+    when = 'Q'
+      stop
+
+    when = 'D'
+      if $Prcs_Process_Instance = ''
+         do Get-Diskette-Format
+      end-if
+      move &TX.Recording_Cd to $Recording_Cd
+      break
+
+    when = 'T'
+      move &TX.Tape_Density      to $Density
+      move &TX.Recording_Cd      to $Recording_Cd
+      move 'SL'                  to $Tape_Label
+      move &TX.Computer_Mfr      to $Computer_Mfr
+      move 'MT'                  to $FilingType
+      move '09'                  to $Tracks
+      break
+
+    when = 'C'
+      move &TX.Recording_Cd      to $Recording_Cd
+      move 'SL'                  to $Tape_Label
+      move &TX.Computer_Mfr      to $Computer_Mfr
+      move 'MC'                  to $FilingType
+
+  end-evaluate
+end-procedure
+
+begin-procedure Prompts
+
+  display 'Enter Transmitter Contact Information:'
+  input $TransmitterContact  maxlen=30 '  Contact name (30 char max)'
+  input $TransmitterPhone    maxlen=10 '  Contact phone (e.g. 9995551212)'
+  input $TransmitterPhoneExt maxlen=4  '  Contact 4-digit extension'
+
+  while $FileType = ''
+    input $FileType 'Tape, cartridge or diskette file? (T, C, D or Q to quit)'
+    uppercase $FileType
+    if INSTR('TDCQ',$FileType,1) = 0
+      display ' '
+      display '***** Enter T, D, C or Q *****'
+      display ' '
+      move '' to $FileType
+    end-if
+  end-while
+  input $Reimbursable_ER '    Reimbursable? Y or space '
+end-procedure
+
+begin-procedure Employer-Prompts
+  display ' '
+  display 'Enter quarterly data for ' noline
+  display $Company noline
+  display ':'
+  display '(Numbers should not include commas)'
+  input $RemittAmt       '   Remittance Amount     '
+  input $Month1Count     '   Month 1 employee count'
+  input $Month2Count     '   Month 2 employee count'
+  input $Month3Count     '   Month 3 employee count'
+
+  move $RemittAmt       to #RemittAmt
+  move $Month1Count     to #Month1Count
+  move $Month2Count     to #Month2Count
+  move $Month3Count     to #Month3Count
+
+  let  $RemittAmt       = EDIT(#RemittAmt        * 100,'09999999999')
+  move #Month1Count     to $Month1Count     0999999
+  move #Month2Count     to $Month2Count     0999999
+  move #Month3Count     to $Month3Count     0999999
+end-procedure
+
+begin-procedure Company-Run-Control
+begin-select
+CT.REMITT_AMT
+CT.MONTH1_COUNT
+CT.MONTH2_COUNT
+CT.MONTH3_COUNT
+FROM PS_RC_TAX810CT CT
+WHERE CT.OPRID = $Prcs_OprID
+  AND CT.RUN_CNTL_ID = $Prcs_Run_Cntl_ID
+  AND CT.COMPANY = &C.Company
+end-SELECT
+
+
+  move &CT.Remitt_Amt       to #RemittAmt
+  move &CT.Month1_Count     to #Month1Count
+  move &CT.Month2_Count     to #Month2Count
+  move &CT.Month3_Count     to #Month3Count
+
+  let  $RemittAmt       = EDIT(#RemittAmt        * 100,'09999999999')
+  move #Month1Count     to $Month1Count     09999
+  move #Month2Count     to $Month2Count     09999
+  move #Month3Count     to $Month3Count     09999
+end-procedure
+
+#Include 'taxrnctl.sqc'  !Get-Tax-Reporting-Run-Controls procedure
+#Include 'getcodta.sqc'  !Get-Company-Data procedure
+#Include 'getstdta.sqc'  !Get-State-Tax-Data procedure
+#Include 'rotnam10.sqc'  !Rotate-Name procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'rptsmmry.sqc'  !Print-Summary-Data procedure
+#Include 'getbalid.sqc'  !Get-Calendar-Year-Id
+#Include 'stdapi.sqc'    !Update Process API
+#Include 'txovrflw.sqc'  !Split-S-Record Procedure
+#Include 'txrnctl1.sqc'  !Process Scheduler Run Controls
+#Include 'getfrmat.sqc'  !Get-Diskette-Format procedure
+#Include 'getaddr.sqc'   !Get Person Current Address

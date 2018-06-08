@@ -1,0 +1,394 @@
+!*******************************************************************
+!  GLXRESET: Resets GL Interface Run Flag for Test Purposes        *
+!*******************************************************************
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+!   This module contains confidential and proprietary information      *
+!   of Oracle; it is not to be copied, reproduced, or transmitted      *
+!   in any form, by any means, in whole or in part, nor is it to       *
+!   be used for any purpose other than that for which it is            *
+!   expressly provided under the applicable license agreement.         *
+!                                                                      *
+!   Copyright (C) 2007 Oracle. All Rights Reserved.                    *
+!***********************************************************************
+!                                                                      *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+!          $Date:  2007/01/17:11:24:37                                 
+!       $Release:  HR9                                                 
+!    $Resolution:  654914                                              
+!                                                                      *
+!***********************************************************************
+
+#include 'setenv.sqc'    !Set environment
+#Include 'setup31.sqc'   !Printer and page-size initialization
+
+begin-report
+  do Init-Report
+  do Process-Main
+  do Stdapi-Term
+end-report
+
+begin-procedure Init-Report
+  do Init-DateTime
+  do Stdapi-Init
+end-procedure
+
+begin-procedure Process-Main
+
+if $Prcs_Process_Instance = ''
+    input  $run_id         'Enter Run Id (enter if you want to enter company/paygroup)'
+    uppercase $run_id
+    if rtrim($run_id,' ') = ''
+      input  $run_company    'Enter Company'
+      uppercase  $run_company
+      input  $run_paygroup   'Enter Paygroup'
+      uppercase  $run_paygroup
+      input  $run_pay_end_dt 'Enter Pay_End_Dt ({PROMPT-DATE})'
+    end-if
+    input  $reset_dist     'Reset Distribution (Y/N)'
+    uppercase $reset_dist
+else
+    do read-run-params
+end-if
+
+if rtrim($run_id,' ') <> ''
+  let $where  = 'RUN_ID = '''||$run_id||''''
+  let $whereA = 'A.RUN_ID = '''||$run_id||''''
+else
+  let $where  = 'COMPANY = '''||$run_company||''' AND PAYGROUP = '''||$RUN_PAYGROUP||
+                ''' AND PAY_END_DT = '''||$run_pay_end_dt||''''
+  let $whereA = 'A.COMPANY = '''||$run_company||''' AND A.PAYGROUP = '''||$RUN_PAYGROUP||
+                ''' AND A.PAY_END_DT = '''||$run_pay_end_dt||''''
+end-if
+
+do Get-Run-Seq
+do Select-from-pay-calendar
+do Update-pay-calendar
+
+if $reset_dist = 'Y'
+    do Update-Distribution-Ind
+end-if
+
+end-procedure Process-Main
+
+!***********************************************************************
+!**** read-run-params                                                ***
+!***********************************************************************
+begin-procedure read-run-params
+
+begin-SELECT
+
+RUN_ID
+COMPANY
+PAYGROUP
+PAY_END_DT
+RESET_DIST
+
+FROM PS_RUN_GLRESET
+WHERE OPRID = $Prcs_OprID  AND RUN_CNTL_ID = $Prcs_Run_Cntl_ID
+end-SELECT
+
+let $run_id          = &RUN_ID
+let $run_company     = &COMPANY
+let $run_paygroup    = &PAYGROUP
+let $run_pay_end_dt  = &PAY_END_DT
+let $reset_dist      = &RESET_DIST
+
+end-procedure read-run-params
+
+!***********************************************************************
+!**** Get-Run-Seq                                                    ***
+!***********************************************************************
+begin-procedure Get-Run-Seq
+
+  let #prev_instance = 0
+
+begin-SELECT
+RUN_DT
+SEQNUM
+GL_RUN_NUM
+
+  let $run_date = &RUN_DT
+  let #SeqNum   = &SEQNUM
+  let #GLRunNum = &GL_RUN_NUM
+
+  let #acctg_line_process_instance = 0
+  do Get-Acctg-Line-Process-Instance
+
+  if #acctg_line_process_instance <> 0
+
+      if #acctg_line_process_instance <> #prev_instance
+
+          let #prev_instance = #acctg_line_process_instance
+          do Delete-Acctg-Lines-to-be-published
+          do Delete-Expenses-Issued-Lines
+      end-if
+
+      do Delete-Acctg-Lines
+      do Delete-GL-History
+  end-if
+
+FROM PS_GL_GEN_HISTORY
+WHERE [$where]
+AND GL_GEN_STATUS = 'N'
+AND PROGRAM_ID = 'PAYGL01'
+end-SELECT
+
+end-procedure Get-Run-Seq
+
+!***********************************************************************
+!**** Delete-GL-History                                              ***
+!***********************************************************************
+begin-procedure Delete-GL-History
+
+begin-SQL
+
+DELETE FROM PS_GL_GEN_HISTORY WHERE RUN_DT = $run_date AND SEQNUM = #SeqNum
+
+end-SQL
+
+end-procedure Delete-GL-History
+
+
+!***********************************************************************
+!**** Delete-Acctg-Lines                                             ***
+!***********************************************************************
+begin-procedure Delete-Acctg-Lines
+
+begin-SQL
+
+DELETE FROM PS_HR_ACCTG_LINE WHERE RUN_DT = $run_date AND SEQNUM = #SeqNum
+
+end-SQL
+
+end-procedure Delete-Acctg-Lines
+
+!***********************************************************************
+!**** Delete-Acctg-Lines-to-be-published                             ***
+!***********************************************************************
+begin-procedure Delete-Acctg-Lines-to-be-published
+
+begin-SQL
+DELETE FROM PS_EO_MSGBATPRM
+WHERE PROCESS_NAME     = 'PAYGL01'
+  AND PROCESS_STATUS   = 'N'
+  AND PROCESS_INSTANCE = #acctg_line_process_instance
+end-SQL
+
+end-procedure Delete-Acctg-Lines-to-be-published
+
+!***********************************************************************
+!**** Delete-Expenses-Issued-Lines                                   ***
+!***********************************************************************
+begin-procedure Delete-Expenses-Issued-Lines
+
+begin-SQL
+DELETE FROM PS_PAY_ISS_STG_PUB
+WHERE PROCESS_INSTANCE = #acctg_line_process_instance
+end-SQL
+
+end-procedure Delete-Expenses-Issued-Lines
+
+!***********************************************************************
+!**** Update-Pay-Calendar                                            ***
+!***********************************************************************
+begin-procedure Update-Pay-Calendar
+
+begin-SQL
+UPDATE PS_PAY_CALENDAR SET GL_INTERFACE_RUN = 'N', PAY_OFF_CYCLE_CLS = $PayOffCycleCls
+WHERE [$where]
+AND GL_INTERFACE_RUN = 'Y'
+end-SQL
+
+end-procedure Update-Pay-Calendar
+
+
+!***********************************************************************
+!**** Get-Acctg-Line-Process-Instance                                ***
+!***********************************************************************
+begin-procedure Get-Acctg-Line-Process-Instance
+
+begin-SELECT
+ACCTG.PROCESS_INSTANCE
+
+FROM PS_HR_ACCTG_LINE ACCTG
+WHERE RUN_DT = $run_date
+AND SEQNUM = #SeqNum
+end-SELECT
+
+let #acctg_line_process_instance = &ACCTG.PROCESS_INSTANCE
+
+end-procedure Get-Acctg-Line-Process-Instance
+
+!***********************************************************************
+!**** Select-from-pay-calendar                                       ***
+!***********************************************************************
+begin-procedure Select-from-pay-calendar
+
+begin-select
+A.COMPANY
+A.PAYGROUP
+A.PAY_END_DT
+A.GL_INTERFACE_RUN
+A.PAY_DIST_RUN
+A.ACCRUAL_PCT
+A.REVERSE_FLAG
+A.PAY_OFF_CYCLE_CLS
+
+  let $ProcCompany    =    &A.COMPANY
+  let $ProcPayGroup   =    &A.PAYGROUP
+  let $ProcPayEndDt   =    &A.PAY_END_DT
+  let $GLInterface    =    &A.GL_INTERFACE_RUN
+  let $PayDistRun     =    &A.PAY_DIST_RUN
+  let #AccrualPct     =    &A.ACCRUAL_PCT
+  let $ReverseAccrual =    &A.REVERSE_FLAG
+  let $PayOffCycleCls =    &A.PAY_OFF_CYCLE_CLS
+
+  if $PayDistRun = 'Y' and $reset_dist = 'Y'
+      do Delete-Distribution-Records
+      do Delete-AP-Liability-Records
+  end-if
+
+  if $PayOffCycleCls = 'Y'
+     let $PayOffCycleCls = 'N'
+  end-if
+
+  if $GLInterface = 'Y'
+      if $ReverseAccrual = 'N' and #AccrualPct <> 0
+          do Delete-Accruals
+      end-if
+
+      if $ReverseAccrual = 'Y'
+          do Delete-Accruals
+          do Reset-Accrual-Reverse-Flag
+      end-if
+  end-if
+
+FROM PS_PAY_CALENDAR A
+WHERE [$whereA]
+end-select
+
+end-procedure Select-from-pay-calendar
+
+!***********************************************************************
+!**** Delete-Distribution-Records                                    ***
+!***********************************************************************
+begin-procedure Delete-Distribution-Records
+
+begin-SQL
+DELETE FROM PS_PAY_NA_EARNINGS
+WHERE COMPANY    = $ProcCompany
+AND   PAYGROUP   = $ProcPayGroup
+AND   PAY_END_DT = $ProcPayEndDt
+end-SQL
+
+begin-SQL
+DELETE FROM PS_PAY_NA_ERN_DIST
+WHERE COMPANY    = $ProcCompany
+AND   PAYGROUP   = $ProcPayGroup
+AND   PAY_END_DT = $ProcPayEndDt
+end-SQL
+
+begin-SQL
+DELETE FROM PS_PAY_NA_DED_DIST
+WHERE COMPANY    = $ProcCompany
+AND   PAYGROUP   = $ProcPayGroup
+AND   PAY_END_DT = $ProcPayEndDt
+end-SQL
+
+begin-SQL
+DELETE FROM PS_PAY_NA_TAX_DIST
+WHERE COMPANY    = $ProcCompany
+AND   PAYGROUP   = $ProcPayGroup
+AND   PAY_END_DT = $ProcPayEndDt
+end-SQL
+
+begin-SQL
+DELETE FROM PS_PAY_NA_CTX_DIST
+WHERE COMPANY    = $ProcCompany
+AND   PAYGROUP   = $ProcPayGroup
+AND   PAY_END_DT = $ProcPayEndDt
+end-SQL
+
+begin-SQL
+DELETE FROM PS_PAY_NA_NET_DIST
+WHERE COMPANY    = $ProcCompany
+AND   PAYGROUP   = $ProcPayGroup
+AND   PAY_END_DT = $ProcPayEndDt
+end-SQL
+
+end-procedure Delete-Distribution-Records
+
+!***********************************************************************
+!**** Delete-AP-Liability-Records                                    ***
+!***********************************************************************
+begin-procedure Delete-AP-Liability-Records
+
+begin-SQL
+DELETE FROM PS_PAY_NA_DED_LIAB
+WHERE COMPANY    = $ProcCompany
+AND   PAYGROUP   = $ProcPayGroup
+AND   PAY_END_DT = $ProcPayEndDt
+end-SQL
+
+begin-SQL
+DELETE FROM PS_PAY_NA_TAX_LIAB
+WHERE COMPANY    = $ProcCompany
+AND   PAYGROUP   = $ProcPayGroup
+AND   PAY_END_DT = $ProcPayEndDt
+end-SQL
+
+begin-SQL
+DELETE FROM PS_PAY_NA_CTX_LIAB
+WHERE COMPANY    = $ProcCompany
+AND   PAYGROUP   = $ProcPayGroup
+AND   PAY_END_DT = $ProcPayEndDt
+end-SQL
+
+end-procedure Delete-AP-Liability-Records
+
+
+!***********************************************************************
+!**** Delete-Accruals                                                ***
+!***********************************************************************
+begin-procedure Delete-Accruals
+
+begin-SQL
+DELETE FROM PS_R_HR_ACCRUAL
+WHERE COMPANY    = $ProcCompany
+AND   PAYGROUP   = $ProcPayGroup
+AND   PAY_END_DT = $ProcPayEndDt
+end-SQL
+end-procedure Delete-Accruals
+
+!***********************************************************************
+!**** Reset-Accrual-Reverse-Flag                                     ***
+!***********************************************************************
+begin-procedure Reset-Accrual-Reverse-Flag
+begin-SQL
+UPDATE PS_R_HR_ACCRUAL SET REVERSED = 'N'
+WHERE COMPANY    = $ProcCompany
+AND   PAYGROUP   = $ProcPayGroup
+end-SQL
+end-procedure Reset-Accrual-Reverse-Flag
+
+!***********************************************************************
+!**** Update-Distribution-Ind                                        ***
+!***********************************************************************
+begin-procedure Update-Distribution-Ind
+
+begin-SQL
+UPDATE PS_PAY_CALENDAR SET PAY_DIST_RUN = 'N', PAY_OFF_CYCLE_CLS = $PayOffCycleCls
+WHERE [$where]
+AND PAY_DIST_RUN = 'Y'
+end-SQL
+
+end-procedure Update-Distribution-Ind
+
+#Include 'stdapi.sqc'    !Update Process API
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting

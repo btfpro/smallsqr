@@ -1,0 +1,3576 @@
+!***********************************************************************
+!  PAY003CN:  Payroll Cheque Print - Canada                            *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+!                                                                      *
+! This module contains confidential and proprietary information        *
+! of Oracle; it is not to be copied, reproduced, or transmitted        *
+! in any form, by any means, in whole or in part, nor is it to         *
+! be used for any purpose other than that for which it is              *
+! expressly provided under the applicable license agreement.           *
+!                                                                      *
+! Copyright (C) 2007 Oracle. All Rights Reserved.                      *
+!                                                                      *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!          $Date:  2007/03/19:15:15:07                                 !
+!       $Release:  HR9                                                 !
+!    $Resolution:  698735                                              !
+!                                                                      *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+! Function: Generates paycheques and earnings statements for a given   *
+!           RUN_ID or (partial) pay calendar.                          *
+!                                                                      *
+! Comments: Utilizes a bank microcode soft font and a custom signature *
+!           font catridge to allow printing of the entire cheque on an *
+!           HP LaserJet printer so equipped and configured.            *
+!                                                                      *
+!***********************************************************************
+
+
+#include 'setenv.sqc'    !set database environment
+#include 'chkadvpr.sqc'  !Printer settings for the Check-Advice printing
+#include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#include 'getdednm.sqc'  !Get-Deduction-Name procedure
+#include 'getdptnm.sqc'  !Get-Department-Name procedure
+#include 'geternnm.sqc'  !Get-Earnings-Name procedure
+#include 'getsetid.sqc'  !Get-Setid procedure
+#include 'getjobtl.sqc'  !Get-Job-Title procedure
+#include 'getlocnm.sqc'  !Get-Location-Name procedure
+#include 'ldnumtrn.sqc'  !Load-NumberLits-Array procedure
+#include 'netintrn.sqc'  !Net-Pay-In-Words procedure
+#include 'readxlat.sqc'  !Read-Translate-Table procedure
+#include 'rotname1.sqc'  !Rotate-Name procedure
+#include 'datetime.sqc'  !general date and time formatting procedures
+#include 'datemath.sqc'  !date arithmetic procedures
+#include 'number.sqc'    !general number formatting procedures
+#include 'payinit.sqc'   !Payroll-Report-Initialization procedure
+#include 'payrnctl.sqc'  !Get-Run-Control procedure
+#include 'stdapi.sqc'    !StdAPI-Init procedure
+#include 'reset1.sqc'    !Reset printer procedure
+#include 'getbalid.sqc'  !Get-Calendar-Year-Id
+#Include 'sqrtrans.sqc'  !Translate SQR strings to given language
+#Include 'getrplng.sqc'  !Get the report language
+#include 'canrpt.sqc'    !Get CAN variables
+#Include 'getaddr.sqc'   !Get Current Person Address
+
+#include 'pysspxml.sqc'  !Self Service Paycheck (SSP) XML Data process
+
+
+!***********************************************************************
+begin-procedure Init-Page-Size
+!***********************************************************************
+! This sends a 'Perforation Skip' command to disable any bottom
+! margin and obtain the maximum PCL page.  This is required to
+! print the MICR line sufficiently close to the bottom of the
+! form to be correctly positioned on the cheque.
+
+#ifndef MVS
+#ifndef OS400
+ encode '<27>&l0L' into $perforation_skip
+#else
+ encode '<39>&l0L' into $perforation_skip
+#endif
+#else
+ encode '<39>&l0L' into $perforation_skip
+#endif
+
+  print $perforation_skip () code-printer={PRINTER_CHQADV}
+
+end-procedure
+
+
+!***********************************************************************
+begin-procedure Init-Variables
+!***********************************************************************
+
+  let $ReportID    = 'PAY003CN'
+  let $ReportTitle = $Pay003cn_ReportTitle
+  let $Country     = 'CAN'
+
+  let #StdFont     = 5                  !Times Roman proportional
+  let #StmtPntSize = 7                  !statement point-size
+  let #ChkPntSize  = 9                  !cheque point-size
+
+!printer escape sequence for cheque signature font
+
+#ifndef MVS
+#ifndef OS400
+  encode '<27>&l0O<27>(1Q<27>(s0p1.00h72.0v0s0b0T' into $SigFont
+#else
+  encode '<39>&l0O<39>(1Q<39>(s0p1.00h72.0v0s0b0T' into $SigFont
+#endif
+#else
+  encode '<39>&l0O<39>(1Q<39>(s0p1.00h72.0v0s0b0T' into $SigFont
+#endif
+
+end-procedure
+
+
+!***********************************************************************
+begin-procedure Init-Arrays
+!***********************************************************************
+
+  #define m  7  !number of separate detail sections
+  #define n 13  !maximum number of detail entries per section
+
+  let #RatesRow       = 0
+  let #HoursRow       = 1
+  let #EarnsRow       = 2
+  let #PreTaxDedsRow  = 3
+  let #TaxesRow       = 4
+  let #PostTaxDedsRow = 5
+  let #BenefitsRow    = 6
+
+  let #lastRow  = {m}-1
+  let #lastCol  = {n}-1
+  let $lastCode = '***'
+  let $lastName1 = $Pay003cn_Other
+  let $lastCmpRtCd = '***'
+  let #lastRate = 0
+
+  create-array name  = ETDarray       -
+               size  = {m}            -
+               field = Code:char:{n}  -
+               field = Name:char:{n}  -
+               field = CmpRtCd:char:{n} -    ! Comp_rate_code
+               field = Cur:number:{n} -
+               field = YTD:number:{n}
+
+  do Load-NumberLits-Array  !load literals for converting Net Pay to words
+
+end-procedure
+
+
+!***********************************************************************
+begin-report
+!***********************************************************************
+
+! use-report chkadvprn
+  use-printer-type {PRINTER_CHQADV}
+  do Init-DateTime
+  do Get-Current-DateTime
+  do Init-Number
+  do Get-Calendar-Year-Id
+  do StdAPI-Init
+
+  let $ReportID    = 'PAY003CN'
+  let $ssp_setup_id = 'PNACAN'
+
+  do Get-Report-Language   ! Procedure that decides the report language
+                           ! and then calls 'Report-Translation' procedure
+                           ! that reads the language dep. text.
+
+  do Init-Variables
+  do Init-Arrays
+  do Init-SSP-XML-Variables
+  do Payroll-Report-Initialization      !calls "Report" procedure
+
+  do Open-XML-Data-For-Bulk-Print
+
+  do Delete-SSP-Temporary-Guide-Data
+  do Get-Paycheques
+
+  if $FirstRecord = 'N' and $RC_PAYINIT.Text15 = $Create_XML_DATA
+     let $xmltag = 'CAN_CHEQUE'
+     let $xmloutput_line = ''
+     let $xmloutput_line = $xmlcntrl_begin || $xmltag_end || $xmltag || $xmlcntrl_end
+     write #outputfile from $xmloutput_line
+  end-if
+
+  do Close-XML-Data-For-Bulk-Print
+
+  display 'Total Cheques ' noline
+  display #TotalCheques 999,999,999
+  display 'Total Net Pay ' noline
+  display #TotalNetPay  $$$,$$$,$$9.99mi
+  display 'XML Data File ' noline
+  display $xmlssp_filenm
+
+  do StdAPI-Term
+  do Reset
+
+end-report
+
+
+! This procedure is used to read language-dependent text from the database.
+begin-procedure Report-Translation
+
+
+! Read from PAY003CN  program id
+   do Init_Report_Translation($ReportID,$Curr_language_Cd)
+   do Append_Report_Translation('HR')
+
+   do Get_Field_Information ('PAY003CN', 'REPORT_TITLE',  $Pay003cn_ReportTitle,   #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'PAYGRP',        $Pay003cn_PayGrp,        #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'PAY_BEGDT',     $Pay003cn_Pay_BegDt,     #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'PAY_ENDDT',     $Pay003cn_Pay_EndDt,     #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'CHQ',           $Pay003cn_Chq,           #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'ONLN_CHQ',      $Pay003cn_OnLn_Chq,      #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'FNL_CHQ',       $Pay003cn_Fnl_Chq,       #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'ONLN_FNL',      $Pay003cn_Onln_Fnl,      #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'CHQDT',         $Pay003cn_ChqDt,         #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'SIN',           $Pay003cn_SIN,           #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'EMPID',         $Pay003cn_EmpId,         #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'DEPT',          $Pay003cn_Dept,          #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'LOCN',          $Pay003cn_Locn,          #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'JOB_TITLE',     $Pay003cn_Job_Title,     #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'PAY_RT',        $Pay003cn_Pay_Rt,        #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'TAX_DATA',      $Pay003cn_Tax_Data,      #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'NET_CLMAMT',    $Pay003cn_Net_ClmAmt,    #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'SPCL_LETR',     $Pay003cn_Spcl_Letr,     #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'ADDL_PCT',      $Pay003cn_Addl_Pct,      #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'ADDL_AMT',      $Pay003cn_Addl_Amt,      #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'FED',           $Pay003cn_Fed,           #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'QUEBEC',        $Pay003cn_Quebec,        #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'HRS_EARNS',     $Pay003cn_Hrs_Earns,     #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'TAXES',         $Pay003cn_Taxes,         #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'CURRENT',       $Pay003cn_Current,       #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'YTDATE',        $Pay003cn_YTDate,        #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'DESCR',         $Pay003cn_Descr,         #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'CMPRTCD1',      $Pay003cn_CmpCd1,        #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'CMPRTCD2',      $Pay003cn_CmpCd2,        #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'RATE',          $Pay003cn_Rate,          #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'HOURS',         $Pay003cn_Hours,         #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'EARNS',         $Pay003cn_Earns,         #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'CURR1',         $Pay003cn_Curr1,         #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'YTD1',          $Pay003cn_YTD1,          #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'CURR2',         $Pay003cn_Curr2,         #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'YTD2',          $Pay003cn_YTD2,          #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'BEF_TXDED',     $Pay003cn_Bef_TxDed,     #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'AFT_TXDED',     $Pay003cn_Aft_TxDed,     #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'EMPLR_PDBEN',   $Pay003cn_Emplr_PdBen,   #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'TOTAL',         $Pay003cn_Total,         #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'TAXABLE',       $Pay003cn_Taxable,       #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'TOT_GRS',       $Pay003cn_Tot_Grs,       #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'CIT_TX_GRS',    $Pay003cn_CIT_Tx_Grs,    #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'TOT_TX',        $Pay003cn_Tot_Tx,        #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'TOT_DEDN',      $Pay003cn_Tot_Dedn,      #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'NETPAY',        $Pay003cn_NetPay,        #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'PTO_HRS',       $Pay003cn_PTO_Hrs,       #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'ST_BAL',        $Pay003cn_St_Bal,        #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'ERND',          $Pay003cn_Ernd,          #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'BOUGHT',        $Pay003cn_Bought,        #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'TAKEN',         $Pay003cn_Taken,         #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'SOLD',          $Pay003cn_Sold,          #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'ADJ',           $Pay003cn_Adj,           #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'END_BAL',       $Pay003cn_End_Bal,       #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'NETPAY_DSTRBN', $Pay003cn_NetPay_Dstrbn, #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'MSG',           $Pay003cn_Msg,           #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'CHQNO',         $Pay003cn_ChqNo,         #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'DATE',          $Pay003cn_Date,          #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'PAYAMT',        $Pay003cn_PayAmt,        #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'PAYTXT1',       $Pay003cn_PayTxt1,       #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'PAYTXT2',       $Pay003cn_PayTxt2,       #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'PAYTXT3',       $Pay003cn_PayTxt3,       #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'DEPTID',        $Pay003cn_DeptId,        #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'LOCNID',        $Pay003cn_LocnId,        #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'CIT',           $Pay003cn_CIT,           #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'CPP',           $Pay003cn_CPP,           #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'EI',            $Pay003cn_EI,            #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'NWT',           $Pay003cn_NWT,           #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'QIT',           $Pay003cn_QIT,           #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'QPP',           $Pay003cn_QPP,           #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'OTHER',         $Pay003cn_Other,         #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'ADV',           $Pay003cn_Adv,           #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'XFOOT_MSG_1',   $Pay003cn_XFootMsg1,     #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'XFOOT_MSG_2',   $Pay003cn_XFootMsg2,     #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'QIE',           $Pay003cn_QIE,           #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'DATE_IND',      $Pay003cn_Date_Ind,      #dummy_width)
+
+   do Get_Field_Information ('HR',     'BUS_UNIT',        $HR_Bus_Unit,            #dummy_width)
+
+   do Get_Field_Information ('PAY003CN', 'YEARTODT',      $Pay003cn_YrToDt,        #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'PAIDTO',        $Pay003cn_PaidTmOff,     #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'SICKLV',        $Pay003cn_SickLeave,     #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'PAYTYPE',       $Pay003cn_PayType,       #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'AMOUNT',        $Pay003cn_Amount,        #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'ACCNO',         $Pay003cn_Acct_Num,      #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'ACCTYPE',       $Pay003cn_Acct_type,     #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'COFEE',         $Pay003cn_Co_Fee,        #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'PAYFEE',        $Pay003cn_Pay_Fee,       #dummy_width)
+   do Get_Field_Information ('PAY003CN', 'GARN_TTL',      $Pay003cn_Total_Garn,    #dummy_width)
+
+  let $Pay003cn_Curr1  = lpad($Pay003cn_Curr1,8,' ')
+  let $Pay003cn_Rate   = lpad($Pay003cn_Rate,5,' ')
+  let $Pay003cn_YTDL7  = lpad($Pay003cn_YTD1,7,' ')
+  let $Pay003cn_YTDL6  = lpad($Pay003cn_YTD1,6,' ')
+  let $Pay003cn_YTDL10 = lpad($Pay003cn_YTD1,10,' ')
+  let $Pay003cn_Hours =  lpad($Pay003cn_Hours,6,' ')
+
+  let $Pay003cn_Chq2   = rtrim($Pay003cn_Chq,':')
+  let $Pay003cn_Adv2   = rtrim($Pay003cn_Adv,':')
+
+
+end-procedure
+
+!***********************************************************************
+begin-procedure Report
+!***********************************************************************
+
+  if $Prcs_Process_Instance = ''
+    display 'Enter a Beginning Cheque No. if restarting the run; ' noline
+    display 'otherwise leave blank'
+    input $BeginCheque# maxlen=15 'Enter Beginning Cheque No.' type=integer
+    move  $BeginCheque# to #BeginCheque#
+    input $ThruCheque# maxlen=15 'Enter Thru Cheque No.' type=integer
+    if $ThruCheque# = ''
+      move '999999999999' to $ThruCheque#
+    end-if
+    move $ThruCheque# to #ThruCheque#
+    input $ChequeMessage maxlen=110 'Enter Cheque Message'
+  else
+    move #RC_PAYINIT.ChkAdv_No_Start to #BeginCheque#
+    move #RC_PAYINIT.ChkAdv_No_Thru  to #ThruCheque#
+    move $RC_PAYINIT.Message_Text   to $ChequeMessage
+  end-if
+
+end-procedure
+
+
+!***********************************************************************
+begin-procedure Get-Paycheques
+!***********************************************************************
+
+let $prev_emp_lang = ' '
+let $save_prev_emp_lang = ' '
+
+begin-SELECT
+A.COMPANY,A.PAYGROUP,A.PAY_BEGIN_DT,A.PAY_END_DT,A1.BALANCE_ID
+A1.BALANCE_YEAR,A1.BALANCE_PERIOD,A.CHECK_DT
+B.OFF_CYCLE,B.PAGE_NUM,B.LINE_NUM,B.SEPCHK
+B.FORM_ID,B.PAYCHECK_NBR,B.CHECK_DT
+B.EMPLID,B.EMPL_RCD,B.NAME,B.PAYCHECK_NAME,B.ADDRESS1,B.ADDRESS2,B.CITY,B.STATE,B.POSTAL
+B.PAYCHECK_OPTION,B.PAYCHECK_ADDR_OPTN
+B.TOTAL_GROSS,B.TOTAL_TAXES,B.TOTAL_DEDUCTIONS,B.NET_PAY
+B.PAY_SHEET_SRC, B.BUSINESS_UNIT
+G.EFFDT, B.UPDATE_DT
+P.LANG_CD
+  !show 'emplid ' &B.EMPLID
+  let $curr_emp_lang = &P.LANG_CD
+  let $save_prev_emp_lang = $prev_emp_lang
+
+  if $prcs_language_option = 'R'
+      if not ISNULL(&P.LANG_CD)
+         if $curr_emp_lang  <> $prev_emp_lang
+
+         ! Call Report-Translation only if the current language is different !
+         ! from the previous one.                                            !
+
+             let $curr_language_cd = $curr_emp_lang
+             let $language_cd      = $curr_emp_lang
+             do Report-Translation
+
+             let $Ldnumtrn_appended = ''
+             do Load-NumberLits-Array
+
+         end-if
+      else
+
+         ! if language code is not defined for the Recipient level, then use !
+         ! system default - installation language($PSOptions_language_cd)    !
+
+         let $curr_language_cd = $PsOptions_language_cd
+         if $prev_emp_lang    <> $PsOptions_language_cd
+            do Report-Translation
+         end-if
+       end-if
+       let $prev_emp_lang = $curr_emp_lang
+  end-if
+
+  let $bus_unit  = &B.Business_unit
+  if &A.Company <> $Company or $curr_emp_lang <> $save_prev_emp_lang
+    move &A.Company    to $Company
+    move &A.Pay_End_Dt to $AsOfDate
+    do Get-Company-Data
+    move ''            to $PayGroup
+  end-if
+
+  if &A.PayGroup <> $PayGroup or $curr_emp_lang <> $save_prev_emp_lang
+    move &A.PayGroup   to $PayGroup
+    move &A.Pay_End_Dt to $AsOfDate
+    do Get-PayGroup-Data
+  end-if
+
+  do Reset-Variables
+
+  do Get-Ee-Job-Data
+  do Get-Ee-Tax-Data
+
+  do Get-Earnings-Detail
+  do Get-Taxes-Detail
+  do Get-Deductions-Detail
+  do Get-Cheque-Balances
+
+  let $adv_acct_type = ''
+  let $deposit_acct_nbr = ''
+  let $deposit_acct_nbr_chckngs = ''
+  let $deposit_acct_nbr_savings = ''
+  let #chkg_ctr = 0
+  let #svng_ctr = 0
+
+  let $adv_checkings = ''
+  let $adv_savings = ''
+  let $chk_issued = ''
+
+  if &B.PayCheck_Option = '&'           !both advice and cheque
+    do Get-Net-Pay-Distribution
+  else
+    let $FieldName  = 'ACCOUNT_TYPE'
+    let $FieldValue = '$'
+    do Read-Translate-Table
+    move $XLatShortName to $chk_issued
+    move &B.Net_Pay     to #ChequeNetPay
+  end-if
+
+  do Get-Vacation-Balances
+
+  if $FirstRecord = 'Y'
+
+     let $FirstRecord = 'N'
+     let $PY_PSLP_PROCNAME = 'PrtCheque'
+
+     if $RC_PAYINIT.Text15 = $Create_XML_DATA
+        do Insert-SSP-Temporary-Guide-Hdr
+        do Write-1st-SSP-XML-Data
+        let $xmltag = 'CAN_CHEQUE'
+        let $xmloutput_line = ''
+        let $xmloutput_line = $xmlcntrl_begin || $xmltag || $xmlcntrl_end
+        write #outputfile  from $xmloutput_line
+     end-if
+
+  end-if
+
+  if $RC_PAYINIT.Text15 = $Create_XML_DATA
+
+     do Get-Unique-Burst-Value
+
+     let $burstfilename  = $xmlssp_burst || '.xml'
+     let $xmlssp_filenm2 = '{IMPORTPREFIX}' || $burstfilename || '{IMPORTSUFFIX}'
+
+     open $xmlssp_filenm2 as 20 for-writing record=150:vary
+     write #outputfile2 from '<?xml version="1.0" encoding="Windows-1252"?>'
+
+     let $xmltag = 'CAN_CHEQUE'
+     let $xmloutput_line = ''
+     let $xmloutput_line = $xmlcntrl_begin || $xmltag || $xmlcntrl_end
+     write #outputfile2  from $xmloutput_line
+
+     let $xmltag = 'G_EMP_DATA'
+     do Process-SSP-XML-Tag-Beg
+
+     if #RC_PAYINIT.PY_BATCH_SIZE > 0
+        add 1 to #xmlssp_btch_ctr
+        if #xmlssp_btch_ctr > #RC_PAYINIT.PY_BATCH_SIZE
+           move 1 to #xmlssp_btch_ctr
+           add  1 to #xmlssp_batch_id
+        end-if
+     end-if
+
+     do SSP-Statement
+
+     if &B.PAYCHECK_OPTION <> 'M'
+        do SSP-Cheque
+     end-if
+
+     do Insert-SSP-Temporary-Guide-Dtl
+
+     let $xmltag = 'G_EMP_DATA'
+     do Process-SSP-XML-Tag-End
+
+     let $xmltag = 'CAN_CHEQUE'
+     let $xmloutput_line = ''
+     let $xmloutput_line = $xmlcntrl_begin || $xmltag_end || $xmltag || $xmlcntrl_end
+     write #outputfile2 from $xmloutput_line
+
+     close #outputfile2
+
+  else
+
+     do Print-Statement
+     do Print-Cheque
+  end-if
+
+  add 1             to #TotalCheques
+  add #ChequeNetPay to #TotalNetPay
+
+FROM  PS_PAY_CALENDAR  A, PS_PAY_CAL_BAL_ID A1,
+      PS_PAY_CHECK     B,
+      PS_PAYGROUP_TBL  G,
+      PS_PERSONAL_DT_FST P
+WHERE [$SlctCalendar]
+  AND A.COMPANY = A1.COMPANY AND A.PAYGROUP = A1.PAYGROUP
+  AND A.PAY_END_DT = A1.PAY_END_DT AND A1.BALANCE_ID = $Calendar_Year_Id
+  AND B.OFF_CYCLE IN ($SlctOffCycleA, $SlctOffCycleB)
+  AND B.PAGE_NUM BETWEEN #SlctPageFrom AND #SlctPageThru
+  AND B.COMPANY         = A.COMPANY
+  AND B.PAYGROUP        = A.PAYGROUP
+  AND B.PAY_END_DT      = A.PAY_END_DT
+  AND B.PAYCHECK_NBR         <> 0
+  AND B.PAYCHECK_NBR         >= #BeginCheque#
+  AND B.PAYCHECK_NBR         <= #ThruCheque#
+  AND (($RC_PAYINIT.PY_SSP_MAN_CHK = 'R' AND B.PAYCHECK_OPTION IN ('C','&')) OR
+       ($RC_PAYINIT.PY_SSP_MAN_CHK = 'M' AND B.PAYCHECK_OPTION = 'M'))
+  AND B.PAYCHECK_STATUS = 'F'
+  AND B.EMPLID         >= $RC_PAYINIT.Emplid_From
+  AND B.EMPLID         <= $RC_PAYINIT.Emplid_To
+  AND G.COMPANY         = A.COMPANY
+  AND G.PAYGROUP        = A.PAYGROUP
+  AND G.COUNTRY         = $Country
+  AND G.EFFDT           =
+    (SELECT MAX(EFFDT)
+       FROM PS_PAYGROUP_TBL
+      WHERE COMPANY    = A.COMPANY
+        AND PAYGROUP   = A.PAYGROUP
+        AND EFF_STATUS = 'A'
+        AND EFFDT     <= A.PAY_END_DT)
+  AND B.EMPLID         = P.EMPLID
+ORDER BY B.FORM_ID,
+         B.PAYCHECK_NBR
+end-SELECT
+
+end-procedure
+
+
+!***********************************************************************
+begin-procedure Get-Company-Data
+!***********************************************************************
+
+begin-SELECT
+CT.DESCR,CT.ADDRESS1,CT.ADDRESS2,CT.CITY,CT.STATE,CT.POSTAL,CT.EFFDT
+
+  let $CompanyName      = &CT.Descr
+  let $CompanyCityState =
+      rtrim(&CT.City,' ') || ' ' || rtrim(&CT.State,' ') || '  ' || &CT.Postal
+
+  let $CompanyAddrLine1   = &CT.Address1
+  let $CompanyAddrLine3   = ''
+  if rtrim(&CT.Address2,' ') = ''
+    let $CompanyAddrLine2 = $CompanyCityState
+  else
+    let $CompanyAddrLine2 = &CT.Address2
+    let $CompanyAddrLine3 = $CompanyCityState
+  end-if
+  let $Basedate           = &CT.EFFDT
+
+FROM  PS_COMPANY_TBL CT
+WHERE COMPANY = &A.COMPANY
+  AND EFFDT   =
+    (SELECT MAX(EFFDT)
+       FROM PS_COMPANY_TBL
+       WHERE COMPANY = CT.COMPANY
+        AND EFFDT   <= &A.PAY_END_DT)
+end-SELECT
+
+!---------------------------------------------------------------!
+! Only retrieve data from the related language table if         !
+! the operator language is not the same to the installation     !
+! language or $curr_language_cd  is different from $language_cd !
+!---------------------------------------------------------------!
+
+    if $curr_language_cd <> $Psoptions_Language_Cd
+       do Get_Rel_Lang_Comp
+    end-if
+
+end-procedure
+
+
+!********************************!
+begin-procedure Get_Rel_Lang_Comp
+!********************************!
+
+begin-SELECT
+CTL.DESCR
+
+   if rtrim(&CTL.Descr,' ') <> ''
+        let $CompanyName       = rtrim(&CTL.Descr,' ')
+   end-if
+
+FROM  PS_COMPNY_TBL_LANG CTL
+WHERE CTL.COMPANY       = &A.COMPANY
+  AND CTL.LANGUAGE_CD   = $curr_language_cd
+  AND CTL.EFFDT         =
+     (SELECT MAX(EFFDT)
+      FROM   PS_COMPNY_TBL_LANG
+      WHERE  COMPANY      = CTL.COMPANY
+        AND  LANGUAGE_CD  = $curr_language_cd
+        AND  EFFDT        <= $Basedate)
+end-SELECT
+
+end-procedure
+
+
+!***********************************************************************
+begin-procedure Get-PayGroup-Data
+!***********************************************************************
+
+begin-SELECT
+PG.DESCR
+PG.ERNCD_REG_HRS,PG.ERNCD_OT_HRS,PG.ERNCD_REG_EARNS
+PG.SRC_BANK_ID,PG.EFFDT
+SB.SRC_BANK_ID,SB.BANK_CD,SB.BRANCH_EC_CD,SB.ACCOUNT_EC_ID
+BT.BANK_NM,BT.ADDRESS1,BT.ADDRESS2,BT.CITY,BT.STATE,BT.POSTAL
+
+  let $PayGroupName = &PG.DESCR
+  let $TransitNum   = &SB.BRANCH_EC_CD || 'D' || &SB.BANK_CD
+  let $AccountNum   = translate(rtrim(&SB.ACCOUNT_EC_ID,' '),'-','D')
+
+  let $ErnCd = &PG.ErnCd_Reg_Hrs
+  do Get-Earnings-Name
+  let $ShiftDiffEligRegular = $ShiftDiffElig
+  let #FactorMultRegular    = #FactorMult
+
+ ! If length(rtrim($EarningsName,' ')) < 22
+    move $EarningsName to $EarnNameRegHrs
+ ! else
+ !   move $EarningsAbbrv to $EarnNameRegHrs
+ ! End-if
+
+  let $ErnCd = &PG.ErnCd_OT_Hrs
+  do Get-Earnings-Name
+  let $ShiftDiffEligOT = $ShiftDiffElig
+  let #FactorMultOT    = #FactorMult
+
+ ! If length(rtrim($EarningsName,' ')) < 22
+    move $EarningsName to $EarnNameOTHrs
+ ! else
+ !   move $EarningsAbbrv to $EarnNameOTHrs
+ ! End-if
+
+  let $ErnCd = &PG.ErnCd_Reg_Earns
+  do Get-Earnings-Name
+
+ ! If length(rtrim($EarningsName,' ')) < 22
+    move $EarningsName to $EarnNameRegEarns
+ ! else
+ !   move $EarningsAbbrv to $EarnNameRegEarns
+ ! End-if
+
+
+  let $BankName        = &BT.BANK_NM
+  let $BankCityState   =
+      rtrim(&BT.CITY,' ') || ' ' || rtrim(&BT.STATE,' ') || '  ' || &BT.POSTAL
+
+  let $BankAddrLine1   = &BT.ADDRESS1
+  let $BankAddrLine3   = ''
+  if rtrim(&BT.Address2,' ') = ''
+    let $BankAddrLine2 = $BankCityState
+  else
+    let $BankAddrLine2 = &BT.ADDRESS2
+    let $BankAddrLine3 = $BankCityState
+  end-if
+  let $Basedate        = &PG.EFFDT
+
+!-------------------------------------------------------------------------!
+! Only retrieve data from the related language table if                   !
+! the operator language is not the same to the installation               !
+! language or $curr_language_cd  is different from $PsOptions_Language_Cd !
+!-------------------------------------------------------------------------!
+
+  if $curr_language_cd <> $PsOptions_Language_Cd
+     do Get-Rel-Lang-Pay
+  end-if
+
+FROM  PS_PAYGROUP_TBL PG,
+      PS_SRC_BANK SB,
+      PS_BANK_EC_TBL BT
+WHERE PG.COMPANY  = &A.COMPANY
+  AND PG.PAYGROUP = &A.PAYGROUP
+  AND PG.COUNTRY  = $Country
+  AND PG.EFFDT    = &G.EFFDT
+  AND PG.SRC_BANK_ID  = SB.SRC_BANK_ID
+  AND BT.COUNTRY      = PG.COUNTRY
+  AND BT.BANK_CD      = SB.BANK_CD
+end-SELECT
+
+end-procedure
+
+
+!*******************************!
+begin-procedure Get-Rel-Lang-Pay
+!*******************************!
+
+begin-SELECT
+
+PGL.DESCR,PGL.DESCRSHORT
+
+  let $PayGroupName           = &PGL.DESCR
+
+FROM  PS_PAYGROUP_LANG PGL
+
+WHERE PGL.COMPANY     = &A.COMPANY
+  AND PGL.PAYGROUP    = &A.PAYGROUP
+  AND PGL.LANGUAGE_CD = $CURR_LANGUAGE_CD
+  AND PGL.EFFDT       =
+         (SELECT MAX(EFFDT)
+          FROM  PS_PAYGROUP_LANG
+          WHERE COMPANY     = &A.COMPANY
+            AND PAYGROUP    = &A.PAYGROUP
+            AND LANGUAGE_CD = PGL.LANGUAGE_CD
+            AND EFFDT       <= $Basedate)
+end-SELECT
+
+end-procedure
+
+
+!***********************************************************************
+begin-procedure Get-Ee-Job-Data
+!***********************************************************************
+
+begin-SELECT
+J.DEPTID,J.JOBCODE,J.LOCATION,J.COMPRATE
+P.NAME,
+J.BUSINESS_UNIT
+J.SETID_JOBCODE
+FQ.FREQUENCY_TYPE
+
+  let $BU       = rtrim(&J.BUSINESS_UNIT,' ')
+  let $DeptID   = rtrim(&J.DeptID,' ')
+  do Get-Department-Name
+  let $SetID = rtrim(&J.SetID_JobCode, ' ')
+  let $JobCode  = rtrim(&J.JobCode,' ')
+  do Get-Job-Title
+  move &J.Business_unit to $Busunit
+  let $Recname  = 'LOCATION_TBL'
+  do Get-Setid($Busunit, $Recname, $Setid)
+  let $Location = rtrim(&J.Location,' ')
+  do Get-Location-Name
+
+  let $FieldName  = 'FREQUENCY_TYPE'
+  let $FieldValue = &FQ.FREQUENCY_TYPE
+  do Read-Translate-Table
+  move $XLatLongName to $CompFrequency
+
+  let $Name = &P.Name
+  do Rotate-Name
+  move $Name to $HomeName
+
+  Do Get-Empl-Address (&B.Emplid,'HOME', $AddressFound)
+
+   let $ADDRESS1 = $GETADDR_Address1
+   let $ADDRESS2 = $GETADDR_Address2
+   let $CITY = $GETADDR_CITY
+   let $STATE =$GETADDR_STATE
+   let $POSTAL   = $GETADDR_POSTAL
+
+  let $HomeCityState =
+      rtrim($City,' ') || ' ' || rtrim($State,' ') || '  ' || $Postal
+
+  let $HomeAddrLine1   = $Address1
+  let $HomeAddrLine3   = ''
+  if rtrim($Address2,' ') = ''
+    let $HomeAddrLine2 = $HomeCityState
+  else
+    let $HomeAddrLine2 = $Address2
+    let $HomeAddrLine3 = $HomeCityState
+  end-if
+
+FROM  PS_JOB           J,
+      PS_NAMES P,
+      PS_FREQUENCY_TBL FQ
+WHERE P.EMPLID            = J.EMPLID
+  AND J.EMPLID            = &B.EmplID
+  AND J.EMPL_RCD         = &B.EMPL_RCD
+  AND J.COMPANY          = &A.COMPANY
+  AND J.EFFDT             =
+    (SELECT MAX(EFFDT)
+       FROM PS_JOB
+      WHERE EMPLID    = J.EMPLID
+        AND EMPL_RCD = J.EMPL_RCD
+        AND COMPANY = J.COMPANY
+        AND EFFDT    <= &A.Pay_End_Dt)
+  AND J.EFFSEQ =
+    (SELECT MAX(EFFSEQ)
+       FROM PS_JOB
+      WHERE EMPLID    = J.EMPLID
+        AND EMPL_RCD = J.EMPL_RCD
+        AND COMPANY = J.COMPANY
+        AND EFFDT     = J.EFFDT)
+  AND J.COMP_FREQUENCY    = FQ.FREQUENCY_ID
+  AND FQ.EFF_STATUS       = 'A'
+  AND FQ.EFFDT            =
+    (SELECT MAX(FQ1.EFFDT)
+       FROM PS_FREQUENCY_TBL FQ1
+      WHERE FQ1.FREQUENCY_ID   = FQ.FREQUENCY_ID
+        AND FQ1.EFF_STATUS     = FQ.EFF_STATUS
+        AND FQ1.EFFDT         <= J.EFFDT)
+  AND P.NAME_TYPE = 'PRI'
+  AND P.EFFDT =
+      (SELECT MAX(PN.EFFDT)
+       FROM   PS_NAMES PN
+       WHERE  PN.EMPLID    = P.EMPLID
+         AND  PN.NAME_TYPE = P.NAME_TYPE
+         AND  PN.EFFDT    <= $AsOfToday)
+end-SELECT
+
+end-procedure
+
+
+!***********************************************************************
+begin-procedure Get-Ee-Tax-Data
+!***********************************************************************
+
+begin-SELECT
+FT.CIT_NET_CLAIM_AMT,FT.CIT_SPECIAL_LTRS,FT.CIT_ADDL_PCT,FT.CIT_ADDL_AMT
+FT.QIT_NET_CLAIM_AMT,FT.QIT_SPECIAL_LTRS,FT.QIT_ADDL_PCT,FT.QIT_ADDL_AMT
+
+FROM  PS_CAN_TAX_DATA FT
+WHERE FT.EMPLID   = &B.EmplID
+  AND FT.COMPANY  = &A.Company
+  AND FT.EFFDT    =
+    (SELECT MAX(EFFDT)
+       FROM PS_CAN_TAX_DATA
+      WHERE EMPLID  = FT.EMPLID
+        AND COMPANY = FT.COMPANY
+        AND CREATION_DT <= &B.UPDATE_DT
+        AND EFFDT  <= &A.Check_Dt)
+end-SELECT
+
+end-procedure
+
+
+!***********************************************************************
+begin-procedure Get-Earnings-Detail
+!***********************************************************************
+
+begin-SELECT
+!E.HOURLY_RT
+E.REG_HRS,E.REG_HRLY_EARNS
+E.OT_HRS,E.OT_HRLY_EARNS
+E.REG_EARNS
+E.COMP_RATECD_REG
+E.COMP_RATECD_OT
+E.COMPRATE_USED_REG
+E.COMPRATE_USED_OT
+E.ADDL_NBR
+E.RATE_USED
+E.SHIFT_RT
+  move &E.Shift_Rt                 to #ShiftRate
+  let #k = 1
+  WHILE #k <= 3
+    evaluate #k
+      when = 1
+        move &PG.ErnCd_Reg_Hrs     to $Code
+        move $EarnNameRegHrs       to $Name
+        move &E.Comp_Ratecd_Reg    to $CmpRtCd
+!       move &E.Hourly_Rt          to #Rate
+        move &E.Comprate_used_reg  to #Rate
+        move &E.Reg_Hrs            to #Hours
+        move &E.Reg_Hrly_Earns     to #Earns
+        move ''                    to $RateUsed
+        move $ShiftDiffEligRegular to $ShiftDiffElig
+        move #FactorMultRegular    to #FactorMult
+        do Test-For-Rate-Recalc
+      when = 2
+        move &PG.ErnCd_OT_Hrs      to $Code
+        move $EarnNameOTHrs        to $Name
+        move &E.Comp_Ratecd_Ot     to $CmpRtCd        !++
+        move &E.Comprate_used_Ot   to #Rate           !++
+        move &E.OT_Hrs             to #Hours
+        move &E.OT_Hrly_Earns      to #Earns
+        move &E.Rate_Used          to $RateUsed
+        move $ShiftDiffEligOT      to $ShiftDiffElig
+        move #FactorMultOT         to #FactorMult
+        do Test-For-Rate-Recalc
+      when = 3
+        move &PG.ErnCd_Reg_Earns   to $Code
+        move $EarnNameRegEarns     to $Name
+        move ''                    to $CmpRtCd        !++
+        move 0                     to #Rate
+        move 0                     to #Hours
+        move &E.Reg_Earns          to #Earns
+     end-evaluate
+     move #RatesRow                to #i
+     do Update-ETDarray-Current-Earnings
+     add 1 to #k
+  END-WHILE
+  do Get-Other-Earnings-Detail
+FROM  PS_PAY_EARNINGS E
+WHERE E.COMPANY    = &A.Company
+  AND E.PAYGROUP   = &A.PayGroup
+  AND E.PAY_END_DT = &A.Pay_End_Dt
+  AND E.OFF_CYCLE  = &B.Off_Cycle
+  AND E.PAGE_NUM      = &B.PAGE_NUM
+  AND E.LINE_NUM      = &B.LINE_NUM
+  AND E.SEPCHK     = &B.SepChk
+  AND E.SINGLE_CHECK_USE IN ('C', 'N')
+ORDER BY E.ADDL_NBR
+end-SELECT
+  do Get-Earning-Balances
+end-procedure
+
+
+!***********************************************************************
+begin-procedure Get-Other-Earnings-Detail
+!***********************************************************************
+
+begin-SELECT
+OE.ERNCD
+  let $ErnCd = &OE.ErnCd
+  do Get-Earnings-Name
+OE.COMP_RATECD
+OE.COMPRATE_USED
+OE.OTH_HRS
+OE.OTH_EARNS
+OE.OTH_PAY
+OE.HRS_DIST_SW
+OE.RATE_USED
+  move $ErnCd            to $Code
+
+ ! If length(rtrim($EarningsName,' ')) < 22
+    move $EarningsName to $Name
+ ! else
+ !   move $EarningsAbbrv to $Name
+ ! End-if
+
+  do Check-Override-Rate
+
+  move &OE.Comp_Ratecd   to $CmpRtCd        !++
+
+  if $override-yes = 'Y'
+    move &OV.Perunit_Ovr_Rt to #Rate
+  else
+    if &OE.OTH_HRS <> 0 and &OE.OTH_PAY <> 0
+      move 0                  to #Rate
+    else
+      move &OE.Comprate_used  to #Rate
+    end-if
+  end-if
+
+  if &OE.HRS_DIST_SW = 'Y'
+    move 0                   to #Rate
+    move 0                   to #Hours
+  else
+    move &OE.Oth_Hrs   to #Hours
+  end-if
+
+  move &OE.Oth_Earns to #Earns
+  move &OE.Rate_Used to $RateUsed
+  do Test-For-Rate-Recalc
+
+  move #RatesRow     to #i
+  do Update-ETDarray-Current-Earnings
+FROM  PS_PAY_OTH_EARNS OE
+WHERE OE.COMPANY    = &A.Company
+  AND OE.PAYGROUP   = &A.PayGroup
+  AND OE.PAY_END_DT = &A.Pay_End_Dt
+  AND OE.OFF_CYCLE  = &B.Off_Cycle
+  AND OE.PAGE_NUM      = &B.PAGE_NUM
+  AND OE.LINE_NUM      = &B.LINE_NUM
+  AND OE.SEPCHK     = &B.SepChk
+  AND OE.ADDL_NBR      = &E.ADDL_NBR
+ORDER BY OE.ERNCD
+end-SELECT
+
+end-procedure
+
+
+!***********************************************************************
+begin-procedure Check-Override-Rate
+!***********************************************************************
+
+  let $override-yes = 'N'
+
+begin-SELECT
+OV.PERUNIT_OVR_RT
+
+  let $override-yes = 'Y'
+
+FROM  PS_EARNINGS_TBL OV
+WHERE OV.ERNCD        = &OE.ERNCD
+  AND OV.EFF_STATUS   = 'A'
+  AND OV.PAYMENT_TYPE = 'U'
+  AND OV.EFFDT        =
+     (SELECT MAX(EFFDT)
+        FROM PS_EARNINGS_TBL
+       WHERE ERNCD         = OV.ERNCD
+         AND EFF_STATUS    = OV.EFF_STATUS
+         AND EFFDT        <= &A.Pay_End_Dt)
+end-SELECT
+
+end-procedure
+
+
+!***********************************************************************
+begin-procedure Test-For-Rate-Recalc
+!***********************************************************************
+
+  if #Rate <> 0 and #Hours <> 0 and #Earns <> 0
+
+    let #wEarns = #Rate * #Hours
+    let #wEarns = #wEarns - #Earns
+
+    if #wEarns > .01 or #wEarns < -.01
+
+      if $RateUsed = 'F' or $RateUsed = 'A'
+        or #FactorHrsAdj <> 0 or #FactorErnAdj <> 0
+        move 'Y' to $NeedXfootMsg
+      else
+        if $ShiftDiffElig = 'Y'
+          let #Rate = (#Rate + #ShiftRate + #FactorRateAdj) * #FactorMult
+        else
+          let #Rate = (#Rate + #FactorRateAdj) * #FactorMult
+        end-if
+
+        let #wEarns = #Rate * #Hours
+        let #wEarns = #wEarns - #Earns
+
+        if #wEarns > .01 or #wEarns < -.01
+          let #Rate = #Earns / #Hours
+        end-if
+
+        if #Rate < 0
+          let #Rate = #Rate * -1
+        end-if
+      end-if
+    end-if
+  end-if
+
+end-procedure
+
+
+!***********************************************************************
+begin-procedure Get-Earning-Balances
+!***********************************************************************
+
+  let #Cur = 0
+
+begin-SELECT
+EB.EMPL_RCD, EB.ERNCD,EB.HRS_YTD,EB.GRS_YTD
+
+  let $ErnCd = &EB.ErnCd
+  do Get-Earnings-Name
+  let $Code = $ErnCd
+  let $Name = $EarningsName
+
+  let #k = 1
+  WHILE #k <= 3
+    evaluate #k
+      when = 1
+        move 0           to #YTD
+        move #RatesRow   to #i
+      when = 2
+        move &EB.Hrs_YTD to #YTD
+        move #HoursRow   to #i
+      when = 3
+        move &EB.Grs_YTD to #YTD
+        move #EarnsRow   to #i
+    end-evaluate
+    do Update-ETDarray
+    add 1 to #k
+  END-WHILE
+
+FROM  PS_CAN_ERN_BALANCE EB
+WHERE EB.EMPLID        = &B.EmplID
+  AND EB.COMPANY       = &A.Company
+  AND EB.BALANCE_ID    = &A1.BALANCE_ID
+  AND EB.BALANCE_YEAR  = &A1.BALANCE_YEAR
+  AND EB.SPCL_BALANCE  = 'N'
+  AND EB.BALANCE_PERIOD      =
+    (SELECT MAX(BALANCE_PERIOD)
+       FROM PS_CAN_ERN_BALANCE
+      WHERE EMPLID         = EB.EMPLID
+        AND EMPL_RCD       = EB.EMPL_RCD
+        AND COMPANY        = EB.COMPANY
+        AND BALANCE_ID    = EB.BALANCE_ID
+        AND BALANCE_YEAR  = EB.BALANCE_YEAR
+        AND WAGE_LOSS_PLAN = EB.WAGE_LOSS_PLAN
+        AND PROVINCE       = EB.PROVINCE
+        AND SPCL_BALANCE   = EB.SPCL_BALANCE
+        AND ERNCD          = EB.ERNCD
+        AND BALANCE_PERIOD       <= &A1.BALANCE_PERIOD)
+ORDER BY EB.EMPL_RCD, EB.ERNCD
+end-SELECT
+
+end-procedure
+
+
+!***********************************************************************
+begin-procedure Get-Taxes-Detail
+!***********************************************************************
+
+  let #YTD = 0
+  let #i   = #TaxesRow
+
+  let #k = 1
+  WHILE #k <= 9
+    evaluate #k
+      when = 1
+        move 'CIT'                to $Code
+        move $Pay003cn_CIT        to $Name
+        move 'CIT'                to $TaxType
+      when = 2
+        move 'T4A'                to $TaxType
+      when = 3
+        move 'CPP'                to $Code
+        move $Pay003cn_CPP        to $Name
+        move 'CPP'                to $TaxType
+      when = 4
+        move 'EIEE'               to $Code
+        move $Pay003cn_EI         to $Name
+        move 'EIE'                to $TaxType
+      when = 5
+        move 'Payroll'            to $Code
+        move $Pay003cn_NWT        to $Name
+        move 'PYT'                to $TaxType
+      when = 6
+        move 'QIT'                to $Code
+        move $Pay003cn_QIT        to $Name
+        move 'QIT'                to $TaxType
+      when = 7
+        move 'RV2'                to $TaxType
+      when = 8
+        move 'QPP'                to $Code
+        move $Pay003cn_QPP        to $Name
+        move 'QPP'                to $TaxType
+      when = 9
+        move 'QIE'                to $Code
+        move $Pay003cn_QIE        to $Name
+        move 'QIE'                to $TaxType
+    end-evaluate
+
+    do Get-TaxType-Detail
+
+    move #TaxType_Amt          to #Cur
+
+    if #Cur <> 0
+       do Update-ETDarray
+    end-if
+    add 1 to #k
+  END-WHILE
+
+  do Get-Tax-Balances
+end-procedure
+
+begin-procedure Get-TaxType-Detail
+
+  move 0.00 to #TaxSum
+
+begin-SELECT
+T.TAX_CUR
+T.TXGRS_CUR
+
+  add &T.TAX_CUR to #TaxSum
+
+  if $TaxType = 'CIT'
+     add &T.TXGRS_CUR to #FedTaxGrossCur   round=2
+  end-if
+
+FROM  PS_PAY_TAX_CAN T
+WHERE T.COMPANY       = &A.Company
+  AND T.PAYGROUP      = &A.PayGroup
+  AND T.PAY_END_DT    = &A.Pay_End_Dt
+  AND T.OFF_CYCLE     = &B.Off_Cycle
+  AND T.PAGE_NUM         = &B.PAGE_NUM
+  AND T.LINE_NUM         = &B.LINE_NUM
+  AND T.SEPCHK        = &B.SepChk
+  AND T.TAX_CLASS_CAN = $TaxType
+end-SELECT
+
+  move #TaxSum to #TaxType_Amt
+
+end-procedure
+
+
+!***********************************************************************
+begin-procedure Get-Tax-Balances
+!***********************************************************************
+
+  let #Cur = 0
+
+  let #k = 1
+  WHILE #k <= 9
+    evaluate #k
+      when = 1
+        move 'CIT'                to $Code
+        move $Pay003cn_CIT        to $Name
+        move 'CIT'                to $TaxType
+      when = 2
+        move 'T4A'                to $TaxType
+      when = 3
+        move 'CPP'                to $Code
+        move $Pay003cn_CPP        to $Name
+        move 'CPP'                to $TaxType
+      when = 4
+        move 'EIEE'               to $Code
+        move $Pay003cn_EI         to $Name
+        move 'EIE'                to $TaxType
+      when = 5
+        move 'Payroll'            to $Code
+        move $Pay003cn_NWT        to $Name
+        move 'PYT'                to $TaxType
+      when = 6
+        move 'QIT'                to $Code
+        move $Pay003cn_QIT        to $Name
+        move 'QIT'                to $TaxType
+      when = 7
+        move 'RV2'                to $TaxType
+      when = 8
+        move 'QPP'                to $Code
+        move $Pay003cn_QPP        to $Name
+        move 'QPP'                to $TaxType
+      when = 9
+        move 'QIE'                to $Code
+        move $Pay003cn_QIE        to $Name
+        move 'QIE'                to $TaxType
+    end-evaluate
+
+    do Get-TaxType-YTD
+
+    move #TaxType_Amt          to #YTD
+
+    if #YTD <> 0
+       do Update-ETDarray
+    end-if
+    add 1 to #k
+  END-WHILE
+
+end-procedure
+
+begin-procedure Get-TaxType-YTD
+
+  move 0.00 to #TaxSum
+
+begin-SELECT
+TB.TAX_YTD
+TB.TXGRS_YTD
+
+  add &TB.TAX_YTD to #TaxSum
+
+  if $TaxType = 'CIT'
+     add &TB.TXGRS_YTD to #FedTaxGrossYTD  round=2
+  end-if
+
+FROM  PS_CAN_TAX_BALANCE TB
+WHERE TB.EMPLID        = &B.EmplID
+  AND TB.COMPANY       = &A.Company
+  AND TB.BALANCE_ID    = &A1.BALANCE_ID
+  AND TB.BALANCE_YEAR  = &A1.BALANCE_YEAR
+  AND TB.TAX_CLASS_CAN = $TaxType
+  AND TB.BALANCE_PERIOD      =
+    (SELECT MAX(BALANCE_PERIOD)
+       FROM PS_CAN_TAX_BALANCE
+      WHERE EMPLID         = TB.EMPLID
+        AND COMPANY        = TB.COMPANY
+        AND BALANCE_ID     = TB.BALANCE_ID
+        AND BALANCE_YEAR   = TB.BALANCE_YEAR
+        AND WAGE_LOSS_PLAN = TB.WAGE_LOSS_PLAN
+        AND PROVINCE       = TB.PROVINCE
+        AND TAX_CLASS_CAN  = TB.TAX_CLASS_CAN
+        AND BALANCE_PERIOD <= &A1.BALANCE_PERIOD)
+end-SELECT
+
+  move #TaxSum to #TaxType_Amt
+
+end-procedure
+
+!***********************************************************************
+begin-procedure Get-Deductions-Detail
+!***********************************************************************
+
+  let #YTD = 0
+
+begin-SELECT
+N.PLAN_TYPE,N.DEDCD,N.DED_CLASS,N.DED_CUR
+
+
+  let $PlanType = &N.Plan_Type
+  let $DedCd    = &N.DedCd
+  do Get-Deduction-Name
+
+  if $SpclProcess = 'G'
+    do Get-Garnishment-Detail
+  else
+    let $Code = &N.Plan_Type || &N.DedCd
+    let $Name = $DeductionName
+
+    evaluate &N.Ded_Class
+      when = 'B'           !Before-tax deductions
+        move 'B'             to $DedClass
+        move #PreTaxDedsRow  to #i
+      when = 'A'           !After-tax deductions
+        move 'A'             to $DedClass
+        move #PostTaxDedsRow to #i
+      when = 'N'           !Non-taxable benefits
+      when = 'P'
+        move 'N'             to $DedClass
+        move #BenefitsRow    to #i
+      when = 'L'           !Taxable benefits
+      when = 'T'
+        move 'T'             to $DedClass
+        move #BenefitsRow    to #i
+        concat '*' with $Name
+      when-other
+        move ' '             to $DedClass
+        move #PostTaxDedsRow to #i
+    end-evaluate
+
+    concat $DedClass with $Code
+    move &N.Ded_Cur    to #Cur
+    do Update-ETDarray
+  end-if
+
+FROM  PS_PAY_DEDUCTION N
+WHERE N.COMPANY    = &A.Company
+  AND N.PAYGROUP   = &A.PayGroup
+  AND N.PAY_END_DT = &A.Pay_End_Dt
+  AND N.OFF_CYCLE  = &B.Off_Cycle
+  AND N.PAGE_NUM      = &B.PAGE_NUM
+  AND N.LINE_NUM      = &B.LINE_NUM
+  AND N.SEPCHK     = &B.SepChk
+end-SELECT
+  do Get-Deduction-Balances
+end-procedure
+
+
+!**********************************************************************
+begin-procedure Get-Garnishment-Detail
+!**********************************************************************
+
+  let #YTD = 0
+
+begin-SELECT
+GR.GARNID, GR.DEDUCT_AMT
+GR.DEDUCT_GARN_AMT, GR.DEDUCT_CMPNY_FEE, GR.DEDUCT_PAYEE_FEE
+GR.DEDCD
+
+  if &N.DEDCD = &GR.DEDCD
+
+    evaluate &N.Ded_Class
+      when = 'B'           !Before-tax deductions
+        move #PreTaxDedsRow  to #i
+      when = 'A'           !After-tax deductions
+        move #PostTaxDedsRow to #i
+    end-evaluate
+
+    do Get-ETDarray-Entry-Count
+
+    let $GarnID    = RTRIM(&GR.Garnid, ' ')
+    do Get-Garn-Type
+    let $FieldName = 'GARN_TYPE'
+    do Read-Translate-Table
+    let $GarnName  = RTRIM($XlatShortName, ' ')
+    let $GarnDedCd = RTRIM(&GR.DEDCD, ' ')
+
+    if &GR.Deduct_Amt = &GR.Deduct_Garn_Amt
+
+        let #GarnAmt = &GR.Deduct_Amt
+        let $Name = $GarnDedCd || ' ' || $GarnID || ' ' || $GarnName
+        let $Code = 'GG' || $GarnID || &N.Ded_Class
+        move #GarnAmt to #Cur
+        do Update-ETDarray
+
+    else
+
+        if #ecnt > 8
+
+           let #GarnAmt = &GR.Deduct_Amt
+           let $Name = $GarnDedCd || ' ' || $GarnID || ' ' || $GarnName || ' (' || $Pay003cn_Total_Garn || ')'
+           let $Code = 'GG' || $GarnID || &N.Ded_Class
+           move #GarnAmt to #Cur
+           do Update-ETDarray
+
+        else
+
+           do Check-For-Garn-YTD-Balances
+
+           if &GR.Deduct_Garn_Amt <> 0 or $CGBE.Ded_Garn_YTD = 'Y'
+              let #Cur = &GR.Deduct_Garn_Amt
+              let $Name = $GarnDedCd || ' ' || $GarnID || ' ' || $GarnName || ' (' || $Pay003cn_Amount || ')'
+              let $Code = 'GG' || $GarnID || &N.Ded_Class ||'AM'
+              do Update-ETDarray
+           end-if
+
+           if &GR.Deduct_Cmpny_Fee <> 0 or $CGBE.Ded_CFee_YTD = 'Y'
+              let #Cur = &GR.Deduct_Cmpny_Fee
+              let $Name = $GarnDedCd || ' ' || $GarnID || ' ' || $GarnName || ' (' || $Pay003cn_Co_Fee || ')'
+              let $Code = 'GG' || $GarnID || &N.Ded_Class ||'CF'
+              do Update-ETDarray
+           end-if
+
+           if &GR.Deduct_payee_fee <> 0 or $CGBE.Ded_pfee_YTD = 'Y'
+              let #Cur = &GR.Deduct_payee_fee
+              let $Name = $GarnDedCd || ' ' || $GarnID || ' ' || $GarnName || ' (' || $Pay003cn_Pay_Fee || ')'
+              let $Code = 'GG' || $GarnID || &N.Ded_Class ||'PF'
+              do Update-ETDarray
+           end-if
+
+        end-if
+
+    end-if
+  end-if
+
+FROM PS_PAY_GARNISH GR
+WHERE GR.COMPANY = &A.COMPANY
+  AND GR.PAYGROUP = &A.PAYGROUP
+  AND GR.PAY_END_DT = &A.PAY_END_DT
+  AND GR.OFF_CYCLE = &B.OFF_CYCLE
+  AND GR.PAGE_NUM = &B.PAGE_NUM
+  AND GR.LINE_NUM = &B.LINE_NUM
+  AND GR.SEPCHK = &B.SEPCHK
+ORDER BY GR.GARNID
+end-SELECT
+end-procedure
+
+
+!***********************************************************************
+begin-procedure Get-Garn-Type
+!***********************************************************************
+
+begin-SELECT
+GS.GARN_TYPE
+
+  let $FieldValue = &GS.Garn_Type
+
+FROM PS_GARN_SPEC GS
+WHERE GS.EMPLID = &B.EMPLID
+  AND GS.COMPANY = &A.COMPANY
+  AND GS.GARNID = $Garnid
+end-SELECT
+
+end-procedure
+
+
+!***********************************************************************
+begin-procedure Get-Deduction-Balances
+!***********************************************************************
+
+  let #Cur = 0
+  move '' to $Garn_dedcd
+
+begin-SELECT
+NB.PLAN_TYPE,NB.DEDCD,NB.DED_CLASS,NB.DED_YTD
+
+
+  let $PlanType = &NB.Plan_Type
+  let $DedCd    = &NB.DedCd
+
+  do Get-Deduction-Name
+
+  if &DT.Spcl_Process = 'G'
+    if $Garn_dedcd <> &NB.Dedcd
+       do Get-Garn-Balances
+       move &NB.Dedcd to $Garn_dedcd
+    end-if
+  else
+    let $Name = $DeductionName
+    let $Code = &NB.Plan_Type || &NB.DedCd
+
+    evaluate &NB.Ded_Class
+      when = 'B'           !Before-tax deductions
+        move 'B'             to $DedClass
+        move #PreTaxDedsRow  to #i
+      when = 'A'           !After-tax deductions
+        move 'A'             to $DedClass
+        move #PostTaxDedsRow to #i
+      when = 'N'           !Non-taxable benefits
+      when = 'P'
+        move 'N'             to $DedClass
+        move #BenefitsRow    to #i
+      when = 'L'           !Taxable benefits
+      when = 'T'
+        move 'T'             to $DedClass
+        move #BenefitsRow    to #i
+        concat '*' with $Name
+      when-other
+        move ' '             to $DedClass
+        move #PostTaxDedsRow to #i
+    end-evaluate
+
+    concat $DedClass with $Code
+    move &NB.Ded_YTD   to #YTD
+    do Update-ETDarray
+  end-if
+
+FROM  PS_CAN_DED_BALANCE NB
+WHERE NB.EMPLID        = &B.EmplID
+  AND NB.COMPANY       = &A.Company
+  AND NB.BALANCE_ID    = &A1.BALANCE_ID
+  AND NB.BALANCE_YEAR  = &A1.BALANCE_YEAR
+  AND NB.BALANCE_PERIOD       =
+    (SELECT MAX(BALANCE_PERIOD)
+       FROM PS_CAN_DED_BALANCE
+      WHERE EMPLID          = NB.EMPLID
+        AND COMPANY         = NB.COMPANY
+        AND BALANCE_ID      = NB.BALANCE_ID
+        AND BALANCE_YEAR    = NB.BALANCE_YEAR
+        AND WAGE_LOSS_PLAN  = NB.WAGE_LOSS_PLAN
+        AND PROVINCE        = NB.PROVINCE
+        AND BENEFIT_RCD_NBR = NB.BENEFIT_RCD_NBR
+        AND PLAN_TYPE       = NB.PLAN_TYPE
+        AND BENEFIT_PLAN    = NB.BENEFIT_PLAN
+        AND DEDCD           = NB.DEDCD
+        AND DED_CLASS       = NB.DED_CLASS
+        AND DED_SLSTX_CLASS = NB.DED_SLSTX_CLASS
+        AND BALANCE_PERIOD       <= &A1.BALANCE_PERIOD)
+end-SELECT
+
+end-procedure
+
+
+!**********************************************************************
+begin-procedure Get-Garn-Balances
+!**********************************************************************
+
+  let #Cur = 0
+
+begin-SELECT
+NG.GARNID, NG.DED_CLASS, NG.DED_YTD
+NG.BALANCE_PERIOD, NG.DED_GARN_YTD, NG.DED_CFEE_YTD, NG.DED_PFEE_YTD
+NG.DEDCD
+
+  if &NB.DEDCD = &NG.DEDCD
+
+     evaluate &NG.Ded_Class
+       when = 'B'           !Before-tax deductions
+         move #PreTaxDedsRow  to #i
+       when = 'A'           !After-tax deductions
+         move #PostTaxDedsRow to #i
+     end-evaluate
+
+     let $GarnID    = RTRIM(&NG.Garnid, ' ')
+     do Get-Garn-Type
+     let $FieldName = 'GARN_TYPE'
+     do Read-Translate-Table
+     let $GarnName  = RTRIM($XlatShortName, ' ')
+     let $GarnDedCd = RTRIM(&NG.DEDCD, ' ')
+
+     if &NG.Ded_YTD = &NG.Ded_Garn_YTD
+        let #YTD = &NG.Ded_YTD
+        let $Name = $GarnDedCd || ' ' || $GarnID || ' ' || $GarnName
+        let $Code = 'GG' || $GarnID || &NG.Ded_Class
+        do Update-ETDarray
+
+     else
+        let $Garn_Code_Tot  = 'GG' || $GarnID || &NG.Ded_Class
+        let $Garn_Code_Amt  = 'GG' || $GarnID || &NG.Ded_Class ||'AM'
+        let $Garn_Code_CFee = 'GG' || $GarnID || &NG.Ded_Class ||'CF'
+        let $Garn_Code_Pfee = 'GG' || $GarnID || &NG.Ded_Class ||'PF'
+
+        do Check-ETDarray-Garn-Code
+
+        If $Garn_Tot  = 'Y' or $Garn_Amt  = 'Y' or $Garn_CFee = 'Y' or $Garn_Pfee = 'Y'
+
+           If $Garn_Tot  = 'Y'
+              let #YTD = &NG.Ded_YTD
+              let $Name = $GarnDedCd || ' ' || $GarnID || ' ' || $GarnName || ' (' || $Pay003cn_Total_Garn || ')'
+              let $Code = 'GG' || $GarnID || &NG.Ded_Class
+              do Update-ETDarray
+           else
+              if &NG.Ded_Garn_YTD <> 0
+                 let #YTD = &NG.Ded_Garn_YTD
+                 let $Name = $GarnDedCd || ' ' || $GarnID || ' ' || $GarnName || ' (' || $Pay003cn_Amount || ')'
+                 let $Code = 'GG' || $GarnID || &NG.Ded_Class ||'AM'
+                 do Update-ETDarray
+              end-if
+              if &NG.Ded_CFee_YTD <> 0
+                 let #YTD = &NG.Ded_CFee_YTD
+                 let $Name = $GarnDedCd || ' ' || $GarnID || ' ' || $GarnName || ' (' || $Pay003cn_Co_Fee || ')'
+                 let $Code = 'GG' || $GarnID || &NG.Ded_Class ||'CF'
+                 do Update-ETDarray
+              end-if
+              if &NG.Ded_PFee_YTD <> 0
+                 let #YTD = &NG.Ded_PFee_YTD
+                 let $Name = $GarnDedCd || ' ' || $GarnID || ' ' || $GarnName || ' (' || $Pay003cn_Pay_Fee || ')'
+                 let $Code = 'GG' || $GarnID || &NG.Ded_Class ||'PF'
+                 do Update-ETDarray
+              end-if
+           end-if
+
+        else
+
+           do Get-ETDarray-Entry-Count
+
+           if #ecnt > 8
+              let #YTD = &NG.Ded_YTD
+              let $Name = $GarnDedCd || ' ' || $GarnID || ' ' || $GarnName || ' (' || $Pay003cn_Total_Garn || ')'
+              let $Code = 'GG' || $GarnID || &NG.Ded_Class
+              do Update-ETDarray
+           else
+              if &NG.Ded_Garn_YTD <> 0
+                 let #YTD = &NG.Ded_Garn_YTD
+                 let $Name = $GarnDedCd || ' ' || $GarnID || ' ' || $GarnName || ' (' || $Pay003cn_Amount || ')'
+                 let $Code = 'GG' || $GarnID || &NG.Ded_Class ||'AM'
+                 do Update-ETDarray
+              end-if
+              if &NG.Ded_CFee_YTD <> 0
+                 let #YTD = &NG.Ded_CFee_YTD
+                 let $Name = $GarnDedCd || ' ' || $GarnID || ' ' || $GarnName || ' (' || $Pay003cn_Co_Fee || ')'
+                 let $Code = 'GG' || $GarnID || &NG.Ded_Class ||'CF'
+                 do Update-ETDarray
+              end-if
+              if &NG.Ded_PFee_YTD <> 0
+                 let #YTD = &NG.Ded_PFee_YTD
+                 let $Name = $GarnDedCd || ' ' || $GarnID || ' ' || $GarnName || ' (' || $Pay003cn_Pay_Fee || ')'
+                 let $Code = 'GG' || $GarnID || &NG.Ded_Class ||'PF'
+                 do Update-ETDarray
+              end-if
+           end-if
+
+        end-if
+
+     end-if
+
+  end-if
+
+FROM  PS_GARN_BALANCE NG
+WHERE NG.EMPLID = &B.EMPLID
+  AND NG.COMPANY = &A.COMPANY
+  AND NG.BALANCE_ID = &A1.BALANCE_ID
+  AND NG.BALANCE_YEAR = &A1.BALANCE_YEAR
+  AND NG.BALANCE_PERIOD =
+      (SELECT MAX(BALANCE_PERIOD)
+         FROM PS_GARN_BALANCE
+        WHERE EMPLID = NG.EMPLID
+          AND COMPANY = NG.COMPANY
+          AND BALANCE_ID = NG.BALANCE_ID
+          AND BALANCE_YEAR = NG.BALANCE_YEAR
+          AND PLAN_TYPE = NG.PLAN_TYPE
+          AND BENEFIT_PLAN = NG.BENEFIT_PLAN
+          AND DEDCD = NG.DEDCD
+          AND DED_CLASS = NG.DED_CLASS
+          AND GARNID = NG.GARNID
+          AND BALANCE_PERIOD <= &A1.BALANCE_PERIOD)
+ ORDER BY NG.GARNID
+end-SELECT
+
+end-procedure
+
+!**********************************************************************
+begin-procedure Check-For-Garn-YTD-Balances
+!**********************************************************************
+
+     let $CGBE.Ded_Garn_YTD = 'N'
+     let $CGBE.Ded_CFee_YTD = 'N'
+     let $CGBE.Ded_pfee_YTD = 'N'
+
+begin-SELECT
+CGBE.DED_GARN_YTD, CGBE.DED_CFEE_YTD, CGBE.DED_PFEE_YTD
+
+     if &CGBE.Ded_Garn_YTD <> 0
+        let $CGBE.Ded_Garn_YTD = 'Y'
+     end-if
+     if &CGBE.Ded_CFee_YTD <> 0
+        let $CGBE.Ded_CFee_YTD = 'Y'
+     end-if
+     if &CGBE.Ded_pfee_YTD <> 0
+        let $CGBE.Ded_pfee_YTD = 'Y'
+     end-if
+
+FROM  PS_GARN_BALANCE CGBE
+WHERE CGBE.EMPLID = &B.EMPLID
+  AND CGBE.COMPANY = &A.COMPANY
+  AND CGBE.BALANCE_ID = &A1.BALANCE_ID
+  AND CGBE.BALANCE_YEAR = &A1.BALANCE_YEAR
+  AND CGBE.BALANCE_PERIOD =
+      (SELECT MAX(BALANCE_PERIOD)
+         FROM PS_GARN_BALANCE
+        WHERE EMPLID = CGBE.EMPLID
+          AND COMPANY = CGBE.COMPANY
+          AND BALANCE_ID = CGBE.BALANCE_ID
+          AND BALANCE_YEAR = CGBE.BALANCE_YEAR
+          AND PLAN_TYPE = CGBE.PLAN_TYPE
+          AND BENEFIT_PLAN = CGBE.BENEFIT_PLAN
+          AND DEDCD = CGBE.DEDCD
+          AND DED_CLASS = CGBE.DED_CLASS
+          AND GARNID = CGBE.GARNID
+          AND BALANCE_PERIOD <= &A1.BALANCE_PERIOD)
+end-SELECT
+
+end-procedure
+
+!***********************************************************************
+begin-procedure Get-Cheque-Balances
+!***********************************************************************
+
+begin-SELECT
+Y.TOTAL_GROSS_YTD,Y.TOTAL_TAXES_YTD,Y.TOTAL_DEDNS_YTD,Y.NET_PAY_YTD
+
+  add &Y.Total_Gross_YTD to #TotalGrossYTD
+  add &Y.Total_Taxes_YTD to #TotalTaxesYTD
+  add &Y.Total_Dedns_YTD to #TotalDednsYTD
+  add &Y.Net_Pay_YTD     to #NetPayYTD
+
+
+FROM  PS_CAN_CHECK_YTD Y
+WHERE Y.EMPLID        = &B.EmplID
+  AND Y.COMPANY       = &A.Company
+  AND Y.BALANCE_ID   =    &A1.BALANCE_ID
+  AND Y.BALANCE_YEAR   =  &A1.BALANCE_YEAR
+  AND Y.BALANCE_PERIOD      =
+    (SELECT MAX(BALANCE_PERIOD)
+       FROM PS_CAN_CHECK_YTD
+      WHERE EMPLID          = Y.EMPLID
+        AND COMPANY         = Y.COMPANY
+        AND BALANCE_YEAR    = Y.BALANCE_YEAR
+        AND BALANCE_ID      = Y.BALANCE_ID
+        AND WAGE_LOSS_PLAN  = Y.WAGE_LOSS_PLAN
+        AND PROVINCE        = Y.PROVINCE
+        AND BALANCE_PERIOD <= &A1.BALANCE_PERIOD)
+end-SELECT
+
+end-procedure
+
+!***********************************************************************
+begin-procedure Get-Net-Pay-Distribution
+!***********************************************************************
+
+begin-SELECT
+PD.PAYCHECK_NBR,PD.ACCOUNT_TYPE,PD.DEPOSIT_AMOUNT,PD.ACCOUNT_NUM
+
+  let $FieldName  = 'ACCOUNT_TYPE'
+  let $FieldValue = &PD.Account_Type
+  do Read-Translate-Table
+
+  if &PD.Account_Type = '$'             !cheque
+    add &PD.Deposit_Amount to #ChequeNetPay
+    move $XLatShortName    to $chk_issued
+  else
+    move &PD.PAYCHECK_NBR  to #Advice#
+    add &PD.Deposit_Amount to #DepositNetPay
+    move &PD.ACCOUNT_NUM   to $deposit_acct_nbr
+    if &PD.Account_Type = 'C'           !checking
+        move $XLatShortName    to $adv_checkings
+        add &PD.Deposit_Amount to #Depositcheckings
+        add 1 to #chkg_ctr
+        if #chkg_ctr = 1
+           move &PD.ACCOUNT_NUM     to $deposit_acct_nbr_chckngs
+        else
+           move ''                  to $deposit_acct_nbr_chckngs
+        end-if
+    else
+       if &PD.Account_Type = 'S'        !savings
+           move $XLatShortName    to $adv_savings
+           add &PD.Deposit_Amount to #Depositsavings
+           add 1 to #svng_ctr
+           if #svng_ctr = 1
+              move &PD.ACCOUNT_NUM to $deposit_acct_nbr_savings
+           else
+              move ''              to $deposit_acct_nbr_savings
+           end-if
+       end-if
+    end-if
+  end-if
+
+FROM  PS_PAY_DISTRIBUTN PD
+WHERE PD.COMPANY    = &A.Company
+  AND PD.PAYGROUP   = &A.PayGroup
+  AND PD.PAY_END_DT = &A.Pay_End_Dt
+  AND PD.OFF_CYCLE  = &B.Off_Cycle
+  AND PD.PAGE_NUM      = &B.PAGE_NUM
+  AND PD.LINE_NUM      = &B.LINE_NUM
+  AND PD.SEPCHK     = &B.SepChk
+end-SELECT
+
+end-procedure
+
+!***********************************************************************
+begin-procedure Get-Vacation-Balances
+!***********************************************************************
+
+  move 0  to  #VacStartBal
+  move 0  to  #VacEarned
+  move 0  to  #VacBought
+  move 0  to  #VacTaken
+  move 0  to  #VacSold
+  move 0  to  #VacAdjust
+  move 0  to  #VacEndBal
+
+  move 0  to  #SickStartBal
+  move 0  to  #SickEarned
+  move 0  to  #SickBought
+  move 0  to  #SickTaken
+  move 0  to  #SickSold
+  move 0  to  #SickAdjust
+  move 0  to  #SickEndBal
+begin-SELECT
+V.HRS_CARRYOVER,V.HRS_EARNED_YTD,V.HRS_TAKEN_YTD
+V.HRS_ADJUST_YTD,V.HRS_BOUGHT_YTD,V.HRS_SOLD_YTD
+V.HRS_TAKEN_UNPROC,V.HRS_ADJUST_UNPROC
+V.HRS_BOUGHT_UNPROC,V.HRS_SOLD_UNPROC
+V.ACCRUAL_PROC_DT,V.PLAN_TYPE
+
+  if &V.PLAN_TYPE        = '50'
+  let #SickStartBal = #SickStartBal + &V.Hrs_Carryover
+  let #SickEarned   = #SickEarned + &V.Hrs_Earned_YTD
+  let #SickBought   = #SickBought + &V.Hrs_Bought_YTD + &V.Hrs_Bought_Unproc
+  let #SickTaken    = #SickTaken + &V.Hrs_Taken_YTD  + &V.Hrs_Taken_Unproc
+  let #SickSold     = #SickSold + &V.Hrs_Sold_YTD   + &V.Hrs_Sold_Unproc
+  let #SickAdjust   = #SickAdjust + &V.Hrs_Adjust_YTD + &V.Hrs_Adjust_Unproc
+  let #SickEndBal   = #SickStartBal + #SickEarned + #SickBought
+                 - #SickTaken - #SickSold + #SickAdjust
+   else
+  let #VacStartBal = #VacStartBal + &V.Hrs_Carryover
+  let #VacEarned   = #VacEarned + &V.Hrs_Earned_YTD
+  let #VacBought   = #VacBought + &V.Hrs_Bought_YTD + &V.Hrs_Bought_Unproc
+  let #VacTaken    = #VacTaken + &V.Hrs_Taken_YTD  + &V.Hrs_Taken_Unproc
+  let #VacSold     = #VacSold + &V.Hrs_Sold_YTD   + &V.Hrs_Sold_Unproc
+  let #VacAdjust   = #VacAdjust + &V.Hrs_Adjust_YTD + &V.Hrs_Adjust_Unproc
+  let #VacEndBal   = #VacStartBal + #VacEarned + #VacBought
+                - #VacTaken - #VacSold + #VacAdjust
+   end-if
+
+FROM  PS_LEAVE_ACCRUAL V
+WHERE V.EMPLID           = &B.Emplid
+  AND V.COMPANY          = &A.Company
+  AND (V.PLAN_TYPE        = '51'                 !Vacation
+    OR V.PLAN_TYPE        = '50')                !Sick
+  AND V.ACCRUAL_PROC_DT =
+      (SELECT MAX(V1.ACCRUAL_PROC_DT)
+         FROM PS_LEAVE_ACCRUAL V1
+        WHERE V1.EMPLID = V.EMPLID
+          AND V1.EMPL_RCD = V.EMPL_RCD
+          AND V1.COMPANY = V.COMPANY
+          AND V1.PLAN_TYPE = V.PLAN_TYPE
+          AND (V1.ACCRUAL_PROC_DT <= &B.Check_Dt
+                OR V1.ACCRUAL_PROC_DT IS NULL))
+ORDER BY V.ACCRUAL_PROC_DT DESC
+end-SELECT
+
+end-procedure
+
+
+!***********************************************************************
+begin-procedure Reset-Variables
+!***********************************************************************
+
+!reset current and YTD amounts
+  move 0 to #Cur
+  move 0 to #YTD
+
+!reset ETDarray
+  move 0 to #i
+  while #i <= #lastRow
+    move 0 to #j
+    while #j <= #lastCol
+      put ' ' ' ' ' ' 0 0 into ETDarray(#i) Code(#j) Name(#j) CmpRtCd(#j) Cur(#j) YTD(#j)
+      add 1 to #j
+    end-while
+    add 1 to #i
+  end-while
+
+!reset vacation totals
+  move 0 to #VacStartBal
+  move 0 to #VacEarned
+  move 0 to #VacBought
+  move 0 to #VacTaken
+  move 0 to #VacSold
+  move 0 to #VacAdjust
+  move 0 to #VacEndBal
+
+!reset non-crossfoot message switch
+  move 'N' to $NeedXfootMsg
+
+!reset current and YTD recalc totals
+  move 0 to #HourCurTotal
+  move 0 to #HourYTDTotal
+  move 0 to #PreTaxDedCurTotal
+  move 0 to #PreTaxDedYTDTotal
+  move 0 to #PostTaxDedCurTotal
+  move 0 to #PostTaxDedYTDTotal
+  move 0 to #FedTaxGrossCur
+  move 0 to #FedTaxGrossYTD
+
+  move 0 to #TotalGrossYTD
+  move 0 to #TotalTaxesYTD
+  move 0 to #TotalDednsYTD
+  move 0 to #NetPayYTD
+
+!reset net pay distribution totals
+  move 0 to #ChequeNetPay
+  move 0 to #DepositNetPay
+  move 0 to #Depositcheckings
+  move 0 to #Depositsavings
+
+end-procedure
+
+
+!***********************************************************************
+begin-procedure Update-ETDarray-Current-Earnings
+!***********************************************************************
+
+  if #Hours <> 0 or #Earns <> 0
+
+    move #RatesRow to #i
+    move 0 to #j
+    while #j <= #lastCol
+      get $jCode $jCmpRtCd #jRate from ETDarray(#i) Code(#j) CmpRtCd(#j) Cur(#j)
+      if rtrim($jCode,' ') = ''                 !if array entry is null
+        break                                   !exit the "while"
+      else
+        if $Code = $jCode and $CmpRtCd = $jCmpRtCd and #Rate = #jRate    !if array entry match
+          break                                                          !exit the "while"
+        else
+          if #j = #lastCol
+            move $lastCode to $Code
+            move $lastName1 to $Name
+            move $lastCmpRtCd to $CmpRtCd
+            move #lastRate to #Rate
+            break                               !exit the "while"
+          end-if
+        end-if
+      end-if
+      add 1 to #j
+    end-while
+
+    while #i <= #EarnsRow
+      evaluate #i
+        when = #RatesRow
+          move #Rate  to #Cur
+        when = #HoursRow
+          move #Hours to #Cur
+        when = #EarnsRow
+          move #Earns to #Cur
+        when-other
+          move 0      to #Cur
+      end-evaluate
+
+      put $Code $Name $CmpRtCd into ETDarray(#i) Code(#j) Name(#j) CmpRtCd(#j)
+
+      if #i = #RatesRow
+        put #Cur     into ETDarray(#i) Cur(#j)
+      else
+        array-add #Cur to ETDarray(#i) Cur(#j)
+      end-if
+      add 1 to #i
+    end-while
+
+  end-if
+end-procedure
+
+
+!***********************************************************************
+begin-procedure Update-ETDarray
+!***********************************************************************
+
+  move 0 to #j
+  while #j <= #lastCol
+
+    get $jCode from ETDarray(#i) Code(#j)
+    if rtrim($jCode,' ') = ''                   !if array entry is null
+      put $Code $Name into ETDarray(#i) Code(#j) Name(#j)
+      break                                     !exit the "while"
+    else
+      if $Code = $jCode                         !if array entry match
+        break                                   !exit the "while"
+      else
+        if #j = #lastCol
+          put $lastCode $Pay003cn_Other into ETDarray(#i) Code(#j) Name(#j)
+          break                                 !exit the "while"
+        end-if
+      end-if
+    end-if
+    add 1 to #j
+
+  end-while
+
+  array-add #Cur #YTD to ETDarray(#i) Cur(#j) YTD(#j)
+
+end-procedure
+
+
+!***********************************************************************
+begin-procedure Read-ETDarray
+!***********************************************************************
+
+  move 0 to #i
+  while #i <= #lastRow
+    get $Name $CmpRtCd #Cur #YTD from ETDarray(#i) Name(#j) CmpRtCd(#j) Cur(#j) YTD(#j)
+    evaluate #i
+      when = #RatesRow
+        move $Name to $EarnName
+        move $CmpRtCd to $CompCode
+        move #Cur  to #EarnRate
+      when = #HoursRow
+        move #Cur  to #HourCur
+        move #YTD  to #HourYTD
+        add  #Cur  to #HourCurTotal
+        add  #YTD  to #HourYTDTotal
+      when = #EarnsRow
+        move #Cur  to #EarnCur
+        move #YTD  to #EarnYTD
+      when = #PreTaxDedsRow
+        move $Name to $PreTaxDedName
+        move #Cur  to #PreTaxDedCur
+        move #YTD  to #PreTaxDedYTD
+        add  #Cur  to #PreTaxDedCurTotal
+        add  #YTD  to #PreTaxDedYTDTotal
+      when = #TaxesRow
+        move $Name to $TaxName
+        move #Cur  to #TaxCur
+        move #YTD  to #TaxYTD
+      when = #PostTaxDedsRow
+        move $Name to $PostTaxDedName
+        move #Cur  to #PostTaxDedCur
+        move #YTD  to #PostTaxDedYTD
+        add  #Cur  to #PostTaxDedCurTotal
+        add  #YTD  to #PostTaxDedYTDTotal
+      when = #BenefitsRow
+        move $Name to $BenefitName
+        move #Cur  to #BenefitCur
+        move #YTD  to #BenefitYTD
+    end-evaluate
+    add 1 to #i
+  end-while
+end-procedure
+
+
+!***********************************************************************
+begin-procedure Print-Statement
+!***********************************************************************
+
+!print the pay period information
+  let #row = 1
+
+  columns 58
+
+  graphic (#row,1,69) box 3 10
+
+  columns 2 59 72 102 113
+
+  do Alter-Printer-ChqAdv
+
+  print $CompanyName            (#row,1) bold
+
+  do Alter-Printer-Statement
+
+
+  if rtrim($CompanyAddrLine3,' ') <> ''
+    let $CompanyAddrLine1_2 = rtrim($CompanyAddrLine1,' ') || ', ' || $CompanyAddrLine2
+    print $CompanyAddrLine1_2   (+1,1)
+    print $CompanyAddrLine3     (+1,1)
+  else
+    print $CompanyAddrLine1     (+1,1)
+    print $CompanyAddrLine2     (+1,1)
+  end-if
+
+  next-column
+
+  print $Pay003cn_PayGrp        (#row,1)
+  print $Pay003cn_Pay_BegDt     (+1,1)
+  print $Pay003cn_Pay_EndDt     (+1,1)
+
+  next-column
+  let $out = $PayGroup || '-' || $PayGroupName
+  print $out                    (#row,1)
+
+  do Format-DateTime(&A.Pay_Begin_Dt, $out, {DEFDATE}, '', '')
+  print $out                    (+1,1)
+
+  do Format-DateTime(&A.Pay_End_Dt, $out, {DEFDATE}, '', '')
+  print $out                    (+1,1)
+
+  let $PayShtSrc = ''
+  evaluate &B.Pay_Sheet_Src
+    when = 'O'
+      print $Pay003cn_Onln_Chq  (0,13)
+      let $PayShtSrc = $Pay003cn_Onln_Chq
+      break
+    when = 'K'
+      print $Pay003cn_Fnl_Chq   (0,13)
+      let $PayShtSrc = $Pay003cn_Fnl_Chq
+      break
+    when = 'L'
+      print $Pay003cn_Onln_Fnl  (0,13)
+      let $PayShtSrc = $Pay003cn_Onln_Fnl
+      break
+  end-evaluate
+
+  next-column
+  print $Hr_Bus_Unit            (#row,1)
+  print $Pay003cn_Chq           (+1,1)
+  print $Pay003cn_ChqDt         (+1,1)
+
+  next-column
+  print $bus_unit               (#row,1,5)
+
+  do Format-Number(&B.PAYCHECK_NBR, $out, '099999999999999')
+  print $out                    (+1,1) bold
+
+  do Format-DateTime(&B.Check_Dt, $out, {DEFDATE}, '', '')
+  print $out                    (+1,1)
+
+!print the employee information
+
+  let #row = 5
+
+  columns 1 43 85
+
+  graphic (#row,1,42) box 5 10
+  next-column
+  graphic (#row,1,42) box 5 10
+  next-column
+  graphic (#row,1,42) box 1 10
+  graphic (+1,1,42)   box 4 10
+
+  columns 2 44 54 86 98 108 117
+
+  print $HomeName               (#row,1) bold
+  print $HomeAddrLine1          (+1,1)
+  print $HomeAddrLine2          (+1,1)
+  print $HomeAddrLine3          (+1,1)
+
+  next-column
+
+  print $Pay003cn_EmpId         (#row,1)
+  print $Pay003cn_Dept          (+1,1)
+  print $Pay003cn_Locn          (+1,1)
+  print $Pay003cn_Job_Title     (+1,1)
+  print $Pay003cn_Pay_Rt        (+1,1)
+
+  next-column
+  print &B.EmplID               (#row,1)
+  let $out = $DeptID || '-' || $DeptName
+  print $out                    (+1,1)
+  print $LocationName           (+1,1)
+  print $JobTitle               (+1,1)
+
+  if &FQ.FREQUENCY_TYPE  = 'H'
+     let $Comp_freq_format_mask =  '$$$,$$$,$$$,$$9.999999'
+  else
+     let $Comp_freq_format_mask =  '$$$,$$$,$$$,$$9.99'
+  end-if
+
+  let $out =
+    ltrim(edit(&J.Comprate,$Comp_freq_format_mask),' ') || ' ' || $CompFrequency
+  print $out                    (+1,1)
+
+  next-column
+
+  print $Pay003cn_Tax_Data      (#row,1)
+  print $Pay003cn_Net_ClmAmt    (+1,1)
+  print $Pay003cn_Spcl_Letr     (+1,1)
+  print $Pay003cn_Addl_Pct      (+1,1)
+  print $Pay003cn_Addl_Amt      (+1,1)
+
+  next-column
+  print $Pay003cn_Fed           (#row,1)
+
+  let   $out = ltrim(edit(&FT.CIT_Net_Claim_Amt,'b,999,999.99'), ' ')
+  print $out                    (+1,1)
+
+  let   $out = ltrim(edit(&FT.CIT_Special_Ltrs,'b,999,999'), ' ')
+  print $out                    (+1,1)
+
+  let   $out = ltrim(edit(&FT.CIT_Addl_Pct,'b9.999'), ' ')
+  print $out                    (+1,1)
+
+  let   $out = ltrim(edit(&FT.CIT_Addl_Amt,'b9,999.99'), ' ')
+  print $out                    (+1,1)
+
+  next-column
+  print $Pay003cn_Quebec        (#row,1)
+
+  let   $out = ltrim(edit(&FT.QIT_Net_Claim_Amt,'b,999,999.99'), ' ')
+  print $out                    (+1,1)
+
+  let   $out = ltrim(edit(&FT.QIT_Special_Ltrs,'b,999,999'), ' ')
+  print $out                    (+1,1)
+
+  let   $out = ltrim(edit(&FT.QIT_Addl_Pct,'b9.999'), ' ')
+  print $out                    (+1,1)
+
+  let   $out = ltrim(edit(&FT.QIT_Addl_Amt,'b9,999.99'), ' ')
+  print $out                    (+1,1)
+
+  do Find-tax-location
+
+  if $TLC_province <> 'NN' and
+     $TLC_province <> 'NU' and
+     $TLC_province <> 'NT' and
+     $TLC_province <> 'YT' and
+     $TLC_province <> 'ZZ' and
+     $TLC_province <> 'QC'
+     do Find-provincial-data
+
+     if $prov_record_found = 'Y'
+        next-column
+        print $TLC_province        (#row,1)
+
+        let   $out = ltrim(edit($PRV_Net_Claim_Amt,'b,999,999.99'), ' ')
+        print $out                 (+1,1)
+     else
+        do Find-basic-tax-credit
+        next-column
+        print $TLC_province        (#row,1)
+
+        let   $out = ltrim(edit($CTP_tax_credit_amt,'b,999,999.99'), ' ')
+        print $out                 (+1,1)
+     end-if
+
+  end-if
+
+!print the ETD detail information
+
+  let #row1 = 11
+  let #row2 = 28
+
+  columns 1 85 1 43 85
+
+  graphic (#row1,1,84) box  1 10 12
+  graphic (#row1,,84)  box  1 10
+  graphic (+1,,84)     box  2 10
+  graphic (+2,,84)     box 13 10
+  graphic (+13,,84)    box  1 10
+  next-column
+  graphic (#row1,1,42) box  1 10 12
+  graphic (#row1,,42)  box  1 10
+  graphic (+1,,42)     box  2 10
+  graphic (+2,,42)     box 13 10
+  graphic (+13,,42)    box  1 10
+  next-column
+  graphic (#row2,1,42) box  1 10 12
+  graphic (#row2,,42)  box  1 10
+  graphic (+1,,42)     box  1 10
+  graphic (+1,,42)     box 13 10
+  graphic (+13,,42)    box  1 10
+  next-column
+  graphic (#row2,1,42) box  1 10 12
+  graphic (#row2,,42)  box  1 10
+  graphic (+1,,42)     box  1 10
+  graphic (+1,,42)     box 13 10
+  graphic (+13,,42)    box  1 10
+  next-column
+  graphic (#row2,1,42) box  1 10 12
+  graphic (#row2,,42)  box  1 10
+  graphic (+1,,42)     box  1 10
+  graphic (+1,,42)     box 13 10
+  graphic (+13,,42)    box  1 10
+
+  use-column 0
+
+  print $Pay003cn_Hrs_Earns     (#row1,35) bold
+  print $Pay003cn_Taxes         (,103)      bold
+
+!  print $Pay003cn_CmpCd1        (+1,25)   ++
+  print $Pay003cn_Current       (+1,34)
+  print $Pay003cn_YTDate        (0,64)
+  print $Pay003cn_Descr         (+1,2)
+!  print $Pay003cn_CmpCd2        (,25)     ++
+  print $Pay003cn_Rate          (,36)
+  print $Pay003cn_Hours         (,44)
+  if length($Pay003cn_Earns) > 5
+    print $Pay003cn_Earns       (,53) ! English
+  else
+    print $Pay003cn_Earns       (,55) ! French
+  end-if
+  print $Pay003cn_Hours         (,64)
+  if length($Pay003cn_Earns) > 5
+    print $Pay003cn_Earns       (,74) ! English
+  else
+    print $Pay003cn_Earns       (,76) ! French
+  end-if
+  print $Pay003cn_Descr         (,86)
+  print $Pay003cn_Curr1         (,107)
+  print $Pay003cn_YTDL7         (,120)
+
+  print $Pay003cn_Bef_TxDed     (#row2,11) bold
+  if length($Pay003cn_Aft_TxDed) > 20
+    print $Pay003cn_Aft_TxDed     (,53)      bold ! French
+  else
+    print $Pay003cn_Aft_TxDed     (,54)      bold ! English
+  end-if
+
+  if length($Pay003cn_Emplr_PdBen) > 22
+    print $Pay003cn_Emplr_PdBen (,90)      bold  ! French
+  else
+    print $Pay003cn_Emplr_PdBen (,95)      bold  ! English
+  end-if
+
+  print $Pay003cn_Descr         (+1,2)
+  print $Pay003cn_Curr1         (,26)
+
+  print $Pay003cn_YTDL6         (,37)
+  print $Pay003cn_Descr         (,44)
+  print $Pay003cn_Curr1         (,68)
+  print $Pay003cn_YTDL6         (,79)
+  print $Pay003cn_Descr         (,86)
+  print $Pay003cn_Curr1         (,110)
+  print $Pay003cn_YTDL6         (,121)
+
+  let #row1 = #row1 + 3
+  let #row2 = #row2 + 2
+
+  columns 2 25 32 44 51 63 71  86 105 117  2 24 33  44 66 75  86 108 117
+
+  move 0 to #j
+  while #j <= {n}
+    if #j = {n}                 !totals lines
+
+      move $Pay003cn_Total      to $EarnName
+      move 0                    to #EarnRate
+      move #HourCurTotal        to #HourCur
+      move #HourYTDTotal        to #HourYTD
+      move &B.Total_Gross       to #EarnCur
+      move #TotalGrossYTD       to #EarnYTD
+      move $Pay003cn_Total      to $PreTaxDedName
+      move #PreTaxDedCurTotal   to #PreTaxDedCur
+      move #PreTaxDedYTDTotal   to #PreTaxDedYTD
+      move $Pay003cn_Total      to $TaxName
+      move &B.Total_Taxes       to #TaxCur
+      move #TotalTaxesYTD       to #TaxYTD
+      move $Pay003cn_Total      to $PostTaxDedName
+      move #PostTaxDedCurTotal  to #PostTaxDedCur
+      move #PostTaxDedYTDTotal  to #PostTaxDedYTD
+      move $Pay003cn_Taxable    to $BenefitName
+      move 0                    to #BenefitCur
+      move 0                    to #BenefitYTD
+    else
+      do Read-ETDarray
+    end-if
+
+    print $EarnName             (#row1,1)
+    next-column             !++
+  ! print $CompCode             ()   ++
+    next-column
+    if #HourCur <> 0
+      print #EarnRate           () edit b999.999999mi ! change to 12,6 if needed
+    end-if
+    next-column
+    print #HourCur              () edit b999.99mi
+    next-column
+    if rtrim($EarnName,' ') <> ''
+      print #EarnCur            () edit 9,999,990.99mi
+    end-if
+    next-column
+    print #HourYTD              () edit b9,999.99mi
+    next-column
+    if rtrim($EarnName,' ') <> ''
+      print #EarnYTD            () edit 999,999,990.99mi
+    end-if
+
+    next-column
+    print $TaxName              ()
+    next-column
+    if rtrim($TaxName,' ') <> ''
+      print #TaxCur             () edit 9,999,990.99mi
+      next-column
+      print #TaxYTD             () edit 99,999,990.99mi
+    else
+      next-column
+    end-if
+
+    next-column
+    print $PreTaxDedName        (#row2,1)
+    next-column
+    if rtrim($PreTaxDedName,' ') <> ''
+      print #PreTaxDedCur       () edit 9,999,990.99mi
+      next-column
+      print #PreTaxDedYTD       () edit 99,999,990.99mi
+    else
+      next-column
+    end-if
+
+    next-column
+    print $PostTaxDedName       ()
+    next-column
+    if rtrim($PostTaxDedName,' ') <> ''
+      print #PostTaxDedCur      () edit 9,999,990.99mi
+      next-column
+      print #PostTaxDedYTD      () edit 99,999,990.99mi
+    else
+      next-column
+    end-if
+
+    next-column
+    print $BenefitName          ()
+    next-column
+    if rtrim($BenefitName,' ') <> ''
+      if #j <= #lastCol         !not totals line
+        print #BenefitCur       () edit 9,999,990.99mi
+        next-column
+        print #BenefitYTD       () edit 99,999,990.99mi
+      end-if
+    else
+      next-column
+    end-if
+
+    add 1 to #row1
+    add 1 to #row2
+    next-column
+    add 1 to #j
+
+  end-while
+
+ let #lncnt = {n}
+
+!print the current and YTD summary totals
+
+  let #row = 44
+
+  columns 1
+
+  graphic (#row,1,126) box 1 10 15
+  graphic (#row,,126)  box 1 10
+  graphic (+1,,126)    box 2 10
+
+  columns 2 24 48 72 94 116
+
+  print ''                      (#row,1)
+  print $Pay003cn_Curr2          (+1,1)
+  print $Pay003cn_YTD2           (+1,1)
+
+  next-column
+
+  if length($Pay003cn_Tot_Grs) > 10
+    print $Pay003cn_Tot_Grs       (#row,-2) bold ! English
+  else
+    print $Pay003cn_Tot_Grs       (#row,-1) bold ! French
+  end-if
+
+  print &B.Total_Gross          (+1,1) edit 999,999,990.99mi
+  print #TotalGrossYTD          (+1,1) edit 999,999,990.99mi
+
+  next-column
+
+  if length($Pay003cn_CIT_Tx_Grs) > 17
+    print $Pay003cn_CIT_Tx_Grs    (#row,-10) bold ! French
+  else
+    print $Pay003cn_CIT_Tx_Grs    (#row,-7) bold  ! English
+  end-if
+
+  print #FedTaxGrossCur         (+1,1) edit 999,999,990.99mi
+  print #FedTaxGrossYTD         (+1,1) edit 999,999,990.99mi
+
+  next-column
+   if length($Pay003cn_Tot_Tx) > 11
+     print $Pay003cn_Tot_Tx        (#row,-4) bold ! French
+   else
+     let $Pay003cn_Tot_Tx = lpad($Pay003cn_Tot_Tx,12,' ')
+     print $Pay003cn_Tot_Tx        (#row,-3) bold ! English
+     let $Pay003cn_Tot_Tx = ltrim($Pay003cn_Tot_Tx,' ')
+  end-if
+
+  print &B.Total_Taxes          (+1,1) edit 99,999,990.99mi
+  print #TotalTaxesYTD          (+1,1) edit 99,999,990.99mi
+
+  next-column
+
+  print $Pay003cn_Tot_Dedn      (#row,-8) bold
+  print &B.Total_Deductions     (+1,1) edit 99,999,990.99mi
+  print #TotalDednsYTD          (+1,1) edit 99,999,990.99mi
+
+  next-column
+
+  if length($Pay003cn_NetPay) > 7
+    print $Pay003cn_NetPay        (#row,1) bold ! French
+  else
+    let $Pay003cn_NetPay=lpad($Pay003cn_NetPay,8,' ')
+    print $Pay003cn_NetPay        (#row,+2) bold ! English
+    let $Pay003cn_NetPay=ltrim($Pay003cn_NetPay,' ')
+  end-if
+
+  print &B.Net_Pay              (+1,1) edit 999,999,990.99mi
+  print #NetPayYTD              (+1,1) edit 999,999,990.99mi
+
+  do Current-YearToDate-Totals-XML-Data-CAN
+
+!print the vacation balance totals
+
+  let #row = 47
+
+  columns 1
+
+  graphic (#row,1,24) box  1 10 12
+  graphic (#row,,24)  box  1 10
+  graphic (+1,,24)    box  6 10
+  graphic (+6,,24)    box  1 10
+
+  columns 2 19
+
+  print $Pay003cn_PTO_Hrs       (#row,1) bold
+  print $Pay003cn_St_Bal        (+1,1)
+  print $Pay003cn_Ernd          (+1,1)
+  print $Pay003cn_Bought        (+1,1)
+  print $Pay003cn_Taken         (+1,1)
+  print $Pay003cn_Sold          (+1,1)
+  print $Pay003cn_Adj           (+1,1)
+  print $Pay003cn_End_Bal       (+1,1)
+
+  next-column
+  print $Pay003cn_YTDL10        (#row,-2) bold
+  print #VacStartBal            (+1,1) edit 9,990.9mi
+  print #VacEarned              (+1,1) edit b,999.9mi
+  print #VacBought              (+1,1) edit b,999.9mi
+  print #VacTaken               (+1,1) edit b,999.9mi
+  print #VacSold                (+1,1) edit b,999.9mi
+  print #VacAdjust              (+1,1) edit b,999.9mi
+  print #VacEndBal              (+1,1) edit 9,990.9mi
+
+!print non-crossfoot message
+
+  if $NeedXfootMsg = 'Y'
+    let #row = 47
+    columns 30
+    print $Pay003cn_XFootMsg1   (#row,1)
+    print $Pay003cn_XfootMsg2   (+1,1)
+  end-if
+
+!print the net pay distribution
+
+  let #row = 47
+
+  columns 92
+
+  graphic (#row,1,35) box  1 10 12
+  graphic (#row,,35)  box  1 10
+  graphic (+1,,35)    box  2 10
+  graphic (+2,,35)    box  1 10
+
+  columns 93 116
+
+  print $Pay003cn_NetPay_Dstrbn  (#row,1) bold
+
+
+  if #DepositNetPay <> 0
+    do Format-Number(#Advice#, $out, '099999999999999')
+    let $out = $Pay003cn_Adv2 || $out
+    print $out                  (+1,1)
+    next-column
+    print #DepositNetPay        () edit b99,999,999.99mi
+    next-column
+  end-if
+
+  if #ChequeNetPay <> 0
+    do Format-Number(&B.PAYCHECK_NBR, $out, '099999999999999')
+    let $out = $Pay003cn_Chq2 || $out
+    print $out                  (+1,1)
+    next-column
+    print #ChequeNetPay         () edit b99,999,999.99mi
+    next-column
+  end-if
+
+  position                      (50,1)
+  print $Pay003cn_Total         ()
+  next-column
+  print &B.Net_Pay              () edit 999,999,990.99mi
+
+!print the cheque message
+
+  let #row = 56
+
+  columns 2
+
+  print $Pay003cn_Msg           (#row,1) bold
+  print $ChequeMessage          (0,+1)
+
+end-procedure
+
+
+!***********************************************************************
+begin-procedure Print-Cheque
+!***********************************************************************
+
+  do Alter-Printer-ChqAdv
+
+  do Format-Cheque-Name-Address
+
+!print the company and bank information and the cheque number
+
+  let #row = 61
+
+  columns 2 65 109
+
+  print $CompanyName            (#row,1) bold
+  print $CompanyAddrLine1       (+1,1)
+  print $CompanyAddrLine2       (+1,1)
+  print $CompanyAddrLine3       (+1,1)
+
+  next-column
+
+  do Alter-Printer-Statement-Can
+
+  print $BankName               (#row,1) bold
+  print $BankAddrLine1          (+1,1)
+  print $BankAddrLine2          (+1,1)
+  print $BankAddrLine3          (+1,1)
+
+  do Alter-Printer-ChqAdv
+
+  next-column
+  print $Pay003cn_ChqNo         (#row,1) bold
+  do Format-Number(&B.PAYCHECK_NBR, $out, '999999999999')
+  let $out = ltrim($out,' ')
+  print $out                    (+1,1)   bold
+
+!print the cheque date and numeric amount
+
+!print the cheque date
+
+  do Alter-Printer-Statement-Can
+
+  let #row = 64
+
+  columns 109
+
+  do Format-DateTime(&B.Check_Dt, $out, {DEFYMD}, '', '')
+  let $out = replace($out,'/','-')
+  print $out                    (#row,1) bold
+
+!print the date indicator
+
+  let #row = 65
+
+  columns 104 109
+
+  print $Pay003cn_Date          (#row,1) bold
+
+  next-column
+
+  do Alter-Printer-Date-Indicator
+  print $Pay003cn_Date_Ind      (#row,1) bold
+
+!print the numeric amount
+
+  do Alter-Printer-ChqAdv-Can
+
+  let #row = 68
+
+  columns 96 110
+
+  print $Pay003cn_PayAmt        (#row,1) bold
+
+  next-column
+  do Format-Number(#ChequeNetPay, $out, '9,999,999,999.99mi')
+  let $out = lpad(ltrim($out,' '),14,'*')
+  let $out = '$' || $out
+
+  print $out                    (#row,1) bold
+
+!print the amount in words and the payee information
+
+  let #row = 71
+
+  columns 2 14
+
+  print $Pay003cn_PayTxt1        (#row,1) bold
+
+  next-column
+  graphic                       (#row,1,112) horz-line 7
+  move #ChequeNetPay to #NetPay
+  do Net-Pay-In-Words           !convert numbers to words
+  let $NetInWords = '****' || upper($NetInWords)
+  print $NetInWords             ()
+
+  do Alter-Printer-ChqAdv
+
+  next-column
+  print $Pay003cn_PayTxt2       (+2,1) bold
+  print $Pay003cn_PayTxt3       (+1,1) bold
+
+  do Alter-Printer-ChqAdv-Can
+
+  next-column
+  print $ChequeName             (+1,1) bold
+  print $ChequeAddrLine1        (+1,1)
+  print $ChequeAddrLine2        (+1,1)
+  print $ChequeAddrLine3        (+1,1)
+  print $ChequeLocation         (+1,1)
+
+!print the check signature
+
+  let #row = 79
+
+  columns 84
+
+  graphic                       (#row,1,42) horz-line 7
+  print $SigFont                (+2,1) code-printer={PRINTER_CHQADV}
+  print '!!a'                   (,+2)
+
+!print the bank microcode
+
+  use-column 0
+  do Format-Number(&B.PAYCHECK_NBR,$ChequeNum , '099999999999999')
+  let $MicrLine =
+    'C' || $ChequeNum  || 'C' || ' ' ||
+    'A' || $TransitNum || 'A' || '    ' ||
+           $AccountNum || 'C'
+  do Alter-Printer-Microcode
+  print $MicrLine               (83,21)
+
+  new-page
+
+end-procedure
+
+
+!***********************************************************************
+begin-procedure Format-Cheque-Name-Address
+!***********************************************************************
+
+  if rtrim(&B.PayCheck_Name,' ') <> ''
+    let $Name = &B.PayCheck_Name
+    do Rotate-Name
+    let $ChequeName = $Name
+  end-if
+
+  let $ChequeAddrLine3 = ' '
+  let $ChequeLocation =  ' '
+
+  evaluate &B.PayCheck_Addr_Optn
+    when = 'C'  !Mail to Cheque Address
+    when = 'H'  !Mail to Home Address
+    when = 'M'  !Mail to Mail Address
+
+      let $ChequeCityState =
+        rtrim(&B.City,' ') || ' ' || rtrim(&B.State,' ') || '  ' || &B.Postal
+
+      let $ChequeAddrLine1   = &B.Address1
+      if rtrim(&B.Address2,' ') = ''
+        let $ChequeAddrLine2 = $ChequeCityState
+      else
+        let $ChequeAddrLine2 = &B.Address2
+        let $ChequeAddrLine3 = $ChequeCityState
+      end-if
+
+      let $ChequeLocation = $Pay003cn_Locn || $LocationName
+
+    when = 'D'  !Deliver to Home Department
+      let $ChequeAddrLine1 = $Pay003cn_DeptId || ' ' || $DeptID
+      let $ChequeAddrLine2 = $DeptName
+
+    when = 'L'  !Deliver to Job Location
+    when = 'P'  !Deliver to Cheque Location
+      let $ChequeAddrLine1 = $Pay003cn_LocnId || ' ' || $Location
+      let $ChequeAddrLine2 = $LocationName
+  end-evaluate
+
+end-procedure
+
+begin-procedure Find-provincial-data
+
+let $prov_record_found = 'N'
+
+begin-SELECT
+PRV.PROVINCE,
+PRV.CIT_NET_CLAIM_AMT
+
+   move &PRV.PROVINCE          to $PRV_Province
+   move &PRV.CIT_NET_CLAIM_AMT to $PRV_Net_Claim_Amt
+   let $prov_record_found = 'Y'
+
+FROM PS_CAN_TAX_PRVDATA PRV, PS_CAN_TAX_DATA CTD
+WHERE PRV.EMPLID = &B.EmplID
+   AND PRV.COMPANY = &A.COMPANY
+   AND PRV.EMPLID = CTD.EMPLID
+   AND PRV.COMPANY = CTD.COMPANY
+   AND PRV.PROVINCE = $TLC_province
+   AND PRV.EFFDT =
+  (SELECT MAX(EFFDT)
+   FROM PS_CAN_TAX_DATA CTD1
+   WHERE CTD1.EMPLID  = PRV.EMPLID
+   AND CTD1.COMPANY   = PRV.COMPANY
+   AND CTD1.CREATION_DT <= &B.UPDATE_DT
+   AND CTD1.EFFDT    <= &A.Check_Dt)
+  AND CTD.EFFDT =
+  (SELECT MAX(EFFDT)
+   FROM PS_CAN_TAX_DATA CTD1
+   WHERE CTD1.EMPLID  = PRV.EMPLID
+   AND CTD1.COMPANY   = PRV.COMPANY
+   AND CTD1.CREATION_DT <= &B.UPDATE_DT
+   AND CTD1.EFFDT    <= &A.Check_Dt)
+end-SELECT
+
+end-procedure
+
+begin-procedure Find-basic-tax-credit
+
+
+begin-SELECT
+CTP.PROVINCE,
+CTP.PIT_TCP
+
+   move &CTP.PIT_TCP to $CTP_tax_credit_amt
+
+FROM PS_CAN_TAX_PROV CTP
+WHERE CTP.PROVINCE = $TLC_province
+   AND CTP.EFFDT =
+   (SELECT MAX(EFFDT)
+   FROM PS_CAN_TAX_PROV
+   WHERE PROVINCE  = CTP.PROVINCE
+   AND EFFDT    <= &A.Check_Dt)
+end-SELECT
+
+end-procedure
+
+begin-procedure Find-tax-location
+
+let $TLC_province = ''
+
+begin-SELECT
+TLC.STATE
+
+   let $TLC_province = RTRIM(&TLC.STATE, ' ')
+
+FROM PS_TAX_DISTRIB TLC
+WHERE TLC.EMPLID = &B.EmplID
+   AND TLC.EMPL_RCD = &B.Empl_Rcd
+   AND TLC.EFFDT =
+   (SELECT MAX(EFFDT)
+   FROM PS_TAX_DISTRIB
+   WHERE EMPLID = TLC.EMPLID
+   AND EMPL_RCD = TLC.EMPL_RCD
+   AND EFFDT    <= &A.Check_Dt)
+end-SELECT
+
+end-procedure
+
+
+!***********************************************************************
+begin-procedure SSP-Statement
+!***********************************************************************
+
+!Create only XML data for Manual Cheque View Self Service
+
+  do Format-Number(#xmlssp_batch_id, $out, '0999')
+  let $out = 'Batch' || ltrim($out,' ')
+  let $xmltag = 'BATCH_ID'
+  let $xmlcontent = $out
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag = 'BURST_VAL'
+  let $xmlcontent = $xmlssp_burst
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag = 'emp_id'
+  Let $xmlcontent = rtrim(&B.EmplID,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $emplangcd = $curr_language_cd
+  let $xmltag = 'emp_langcd'
+  Let $xmlcontent = rtrim($emplangcd,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag = 'COMPANY_INFO'
+  do Process-SSP-XML-Tag-Beg
+
+  let $xmltag = 'company'
+  let $xmlcontent = $CompanyName
+  do  Process-SSP-XML-Tag-Content
+
+  if rtrim($CompanyAddrLine3,' ') <> ''
+    let $CompanyAddrLine1_2 = rtrim($CompanyAddrLine1,' ') || ', ' || $CompanyAddrLine2
+
+    let $xmltag = 'co_addr_l1'
+    let $xmlcontent = rtrim($CompanyAddrLine1_2,' ')
+    do  Process-SSP-XML-Tag-Content
+
+    let $xmltag = 'co_addr_l2'
+    let $xmlcontent = rtrim($CompanyAddrLine3,' ')
+    do  Process-SSP-XML-Tag-Content
+  else
+    let $xmltag = 'co_addr_l1'
+    let $xmlcontent = rtrim($CompanyAddrLine1,' ')
+    do  Process-SSP-XML-Tag-Content
+
+    let $xmltag = 'co_addr_l2'
+    let $xmlcontent = rtrim($CompanyAddrLine2,' ')
+    do  Process-SSP-XML-Tag-Content
+  end-if
+
+  let $xmltag = 'COMPANY_INFO'
+  do Process-SSP-XML-Tag-End
+
+  let $xmltag = 'PAYGROUP_INFO'
+  do Process-SSP-XML-Tag-Beg
+
+!*$$$$**********
+  let $xmltag = 'Pay003cn_PayGrp'
+  Let $xmlcontent = rtrim($Pay003cn_PayGrp,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag = 'Pay003cn_Pay_BegDt'
+  Let $xmlcontent = rtrim($Pay003cn_Pay_BegDt,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag = 'Pay003cn_Pay_EndDt'
+  Let $xmlcontent = rtrim($Pay003cn_Pay_EndDt,' ')
+  do  Process-SSP-XML-Tag-Content
+!*$$$$**********
+
+  let $out = $PayGroup || '-' || $PayGroupName
+  let $xmltag = 'pay_gp'
+  let $xmlcontent = rtrim($out,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  do Format-DateTime(&A.Pay_Begin_Dt, $out, {DEFDATE}, '', '')
+  let $xmltag = 'pay_beg_dt'
+  let $xmlcontent = rtrim($out,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  do Format-DateTime(&A.Pay_End_Dt, $out, {DEFDATE}, '', '')
+  let $xmltag = 'pay_end_dt'
+  let $xmlcontent = rtrim($out,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $PayShtSrc = ''
+  evaluate &B.Pay_Sheet_Src
+    when = 'O'
+      let $PayShtSrc = $Pay003cn_Onln_Chq
+      break
+    when = 'K'
+      let $PayShtSrc = $Pay003cn_Fnl_Chq
+      break
+    when = 'L'
+      let $PayShtSrc = $Pay003cn_Onln_Fnl
+      break
+  end-evaluate
+
+  let $xmltag = 'pay_sht_src'
+  let $xmlcontent = rtrim($PayShtSrc,' ')
+  do  Process-SSP-XML-Tag-Content
+
+!*$$$$**********
+  let $xmltag = 'Hr_Bus_Unit'
+  Let $xmlcontent = rtrim($Hr_Bus_Unit,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag = 'Pay003cn_Chq'
+  Let $xmlcontent = rtrim($Pay003cn_Chq,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag = 'Pay003cn_ChqDt'
+  Let $xmlcontent = rtrim($Pay003cn_ChqDt,' ')
+  do  Process-SSP-XML-Tag-Content
+!*$$$$**********
+
+  let $xmltag = 'bus_unit'
+  let $xmlcontent = rtrim($bus_unit,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  do Format-Number(&B.PAYCHECK_NBR, $out, '099999999999999')
+  let $xmltag = 'check_num'
+  let $xmlcontent = rtrim($out,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  do Format-DateTime(&B.Check_Dt, $out, {DEFDATE}, '', '')
+  let $xmltag = 'check_dt'
+  let $xmlcontent = rtrim($out,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag = 'PAYGROUP_INFO'
+  do Process-SSP-XML-Tag-End
+
+  do GET-SSP-View-Date
+
+  let $xmltag = 'EMPLOYEE_INFO'
+  do Process-SSP-XML-Tag-Beg
+
+  let $xmltag = 'emp_name'
+  let $xmlcontent = rtrim($HomeName,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag = 'emp_addr_l1'
+  let $xmlcontent = rtrim($HomeAddrLine1,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag = 'emp_addr_l2'
+  let $xmlcontent = rtrim($HomeAddrLine2,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag = 'emp_addr_l3'
+  let $xmlcontent = rtrim($HomeAddrLine3,' ')
+  do  Process-SSP-XML-Tag-Content
+
+!*$$$$**********
+  let $xmltag = 'Pay003cn_EmpId'
+  Let $xmlcontent = rtrim($Pay003cn_EmpId,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag = 'Pay003cn_Dept'
+  Let $xmlcontent = rtrim($Pay003cn_Dept,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag = 'Pay003cn_Locn'
+  Let $xmlcontent = rtrim($Pay003cn_Locn,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag = 'Pay003cn_Job_Title'
+  Let $xmlcontent = rtrim($Pay003cn_Job_Title,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag = 'Pay003cn_Pay_Rt'
+  Let $xmlcontent = rtrim($Pay003cn_Pay_Rt,' ')
+  do  Process-SSP-XML-Tag-Content
+!*$$$$**********
+
+  let $out = $DeptID || '-' || $DeptName
+  let $xmltag = 'emp_dept'
+  let $xmlcontent = rtrim($out,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag = 'locn_code'
+  let $xmlcontent = rtrim($LocationName,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag = 'job_title'
+  let $xmlcontent = rtrim($JobTitle,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  if &FQ.FREQUENCY_TYPE  = 'H'
+     let $Comp_freq_format_mask =  '$$$,$$$,$$$,$$9.999999'
+  else
+     let $Comp_freq_format_mask =  '$$$,$$$,$$$,$$9.99'
+  end-if
+
+  let $out =
+    ltrim(edit(&J.Comprate,$Comp_freq_format_mask),' ') || ' ' || $CompFrequency
+  let $xmltag = 'pay_rt'
+  let $xmlcontent = rtrim($out,' ')
+  do  Process-SSP-XML-Tag-Content
+
+!*$$$$**********
+  let $xmltag = 'Pay003cn_Tax_Data'
+  Let $xmlcontent = rtrim($Pay003cn_Tax_Data,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag = 'Pay003cn_Net_ClmAmt'
+  Let $xmlcontent = rtrim($Pay003cn_Net_ClmAmt,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag = 'Pay003cn_Spcl_Letr'
+  Let $xmlcontent = rtrim($Pay003cn_Spcl_Letr,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag = 'Pay003cn_Addl_Pct'
+  Let $xmlcontent = rtrim($Pay003cn_Addl_Pct,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag = 'Pay003cn_Addl_Amt'
+  Let $xmlcontent = rtrim($Pay003cn_Addl_Amt,' ')
+  do  Process-SSP-XML-Tag-Content
+!*$$$$**********
+
+!*$$$$**********
+  let $xmltag = 'Pay003cn_Fed'
+  Let $xmlcontent = rtrim($Pay003cn_Fed,' ')
+  do  Process-SSP-XML-Tag-Content
+!*$$$$**********
+
+  let   $out = ltrim(edit(&FT.CIT_Net_Claim_Amt,'b,999,999.99'), ' ')
+  let $xmltag = 'net_clm_amt'
+  let $xmlcontent = $out
+  do  Process-SSP-XML-Tag-Content
+
+  let   $out = ltrim(edit(&FT.CIT_Special_Ltrs,'b,999,999'), ' ')
+  let $xmltag = 'spcl_letters'
+  let $xmlcontent = $out
+  do  Process-SSP-XML-Tag-Content
+
+  let   $out = ltrim(edit(&FT.CIT_Addl_Pct,'b9.999'), ' ')
+  let $xmltag = 'fed_addl_pct'
+  let $xmlcontent = $out
+  do  Process-SSP-XML-Tag-Content
+
+  let   $out = ltrim(edit(&FT.CIT_Addl_Amt,'b9,999.99'), ' ')
+  let $xmltag = 'fed_addl_amt'
+  let $xmlcontent = $out
+  do  Process-SSP-XML-Tag-Content
+
+!*$$$$**********
+  let $xmltag = 'Pay003cn_Quebec'
+  Let $xmlcontent = rtrim($Pay003cn_Quebec,' ')
+  do  Process-SSP-XML-Tag-Content
+!*$$$$**********
+
+  let   $out = ltrim(edit(&FT.QIT_Net_Claim_Amt,'b,999,999.99'), ' ')
+  let $xmltag = 'qbc_nclm_amt'
+  let $xmlcontent = $out
+  do  Process-SSP-XML-Tag-Content
+
+  let   $out = ltrim(edit(&FT.QIT_Special_Ltrs,'b,999,999'), ' ')
+  let $xmltag = 'qbc_spcl_ltrs'
+  let $xmlcontent = $out
+  do  Process-SSP-XML-Tag-Content
+
+  let   $out = ltrim(edit(&FT.QIT_Addl_Pct,'b9.999'), ' ')
+  let $xmltag = 'qbc_addl_pct'
+  let $xmlcontent = $out
+  do  Process-SSP-XML-Tag-Content
+
+  let   $out = ltrim(edit(&FT.QIT_Addl_Amt,'b9,999.99'), ' ')
+  let $xmltag = 'qbc_addl_amt'
+  let $xmlcontent = $out
+  do  Process-SSP-XML-Tag-Content
+
+  do Find-tax-location
+
+  if $TLC_province <> 'NN' and
+     $TLC_province <> 'NU' and
+     $TLC_province <> 'NT' and
+     $TLC_province <> 'YT' and
+     $TLC_province <> 'ZZ' and
+     $TLC_province <> 'QC'
+     do Find-provincial-data
+
+     if $prov_record_found = 'Y'
+        let $xmltag = 'emp_prov'
+        let $xmlcontent = $TLC_province
+        do  Process-SSP-XML-Tag-Content
+
+        let   $out = ltrim(edit($PRV_Net_Claim_Amt,'b,999,999.99'), ' ')
+        let $xmltag = 'prov_nclm_amt'
+        let $xmlcontent = $out
+        do  Process-SSP-XML-Tag-Content
+
+     else
+        do Find-basic-tax-credit
+        let $xmltag = 'emp_prov'
+        let $xmlcontent = $TLC_province
+        do  Process-SSP-XML-Tag-Content
+
+        let   $out = ltrim(edit($CTP_tax_credit_amt,'b,999,999.99'), ' ')
+        let $xmltag = 'prov_nclm_amt'
+        let $xmlcontent = $out
+        do  Process-SSP-XML-Tag-Content
+     end-if
+
+  else
+     let $xmltag = 'emp_prov'
+     let $xmlcontent = ''
+     do  Process-SSP-XML-Tag-Content
+
+     let $xmltag = 'prov_nclm_amt'
+     let $xmlcontent = ''
+     do  Process-SSP-XML-Tag-Content
+  end-if
+
+  let $xmltag = 'EMPLOYEE_INFO'
+  do Process-SSP-XML-Tag-End
+
+!*$$$$**********
+  let $xmltag = 'Pay003cn_Hrs_Earns'
+  Let $xmlcontent = rtrim($Pay003cn_Hrs_Earns,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag = 'Pay003cn_Taxes'
+  Let $xmlcontent = rtrim($Pay003cn_Taxes,' ')
+  do  Process-SSP-XML-Tag-Content
+!*$$$$**********
+
+!*$$$$**********
+  let $xmltag = 'Pay003cn_Current'
+  Let $xmlcontent = rtrim($Pay003cn_Current,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag = 'Pay003cn_YTDate'
+  Let $xmlcontent = rtrim($Pay003cn_YTDate,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag = 'Pay003cn_Descr'
+  Let $xmlcontent = rtrim($Pay003cn_Descr,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag = 'Pay003cn_Rate'
+  Let $xmlcontent = rtrim($Pay003cn_Rate,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag = 'Pay003cn_Hours'
+  Let $xmlcontent = rtrim($Pay003cn_Hours,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag = 'Pay003cn_Earns'
+  Let $xmlcontent = rtrim($Pay003cn_Earns,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag = 'Pay003cn_Curr1'
+  Let $xmlcontent = rtrim($Pay003cn_Curr1,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag = 'Pay003cn_YTDL7'
+  Let $xmlcontent = rtrim($Pay003cn_YTDL7,' ')
+  do  Process-SSP-XML-Tag-Content
+!*$$$$**********
+
+!*$$$$**********
+  let $xmltag = 'Pay003cn_Bef_TxDed'
+  Let $xmlcontent = rtrim($Pay003cn_Bef_TxDed,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag = 'Pay003cn_Aft_TxDed'
+  Let $xmlcontent = rtrim($Pay003cn_Aft_TxDed,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag = 'Pay003cn_Emplr_PdBen'
+  Let $xmlcontent = rtrim($Pay003cn_Emplr_PdBen,' ')
+  do  Process-SSP-XML-Tag-Content
+!*$$$$**********
+
+!*$$$$**********
+  let $xmltag = 'Pay003cn_YTDL6'
+  Let $xmlcontent = rtrim($Pay003cn_YTDL6,' ')
+  do  Process-SSP-XML-Tag-Content
+!*$$$$**********
+
+ let #lncnt = {n}
+ do Create-Earnings-XML-Data
+ do Create-Taxes-XML-Data
+ do Create-Before-Tax-Deduction-XML-Data
+ do Create-After-Tax-Deduction-XML-Data
+ do Create-Employee-Paid-Benefits-XML-Data
+
+!*$$$$**********
+  let $xmltag = 'Pay003cn_Curr2'
+  Let $xmlcontent = rtrim($Pay003cn_Curr2,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag = 'Pay003cn_YTD2'
+  Let $xmlcontent = rtrim($Pay003cn_YTD2,' ')
+  do  Process-SSP-XML-Tag-Content
+!*$$$$**********
+
+!*$$$$**********
+  let $xmltag = 'Pay003cn_Tot_Grs'
+  Let $xmlcontent = rtrim($Pay003cn_Tot_Grs,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag = 'Pay003cn_CIT_Tx_Grs'
+  Let $xmlcontent = rtrim($Pay003cn_CIT_Tx_Grs,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag = 'Pay003cn_Tot_Tx'
+  Let $xmlcontent = rtrim($Pay003cn_Tot_Tx,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag = 'Pay003cn_Tot_Dedn'
+  Let $xmlcontent = rtrim($Pay003cn_Tot_Dedn,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag = 'Pay003cn_NetPay'
+  Let $xmlcontent = rtrim($Pay003cn_NetPay,' ')
+  do  Process-SSP-XML-Tag-Content
+!*$$$$**********
+
+  do Current-YearToDate-Totals-XML-Data-CAN
+
+!*$$$$**********
+  let $xmltag = 'Pay003cn_YrToDt'
+  Let $xmlcontent = rtrim($Pay003cn_YrToDt,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag = 'Pay003cn_PaidTmOff'
+  Let $xmlcontent = rtrim($Pay003cn_PaidTmOff,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag = 'Pay003cn_SickLeave'
+  Let $xmlcontent = rtrim($Pay003cn_SickLeave,' ')
+  do  Process-SSP-XML-Tag-Content
+!*$$$$**********
+
+  do PTO-Sick-Hours-XML-Data
+
+  if $NeedXfootMsg = 'Y'
+    let $xmltag     = 'xfoot_msg1'
+    let $xmlcontent = $Pay003cn_XFootMsg1
+    do  Process-SSP-XML-Tag-Content
+
+    let $xmltag     = 'xfoot_msg2'
+    let $xmlcontent = $Pay003cn_XFootMsg2
+    do  Process-SSP-XML-Tag-Content
+
+  else
+    let $xmltag     = 'xfoot_msg1'
+    let $xmlcontent = ''
+    do  Process-SSP-XML-Tag-Content
+
+    let $xmltag     = 'xfoot_msg2'
+    let $xmlcontent = ''
+    do  Process-SSP-XML-Tag-Content
+  end-if
+
+!*$$$$**********
+  let $xmltag = 'Pay003cn_NetPay_Dstrbn'
+  Let $xmlcontent = rtrim($Pay003cn_NetPay_Dstrbn,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag = 'Pay003cn_PayType'
+  Let $xmlcontent = rtrim($Pay003cn_PayType,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag = 'Pay003cn_Amount'
+  Let $xmlcontent = rtrim($Pay003cn_Amount,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag = 'Pay003cn_Acct_Num'
+  Let $xmlcontent = rtrim($Pay003cn_Acct_Num,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag = 'Pay003cn_Acct_type'
+  Let $xmlcontent = rtrim($Pay003cn_Acct_type,' ')
+  do  Process-SSP-XML-Tag-Content
+!*$$$$**********
+
+  let $xmltag = 'NET_PAY_DISTRIBUTIONS'
+  do Process-SSP-XML-Tag-Beg
+
+  if #DepositNetPay <> 0
+
+    if #Depositcheckings <> 0
+       let $xmltag = 'net_distrib'
+       do Process-SSP-XML-Tag-Beg
+
+       let $xmltag     = 'py_type'
+       do Format-Number(#Advice#, $out, '099999999999999')
+       let $xmlcontent = $Pay003cn_Adv2 || $out
+       do  Process-SSP-XML-Tag-Content
+
+       let $xmltag     = 'acct_type'
+       let $xmlcontent = $adv_checkings
+       do  Process-SSP-XML-Tag-Content
+
+       let $xmltag     = 'acct_num'
+       let $xmlcontent = $deposit_acct_nbr_chckngs
+       do  Process-SSP-XML-Tag-Content
+
+       let $xmltag     = 'net_amt'
+       do Format-Number(#Depositcheckings, $out, '99,999,999.99')
+       let $xmlcontent = ltrim($out,' ')
+       do  Process-SSP-XML-Tag-Content
+
+       let $xmltag = 'net_distrib'
+       do Process-SSP-XML-Tag-End
+    end-if
+
+    if #Depositsavings <> 0
+       let $xmltag = 'net_distrib'
+       do Process-SSP-XML-Tag-Beg
+
+       let $xmltag     = 'py_type'
+       do Format-Number(#Advice#, $out, '099999999999999')
+       let $xmlcontent = $Pay003cn_Adv2 || $out
+       do  Process-SSP-XML-Tag-Content
+
+       let $xmltag     = 'acct_type'
+       let $xmlcontent = $adv_savings
+       do  Process-SSP-XML-Tag-Content
+
+       let $xmltag     = 'acct_num'
+       let $xmlcontent = $deposit_acct_nbr_savings
+       do  Process-SSP-XML-Tag-Content
+
+       let $xmltag     = 'net_amt'
+       do Format-Number(#Depositsavings, $out, '99,999,999.99')
+       let $xmlcontent = ltrim($out,' ')
+       do  Process-SSP-XML-Tag-Content
+
+       let $xmltag = 'net_distrib'
+       do Process-SSP-XML-Tag-End
+    end-if
+
+  end-if
+
+  if #ChequeNetPay <> 0
+    let $xmltag = 'net_distrib'
+    do Process-SSP-XML-Tag-Beg
+
+    let $xmltag     = 'py_type'
+    do Format-Number(&B.PAYCHECK_NBR, $out, '099999999999999')
+    let $xmlcontent = $Pay003cn_Chq2 || $out
+    do  Process-SSP-XML-Tag-Content
+
+    let $xmltag     = 'acct_type'
+    let $xmlcontent = $chk_issued
+    do  Process-SSP-XML-Tag-Content
+
+    let $xmltag     = 'acct_num'
+    let $xmlcontent = ''
+    do  Process-SSP-XML-Tag-Content
+
+    let $xmltag     = 'net_amt'
+    do Format-Number(#ChequeNetPay, $out, '99,999,999.99')
+    let $xmlcontent = ltrim($out,' ')
+    do  Process-SSP-XML-Tag-Content
+
+    let $xmltag = 'net_distrib'
+    do Process-SSP-XML-Tag-End
+  end-if
+
+  let $xmltag = 'NET_PAY_DISTRIBUTIONS'
+  do Process-SSP-XML-Tag-End
+
+  let $xmltag     = 'net_amt_total'
+  do Format-Number(&B.Net_Pay, $out, '999,999,999.99')
+  let $xmlcontent = ltrim($out,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  if &B.PAYCHECK_OPTION <> 'M'
+     !*$$$$**********
+     let $xmltag = 'Pay003cn_Msg'
+     let $xmlcontent = rtrim($Pay003cn_Msg,' ')
+     do  Process-SSP-XML-Tag-Content
+     !*$$$$**********
+
+     let $xmltag     = 'pay_slip_msg'
+     let $xmlcontent = $ChequeMessage
+     do  Process-SSP-XML-Tag-Content
+  end-if
+
+end-procedure
+
+!***********************************************************************
+begin-procedure SSP-Cheque
+!***********************************************************************
+
+  do Format-Cheque-Name-Address
+
+  let $xmltag = 'CHECK_INFO'
+  do Process-SSP-XML-Tag-Beg
+
+  !print the company and bank information and the cheque number
+
+  let $xmltag     = 'chk_co_name'
+  let $xmlcontent = rtrim($CompanyName,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag     = 'chk_co_adl1'
+  let $xmlcontent = rtrim($CompanyAddrLine1,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag     = 'chk_co_adl2'
+  let $xmlcontent = rtrim($CompanyAddrLine2,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag     = 'chk_co_adl3'
+  let $xmlcontent = rtrim($CompanyAddrLine3,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag     = 'bnk_nm'
+  let $xmlcontent = rtrim($BankName,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag     = 'bnk_adl1'
+  let $xmlcontent = rtrim($BankAddrLine1,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag     = 'bnk_adl2'
+  let $xmlcontent = rtrim($BankAddrLine2,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag     = 'bnk_adl3'
+  let $xmlcontent = rtrim($BankAddrLine3,' ')
+  do  Process-SSP-XML-Tag-Content
+  do Alter-Printer-ChqAdv
+
+  do Format-Number(&B.PAYCHECK_NBR, $out, '999999999999')
+  let $out = ltrim($out,' ')
+
+!*$$$$**********
+  let $xmltag = 'Pay003cn_ChqNo'
+  Let $xmlcontent = rtrim($Pay003cn_ChqNo,' ')
+  do  Process-SSP-XML-Tag-Content
+!*$$$$**********
+
+  let $xmltag     = 'bnk_chkno'
+  let $xmlcontent = rtrim($out,' ')
+  do  Process-SSP-XML-Tag-Content
+
+!print the cheque date and numeric amount
+
+!print the cheque date
+
+  do Format-DateTime(&B.Check_Dt, $out, {DEFYMD}, '', '')
+  let $out = replace($out,'/','-')
+  let $xmltag     = 'bnk_chkdt'
+  let $xmlcontent = rtrim($out,' ')
+  do  Process-SSP-XML-Tag-Content
+
+!print the date indicator
+
+!*$$$$**********
+  let $xmltag = 'Pay003cn_Date'
+  Let $xmlcontent = rtrim($Pay003cn_Date,' ')
+  do  Process-SSP-XML-Tag-Content
+!*$$$$**********
+
+  let $xmltag     = 'bnk_chkdt_ind'
+  let $xmlcontent = rtrim($Pay003cn_Date_Ind,' ')
+  do  Process-SSP-XML-Tag-Content
+
+!print the numeric amount
+
+!*$$$$**********
+  let $xmltag = 'Pay003cn_PayAmt'
+  Let $xmlcontent = rtrim($Pay003cn_PayAmt,' ')
+  do  Process-SSP-XML-Tag-Content
+!*$$$$**********
+
+  do Format-Number(#ChequeNetPay, $out, '9,999,999,999.99mi')
+  let $out = lpad(ltrim($out,' '),14,'*')
+  let $out = '$' || $out
+  let $xmltag     = 'bnk_payamt'
+  let $xmlcontent = rtrim($out,' ')
+  do  Process-SSP-XML-Tag-Content
+
+!print the amount in words and the payee information
+
+!*$$$$**********
+  let $xmltag = 'Pay003cn_PayTxt1'
+  Let $xmlcontent = rtrim($Pay003cn_PayTxt1,' ')
+  do  Process-SSP-XML-Tag-Content
+!*$$$$**********
+
+  move #ChequeNetPay to #NetPay
+  do Net-Pay-In-Words           !convert numbers to words
+  let $NetInWords = '****' || upper($NetInWords)
+
+  let $xmltag     = 'bnk_amtinwords'
+  let $xmlcontent = rtrim($NetInWords,' ')
+  do  Process-SSP-XML-Tag-Content
+
+!*$$$$**********
+  let $xmltag = 'Pay003cn_PayTxt2'
+  Let $xmlcontent = rtrim($Pay003cn_PayTxt2,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag = 'Pay003cn_PayTxt3'
+  Let $xmlcontent = rtrim($Pay003cn_PayTxt3,' ')
+  do  Process-SSP-XML-Tag-Content
+!*$$$$**********
+
+!*$$$$**********
+  let $xmltag = 'ChequeLocation'
+  Let $xmlcontent = rtrim($ChequeLocation,' ')
+  do  Process-SSP-XML-Tag-Content
+!*$$$$**********
+
+  let $xmltag     = 'chk_pye_name'
+  let $xmlcontent = rtrim($ChequeName,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag     = 'chk_pye_adl1'
+  let $xmlcontent = rtrim($ChequeAddrLine1,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag     = 'chk_pye_adl2'
+  let $xmlcontent = rtrim($ChequeAddrLine2,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag     = 'chk_pye_adl3'
+  let $xmlcontent = rtrim($ChequeAddrLine3,' ')
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag     = 'chk_pye_locn'
+  let $xmlcontent = rtrim($ChequeLocation,' ')
+  do  Process-SSP-XML-Tag-Content
+
+!print the bank microcode
+
+  do Format-Number(&B.PAYCHECK_NBR,$ChequeNum , '099999999999999')
+  let $MicrLine =
+    'C' || $ChequeNum  || 'C' || ' ' ||
+    'A' || $TransitNum || 'A' || '    ' ||
+           $AccountNum || 'C'
+  let $xmltag     = 'chk_mirc_line'
+  let $xmlcontent = $MicrLine
+  do  Process-SSP-XML-Tag-Content
+
+  let $xmltag = 'CHECK_INFO'
+  do Process-SSP-XML-Tag-End
+
+end-procedure
+

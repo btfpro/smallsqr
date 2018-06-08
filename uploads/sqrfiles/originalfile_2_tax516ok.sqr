@@ -1,0 +1,789 @@
+!***********************************************************************
+!  TAX516OK:  State Tax Data Update - Oklahoma - 2006                  *
+!                                                                      *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module contains confidential and proprietary information        *
+! of Oracle; it is not to be copied, reproduced, or transmitted        *
+! in any form, by any means, in whole or in part, nor is it to         *
+! be used for any purpose other than that for which it is              *
+! expressly provided under the applicable license agreement.           *
+!                                                                      *
+! Copyright (C) 2007 Oracle. All Rights Reserved.                      *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+!          $Date:  2007/02/20:22:22:42                                 *
+!       $Release:  HR9                                                 *
+!    $Resolution:  694792                                              *
+!                                                                      *
+!***********************************************************************
+
+
+#include 'setenv.sqc'  !Set environment
+#include 'setup02.sqc' !printer and page-size initialization
+#Include 'usarpt.sqc'  !Get USA variables
+
+begin-report
+  do Init-Report
+  do Process-Main
+  do NTR-Check
+  do Stdapi-Term
+end-report
+
+begin-procedure Init-Report
+  do Init-DateTime
+  move '1' to $MMLZero
+  move '1' to $DDLZero
+  move '1' to $Year4
+  move '-' to $DDelimiter
+  do Stdapi-Init
+
+  if $Prcs_Process_Instance = ''
+    do Prompts
+  else
+    do Select-Parameters
+  end-if
+  move 'TAX516OK' to $ReportID
+  if $ActionType = 'U'
+    move 'Oklahoma State Tax Data Update Report' to $ReportTitle
+  else
+    move 'Oklahoma State Tax Data Audit Report' to $ReportTitle
+  end-if
+  display ' '
+  display $ReportTitle
+  display ' '
+
+  do Get-Current-DateTime
+  let $StartDate = $AsOfToday
+  do Convert-To-DTU-date($AsOfToday,$StDate)
+  do dtu-subtract-days($StDate, 1,$EndDate)
+  do Convert-From-DTU-Date ($EndDate,$OldEffDt)  !native
+  do Format-DateTime($OldEffDt, $OldEffDate, {DEFCMP}, '', '')
+  move 'N' to $EmpFound
+  move $AsOfToday to $NewEffDt
+
+end-procedure
+
+begin-heading 7
+  #include 'stdhdg01.sqc'
+  print $heading_dt                   (-1,,) center
+
+  print 'SWT Status'                                 (+3,98)
+  print 'Employee Id'                                 (+1, 1)
+  print 'Company'                                      (, 15)
+  print 'Name'                                         (, 30)
+  print 'Effective Date'                               (, 80)
+  print 'Prior  New'                                   (, 98)
+  print 'FWT Status'                                   (, 114)
+  print 'Error'                                        (, 128)
+end-heading
+
+
+begin-procedure Process-Main
+
+begin-SELECT
+A.EMPLID
+A.COMPANY
+A.EFFDT
+A.STATE
+PN.LAST_NAME
+PN.FIRST_NAME
+PN.MIDDLE_NAME
+AC.ACTION
+
+  move &A.EFFDT to $A.EFFDT
+  let $State = RTRIM(&A.State,' ')
+  if &AC.ACTION <> 'TER'
+      move $NewEffDt to $EmplidEffDt
+      do Process-EE
+      do Check-for-Future-OK
+  end-if
+
+FROM PS_STATE_TAX_DATA A, PS_PERSON B, PS_PERSON_NAME PN, PS_JOB  AC
+WHERE  A.EFFDT <= $NewEffDt
+  AND A.SWT_MAR_STATUS = 'B'
+  AND A.STATE = 'OK'
+  AND A.EFFDT  = (SELECT MAX(A1.EFFDT) FROM PS_STATE_TAX_DATA A1
+                  WHERE A1.EMPLID  = A.EMPLID
+                    AND A1.EFFDT <= $NewEffDt
+                    AND A1.COMPANY = A.COMPANY)
+  AND A.EMPLID = B.EMPLID
+  AND A.EMPLID = AC.EMPLID
+  AND PN.EMPLID = B.EMPLID
+  AND A.COMPANY = AC.COMPANY
+  AND AC.EFFSEQ = (SELECT MAX(EFFSEQ) FROM PS_JOB AC1
+                        WHERE AC1.EMPLID = AC.EMPLID
+                        AND AC1.EFFDT = AC.EFFDT
+                        AND AC1.COMPANY = AC.COMPANY)
+  AND AC.EFFDT = (SELECT MAX(EFFDT) FROM PS_JOB
+                 WHERE EMPLID = A.EMPLID
+                   AND COMPANY = A.COMPANY
+                   AND EFFDT <= $NewEffDt)
+ORDER BY A.COMPANY,A.EMPLID
+
+end-SELECT
+
+end-procedure
+
+
+begin-procedure Process-EE
+
+   if &A.Emplid <> $HoldEmplid
+     move &A.Emplid to $HoldEmplid
+     move 'N' to $AlreadyUpdated
+   end-if
+   if &A.Company <> $HoldCompany
+     move &A.Company to $HoldCompany
+     move 'N' to $AlreadyUpdated
+   end-if
+   let $err-flag = 'N'
+   do Get-Fed-Tax-Data
+
+   if $err-flag = 'N'
+     do Get-State-Tax-Data
+     do Get-Local-Tax-Data
+   end-if
+
+  let $FutureRow = 'Y'
+
+  While $FutureRow = 'Y'
+     do Process-Future-Rows
+  End-While
+
+end-procedure
+
+
+begin-procedure Get-Fed-Tax-Data
+
+move 'N' to $FedSyncFlag
+
+begin-SELECT
+C.EMPLID,
+C.COMPANY,
+C.EFFDT,
+C.SPECIAL_FWT_STATUS,
+C.FWT_MAR_STATUS,
+C.FWT_ALLOWANCES,
+C.FWT_ADDL_AMT,
+C.FWT_ADDL_PCT,
+C.FUT_EXEMPT,
+C.EIC_STATUS,
+C.STATUTORY_EE,
+C.DECEASED,
+C.PENSION_PLAN,
+C.LEGAL_REP,
+C.DEFERRED_COMP,
+C.USE_TOTAL_WAGE,
+C.LAST_ACTION,
+C.W4_PRCSS,
+C.W5_PRCSS,
+C.LOCK_IN_RECVD,
+C.LOCK_IN_LIMIT,
+C.DATE_OF_ENTRY,
+C.COUNTRY,
+C.FORM_1001_RECD,
+C.FORM_1001_SUBMT_DT,
+C.FORM_8233_RECD,
+C.FORM_8233_SUBMT_DT,
+C.TAXPAYER_ID_NO,
+C.TREATY_EXP_DT,
+C.TREATY_ID,
+C.FORM_1078_RECD,
+C.FORM_1078_SUBMT_DT,
+C.THIRDPARTY_SICKPAY,
+C.W4_NAME_CHECK,
+C.PY_FLAG_FOR_IRS,
+C.PY_FLAG_FOR_IRS_DT,
+C.CREATION_DT,
+C.MARRIED_FILE_SINGL,
+C.NRA_EXEMPT_WHRULE,
+C.NQDC_W2_RPTG
+
+  move &C.FWT_MAR_STATUS  to $FWTMarStatus
+  if $AlreadyUpdated = 'Y'
+    let $err-flag = 'Y'
+    do AlreadyUpdated
+  else
+    if &C.EFFDT < $A.EFFDT
+      do Fed-State-Sync-Needed
+      let $err-flag = 'Y'
+    else
+      move &C.EFFDT to $C.EFFDT
+      move 'Y' to $AlreadyUpdated
+    end-if
+  end-if
+
+  move 'Y' to $FedSyncFlag
+
+FROM PS_FED_TAX_DATA C
+WHERE C.EMPLID   = &A.EMPLID
+  AND C.COMPANY  = &A.COMPANY
+  AND C.EFFDT    = &A.EFFDT
+
+end-SELECT
+
+  if $FedSyncFlag = 'N'
+    do Fed-State-Sync-Needed
+    let $err-flag = 'Y'
+  end-if
+  move '                           ' to $error
+
+end-procedure
+
+
+begin-procedure Insert-Fed-Tax-Row
+  let $sql-statement = 'TAX516OK.SQR,Insert-Fed-Tax-Row,Insert,PS_FED_TAX_DATA'
+BEGIN-SQL
+INSERT INTO PS_FED_TAX_DATA
+(EMPLID,
+COMPANY,
+EFFDT,
+SPECIAL_FWT_STATUS,
+FWT_MAR_STATUS,
+FWT_ALLOWANCES,
+FWT_ADDL_AMT,
+FWT_ADDL_PCT,
+FUT_EXEMPT,
+EIC_STATUS,
+STATUTORY_EE,
+DECEASED,
+PENSION_PLAN,
+LEGAL_REP,
+DEFERRED_COMP,
+USE_TOTAL_WAGE,
+LAST_ACTION,
+W4_PRCSS,
+W5_PRCSS,
+LOCK_IN_RECVD,
+LOCK_IN_LIMIT,
+LAST_UPDATE_DATE,
+DATE_OF_ENTRY,
+COUNTRY,
+FORM_1001_RECD,
+FORM_1001_SUBMT_DT,
+FORM_8233_RECD,
+FORM_8233_SUBMT_DT,
+TAXPAYER_ID_NO,
+TREATY_EXP_DT,
+TREATY_ID,
+FORM_1078_RECD,
+FORM_1078_SUBMT_DT,
+THIRDPARTY_SICKPAY,
+W4_NAME_CHECK,
+PY_FLAG_FOR_IRS,
+PY_FLAG_FOR_IRS_DT,
+CREATION_DT,
+MARRIED_FILE_SINGL,
+NRA_EXEMPT_WHRULE,
+NQDC_W2_RPTG
+)
+VALUES
+(&C.EMPLID,
+&C.COMPANY,
+$NewEffDt,
+&C.SPECIAL_FWT_STATUS,
+&C.FWT_MAR_STATUS,
+&C.FWT_ALLOWANCES,
+&C.FWT_ADDL_AMT,
+&C.FWT_ADDL_PCT,
+&C.FUT_EXEMPT,
+&C.EIC_STATUS,
+&C.STATUTORY_EE,
+&C.DECEASED,
+&C.PENSION_PLAN,
+&C.LEGAL_REP,
+&C.DEFERRED_COMP,
+&C.USE_TOTAL_WAGE,
+&C.LAST_ACTION,
+&C.W4_PRCSS,
+&C.W5_PRCSS,
+&C.LOCK_IN_RECVD,
+&C.LOCK_IN_LIMIT,
+$AsOfToday,
+&C.DATE_OF_ENTRY,
+&C.COUNTRY,
+&C.FORM_1001_RECD,
+&C.FORM_1001_SUBMT_DT,
+&C.FORM_8233_RECD,
+&C.FORM_8233_SUBMT_DT,
+&C.TAXPAYER_ID_NO,
+&C.TREATY_EXP_DT,
+&C.TREATY_ID,
+&C.FORM_1078_RECD,
+&C.FORM_1078_SUBMT_DT,
+&C.THIRDPARTY_SICKPAY,
+&C.W4_NAME_CHECK,
+&C.PY_FLAG_FOR_IRS,
+&C.PY_FLAG_FOR_IRS_DT,
+&C.CREATION_DT,
+&C.MARRIED_FILE_SINGL,
+&C.NRA_EXEMPT_WHRULE,
+&C.NQDC_W2_RPTG
+)
+end-sql
+
+move 'Y' to $InsertedFed
+
+END-PROCEDURE
+
+
+begin-procedure Get-State-Tax-Data
+
+move 'N' to $UpdateNeeded
+move 'N' to $InsertedFed
+
+begin-SELECT
+D.EMPLID,
+D.COMPANY,
+D.EFFDT,
+D.STATE,
+D.RESIDENT,
+D.NON_RES_DECLARED,
+D.SPECIAL_SWT_STATUS,
+D.SWT_MAR_STATUS,
+D.SWT_ALLOWANCES,
+D.SWT_ADDL_ALLOWNCES,
+D.WAGE_PLAN_CD,
+D.ANNL_EXEMPTION_AMT,
+D.PERCENT_OF_FWT,
+D.SWT_ADDL_AMT,
+D.SWT_ADDL_PCT,
+D.SDI_STATUS,
+D.SUT_EXEMPT,
+D.UI_JURISDICTION,
+D.ADDL_AMT_ADJ,
+D.LOCK_IN_RECVD,
+D.LOCK_IN_LIMIT,
+D.RETIREMENT_PLAN,
+D.EIC_STATUS_ST
+
+  move &D.SWT_MAR_STATUS to $OldStatus
+  move &D.EFFDT          to $D.EFFDT
+  do Convert-To-DTU-Date ($D.EFFDT,$EEeffdt)  !native
+
+  let $D.State = RTRIM(&D.State,' ')
+
+  do Evaluate-Status
+  do Print-Name
+  do Print-Info
+
+  if $UpdateNeeded = 'Y'  and $ActionType = 'U'
+
+    if $EEeffdt = $StDate
+      do Update-State-Tax-Row-Today
+    else
+
+      move $NewStatus to $D.SWT_MAR_STATUS
+        if $InsertedFed = 'N'
+          do Insert-Fed-Tax-Row
+        end-if
+      do Insert-State-Tax-Row
+    end-if
+
+  end-if
+
+  move '                           ' to $error
+
+FROM PS_STATE_TAX_DATA D
+WHERE D.EMPLID   = &A.EMPLID
+  AND D.COMPANY  = &A.COMPANY
+  AND D.STATE    = 'OK'
+  AND D.EFFDT    = &A.EFFDT
+end-SELECT
+
+
+end-procedure
+
+begin-procedure Evaluate-Status
+
+      evaluate $FWTMarStatus
+         when = 'S'
+           move 'S' to $NewStatus
+           move 'Y' to $UpdateNeeded
+           break
+         when = 'M'
+           move 'M' to $NewStatus
+           move 'Y' to $UpdateNeeded
+           break
+         when-other
+           do FWT-Marital-Status-Invalid
+           move 'N' to $UpdateNeeded
+           break
+       end-evaluate
+
+end-procedure
+
+begin-procedure Insert-State-Tax-Row
+  let $sql-statement = 'TAX516OK.SQR,Insert-State-Tax-Row,Insert,PS_STATE_TAX_DATA'
+BEGIN-SQL
+INSERT INTO PS_STATE_TAX_DATA
+(EMPLID,
+COMPANY,
+EFFDT,
+STATE,
+RESIDENT,
+NON_RES_DECLARED,
+SPECIAL_SWT_STATUS,
+SWT_MAR_STATUS,
+SWT_ALLOWANCES,
+SWT_ADDL_ALLOWNCES,
+WAGE_PLAN_CD,
+ANNL_EXEMPTION_AMT,
+PERCENT_OF_FWT,
+SWT_ADDL_AMT,
+SWT_ADDL_PCT,
+SDI_STATUS,
+SUT_EXEMPT,
+UI_JURISDICTION,
+ADDL_AMT_ADJ,
+LOCK_IN_RECVD,
+LOCK_IN_LIMIT,
+RETIREMENT_PLAN,
+EIC_STATUS_ST,
+CREATION_DT)
+VALUES
+(&D.EMPLID,
+&D.COMPANY,
+$NewEffDt,
+&D.STATE,
+&D.RESIDENT,
+&D.NON_RES_DECLARED,
+&D.SPECIAL_SWT_STATUS,
+$D.SWT_MAR_STATUS,
+&D.SWT_ALLOWANCES,
+&D.SWT_ADDL_ALLOWNCES,
+&D.WAGE_PLAN_CD,
+&D.ANNL_EXEMPTION_AMT,
+&D.PERCENT_OF_FWT,
+&D.SWT_ADDL_AMT,
+&D.SWT_ADDL_PCT,
+&D.SDI_STATUS,
+&D.SUT_EXEMPT,
+&D.UI_JURISDICTION,
+&D.ADDL_AMT_ADJ,
+&D.LOCK_IN_RECVD,
+&D.LOCK_IN_LIMIT,
+&D.RETIREMENT_PLAN,
+&D.EIC_STATUS_ST,
+$AsOfToday)
+end-sql
+END-PROCEDURE
+
+begin-procedure Get-Local-Tax-Data
+
+begin-SELECT
+E.EMPLID,
+E.COMPANY,
+E.EFFDT,
+E.STATE,
+E.LOCALITY,
+E.RESIDENT,
+E.LWT_ALLOWANCES,
+E.LWT_AMT,
+E.LWT_PCT,
+E.LOCALITY_LINK,
+E.SPECIAL_LWT_STATUS,
+E.LWT_MAR_STATUS
+
+   if $ActionType = 'U'  and $UpdateNeeded = 'Y'
+      do Insert-Local-Tax-Row
+   end-if
+
+FROM PS_LOCAL_TAX_DATA E
+WHERE E.EMPLID   = &A.EMPLID
+  AND E.COMPANY  = &A.COMPANY
+  AND E.EFFDT    = &A.EFFDT
+end-SELECT
+
+end-procedure
+
+
+begin-procedure Process-Future-Rows
+
+move 'N' to $UpdateNeeded
+
+begin-SELECT
+A2.EMPLID
+A2.COMPANY
+A2.EFFDT
+A2.STATE
+A2.SWT_MAR_STATUS
+
+  move &A2.SWT_MAR_STATUS to $OldStatus
+  move &A2.EFFDT to $A2.EffDT
+  move &A2.EFFDT to $EmplidEffDt
+
+  let $A2.State = RTRIM(&A2.State,' ')
+  if $A2.STATE = 'OK'
+
+    do Evaluate-Status
+    if $UpdateNeeded = 'Y'  and $ActionType = 'U'
+      move $NewStatus to $A2.SWT_MAR_STATUS
+      do Update-State-Tax-Row
+    end-if
+  end-if
+
+
+  move &A2.EFFDT to $A2.EFFDT
+  if &AC.ACTION <> 'TER'
+      do Found-Future
+  end-if
+  move '                           ' to $error
+
+FROM  PS_STATE_TAX_DATA A2
+WHERE A2.EFFDT > $NewEffDt
+  AND &A.EMPLID = A2.EMPLID
+  AND &A.COMPANY = A2.COMPANY
+  AND A2.STATE  = 'OK'
+
+end-SELECT
+  move 'N' to $FutureRow
+
+end-procedure
+
+begin-procedure Update-State-Tax-Row
+
+  let $sql-statement = 'TAX516OK.SQR,Update-Local-Tax-Row,Update,PS_STATE_TAX_DATA'
+BEGIN-SQL
+UPDATE PS_STATE_TAX_DATA
+ SET SWT_MAR_STATUS = $NewStatus
+
+WHERE STATE  = 'OK'
+  AND &A2.EMPLID  = EMPLID
+  AND &A2.COMPANY = COMPANY
+  AND $A2.EffDT = EFFDT
+end-sql
+END-PROCEDURE
+
+begin-procedure Check-for-Future-OK
+
+move 'N' to $UpdateNeeded
+
+begin-SELECT
+G.EMPLID
+G.COMPANY
+G.EFFDT
+G.STATE
+G.SWT_MAR_STATUS
+
+  if &G.EMPLID <> $HoldEmplid
+
+    move &G.SWT_MAR_STATUS to $OldStatus
+    move &G.EFFDT to $G.EffDT
+    move &G.EFFDT to $EmplidEffDt
+
+    let $G.State = RTRIM(&G.State,' ')
+    if $G.STATE = 'OK'
+
+       do Evaluate-Status
+       if $UpdateNeeded = 'Y'  and $ActionType = 'U'
+         move $NewStatus to $G.SWT_MAR_STATUS
+         do Update-State-Tax-Row-NEW
+       end-if
+
+       move &G.EFFDT to $G.EFFDT
+      if &AC.ACTION <> 'TER'
+         do Found-Future
+       end-if
+       move '                           ' to $error
+       move &G.EMPLID to $HoldEmplid
+    end-if
+  end-if
+
+FROM PS_STATE_TAX_DATA G
+WHERE G.EFFDT > $NewEffDt
+  AND &A.EMPLID = G.EMPLID
+  AND &A.COMPANY = G.COMPANY
+  AND G.STATE  = 'OK'
+
+
+end-SELECT
+  move 'N' to $FutureRow
+end-procedure
+
+begin-procedure Update-State-Tax-Row-NEW
+
+  let $sql-statement = 'TAX516OK.SQR,Update-Local-Tax-Row,Update,PS_STATE_TAX_DATA'
+BEGIN-SQL
+UPDATE PS_STATE_TAX_DATA
+ SET SWT_MAR_STATUS = $NewStatus
+
+WHERE STATE  = 'OK'
+  AND &G.EMPLID  = EMPLID
+  AND &G.COMPANY = COMPANY
+  AND $G.EffDT = EFFDT
+end-sql
+END-PROCEDURE
+
+begin-procedure Update-State-Tax-Row-Today
+
+  let $sql-statement = 'TAX516OK.SQR,Update-State-Tax-Row-Today,Update,PS_STATE_TAX_DATA'
+BEGIN-SQL
+UPDATE PS_STATE_TAX_DATA
+ SET SWT_MAR_STATUS = $NewStatus
+
+WHERE STATE  = 'OK'
+  AND &D.EMPLID  = EMPLID
+  AND &D.COMPANY = COMPANY
+  AND $D.EffDT = EFFDT
+end-sql
+END-PROCEDURE
+
+
+begin-procedure Insert-Local-Tax-Row
+  let $sql-statement = 'TAX516OK.SQR,Insert-Local-Tax-Row,Insert,PS_LOCAL_TAX_DATA'
+BEGIN-SQL
+INSERT INTO PS_LOCAL_TAX_DATA
+(EMPLID,
+ COMPANY,
+ EFFDT,
+ STATE,
+ LOCALITY,
+ RESIDENT,
+ LWT_ALLOWANCES,
+ LWT_AMT,
+ LWT_PCT,
+ LOCALITY_LINK,
+ SPECIAL_LWT_STATUS,
+ LWT_MAR_STATUS)
+ VALUES
+(&E.EMPLID,
+ &E.COMPANY,
+ $NewEffDt,
+ &E.STATE,
+ &E.LOCALITY,
+ &E.RESIDENT,
+ &E.LWT_ALLOWANCES,
+ &E.LWT_AMT,
+ &E.LWT_PCT,
+ &E.LOCALITY_LINK,
+ &E.SPECIAL_LWT_STATUS,
+ &E.LWT_MAR_STATUS)
+end-sql
+END-PROCEDURE
+
+begin-procedure Print-Name
+  print &A.EMPLID                 (+1,1,11)
+  print &A.COMPANY                (0,17,3)
+
+  print &PN.LAST_NAME              (0,30,20)
+  print ', '                      ()
+  let $FIRST_NAME = rtrim(&PN.FIRST_NAME,' ')
+  print $FIRST_NAME               (0,53,25)
+  print &PN.MIDDLE_NAME            (0,80,1) edit bx
+
+end-procedure
+
+
+begin-procedure Print-Info
+  move 'Y' to $EmpFound
+  print $EmplidEffDt              (0,82,11)
+  print $OldStatus                (0,100)
+  print $NewStatus                (0,106)
+  print $FWTMarStatus             (0,118)
+  print $error                    (0,128)
+
+end-procedure
+
+begin-procedure Found-Future
+
+  show &A.COMPANY ' ' &A.EMPLID ' has a future dated tax row > ' $StartDate '.'
+
+  move 'Found tax row dated > Eff Date. Updated.'   to $error
+  do Print-Name
+  do Print-Info
+end-procedure
+
+
+begin-procedure Fed-State-Sync-Needed
+
+  move ' ' to $OldStatus
+  move ' ' to $NewStatus
+  show &A.COMPANY ' ' &A.EMPLID 'OK and US tax rows EFFDT not equal.'
+
+  move 'Fed and ST tax rows EFFDT not equal - No update.' to $error
+  do Print-Name
+  do Print-Info
+end-procedure
+
+begin-procedure FWT-Marital-Status-Invalid
+
+  move $OldStatus to $NewStatus
+  show &A.COMPANY ' ' &A.EMPLID ' has an incorrect Federal Marital Status ' $StartDate '.'
+
+  move 'Existing Federal Marital Status Invalid - No Update.'  to $error
+
+end-procedure
+
+begin-procedure AlreadyUpdated
+
+  move ' ' to $OldStatus
+  move ' ' to $NewStatus
+  show &A.COMPANY ' ' &A.EMPLID ' has Multiple Jobs and the tax record has been already updated.'
+
+  move 'Multi Job - Same Company - Already Updated.'  to $error
+  do Print-Name
+  do Print-Info
+
+end-procedure
+
+
+begin-procedure Prompts
+  display 'This report will exclude updates to records with ACTION = TER on the '
+  display 'employee PS_JOB record when the effective date of the termination is less '
+  display 'than or equal to the run date of the report.  These represent currently  '
+  display 'terminated employees. '
+  display '  '
+  display '  '
+  while $ActionType = ''
+    input $ActionType 'Audit or Update? (A, U or Q to quit)'
+    uppercase $ActionType
+    if INSTR('AUQ',$ActionType,1) = 0
+      display ' '
+      display '***** Enter A, U, or Q *****'
+      display ' '
+      move '' to $ActionType
+    end-if
+  end-while
+  if $ActionType = 'Q'
+     display 'Quit selected - run stopped '
+     stop
+  end-if
+end-procedure
+
+
+begin-procedure NTR-Check
+  if $EmpFound = 'N'
+    display ' '
+    display '****** No Employee Records Selected ******'
+    display ' '
+    print '********************************'  (+3,1)
+    print '  No Employee Records Selected  '  (+1,1)
+    print '********************************'  (+1,1)
+    date-time () hh:mi:ss &t2
+    display &t2
+  end-if
+end-procedure
+
+begin-procedure Select-Parameters
+
+Begin-select
+MASS.ACTION_TYPE
+
+    let $ActionType     = RTRIM(&MASS.ACTION_TYPE, ' ')
+
+FROM PS_RC_MASS_EE_UPD MASS
+WHERE MASS.OPRID         = $Prcs_OprID
+  AND MASS.RUN_CNTL_ID   = $Prcs_Run_Cntl_ID
+end-SELECT
+end-procedure
+
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'datemath.sqc'  !dtu-subtract-days
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'stdapi.sqc'    !Update Process API

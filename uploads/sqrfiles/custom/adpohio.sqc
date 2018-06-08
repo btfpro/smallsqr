@@ -1,0 +1,415 @@
+!**********************************************************************
+! SQR Name:           adpohio.sqc
+! SQR Descr:          ADP Employment Tax, Ohio Courtesy
+! Created by:         drmonroe
+! Create date:        10/17/2012
+! Last modified by:   drmonroe
+! Last modified date: 12/12/2012
+!***********************************************************************
+!  10/17/2012  These definitions must be in probiz.sqc, along with the procedures in probiz.sqc below
+!**********************************************************************************************************
+!Generic Custom logic routines - Routines in probiz.sqc to handle last minute logic for D, E, and W records 
+!**********************************************************************************************************
+!  This needs to be at the end of the probiz.sqc file -->  (or we need to move this to the adp303q.sqc)
+!
+! --------------------------------------------------
+!            #define OHIO_COURTESY_WITHHOLDING
+!
+! --------------------------------------------------
+!                    1.  This logic will set the $Output_TaxCode  based on Chris Murphy's :
+!                          "actually the only time we should receive a resident code is when the employee lives somewhere 
+!                           other than where they work and the employer withholds the resident tax as a courtesy. "
+!
+!          For OH employees:   From Chris/Nancy 10/15/2012
+!
+!              1.  Only 1 Record in PS (Res or Non-Res) Pass as N-Res
+!                      i.	If we have one tax balance record in the year and it’s a resident locality (from Local Tax Data) 
+!                               we will check to see if the person lives and works in the same place by comparing the CITY (PS_LOCAL_TAX_TBL.LOCALITY_NAME for Ohio)
+!                               vs the CITY in the PS_LOCATION_TBL (based on the Setid/Location of the associate in the JOB table).  If these fields 
+!                               indicate the person does live and work in different Cities  the withholding was a courtesy situation and we’ll leave the taxcode 
+!                               set to resident.  If they really do live and work in the same place we’ll set the taxcode to the work/non-resident code.
+!
+!   To implement this, clients probiz.sqc would need to be configured (above) and this adpohio.sqc would need to be delivered
+!
+! *************************  V4Q2012 Nov 25, 2012 release *********************************
+!   Dec 10, 2012 Change default to starting in 2012, Q4, and 
+!                Change, Courtesy definition to be limited to:
+!                      if the res and non-res tax rates are the same or if the work tax rate is greater
+!   Dec 12, 2012 Set Courtesy flag to 'N' on correct TaxBalance array element (#save_oh_cnt1 not being set), and 'count' OH H balance
+!                      records only if there are QTD Taxable and QTD Taxes too.
+!   Aug 28, 2014 Adding the NOLOCK_SQL below
+!
+!   Oct  8, 2014 LMD1 - For the last position of the code, where Resident = Y, and non-resident = N should change to:
+!   ******************
+!        1.      Y = Those that have [Resident = ‘Y’ in PS] AND [work in a different Locality/Jurisdiction] (search for another active entry in LOCAL_TAX_DATA)
+!        2.      N = Those that have [Resident = ‘N’ in PS]   OR those that have [Resident = ‘Y’ in PS] AND [do not work in a different locality/Jurisdiction]
+! 
+!
+!1.	 Columbus Tax 
+!            is withheld for employees that work in one of our work locations that is within the city limits of Columbus.  
+!            For these employees, we must withhold 2.5% (it doesn’t matter where these employees live).  These employees are to be reported under 36-3604 Columbus.  T
+!            hese employees are always withheld at 2.5%.
+!
+!2.	Columbus Alternative Tax
+!            is withheld for employees who live in Columbus, but work in one of our work locations that is outside of the limits of Columbus and that 
+!            employee’s city of residence has a tax rate that is less than 2.5%.  OR they could work in Columbus and live in another city that does not give them 
+!            100% credit for the Columbus tax that is remitted to Columbus from their paycheck.   The difference in tax is withheld as a  courtesy to our employees 
+!            (so they don’t have to pay tax with their tax returns at the end of the year).  These employees are reported under 36-4297 Columbus ALT.
+!  *********************
+!    Oct 23,2014  MUNI_COURTESY_VIA_TAX_DISTRIB
+!
+!    Nov 10, 2014 In this case, we would have to rely solely on what is on the tax distribution table to determine which 
+!                 locality is a work location (on the tax distribution table) and which one is a resident (courtesy) location (not on the tax distribution table).
+!                 TB.LOCALITY -  if find, they work there, otherwise they reside there resident
+!
+!    Feb 18, 2015 SET_PRIMARY_TAXCODE_LOGIC_FOR_CINCY (proposed)
+!                   update the periodic and quarterly extracts in PeopleSoft to handle locality ‘15000’ / Cincy differently due to scenario b
+!           	    Employee Lives and Works in Cincinnati then the tax code needs to mapped to the Primary ADP Local Code only (OH3602)***
+!.	            A tax code with a unique Indicator for Cincinnati indicating the EE work & Lives in Cincinnati is required
+!                   We currently pass this as taxcode ‘OHH15000      Y’, and with the proposed change would pass it as  ‘OHH15000B     Y’
+!
+!
+!    5/20/15       Updated for Cincy and MCK1 meeting
+!                     Cincinatti  (15000)                                                                                     PeopleSoft 	    ADPCode
+!                      normal        a   Works in Cincy lives somewhere else with two taxcodes        NonResident tax code     OHH15000             0672
+!                                    b   Works and Lives in Cincy one taxcode                         Alternate tax code       OHH150001       Y    3602  
+!                      normal        c   Lives in Cincy works somehwere else with two wage recs       Resident tax code        OHH15000        Y   ‘any alt code’
+!
+!                     non-Cincinatti                                                                                           PeopleSoft 	    ADPCode
+!                      normal        d   Works in Columbus, lives somewhere else with two taxcodes    NonResident tax code      OHH18000           3604  
+!                                    e   Works and Lives in Columbus one taxcode                      NonResident tax code      OHH18000           3604 
+!                      normal        f   Lives in Columbus, works somehwere else with two wage recs   Resident tax code         OHH18000       Y   ‘any alt code’
+!   11/3/16       Updated MUNI_COURTESY_VIA_TAX_DISTRIB logic to allow for more than one ohio local as some clients have more than one resident local
+!
+!----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+#define        adpohio_version     ADPOHIO.SQC Nov 3, 2016
+#ifndef NOLOCK_SQL
+ #define NOLOCK_SQL
+#endif
+
+#ifndef OH_STATE
+  #define OH_STATE  OH
+#endif
+
+#if {SITE_ID} = 'LMD1'
+  #define MUNI_COURTESY_VIA_TAX_DISTRIB
+#endif
+
+#ifdef ADP_TAX_DEV
+    #define OH_COURTESY_CRITERIA_START   (#RptYear >= 2001) 
+#endif
+#ifdef ADP_TAX_QA
+    #define OH_COURTESY_CRITERIA_START   (#RptYear >= 2001) 
+#endif
+
+
+#ifndef OH_COURTESY_CRITERIA_START
+  #define OH_COURTESY_CRITERIA_START   (#RptYear >= 2013) or (#RptYear = 2012 and #RptQtr = 4)  !20121210
+#endif
+
+begin-procedure Ohio-Courtesy-withholding  !called via adp303q.sqc prior to 'E' record being written to rework the balances
+
+ let #ohres_rate    = 0
+ let #ohnonres_rate = 0
+
+ if #Ohio-Courtesy-withholding = 0
+   show ''
+   show 'Ohio-Courtesy-withholding enabled. {adpohio_version}, Starting: if {OH_COURTESY_CRITERIA_START} '
+   #ifdef MUNI_COURTESY_VIA_TAX_DISTRIB
+     show 'MUNI_COURTESY_VIA_TAX_DISTRIB enabled'
+   #endif
+   show ''
+   add 1 to #Ohio-Courtesy-withholding
+ end-if
+
+ if {OH_COURTESY_CRITERIA_START}
+   let #OhioBalances = 0
+   let $live_work_same_local = 'f'
+   #ifdef MUNI_COURTESY_VIA_TAX_DISTRIB
+    do get-ohio-local-balances-via-distrib
+   #else
+    do get-ohio-local-balances    
+    if #OhioBalances = 1
+      do review-ohio-local-balance    !  <------------- needs evaluaton ------------------
+      if $live_work_same_local = 't' and (#ohnonres_rate >= #ohres_rate) and (#ohnonres_rate > 0)   !20121210 rate check added
+        if $SelectEmplid <> ''
+          show 'OH Courtesy: Ohio-Courtesy-withholding, live_work_same_local = ' $live_work_same_local ', setting to WORK Taxcode for Locality ' $save_oh_local          
+          show 'OH Courtesy: Ohio-Courtesy-withholding                Res Rt = ' #ohres_rate edit 99.9999 ', Non-Res Rt ' #ohnonres_rate edit 99.9999
+        end-if
+        put 'N' into TaxBalance(#save_oh_cnt1) TaxBalance_Resident
+      else
+        if $SelectEmplid <> ''
+          show 'OH Courtesy: Ohio-Courtesy-withholding, live_work_same_local = ' $live_work_same_local ', Courtesy Withholding.  Keeping Resident Taxcode for Locality ' $save_oh_local          
+        end-if
+      end-if
+    end-if
+   #endif
+   
+ end-if
+
+end-procedure
+
+#ifdef MUNI_COURTESY_VIA_TAX_DISTRIB
+begin-procedure get-ohio-local-balances-via-distrib
+
+    if $SelectEmplid <> ''
+      show 'OH Courtesy: MUNI_COURTESY_VIA_TAX_DISTRIB: get-ohio-local-balances: Tax Balances: ' #Last_TaxBalance_Cnt edit 999             
+    end-if
+
+    let #OhioBalances = 0
+    do get-ohio-local-balances    
+
+    let #oh_cnt = 0
+    while #oh_cnt < #Last_TaxBalance_Cnt
+       Add 1 to #oh_cnt
+       get $OH_State $OH_Class $OH_Local #OH_QTD_Tax #OH_QTD_Txgrs from TaxBalance(#oh_cnt) TaxBalance_State  TaxBalance_Tax_Class TaxBalance_Locality TaxBalance_Tax_Qtd TaxBalance_Txgrs_Qtd
+       if ($OH_State = '{OH_STATE}' and $OH_Class = 'H' and rtrim($OH_Local,' ') <> '' and #OH_QTD_Tax <> 0 and #OH_QTD_Txgrs <> 0)
+          move $OH_Local to $save_oh_local
+          let #l_oh_local = length($save_oh_local)
+          if #l_oh_local > 4       !all 4 char localities in Ohio are S.D. and we don't want to change the S.D. Locals.. they're not related to courtesy logic
+              
+              do get_tax_distrib_oh
+	 											
+!Cincinatti  (15000)                                                                                       PeopleSoft 		ADP		EMPLID
+! normal        a   Works in Cincy lives somewhere else with two taxcodes        NonResident tax code       OHH15000             0672
+!               b   Works and Lives in Cincy one taxcode                         Alternate tax code         OHH150001       Y    3602  
+! normal        c   Lives in Cincy works somehwere else with two wage recs       Resident tax code          OHH15000        Y   ‘any alt code’
+
+             if rtrim($OH_LOCAL,' ') = '15000'
+
+!11/3/16 change             
+!              if #OhioBalances = 1 and $courtesy = 'f'                         !b.   a & c are the normal resident/non-resident situations               
+               do get_local_tax_data_oh
+               if $courtesy = 'f' and $Resident = 'Y'                           !b.   a & c are the normal resident/non-resident situations               
+                 put 'Y' into TaxBalance(#oh_cnt) TaxBalance_Resident
+                 let $Alt_Locality = $OH_Local || '1' 
+                 put $Alt_Locality into TaxBalance(#oh_cnt) TaxBalance_Locality
+                 if $SelectEmplid <> ''
+                   show 'OH Courtesy: MUNI_COURTESY_VIA_TAX_DISTRIB, EMPLID ' $Current_Emplid ', (b) Works and Lives in Cincy one taxcode ' $Alt_Locality ' Resident'
+                 end-if
+               end-if
+               
+             else
+             
+!non-Cincinatti                                                                                           PeopleSoft 	      ADP		EMPLID
+! normal       d    Works in Columbus, lives somewhere else with two taxcodes    NonResident tax code     OHH18000           3604      
+!              e    Works and Lives in Columbus one taxcode                      NonResident tax code     OHH18000           3604 
+! normal       f    Lives in Columbus, works somehwere else with two wage recs   Resident tax code        OHH18000     Y     ‘any alt code’
+
+!11/3/16 change             
+!              if #OhioBalances = 1 and $courtesy = 'f'                         !e.   d & f are the normal resident/non-resident situations               
+               if $courtesy = 'f'                                               !e.   d & f are the normal resident/non-resident situations               
+                 put 'N' into TaxBalance(#oh_cnt) TaxBalance_Resident
+                 if $SelectEmplid <> ''
+                   show 'OH Courtesy: MUNI_COURTESY_VIA_TAX_DISTRIB, EMPLID ' $Current_Emplid ', (e) Works and lives in same locality one taxcode. ' $OH_Local ' Non-Resident'
+                 end-if                   
+               end-if
+            
+             end-if
+              
+             
+          end-if   !Muni
+       end-if      !Ohio withholding with QTD balances
+    end-while
+
+
+    
+
+end-procedure
+
+begin-procedure  get_tax_distrib_oh
+
+ let $courtesy = 't'
+
+BEGIN-SELECT
+OHTD.LOCALITY
+
+  let $courtesy = 'f'
+
+   FROM PS_TAX_DISTRIB OHTD
+     WHERE  OHTD.EMPLID   = $Current_emplid 
+        AND OHTD.STATE    = 'OH' 
+        AND OHTD.LOCALITY = $save_oh_local  !if there, they work there, no courtesy
+        AND OHTD.EFFDT = (SELECT Max(OHED.EFFDT) 
+          FROM   PS_TAX_DISTRIB OHED 
+              WHERE  OHTD.EMPLID     = OHED.EMPLID 
+                 AND OHTD.EMPL_RCD   = OHED.EMPL_RCD 
+                 AND OHED.EFFDT  <= $Qtr_End_Native) 
+
+END-SELECT
+
+  if $SelectEmplid <> ''
+    show 'OH Courtesy: MUNI_COURTESY_VIA_TAX_DISTRIB, get_tax_distrib_oh ' $Current_Emplid ' ' $save_oh_local ' OhioBalances = ' #OhioBalances edit 999  ' --> ' $courtesy
+  end-if                   
+
+
+end-procedure
+
+
+#else
+
+begin-procedure review-ohio-local-balance   !if more than one ohio local balance, plow through the OhioBalances array and update the TaxBalance array as required
+
+     do get_local_tax_data_oh
+     if $OH_Res = 'Y'
+       do get_local_tax_tbl_oh
+       do get_location_tbl_oh
+       do compare_locations_oh
+       if $compare_locations_oh = 't'
+         let $live_work_same_local = 't'
+       end-if
+     end-if
+
+end-procedure
+
+begin-procedure compare_locations_oh 
+ let $compare_locations_oh = 'f'
+ if  ($Location_Locality = $Local_Tax_Tbl_Locality) and ($Location_Locality_ST = $Local_Tax_Tbl_Locality_ST)
+   let $compare_locations_oh = 't'
+ end-if
+end-procedure
+#endif
+
+begin-procedure get_local_tax_data_oh 
+
+  let $TaxBalance_State_Save    = $TaxBalance_State
+  let $TaxBalance_Locality_Save = $TaxBalance_Locality
+  let $Resident_Save            = $Resident
+  
+  let $TaxBalance_State    = '{OH_STATE}'
+  let $TaxBalance_Locality = $save_oh_local
+  do Extract-Resident-Code
+  let $OH_Res = $Resident
+
+  if $SelectEmplid <> ''
+    show 'OH Courtesy: get_local_tax_data_oh: OH_Res ' $OH_Res ', emplid ' $Current_Emplid ', Current_Company ' $Current_Company ', TaxBalance_State ' $TaxBalance_State ', TaxBalance_Locality ' $TaxBalance_Locality
+  end-if
+  
+  let $TaxBalance_State         = $TaxBalance_State_Save
+  let $TaxBalance_Locality      = $TaxBalance_Locality_Save 
+  let $Resident                 = $Resident_Save
+  
+end-procedure
+
+begin-procedure get_local_tax_tbl_oh
+
+  let $Local_Tax_Tbl_Locality    = ''
+  let $Local_Tax_Tbl_Locality_ST = ''
+  let $Local_Tax_Tbl_Loc_jurisdctn = ''
+
+begin-SELECT
+OHY.LOCALITY_NAME
+OHY.RESIDENT_TAX_RT
+OHY.NONRESIDENT_TAX_RT
+OHY.STATE
+OHY.LOC_JURISDCTN
+
+  let #ohres_rate    = &OHY.RESIDENT_TAX_RT
+  let #ohnonres_rate = &OHY.NONRESIDENT_TAX_RT
+  let $Local_Tax_Tbl_Loc_jurisdctn = rtrim(&OHY.LOC_JURISDCTN,' ')
+  
+  
+  let $Local_Tax_Tbl_Locality = rtrim(&OHY.LOCALITY_NAME,' ')
+  let $Local_Tax_Tbl_Locality = upper($Local_Tax_Tbl_Locality)
+  let $Local_Tax_Tbl_Locality_ST = rtrim(&OHY.STATE,' ')
+  let $Local_Tax_Tbl_Locality_ST = upper($Local_Tax_Tbl_Locality_ST)
+
+  FROM PS_LOCAL_TAX_TBL OHY
+    WHERE OHY.STATE      = '{OH_STATE}'
+      AND OHY.TAX_CLASS  = 'H'
+      AND OHY.LOCALITY   = $save_oh_local
+      AND OHY.EFFDT =
+         (SELECT MAX(EFFDT)
+          FROM   PS_LOCAL_TAX_TBL
+          WHERE  STATE     = OHY.STATE
+            AND  TAX_CLASS = OHY.TAX_CLASS
+            AND  LOCALITY  = OHY.LOCALITY
+            AND  EFFDT   <= $Qtr_End_Native)
+
+end-SELECT
+
+  if $SelectEmplid <> ''
+     show 'OH Courtesy: get_local_tax_tbl_oh for Ohio Local: ' $save_oh_local   ', Local_Tax_Tbl_Locality --> ' $Local_Tax_Tbl_Locality ',' $Local_Tax_Tbl_Locality_ST
+     show 'OH Courtesy: get_local_tax_tbl_oh for Ohio Local: Res Rt ' #ohres_rate edit 99.9999 ', Non-Res Rt ' #ohnonres_rate edit 99.9999
+  end-if
+
+end-procedure
+
+begin-procedure get_location_tbl_oh 
+
+  let $Location_Locality    = ''
+  let $Location_Locality_ST = ''
+
+#ifdef OHIO_COURTESY_WITHHOLDING_USE_TAX_LOCATION_CD
+begin-SELECT
+OHZ.CITY
+OHZ.STATE
+
+  let $Location_Locality = rtrim(&OHZ.CITY,' ')
+  let $Location_Locality = upper($Location_Locality)
+  let $Location_Locality_ST = rtrim(&OHZ.STATE,' ')
+  let $Location_Locality_ST = upper($Location_Locality_ST)
+
+ FROM  PS_TAX_LOCATION1 OHZ
+ WHERE OHZ.TAX_LOCATION_CD = $Tax_Location_Cd 
+end-select
+
+  if $SelectEmplid <> ''
+     show 'OH Courtesy: get_location_tbl_oh retrieved: for Tax Location ' $Tax_Location_Cd ', Location_Locality --> ' $Location_Locality ',' $Location_Locality_ST
+  end-if
+
+#else
+begin-SELECT
+OHZ.CITY
+OHZ.STATE
+
+  let $Location_Locality = rtrim(&OHZ.CITY,' ')
+  let $Location_Locality = upper($Location_Locality)
+  let $Location_Locality_ST = rtrim(&OHZ.STATE,' ')
+  let $Location_Locality_ST = upper($Location_Locality_ST)
+
+ FROM  PS_LOCATION_TBL OHZ
+ WHERE OHZ.LOCATION = $Location 
+  AND OHZ.SETID     = $Job_Setid
+  AND OHZ.EFFDT     = (SELECT MAX(EFFDT)
+       FROM   PS_LOCATION_TBL
+       WHERE  LOCATION = OHZ.LOCATION
+       AND    SETID    = OHZ.SETID
+       AND    EFFDT   <= $Qtr_End_Native)
+
+end-SELECT
+
+  if $SelectEmplid <> ''
+     show 'OH Courtesy: get_location_tbl_oh retrieved: for Location ' $Location  ', Job_Setid = ' $Job_Setid ', Location_Locality --> ' $Location_Locality ',' $Location_Locality_ST
+  end-if
+
+#endif
+
+ 
+end-procedure
+
+
+begin-procedure get-ohio-local-balances
+
+    if $SelectEmplid <> ''
+      show 'OH Courtesy: get-ohio-local-balances: Tax Balances: ' #Last_TaxBalance_Cnt edit 999             
+    end-if
+
+    let #oh_cnt = 0
+    while #oh_cnt < #Last_TaxBalance_Cnt
+       Add 1 to #oh_cnt
+       get $OH_State $OH_Class $OH_Local #OH_QTD_Tax #OH_QTD_Txgrs from TaxBalance(#oh_cnt)  
+         TaxBalance_State  TaxBalance_Tax_Class TaxBalance_Locality TaxBalance_Tax_Qtd TaxBalance_Txgrs_Qtd
+       if ($OH_State = '{OH_STATE}' and $OH_Class = 'H' and rtrim($OH_Local,' ') <> '' and #OH_QTD_Tax <> 0 and #OH_QTD_Txgrs <> 0)
+          add 1 to #OhioBalances
+          move $OH_Local to $save_oh_local
+          move #oh_cnt to #save_oh_cnt1
+          if $SelectEmplid <> ''
+            show 'OH Courtesy: get-ohio-local-balances: ' #OhioBalances edit 99 '. Local = ' $save_oh_local               
+          end-if
+       end-if
+    end-while
+
+
+end-procedure

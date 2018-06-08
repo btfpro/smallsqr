@@ -1,0 +1,826 @@
+!***********************************************************************
+!  GEXPY617:  WOTC QTRLY WAGE FILE                                     *
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module is the confidential and proprietary information of       *
+! Giant Eagle, Inc.; it is not to be copied, reproduced,or transmitted *
+! in any form, by any means, in whole or in part, nor is it to be used *
+! for any purpose other than that for which it is expressly provided   *
+! without the written permission of Giant Eagle.                       *
+!                                                                      *
+! Copyright (c) 1997-1998 Giant Eagle,Inc. All Rights Reserved         *
+!                                                                      *
+!***********************************************************************
+!                                                                      *        
+! GEXPY617:             WOTC Qtrly Wage File                           *
+!                                                                      *        
+! Narrative:		This program will generate an output file and  *
+!                       a report for the Work Opportunity Tax Credit.  *
+!                                                                      *
+! #Debugx Used:		#debug9 paragraph trace                        *
+!                       #debug8 key variable values                    *
+!                       #debug7 data returned from sql calls           * 
+!                                                                      *  
+! SQL Tables:           gex_dept_tbl                                   *
+!                       earnings_bal                                   *
+!                       personal_data                                  *
+!                       job                                            *
+!                                                                      *
+! Written by:           Jim Hutchison                                  *       
+!                                                                      *
+! Normally Run:	        Quarterly                                      *
+!                                                                      *
+! Control Parms:        FOR WHERE CLAUSE:                              *
+!                         Company Division Code                        *
+!                         Company  	                               *
+!                         Paygroup  	                               *
+!                         Deptid	                               *
+!                         Employee Status	                       *
+!                         Account Code                                 *
+!                         From Date                                    *
+!                         Thru Date                                    *
+!                         As Of Date                                   *
+!                                                                      *
+!***********************************************************************
+!                         MODIFICATION HISTORY                         *
+!***********************************************************************
+!  INITIALS     DATE            DESCRIPTION OF THE CHANGE              *
+!***********************************************************************
+!  JDH          03/03/1998      Initial Creation                       *
+!  SXK          09/08/1998      Added OUTFILE variable                 *
+!  SXK	        10/26/1998      Added spcl_balance                     *
+!  JDH          01/23/1999      Added SQRW run control logic.          *
+!                               Added logic to get the maximum         *
+!                                 balance period per earnings code     *
+!                                 from the earnings balance table.     *
+!  JDH          02/19/1999      Modified report layout.                *
+!  JDH          03/19/1999      Added logic to exclude non-productive  *
+!                                 earnings codes.                      *
+!                                                                      *
+!  AXL          12/13/99	Force into rule mode.    	       *
+!                                                                      *    
+!  CWB          05/24/2001      Add logic to look for prior term row   *
+!                               when empl_status = 'T', but            *  
+!                               action <> 'TER'.                       *
+!  PSR          08/27/2002      EMPL_RCD is now part of the key for    *
+!                               PS_EARNINGS_BAL - Upgrade 8.3          *
+!                                                                      *  
+!  AXL          02/21/2006      Parse out NAME field. Add ';' as a     *
+!                               delimiter on the dat file.             *
+!                               Disable the Alter Session which was    *
+!                               causing job to run 8+ hours.           *
+!  MXR          08/12/2006     Commented 1 line to allow to pick       *
+!                              up multiple companies and total YTD     *
+!  MXR          09/11/2006     Uncommented the 1 line and added logic  *
+!                              in the main procedure by adding j.company*
+!                              and changed the orderby to print two lines
+!                              ref ITG # 37355.
+! GEX-VENDCXB  08/22/2007      ORG_HIRE_DT was selected from 		        *	
+!			                         PER_ORG_INST table instead of	        	*
+!			                         PERSONAL_DATA. 				                  *
+! ISDVASS      04/01/2008      Add ORG_INSTANCE_ERN from per_org_inst   * 
+!                              to the join                              *
+!GEX_SEC_REENG 2015-04-29 Vahini Katta                                  *
+!Changes related to gex_emplid_mapp/7 digit emplid
+!***********************************************************************
+
+
+#include 'setenv.sqc'    !Set environment
+#Include 'setup32.sqc'   !Printer and page-size initialization
+
+
+#define #column1     1
+#define #column2    12
+#define #column3    44
+#define #column4    56
+#define #column5    65
+#define #column6    77
+#define #column7    90
+#define #column8   103
+#define #column9   119
+#define #column10  135
+#define #column11  151
+#define #column12  164
+
+!***************************************
+begin-report
+#debug9 Show 'begin-report'
+
+  !do Alter-Session	     AXL - 2/21/2006 - Stop setting session to rule optimizer
+  do Init-DateTime           !datetime.sqc
+  do Init-Number             !number.sqc
+  do Get-Current-DateTime    !curdttim.sqc
+  do P000-Init-Report
+  do P100-Open-File
+  do P200-Process-Main
+  do P300-Close-File
+  do Reset                   !reset.sqc
+  do Stdapi-Term             !stdapi.sqc
+  Show 'Successful end of report'
+end-report
+!***************************************
+
+begin-heading 8
+#debug9 Show 'begin-heading'
+
+  #Include 'stdhdg01.sqc'
+
+  If Rtrim($FromDate, ' ') = '' or
+     Rtrim($ThruDate, ' ') = ''
+    PRINT  ''                  (3,)  center
+  Else
+    let $Date_Range = $FromDate_MM_DD_YY || ' Thru ' || $ThruDate_MM_DD_YY
+    PRINT $Date_Range          (3,)  center
+  End-If
+
+  PRINT 'EMP-'                 (+3,{#column1})
+  PRINT 'EMPLOYMENT'           (,{#column3})
+  PRINT 'DEPARTMENT'           (,{#column5})
+  PRINT 'WAGE PERIOD'          (,{#column6})
+  PRINT 'WAGE PERIOD'          (,{#column7})
+  PRINT '     YTD GROSS'       (,{#column8})
+  PRINT '        HOURLY'       (,{#column9})
+  PRINT '     YTD HOURS'       (,{#column10})
+  PRINT 'TERMINATION'          (,{#column11})
+  PRINT 'LAYOFF'               (,{#column12})
+
+  PRINT 'NUMBER'               (+1,{#column1})
+  PRINT 'EMP NAME'             (,{#column2})
+  PRINT 'DATE'                 (,{#column3})
+  PRINT 'COMPANY'              (,{#column4})
+  PRINT 'ID'                   (,{#column5})
+  PRINT 'START DATE'           (,{#column6})
+  PRINT 'END DATE'             (,{#column7})
+  PRINT '         WAGES'       (,{#column8})
+  PRINT '          RATE'       (,{#column9})
+  PRINT '        WORKED'       (,{#column10})
+  PRINT 'DATE'                 (,{#column11})
+  PRINT 'DATE'                 (,{#column12})
+
+  PRINT '-'                    (+1,{#column1},9)  Fill
+  PRINT '-'                    (,{#column2},30)   Fill
+  PRINT '-'                    (,{#column3},10)   Fill
+  PRINT '-'                    (,{#column4},7)    Fill
+  PRINT '-'                    (,{#column5},10)   Fill
+  PRINT '-'                    (,{#column6},11)   Fill
+  PRINT '-'                    (,{#column7},11)   Fill
+  PRINT '-'                    (,{#column8},14)   Fill
+  PRINT '-'                    (,{#column9},14)   Fill
+  PRINT '-'                    (,{#column10},14)  Fill
+  PRINT '-'                    (,{#column11},11)  Fill
+  PRINT '-'                    (,{#column12},8)   Fill
+end-heading
+!***************************************
+
+begin-procedure P000-Init-Report
+#debug9 Show 'P000-Init-Report'
+
+  move 'GEXPY617'                to $ReportID
+  move 'WOTC QTRLY WAGE FILE'    to $ReportTitle
+
+  do Stdapi-Init
+
+  Show '$ReportID='    $ReportID
+  Show '$ReportTitle=' $ReportTitle
+  Show '$ReportDate='  $ReportDate
+  Show '$ReportTime='  $ReportTime
+
+  Let $GEXXX900_Company_Alias  = 'J.COMPANY'
+  Let $GEXXX901_Company_Alias  = 'J.COMPANY'
+  Let $GEXXX901_Paygroup_Alias = 'J.PAYGROUP'
+  Let $GEXXX902_Deptid_Alias   = 'J.DEPTID'
+  Let $GEXXX903_Emp_Stat_Alias = 'J.EMPL_STATUS'
+  Let $GEXXX907_Div_CD_Alias   = 'GDT.GEX_COMPANY_DIV_CD'
+  Let $GEXXX909_Acct_CD_Alias  = 'J.ACCT_CD'
+  
+ 
+  if $prcs_process_instance = ''
+    Do Ask-From-Thru-Date
+      !  let $Prcs_OprID = 'HRBATCH'         ! isdvmxr  comment out after testing *****
+      !  let $Prcs_Run_Cntl_ID = 'gexpy617'  !isdvmxr comment out after testing *****
+    Do GEXXX950-Input-Parameters
+  Else
+    Do GEXXX922-Select-Parameters
+    Do GEXXX900-Select-Company-Parameters
+    Do GEXXX901-Select-Company-Paygroup-Parameters
+    Do GEXXX902-Select-Deptid-Parameters
+    Do GEXXX903-Select-Emp-Stat-Parameters
+    Do GEXXX907-Select-Div-CD-Parameters 
+    Do GEXXX909-Select-Acct-CD-Parameters
+
+    Let $X000_WHERE_SELECT_ASOFDATE = $GEX_RC_PAY.AsOfDate
+    If Rtrim ($GEX_RC_PAY.AsOfDate, ' ') = ''
+      Let $X000_WHERE_SELECT_ASOFDATE = $AsOfToday
+    End-If
+
+    Let $FromDate = $GEX_RC_PAY.FromDate
+    Let $ThruDate = $GEX_RC_PAY.ThruDate
+    show $ThruDate
+  End-If
+
+  let $Year4 = '1'
+  do Format-DateTime($FromDate,$FromDate_MM_DD_YYYY,{DEFMDY},'','')
+  do Format-DateTime($FromDate,$FromDate_MM_DD_YY,{DEFMDY},'','')
+  let $Year4 = '1'
+  do Format-DateTime($ThruDate,$ThruDate_MM_DD_YYYY,{DEFMDY},'','')
+  do Format-DateTime($ThruDate,$ThruDate_MM_DD_YY,{DEFMDY},'','')
+  let #ThruDate_MM   = SUBSTR($ThruDate_MM_DD_YYYY,1,2)
+  let #ThruDate_YYYY = SUBSTR($ThruDate,8,4)
+  !ISDVMXR 080
+  show '   #ThruDate_MM ' #ThruDate_MM
+  show '   #ThruDate_YYYY ' #ThruDate_YYYY
+  Do Format-DateTime($X000_WHERE_SELECT_ASOFDATE, $X000_REPORT_HEADING_ASOFDATE, {DEFDATE}, '', '')
+  Let $X000_ORDER_BY = 'Company, Department, Emp Number'
+
+  Show '$GEXXX907_INCLUDE_DIV_CD_DISPLAY_CRITERIA           ='   $GEXXX907_INCLUDE_DIV_CD_DISPLAY_CRITERIA
+  Show '$GEXXX900_INCLUDE_COMPANY_DISPLAY_CRITERIA          ='   $GEXXX900_INCLUDE_COMPANY_DISPLAY_CRITERIA
+  Show '$GEXXX901_INCLUDE_COMPANY_PAYGROUP_DISPLAY_CRITERIA ='   $GEXXX901_INCLUDE_COMPANY_PAYGROUP_DISPLAY_CRITERIA
+  Show '$GEXXX902_INCLUDE_DEPTID_DISPLAY_CRITERIA           ='   $GEXXX902_INCLUDE_DEPTID_DISPLAY_CRITERIA
+  Show '$GEXXX903_INCLUDE_EMP_STAT_DISPLAY_CRITERIA         ='   $GEXXX903_INCLUDE_EMP_STAT_DISPLAY_CRITERIA
+  Show '$GEXXX909_INCLUDE_ACCT_CD_DISPLAY_CRITERIA          ='   $GEXXX909_INCLUDE_ACCT_CD_DISPLAY_CRITERIA
+  Show '$X000_WHERE_SELECT_ASOFDATE ='   $X000_WHERE_SELECT_ASOFDATE
+
+  Do P050-Print-Cover-Page
+
+  Let $GEXERNCD_Erncd_Alias = 'EB.ERNCD'
+  Do Get-Non-Productive-Erncds
+end-procedure
+
+!***************************************
+Begin-Procedure GEXXX950-Input-Parameters
+
+  Let $GEXXX900_INCLUDE_COMPANY_CRITERIA = '1=1'
+  Let $GEXXX900_INCLUDE_COMPANY_DISPLAY_CRITERIA = 'ALL'
+
+
+  Display 'Enter Company/Paygroup or leave blank to exit.'
+  While 1=1
+    Input $In-Company Maxlen=3 'Company'
+    Uppercase $In-Company
+    If Rtrim($In-Company, ' ') = ''
+      Break
+    Else
+      Input $In-Paygroup Maxlen=3 'Paygroup'
+      Uppercase $In-Paygroup
+      If Rtrim($In-Paygroup, ' ') = ''
+        Let $Include_Condition = '(' || $GEXXX901_Company_Alias || ' = '''  || $In-Company || ''')'
+      Else
+        Let $Include_Condition = '(' || $GEXXX901_Company_Alias || ' = '''  || $In-Company || ''' And ' || $GEXXX901_Paygroup_Alias || ' = '''  || $In-Paygroup || ''')'
+      End-If
+      Add 1 To #GEX_RC_PAYGROUP_ROWS
+      If #GEX_RC_PAYGROUP_ROWS = 1
+        Let $GEXXX901_INCLUDE_COMPANY_PAYGROUP_CRITERIA = '(' || $Include_Condition
+      Else
+        Let $GEXXX901_INCLUDE_COMPANY_PAYGROUP_CRITERIA = $GEXXX901_INCLUDE_COMPANY_PAYGROUP_CRITERIA || ' Or '  || $Include_Condition
+      End-If
+    End-If
+  End-While
+
+  If #GEX_RC_PAYGROUP_ROWS = 0
+    Let $GEXXX901_INCLUDE_COMPANY_PAYGROUP_CRITERIA = '1=1'
+    Let $GEXXX901_INCLUDE_COMPANY_PAYGROUP_DISPLAY_CRITERIA = 'ALL'
+  Else
+    Let $GEXXX901_INCLUDE_COMPANY_PAYGROUP_CRITERIA = $GEXXX901_INCLUDE_COMPANY_PAYGROUP_CRITERIA || ')'
+    Let $GEXXX901_INCLUDE_COMPANY_PAYGROUP_DISPLAY_CRITERIA = $GEXXX901_INCLUDE_COMPANY_PAYGROUP_CRITERIA
+  End-If
+
+
+  Let $DeptIDString = ''''
+  Display 'Enter DeptID or leave blank to exit.'
+  While 1=1
+    Input $In-DeptID Maxlen=10 'DeptID'
+    Uppercase $In-DeptID
+    If Rtrim($In-DeptID, ' ') = ''
+      Concat '''' With $DeptIDString
+      Break
+    End-If
+    If $DeptIDString <> ''''
+      Concat ''',''' With $DeptIDString
+    End-If
+    Concat $In-DeptID With $DeptIDString
+  End-While
+
+  If $DeptIDString = ''''''
+    Let $GEXXX902_INCLUDE_DEPTID_CRITERIA = '1=1'
+    Let $GEXXX902_INCLUDE_DEPTID_DISPLAY_CRITERIA = 'ALL'
+  Else
+    Let $GEXXX902_INCLUDE_DEPTID_CRITERIA = $GEXXX902_Deptid_Alias || ' In (' || $DeptIDString || ')'
+    Let $GEXXX902_INCLUDE_DEPTID_DISPLAY_CRITERIA = $GEXXX902_INCLUDE_DEPTID_CRITERIA
+  End-If
+
+
+  Let $EmplStatusString = ''''
+  Display 'Enter Employee Status or leave blank to exit.'
+  While 1=1
+    Input $In-EmplStatus Maxlen=1 'Employee Status'
+    Uppercase $In-EmplStatus
+    If Rtrim($In-EmplStatus, ' ') = ''
+      Concat '''' With $EmplStatusString
+      Break
+    End-If
+    If $EmplStatusString <> ''''
+      Concat ''',''' With $EmplStatusString
+    End-If
+    Concat $In-EmplStatus With $EmplStatusString
+  End-While
+
+  If $EmplStatusString = ''''''
+    Let $GEXXX903_INCLUDE_EMP_STAT_CRITERIA = '1=1'
+    Let $GEXXX903_INCLUDE_EMP_STAT_DISPLAY_CRITERIA = 'ALL'
+  Else
+    Let $GEXXX903_INCLUDE_EMP_STAT_CRITERIA = $GEXXX903_Emp_Stat_Alias || ' In (' || $EmplStatusString || ')'
+    Let $GEXXX903_INCLUDE_EMP_STAT_DISPLAY_CRITERIA = $GEXXX903_INCLUDE_EMP_STAT_CRITERIA
+  End-If
+
+
+  Let $DivCdString = ''''
+  Display 'Enter Company Division Code or leave blank to exit.'
+  While 1=1
+    Input $In-DivCd Maxlen=3 'Company Division Code'
+    Uppercase $In-DivCd
+    If Rtrim($In-DivCd, ' ') = ''
+      Concat '''' With $DivCdString
+      Break
+    End-If
+    If $DivCdString <> ''''
+      Concat ''',''' With $DivCdString
+    End-If
+    Concat $In-DivCd With $DivCdString
+  End-While
+
+  If $DivCdString = ''''''
+    Let $GEXXX907_INCLUDE_DIV_CD_CRITERIA = '1=1'
+    Let $GEXXX907_INCLUDE_DIV_CD_DISPLAY_CRITERIA = 'ALL'
+  Else
+    Let $GEXXX907_INCLUDE_DIV_CD_CRITERIA = $GEXXX907_Div_CD_Alias || ' In (' || $DivCdString || ')'
+    Let $GEXXX907_INCLUDE_DIV_CD_DISPLAY_CRITERIA = $GEXXX907_INCLUDE_DIV_CD_CRITERIA
+  End-If
+
+
+  Let $AcctCdString = ''''
+  Display 'Enter Account Code or leave blank to exit.'
+  While 1=1
+    Input $In-AcctCd Maxlen=25 'Account Code'
+    Uppercase $In-AcctCd
+    If Rtrim($In-AcctCd, ' ') = ''
+      Concat '''' With $AcctCdString
+      Break
+    End-If
+    If $AcctCdString <> ''''
+      Concat ''',''' With $AcctCdString
+    End-If
+    Concat $In-AcctCd With $AcctCdString
+  End-While
+
+  If $AcctCdString = ''''''
+    Let $GEXXX909_INCLUDE_ACCT_CD_CRITERIA = '1=1'
+    Let $GEXXX909_INCLUDE_ACCT_CD_DISPLAY_CRITERIA = 'ALL'
+  Else
+    Let $GEXXX909_INCLUDE_ACCT_CD_CRITERIA = $GEXXX909_Acct_CD_Alias || ' In (' || $AcctCdString || ')'
+    Let $GEXXX909_INCLUDE_ACCT_CD_DISPLAY_CRITERIA = $GEXXX909_INCLUDE_ACCT_CD_CRITERIA
+  End-If
+
+
+  Let $X000_WHERE_SELECT_ASOFDATE = $ThruDate
+End-Procedure
+!***************************************
+begin-procedure P050-Print-Cover-Page
+#debug9 Show 'P050-Print-Cover-Page'
+
+  Print 'RUN CONTROL INFORMATION FOR THIS REPORT RUN:'            (+5,1)
+  Print '$Prcs_OPRID          ='                                  (+2,5)
+  Print $Prcs_OPRID                                               (0,+2)
+  Print '$PRCS_RUN_CNTL_ID    ='                                  (+1,5)
+  Print $PRCS_RUN_CNTL_ID                                         (0,+2)
+
+  Print 'SELECTION CRITERIA FOR THIS REPORT RUN:'                 (+5,2)
+  Print '$GEXXX907_INCLUDE_DIV_CD_DISPLAY_CRITERIA           ='   (+2,5)
+  Print $GEXXX907_INCLUDE_DIV_CD_DISPLAY_CRITERIA                 (0,+2)
+  Print '$GEXXX900_INCLUDE_COMPANY_DISPLAY_CRITERIA          ='   (+1,5)
+  Print $GEXXX900_INCLUDE_COMPANY_DISPLAY_CRITERIA                (0,+2)
+  Print '$GEXXX901_INCLUDE_COMPANY_PAYGROUP_DISPLAY_CRITERIA ='   (+1,5)
+  Print $GEXXX901_INCLUDE_COMPANY_PAYGROUP_DISPLAY_CRITERIA       (0,+2)
+  Print '$GEXXX902_INCLUDE_DEPTID_DISPLAY_CRITERIA           ='   (+1,5)
+  Print $GEXXX902_INCLUDE_DEPTID_DISPLAY_CRITERIA	          (0,+2)
+  Print '$GEXXX903_INCLUDE_EMP_STAT_DISPLAY_CRITERIA         ='   (+1,5)
+  Print $GEXXX903_INCLUDE_EMP_STAT_DISPLAY_CRITERIA               (0,+2)
+  Print '$GEXXX909_INCLUDE_ACCT_CD_DISPLAY_CRITERIA          ='   (+1,5)
+  Print $GEXXX909_INCLUDE_ACCT_CD_DISPLAY_CRITERIA                (0,+2)
+
+  Print 'As Of Date :'                                        (+2,5)
+  Print $X000_REPORT_HEADING_ASOFDATE                         (0,+2)
+
+  Print 'SORT ORDER FOR THIS REPORT RUN:'                     (+5,2)
+  Print $X000_ORDER_BY                                        (+2,5)
+
+  Let #PAGE-COUNT = 0
+  NEW-PAGE
+End-Procedure
+
+!***************************************
+begin-procedure P100-Open-File
+#debug9 Show 'P100-Open-File'
+
+  !let $file1 = 'c:\TEMP\gexpy617.dat' !isdvmxr  testing comment for prod
+  let $file1 = '{OUTFILE}' || lower($ReportID) || '.dat'  !isdvmxr uncomment for hrprod
+  
+  open $file1
+        as 1
+        for-writing
+        record=188:fixed	!axl 2/21/2006 was 141
+	status=#filestat
+
+  if #filestat != 0
+     display 'Error Opening output file.  Program terminating.'
+     stop
+  end-if
+end-procedure
+!***************************************
+
+begin-procedure P200-Process-Main
+#debug9 Show 'P200-Process-Main'
+ !SHOW 'begin-procedure P200-Process-Main '
+ 
+  
+  Let $Data-Found-Flag = 'N'
+  
+
+begin-SELECT
+J.EMPLID
+J.EFFDT
+J.COMPANY
+J.DEPTID
+J.HOURLY_RT
+J.EMPL_STATUS
+J.EMPL_TYPE
+J.ACTION
+J.ACTION_REASON
+J.EMPL_RCD !PSR Added 08/28/02
+PD.NAME
+PD.LAST_NAME	!AXL 02/21/2006 add
+PD.FIRST_NAME	!AXL 02/21/2006 add
+PD.MIDDLE_NAME	!AXL 02/21/2006 add
+!GEX - VENDCXB BEGIN 
+!PD.ORIG_HIRE_DT!GEX - VENDCXB 08/22/2007
+INST.ORIG_HIRE_DT !GEX - VENDCXB Added 08/22/2007
+!GEX - VENDCXB END
+      
+      
+    
+      
+      ! Show 'J.EMPLID   ='    &J.EMPLID  
+      ! Show 'J.EFFDT    ='    &J.EFFDT
+      ! Show 'J.COMPANY  ='    &J.COMPANY
+      ! Show 'J.DEPTID   ='    &J.DEPTID
+      ! Show 'J.HOURLY_RT='    &J.HOURLY_RT
+      ! Show 'J.EMPL_STATUS =' &J.EMPL_STATUS
+      ! Show 'J.EMPL_TYPE ='   &J.EMPL_TYPE
+      ! Show 'J.EMPL_STATUS='  &J.EMPL_STATUS
+      ! Show 'J.ACTION    '    &J.ACTION
+      ! Show 'J.ACTION_REASON='&J.ACTION_REASON
+      ! Show 'J.EMPL_RCD  ='   &J.EMPL_RCD
+      ! SHOW 'PD.ORIG_HIRE_DT =  '&PD.ORIG_HIRE_DT
+
+  if &J.EMPL_TYPE = 'S'
+    move '00000000' to $Hourly_Rate
+    move $Hourly_Rate to #Hourly_Rate
+    !show ' $Hourly_Rate   &J.EMPL_TYPE = S               '$Hourly_Rate
+  else
+    move &J.HOURLY_RT to #string_in
+    move &J.HOURLY_RT to #Hourly_Rate
+    let #string_in = round(#string_in,4)
+    move #string_in to $string
+    unstring $string by '.' into $string_int $string_after_Dec
+    move $string_int to $string_int_ed 0999
+    let $Hourly_Rate = $string_int_ed || SUBSTR($string_after_Dec,1,4)
+   ! show ' $Hourly_Rate  in esle ' $Hourly_Rate
+  end-if
+
+  let $Termination_Date = ''
+  let $Layoff_Date      = ''
+
+! CWB 05/04/2001 BEGIN
+  if &J.EMPL_STATUS = 'T'
+! CWB 05/04/2001 END
+
+  If &J.ACTION_REASON = 'LOF'
+    do Format-DateTime(&J.EFFDT, $Layoff_Date, {DEFMDY}, '', '')
+  Else
+    If &J.ACTION = 'TER' Or
+       &J.ACTION = 'TWB' Or
+       &J.ACTION = 'TWP'
+        do Format-DateTime(&J.EFFDT, $Termination_Date, {DEFMDY}, '', '')
+! CWB 05/04/2001 BEGIN
+    else
+     do P205-prior-term-row
+! CWB 05/04/2001 END
+    End-If
+  End-If
+! CWB 05/04/2001 BEGIN
+  End-if
+! CWB 05/04/2001 END
+
+  Do P210-Earnings_Bal_Select
+
+  Do Format-DateTime(&INST.ORIG_HIRE_DT, $Orig_Hire_Dt, {DEFMDY}, '', '') ! Tejal Replace PD.ORIG_HIRE_DT 
+
+  move #YTD_Gross_Wages to $string
+  unstring $string by '.' into $string_int $string_after_Dec
+  move $string_int to $string_int_ed 099999
+  let $YTD_Gross_Wages = $string_int_ed || SUBSTR($string_after_Dec,1,2)
+
+  move #YTD_Hours_Worked to $string
+  unstring $string by '.' into $string_int $string_after_Dec
+  move $string_int to $string_int_ed 099999
+  let $YTD_Hours_Worked = $string_int_ed || SUBSTR($string_after_Dec,1,2)
+
+  If Rtrim($Termination_Date, ' ') = '' And
+     Rtrim($Layoff_Date, ' ')      = ''
+    Let $Data-Found-Flag = 'Y'
+    do P230-Print-Record
+    do P240-Write-Record
+  Else
+    If Substr(&J.EFFDT,8,4) >= Substr($FromDate,8,4) And
+       Substr(&J.EFFDT,8,4) <= Substr($ThruDate,8,4)
+      Let $Data-Found-Flag = 'Y'
+      do P230-Print-Record
+      do P240-Write-Record
+    End-If
+  End-If
+
+FROM   ps_gex_dept_tbl     gdt,
+       PS_PERSONAL_DATA    PD,
+       PS_JOB              J,
+       PS_PER_ORG_INST     INST  !Tejal Added 08/22/2007
+
+WHERE  PD.EMPLID           = J.EMPLID
+!GEX - VENDCXB BEGIN 
+	AND PD.EMPLID           = INST.EMPLID !GEX - VENDCXB Added 08/22/2007
+  AND INST.EMPLID           = J.EMPLID  !GEX - VENDCXB Added 08/22/2007
+  AND INST.ORG_INSTANCE_ERN = J.EMPL_RCD ! ISDVASS ADDED 04/01/2008
+!GEX - VENDCXB END        
+
+AND    J.EFFDT             =
+      (SELECT MAX(EFFDT)
+       FROM   PS_JOB
+       WHERE  EMPLID       = J.EMPLID
+       AND    EMPL_RCD    = J.EMPL_RCD
+       AND    COMPANY     = J.COMPANY   !ISDVMXR  09/11/2006
+       AND    EFFDT       <= $X000_WHERE_SELECT_ASOFDATE)
+
+AND    J.EFFSEQ            =
+      (SELECT MAX(EFFSEQ)
+       FROM   PS_JOB
+       WHERE  EMPLID       = J.EMPLID
+       AND    EMPL_RCD    = J.EMPL_RCD
+       AND    EFFDT        = J.EFFDT)
+
+And    j.deptid            = gdt.deptid
+
+And    gdt.effdt           =
+      (Select Max(effdt)
+       From   ps_gex_dept_tbl
+       Where  deptid       = gdt.deptid
+       And    effdt       <= $X000_WHERE_SELECT_ASOFDATE)
+
+And    gdt.sequence_number =
+      (Select Max(sequence_number)
+       From   ps_gex_dept_tbl
+       Where  deptid       = gdt.deptid
+       And    effdt        = gdt.effdt)
+
+AND   [$GEXXX900_INCLUDE_COMPANY_CRITERIA]
+AND   [$GEXXX901_INCLUDE_COMPANY_PAYGROUP_CRITERIA] 
+AND   [$GEXXX902_INCLUDE_DEPTID_CRITERIA]
+AND   [$GEXXX907_INCLUDE_DIV_CD_CRITERIA]
+AND   [$GEXXX903_INCLUDE_EMP_STAT_CRITERIA]
+AND   [$GEXXX909_INCLUDE_ACCT_CD_CRITERIA]
+!ISDVMXR TESTING
+!AND J.EMPLID in ( '227497584','275029642')  ! ISDVMXR comment b4 moving to prod
+!AND J.EMPLID = '227497584'
+!ORDER  BY J.COMPANY, J.DEPTID, J.EMPLID
+ORDER  BY J.EMPLID ,J.COMPANY           !, J.EMPLID  !, J.DEPTID,
+
+end-SELECT
+
+  If $Data-Found-Flag = 'N'
+    Print 'NO DATA SELECTED FOR THIS REPORT RUN'	(25,) Center
+  End-If
+
+  do Format-Number(#recs-written,$recs-written,'888,888,888')
+  display ''
+  display $recs-written noline
+  display ' records written to ' noline
+  display $file1
+  display ''
+end-procedure
+!***************************************
+! CWB 05/24/2001 BEGIN
+Begin-Procedure P205-Prior-Term-Row
+#debug9 Show 'P205-Prior-Term-Row'
+!SHOW 'Begin-Procedure P205-Prior-Term-Row '
+Begin-Select
+J2.EFFDT 
+J2.ACTION
+J2.ACTION_REASON
+
+  If &J2.ACTION_REASON = 'LOF'
+    do Format-DateTime(&J2.EFFDT, $Layoff_Date, {DEFMDY}, '', '')
+  Else
+    If &J2.ACTION = 'TER' Or
+       &J2.ACTION = 'TWB' Or
+       &J2.ACTION = 'TWP'
+        do Format-DateTime(&J2.EFFDT, $Termination_Date, {DEFMDY}, '', '')
+    End-If
+   End-if
+
+FROM   PS_JOB J2
+
+WHERE  J2.EMPLID           = &j.emplid
+
+AND    J2.EFFDT            =
+      (SELECT MAX(EFFDT)
+       FROM   PS_JOB
+       WHERE  EMPLID       = J2.EMPLID
+       AND    EMPL_RCD    = J2.EMPL_RCD
+       AND    EFFDT       <= &J.EFFDT
+       AND ACTION          = J2.ACTION
+       AND    EMPL_STATUS  = 'T')
+
+AND    J2.EFFSEQ           =
+      (SELECT MAX(EFFSEQ)
+       FROM   PS_JOB
+       WHERE  EMPLID       = J2.EMPLID
+       AND    EMPL_RCD    = J2.EMPL_RCD
+       AND    EFFDT        = J2.EFFDT
+       AND ACTION          = J2.ACTION
+       AND    EMPL_STATUS  = 'T')
+
+AND    J2.EMPL_STATUS      = 'T'
+AND    J2.ACTION           IN ('TER','TWB','TWP')
+End-Select
+End-Procedure
+! CWB 05/24/2001 END
+!***************************************
+begin-procedure P210-Earnings_Bal_Select
+#debug9 Show 'P210-Earnings_Bal_Select'
+!SHOW 'begin-procedure P210-Earnings_Bal_Select '
+
+  let #YTD_Gross_Wages  = 0
+  let $YTD_Gross_Wages  = ''
+  let #YTD_Hours_Worked = 0
+  let $YTD_Hours_Worked = ''
+  
+ ! show '&J.EMPLID   =  ' &J.EMPLID
+ ! show ' &J.COMPANY    ' &J.COMPANY
+
+begin-SELECT
+EB.ERNCD    &erncd
+EB.GRS_YTD  &grs_ytd
+EB.HRS_YTD  &hrs_ytd
+EB.COMPANY  &company   !isdvmxr
+
+
+   !SHOW ' &erncd    =   '  &erncd
+   !SHOW ' &grs_ytd  =   ' &grs_ytd
+   !SHOW ' &hrs_ytd  =   ' &hrs_ytd
+   !SHOW ' Company   =   ' &company
+ 
+
+  add &GRS_YTD to #YTD_Gross_Wages
+  add &HRS_YTD to #YTD_Hours_Worked
+
+  
+  !SHOW '#YTD_Gross_Wages    ' #YTD_Gross_Wages
+  !SHOW '#YTD_Hours_Worked   ' #YTD_Hours_Worked
+ 
+
+FROM   PS_EARNINGS_BAL EB
+
+WHERE  EB.EMPLID         = &J.EMPLID
+AND    EB.COMPANY        = &J.COMPANY   
+AND    EB.BALANCE_ID     = 'CY'
+AND    EB.BALANCE_YEAR   = #ThruDate_YYYY
+AND    EB.EMPL_RCD       = &J.EMPL_RCD
+AND    EB.BALANCE_PERIOD      =
+      (SELECT MAX(BALANCE_PERIOD)
+       FROM   PS_EARNINGS_BAL
+       WHERE  EMPLID          = EB.EMPLID
+       AND    COMPANY         = EB.COMPANY
+       AND    BALANCE_ID      = EB.BALANCE_ID
+       AND    BALANCE_YEAR    = EB.BALANCE_YEAR
+       AND    BALANCE_PERIOD <= #ThruDate_MM
+       AND    EMPL_RCD        = EB.EMPL_RCD
+       AND    SPCL_BALANCE    = EB.SPCL_BALANCE
+       AND    ERNCD           = EB.ERNCD)
+
+AND    EB.SPCL_BALANCE        = 'N'
+AND   [$GEXERNCD_EXCLUDE_ERNCD_CRITERIA]
+end-select
+end-procedure
+!***************************************
+
+Begin-Procedure P230-Print-Record
+#debug9 Show 'P230-Print-Record'
+ !GEX_SEC_REENG 2015-04-29 Vahini Katta Begins
+   do Get-Emp-Ssn (&J.EMPLID,$Ssn_Out)
+  !Print &J.EMPLID                      (+1,{#column1})
+  Print $Ssn_Out                      (+1,{#column1})
+ !GEX_SEC_REENG 2015-04-29 Vahini Katta Ends 
+  Print &PD.NAME                       (,{#column2},30)
+  Print $Orig_Hire_Dt                  (,{#column3})
+  Print &J.COMPANY                     (,{#column4})
+  Print &J.DEPTID                      (,{#column5})
+  Print $FromDate_MM_DD_YY             (,{#column6})
+  Print $ThruDate_MM_DD_YY             (,{#column7})
+  Print #YTD_Gross_Wages               (,{#column8})   Edit 999,999,990.00
+  Print #Hourly_Rate                   (,{#column9})   Edit 999,999,990.00
+  Print #YTD_Hours_Worked              (,{#column10})  Edit 999,999,990.00
+  Print $Termination_Date              (,{#column11})
+  Print $Layoff_Date                   (,{#column12})
+End-Procedure
+
+!***************************************
+begin-procedure P240-Write-Record
+#debug9 Show 'P240-Write-Record'
+  !AXL 02/21/2006 Begin
+  Unstring &PD.LAST_NAME By ',' Into $lname $other
+  Unstring &PD.FIRST_NAME By ',' Into $fname $otherx
+
+  add 1 to #recs-written
+  
+  !GEX_SEC_REENG 2015-04-29 Vahini Katta Begins
+   do Get-Emp-Ssn (&J.EMPLID,$Ssn_Out)
+  !write 1 from &J.EMPLID:9
+   write 1 from $Ssn_Out:9
+   !GEX_SEC_REENG 2015-04-29 Vahini Katta Ends 
+               ';'
+	       $lname:30
+		';'
+               $fname:30
+		';'
+               &PD.MIDDLE_NAME:1
+	        ';'
+               !&PD.NAME:30
+               '                              ':30
+	        ';'
+	       $Orig_Hire_Dt:8
+		';'
+               &J.COMPANY:3
+	        ';'
+               &J.DEPTID:5
+	        ';'
+               $FromDate_MM_DD_YY:8
+	        ';'
+               $ThruDate_MM_DD_YY:8
+	        ';'
+               $YTD_Gross_Wages:8
+	        ';'
+               $Hourly_Rate:8
+	        ';'
+               $YTD_Hours_Worked:8
+	        ';'
+               $Termination_Date:8
+	        ';'
+               $Layoff_Date:8
+	       	';'
+		' '
+  !AXL 02/21/2006 End
+  status=#filestat
+
+  if #filestat != 0
+     display 'Error Writing output file.  Program terminating.'
+     stop
+  end-if
+end-procedure
+!***************************************
+
+begin-procedure P300-Close-File
+#debug9 Show 'P300-Close-File'
+
+  close 1
+end-procedure
+!***************************************
+
+#include 'gexxx900.sqc'  !Get company multiple row table
+#include 'gexxx901.sqc'  !Get company/paygroup multiple row table
+#include 'gexxx902.sqc'  !Get deptid multiple row table
+#include 'gexxx903.sqc'  !Get employee status multiple row table
+#include 'gexxx904.sqc'  !Get grade multiple row table
+#include 'gexxx907.sqc'  !Get company/division code multiple row table
+#include 'gexxx908.sqc'  !Get sal_admin_plan multiple row table
+#include 'gexxx909.sqc'  !Get acct_cd code multiple row table
+#include 'gexxx922.sqc'  !Get pay single row run control
+#include 'gexerncd.sqc'
+!#include 'gexaltse.sqc'  !Alter session SQC
+#Include 'askftd.sqc'    !Ask-From-Thru-Date procedure
+#Include 'readxlat.sqc'  !Read-Translate-Table procedure
+#Include 'reset.sqc'     !Reset printer procedure
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'datemath.sqc'  !Routines for date math
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'stdapi.sqc'    !Routines to Update Run Status
+#Include 'getgeid.sqc'   !Get 7 digit Emplid

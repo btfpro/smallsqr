@@ -1,0 +1,551 @@
+!***********************************************************************
+! GEXPY112:  Updates Pension Flag for Emps who are in plan_type '82'   *
+!            and plan '1X'. Also updates the deferred comp flag for    *
+!            eligible employees.
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module is the confidential and proprietary information of       *
+! Giant Eagle, Inc.; it is not to be copied, reproduced,or transmitted *
+! in any form, by any means, in whole or in part, nor is it to be used *
+! for any purpose other than that for which it is expressly provided   *
+! without the written permission of Giant Eagle.                       *
+!                                                                      *
+! Copyright (c) 1997-1998 Giant Eagle,Inc. All Rights Reserved         *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+! Narrative:                                                           *
+!                                                                      *
+! #Debugx Used:         #debug9 paragraph trace                        *
+!                       #debug8 key variable values                    *
+!                       #debug7 data returned from sql calls           *
+!                                                                      *
+! SQL Tables:           FED_TAX_DATA                                   *
+!                       PENSION_PLAN                                   *
+!                       SAVINGS_PLAN                                   *
+!                       DEDUCTION_BAL                                  *
+!                                                                      *
+! Written by:           Joe Besagar                                    *
+!                                                                      *
+! Normally Run:         Yearly                                         *
+!                                                                      *
+! Control Parms:        AsOfDate                                       *
+!                                                                      *
+!***********************************************************************
+!                         MODIFICATION HISTORY                         *
+!***********************************************************************
+! INITIALS  DATE        DESCRIPTION OF THE CHANGE                      *
+!***********************************************************************
+! JNB       10/13/99    Initial Creation                               *
+! CWB       11/16/2000  Added logic to include plan_type '1X' from     *
+!                       PS_HEALTH_BENEFIT                              *
+! CJH       02/18/2003  use Savings plan empl_rcd to join with         *
+!                       ded_bal.benefit_rcd_nbr                        *
+! CWB       02/09/2005  Correct as of date problems                    *
+!                       As of date will be same as thru date.          *
+! ISDVMZA   08/20/2012  Modify to handle the following issues for TMs  *
+!                       with multiple W2 companies for the tax year.   *
+!                   #1: If a TM worked for 2 Corp companies and belong *
+!                       to a pension plan on both companies, both W2   *
+!                       should reflect a 'Y' on the Pension Plan       *
+!                       (Retirement Plan on Box 13 of W2).             *
+!                   #2: If a TM worked for 2 Corp companies            *
+!                       (example: GEI & MGC) and belongs to a pension  *
+!                       plan only while on MGC company, the W2 should  *
+!                       reflect a 'Y' on the Pension Plan for MGC      *
+!                       company only, GEI company should have 'N'.     *
+!                   #3: If a TM worked for 1 Corp company and 1        *
+!                       Independent and belong to a pension plan on    *
+!                       both Corp and Independent company, the W2      *
+!                       should reflect a 'Y' on the Pension Plan for   *
+!                       the Corp company only, the Independent company *
+!                       will be handled by another program GEXPY104.   *
+!***********************************************************************
+
+
+#include 'setenv.sqc'    !Set environment
+#Include 'setup32.sqc'   !Printer and Page-Size Initialization (Landscape)
+
+
+#define #column1     1
+#define #column2    13
+#define #column3    27
+#define #column4    46
+#define #column5    57
+#define #column6    66
+#define #column7    85
+#define #column8   100
+#define #column9   118
+
+
+Begin-Setup
+  Declare-Report Exception-Report
+Printer-Type=HPLASERJET
+    Layout=Default
+  End-Declare
+
+  Declare-Report Update-Report
+Printer-Type=HPLASERJET
+    Layout=Default
+  End-Declare
+End-Setup
+
+
+Begin-Report
+#debug9 Show 'Begin-Report'
+  Do P100-Initialization
+  Do P200-pension-Process
+  Do P201-deferred-comp-Process
+  Do P400-Finalization
+End-Report
+
+
+Begin-Heading 8 For-Reports=(Exception-Report)
+#debug9 Show 'Begin-Heading (Exception-Report)'
+  Let $ReportID      =   'PY112E'
+  Let $ReportTitle   =   'Updates Pension and Deferred Comp Flags'
+  Let $ReportTitle2  =   'Exception Report'
+
+  #Include 'stdhdg01.sqc'
+  Print $ReportTitle2      (3,) Center
+
+  Print 'EMPL ID'          (+3,{#column2})
+
+  Print '-'                (+1,{#column2},9)  Fill
+
+End-Heading
+
+
+Begin-Heading 8 For-Reports=(Update-Report)
+#debug9 Show 'Begin-Heading (Update-Report)'
+  Let $ReportID      =   'PY112U'
+  Let $ReportTitle   =   'Updates Pension and Deferred Comp Flags'
+  Let $ReportTitle2  =   'Update Report'
+
+  #Include 'stdhdg01.sqc'
+  Print $ReportTitle2      (3,) Center
+
+  Print 'EMPLID'           (+3,{#column2})
+
+  Print '-'                (+1,{#column2},9)  Fill
+
+End-Heading
+
+
+Begin-Procedure P100-Initialization
+#debug9 Show 'P100-Initialization'
+  Do Init-DateTime           !datetime.sqc
+  Do Init-Number             !number.sqc
+  Do Get-Current-DateTime    !curdttim.sqc
+  Do Stdapi-Init             !stdapi.sqc
+
+  Let $ReportID      =   'GEXPY112'
+  Let $ReportTitle   =   'Updates Pension and Deferred Comp Flags'
+
+  LET $MESSAGE1 = 'Not Found on FED_TAX_TABLE'
+  Show '$ReportID    = ' $ReportID
+  Show '$ReportTitle = ' $ReportTitle
+
+! for 1999 I used 01/02/1999 and 12/31/1999
+ if $prcs_process_instance = ''
+   Do Ask-From-Thru-Date
+
+   Let $begindate = $FromDate
+   Let $enddate = $ThruDate
+
+! CWB 02/09/2005 BEGIN
+!   Let $Where_Select_AsOfDate = $AsOfToday
+   Let $Where_Select_AsOfDate = $enddate
+
+  else
+    Do GEXXX922-Select-Parameters
+
+    Let $begindate = $GEX_RC_PAY.FromDate
+
+    Let $enddate = $GEX_RC_PAY.ThruDate
+
+    Let $Where_Select_AsOfDate = $enddate
+  end-if
+
+
+    show ' '
+    show '$begindate = ' $begindate
+    show '$enddate   = ' $enddate
+    show 'As of date = ' $Where_Select_AsOfDate
+    show ' '
+
+! CWB 02/09/2005 END
+
+  Let $Year4 = '1'
+  Do Format-DateTime ($begindate, $begindate_YMD, {DEFYMD}, '', '')
+
+  Let $Year4 = '1'
+  Do Format-DateTime ($enddate, $enddate_YMD, {DEFYMD}, '', '')
+
+End-Procedure
+
+Begin-Procedure P200-pension-Process
+#debug9 Show 'P200-Pension-Process'
+
+Begin-Select
+P.EMPLID
+P.PLAN_TYPE
+P.EFFDT
+P.COVERAGE_ELECT
+
+   add 1 to #main_select_count
+   move &p.emplid to $empssn
+
+   Let $Year4 = '1'
+   Do Format-DateTime (&p.effdt, $effdt_YMD, {DEFYMD}, '', '')
+
+   If &p.coverage_elect = 'E'
+      If $effdt_YMD <= $enddate_YMD
+         Do P220-Find-Emp-Match-for-pension
+      Else
+         let $message1 = 'Coverage Elect is E but effdt is out of range'
+         Do P260-Print-Exception-Report
+         add 1 to #e-pen-recs-printed
+      End-IF
+   End-IF
+
+   If &p.coverage_elect = 'T'
+      If $effdt_YMD >= $begindate_YMD and
+         $effdt_YMD <= $enddate_YMD
+         Do P220-Find-Emp-Match-for-pension
+      Else
+         let $message1 = 'Coverage Elect is T but effdt is out of range'
+         Do P260-Print-Exception-Report
+         add 1 to #e-pen-recs-printed
+      End-IF
+   End-IF
+
+
+FROM PS_PENSION_PLAN P
+WHERE P.PLAN_TYPE = '82'
+AND P.COVERAGE_ELECT IN ('E','T')
+AND P.EFFDT =
+    (SELECT MAX(EFFDT) FROM PS_PENSION_PLAN
+     WHERE P.EMPLID = EMPLID
+     AND P.PLAN_TYPE = PLAN_TYPE
+      AND EFFDT <= $enddate)
+
+End-Select
+
+! CWB 11/16/2000 BEGIN
+Begin-Select
+H.EMPLID
+H.PLAN_TYPE
+H.EFFDT
+H.COVERAGE_ELECT
+
+   add 1 to #main_select_count
+   move &h.emplid to $empssn
+
+   Let $Year4 = '1'
+   Do Format-DateTime (&h.effdt, $effdt_YMD, {DEFYMD}, '', '')
+
+   If &h.coverage_elect = 'E'
+      If $effdt_YMD <= $enddate_YMD
+         Do P220-Find-Emp-Match-for-pension
+      Else
+         let $message1 = 'Coverage Elect is E but effdt is out of range'
+         Do P260-Print-Exception-Report
+         add 1 to #e-pen-recs-printed
+      End-IF
+   End-IF
+
+   If &h.coverage_elect = 'T'
+      If $effdt_YMD >= $begindate_YMD and
+         $effdt_YMD <= $enddate_YMD
+         Do P220-Find-Emp-Match-for-pension
+      Else
+         let $message1 = 'Coverage Elect is T but effdt is out of range'
+         Do P260-Print-Exception-Report
+         add 1 to #e-pen-recs-printed
+      End-IF
+   End-IF
+
+
+FROM PS_HEALTH_BENEFIT H
+WHERE H.PLAN_TYPE = '1X'
+AND H.COVERAGE_ELECT IN ('E','T')
+AND H.EFFDT =
+    (SELECT MAX(EFFDT) FROM PS_HEALTH_BENEFIT
+     WHERE H.EMPLID = EMPLID
+     AND H.PLAN_TYPE = PLAN_TYPE
+      AND EFFDT <= $enddate)
+
+End-Select
+
+! CWB 11/16/2000 END
+
+  date-time () HH:MI:SS &timeBegan
+  date-time () MM/DD/YYYY &dateBegan
+  show 'Report Began at ' &timeBegan ' on ' &dateBegan
+  show ' '
+
+End-Procedure
+
+Begin-Procedure P201-deferred-comp-Process
+#debug9 Show 'P201-deferred-comp-Process'
+  let $bal_year = substr($enddate,8,4)
+  show '$bal_year: ' $bal_year
+Begin-Select
+S.EMPLID
+S.PLAN_TYPE
+S.EFFDT
+S.COVERAGE_ELECT
+
+   add 1 to #main_select_count
+   move &S.emplid to $empssn
+
+   Let $Year4 = '1'
+   Do Format-DateTime (&s.effdt, $effdt_YMD, {DEFYMD}, '', '')
+
+   If &s.coverage_elect = 'E'
+      If $effdt_YMD <= $enddate_YMD
+         Do P221-Find-Emp-Match-for-comp
+      Else
+         let $message1 = 'Coverage Elect is E but effdt is out of range'
+         Do P260-Print-Exception-Report
+         add 1 to #e-comp-recs-printed
+      End-IF
+   End-IF
+
+   If &s.coverage_elect = 'T'
+      If $effdt_YMD >= $begindate_YMD and
+         $effdt_YMD <= $enddate_YMD
+         Do P221-Find-Emp-Match-for-comp
+      Else
+         let $message1 = 'Coverage Elect is T but effdt is out of range'
+         Do P260-Print-Exception-Report
+         add 1 to #e-comp-recs-printed
+      End-IF
+   End-IF
+
+
+FROM PS_SAVINGS_PLAN S,
+     PS_DEDUCTION_BAL D
+WHERE S.PLAN_TYPE = '41'
+AND S.COVERAGE_ELECT IN ('E','T')
+AND S.EFFDT =
+    (SELECT MAX(EFFDT) FROM PS_SAVINGS_PLAN
+     WHERE S.EMPLID = EMPLID
+     AND S.PLAN_TYPE = PLAN_TYPE
+      AND EFFDT <= $enddate)
+AND S.EMPLID = D.EMPLID
+! CJH - 02/18/2003 - use Savings plan empl_rcd to join with ded_bal.benefit_rcd_nbr
+AND S.EMPL_RCD = D.BENEFIT_RCD_NBR
+! CJH - 02/18/2003 - end
+AND D.PLAN_TYPE = S.PLAN_TYPE
+AND D.BENEFIT_PLAN = S.BENEFIT_PLAN
+AND D.BALANCE_ID = 'CY'
+AND D.BALANCE_YEAR = $bal_year
+AND D.DED_YTD > 0
+
+End-Select
+
+End-Procedure
+
+Begin-Procedure P220-Find-Emp-Match-for-pension
+#debug9 Show 'P220-Find-Emp-Match-for-pension'
+ Let $Match_Found = 'N'
+ Let #tax-recs-found = 0
+
+Begin-Select
+F.EMPLID
+
+  Let $Match_Found = 'Y'
+
+     Add 1 To #tax-recs-found
+     Do P245-Update-Pension-Plan
+
+     LET $MESSAGE = 'Pension Flag set to Y'
+     Do P250-Print-Update-Report
+     Add 1 To #u-pen-recs-printed
+FROM PS_FED_TAX_DATA F
+WHERE F.EMPLID = $EMPSSN
+  AND F.EFFDT =
+        (SELECT MAX(EFFDT)
+           FROM PS_FED_TAX_DATA
+          WHERE EMPLID = F.EMPLID
+            AND EFFDT <= $WHERE_SELECT_ASOFDATE)
+
+End-Select
+
+ If #tax-recs-found > 1
+   Show $empssn
+ End-If
+
+ If $Match_Found = 'N'
+     LET $MESSAGE1 = 'Not Found on FED_TAX_TABLE'
+     Do P260-Print-Exception-Report
+     add 1 to #e-pen-recs-printed
+ End-If
+
+End-Procedure
+
+Begin-Procedure P221-Find-Emp-Match-for-comp
+#debug9 Show 'P221-Find-Emp-Match-for-comp'
+ Let $Match_Found = 'N'
+ Let #tax-recs-found = 0
+
+Begin-Select
+F1.EMPLID
+
+  Let $Match_Found = 'Y'
+
+     Add 1 To #tax-recs-found
+     Do P246-Update-deferred-comp
+
+     LET $MESSAGE = 'Deferred Comp Flag set to Y'
+     Do P250-Print-Update-Report
+     Add 1 To #u-comp-recs-printed
+FROM PS_FED_TAX_DATA F1
+WHERE F1.EMPLID = $EMPSSN
+    AND F1.EFFDT =
+        (SELECT MAX(EFFDT)
+           FROM PS_FED_TAX_DATA
+          WHERE EMPLID = F1.EMPLID
+            AND EFFDT <= $WHERE_SELECT_ASOFDATE)
+
+End-Select
+
+ If #tax-recs-found > 1
+   Show $empssn
+ End-If
+
+ If $Match_Found = 'N'
+     LET $MESSAGE1 = 'Not Found on FED_TAX_TABLE'
+     Do P260-Print-Exception-Report
+      add 1 to #e-comp-recs-printed
+ End-If
+
+End-Procedure
+
+Begin-Procedure P245-Update-Pension-Plan
+#debug9 Show 'P245-Update-Pension-Plan'
+add 1 to #rows-Updated
+
+
+Begin-SQL
+Update PS_FED_TAX_DATA F1
+set PENSION_PLAN = 'Y'
+
+WHERE F1.EMPLID = $EMPSSN
+  AND F1.EFFDT =
+        (SELECT MAX(EFFDT)
+           FROM PS_FED_TAX_DATA
+          WHERE EMPLID = F1.EMPLID
+            AND EFFDT <= $WHERE_SELECT_ASOFDATE)
+End-SQL
+End-Procedure
+
+Begin-Procedure P246-Update-deferred-comp
+#debug9 Show 'P246-Update-deferred-comp'
+add 1 to #comp-rows-Updated
+
+Begin-SQL
+Update PS_FED_TAX_DATA F1
+set DEFERRED_COMP = 'Y'
+
+WHERE F1.EMPLID = $EMPSSN
+  AND F1.EFFDT =
+        (SELECT MAX(EFFDT)
+           FROM PS_FED_TAX_DATA
+          WHERE EMPLID = F1.EMPLID
+            AND EFFDT <= $WHERE_SELECT_ASOFDATE)
+End-SQL
+End-Procedure
+
+Begin-Procedure P250-Print-Update-Report
+#debug9 Show 'P250-Print-Update-Report'
+      Use-Report Update-Report
+      Let $U-Data-Found-Flag = 'Y'
+
+
+  Print $empssn                   (+1,{#column2})
+  Print $message                  (+0,{#column3})
+
+End-Procedure
+
+Begin-Procedure P260-Print-Exception-Report
+#debug9 Show 'P260-Print-Exception-Report'
+     Use-Report Exception-Report
+      Let $E-Data-Found-Flag = 'Y'
+
+
+  Print $empssn                    (+1,{#column2})
+  Print $message1                  (+0,{#column3})
+
+End-Procedure
+
+
+Begin-Procedure P400-Finalization
+#debug9 Show 'P400-Finalization'
+
+
+  If $E-Data-Found-Flag <> 'Y'
+    Use-Report Exception-Report
+    Print 'NO DATA SELECTED FOR THIS REPORT RUN'        (25,) Center
+  End-If
+
+  If $U-Data-Found-Flag <> 'Y'
+    Use-Report Update-Report
+    Print 'NO DATA SELECTED FOR THIS REPORT RUN'        (25,) Center
+  End-If
+
+  Show ' '
+  Move #main_select_count To $main_select_count 888,888,888
+  Show $main_select_count ' Total Emps who have plan type 82, or 1X, or 41 and coverage elect of E or T'
+  Show ' '
+  Move #e-pen-recs-printed To $e-pen-recs-printed 888,888,888
+  Show $e-pen-recs-printed ' pension records written to exception report'
+  Move #e-comp-recs-printed To $e-comp-recs-printed 888,888,888
+  Show $e-comp-recs-printed ' Deferred comp records written to exception report'
+  Show ' '
+  Move #rows-updated To $rows-updated 888,888,888
+  Show $rows-updated ' rows on ps_fed_Tax_data table with pension flag updated'
+  Move #u-pen-recs-printed To $u-pen-recs-printed 888,888,888
+  Show $u-pen-recs-printed ' pension records written to update report'
+  Show ' '
+  Move #comp-rows-updated To $comp-rows-updated 888,888,888
+  Show $comp-rows-updated ' rows on ps_fed_Tax_data table with deferred comp flag updated'
+  Move #u-comp-recs-printed To $u-comp-recs-printed 888,888,888
+  Show $u-comp-recs-printed ' Deferred comp records written to update report'
+  Show ' '
+
+
+! Rollback
+
+
+  Do Reset                   !reset.sqc
+  Do Stdapi-Term             !stdapi.sqc
+
+  date-time () HH:MI:SS &timeEnded
+  date-time () MM/DD/YYYY &dateEnded
+  show ' '
+  show 'Report Ended at ' &timeEnded ' on ' &dateEnded
+
+  Show 'Successful end of report'
+End-Procedure
+
+
+Begin-Procedure P290-SQL-Error-found($Action)
+#debug9 Show 'P290-SQL-Error'
+  Show $Action ' failed'
+  Show 'SQL Error:  '  $_sql-error
+  Stop
+End-Procedure
+
+#Include 'gexxx922.sqc'  !Run Control parameters from GEX_RC_PAY record
+#include 'askftd.sqc'    !From thru date Procedure
+#Include 'stdapi.sqc'    !Process Scheduler Interface
+#Include 'reset.sqc'     !Reset Printer Procedure
+#Include 'curdttim.sqc'  !Get-Current-DateTime Procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'datemath.sqc'  !Routines for date math

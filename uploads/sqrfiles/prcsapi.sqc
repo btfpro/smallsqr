@@ -1,0 +1,616 @@
+! ***************************************************************!
+!  This software and related documentation are provided under a!
+!  license agreement containing restrictions on use and!
+!  disclosure and are protected by intellectual property!
+!  laws. Except as expressly permitted in your license agreement!
+!  or allowed by law, you may not use, copy, reproduce,!
+!  translate, broadcast, modify, license, transmit, distribute,!
+!  exhibit, perform, publish or display any part, in any form or!
+!  by any means. Reverse engineering, disassembly, or!
+!  decompilation of this software, unless required by law for!
+!  interoperability, is prohibited.!
+!  The information contained herein is subject to change without!
+!  notice and is not warranted to be error-free. If you find any!
+!  errors, please report them to us in writing.!
+!  !
+!  Copyright (C) 1988, 2011, Oracle and/or its affiliates.!
+!  All Rights Reserved.!
+! ***************************************************************!
+ 
+ 
+!                                                                    !
+!***********************************************************************
+!  PrcsAPI : Procedure to update the Process Scheduler request record  *
+!               and get the run control parameters.                    *
+!***********************************************************************
+!                                                                      *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+!                                                                      *
+!                                                                      *
+!                                                                      *
+!                                                                      *
+!***********************************************************************
+
+!This guards against the SQC being #included twice...
+#ifndef PRCSAPI-INCLUDED
+
+#define PRCSAPI-INCLUDED
+begin-procedure Get_Database_Type
+
+begin-select
+UNICODE_ENABLED
+
+  if &UNICODE_ENABLED = 1
+     let #UNICODE_ENABLED = 1
+  else
+     let #UNICODE_ENABLED = 0
+  end-if
+FROM PSSTATUS
+end-select
+
+
+end-procedure
+
+
+begin-procedure Get-Run-Control-Parms
+    #ifdef debugx
+        show 'Entering PRCSAPI.SQC: Get-Run-Control-Parms'
+    #end-if
+
+! Passes the printer type, orientation, maximum columns, maximum lines for
+! use when sending lineprinter output to a AS/400 (either directly-attached
+! or remote network) printer.
+
+    #ifdef OS400
+        #ifdef PRINTER_TYPE
+            let $syscmd='CHGDTAARA (*LDA (901 15)) VALUE(''{PRINTER_TYPE}'')'
+            let #rtnstat = 100
+            call system using $syscmd #rtnstat
+        #end-if
+        #ifdef PAGE_ORIENTATION
+            let $syscmd='CHGDTAARA (*LDA (916 15)) VALUE(''{PAGE_ORIENTATION}'')'
+            let #rtnstat = 100
+            call system using $syscmd #rtnstat
+        #end-if
+        #ifdef PAGE_MAX_COLS
+            let $syscmd='CHGDTAARA (*LDA (931 10)) VALUE(''{PAGE_MAX_COLS}'')'
+            let #rtnstat = 100
+            call system using $syscmd #rtnstat
+        #end-if
+        #ifdef PAGE_MAX_LINES
+            let $syscmd='CHGDTAARA (*LDA (941 10)) VALUE(''{PAGE_MAX_LINES}'')'
+            let #rtnstat = 100
+            call system using $syscmd #rtnstat
+        #end-if
+! Set a spot in the LDA to indicate the SQR is in process.  This will be used by the call
+! CL program to determine if the SQR completed normally.  Currently, the OS/400 of SQR does
+! not properly indicate whether an SQR failed or completed normally.  To workaround this issue,
+! the CL will check if the *LDA for the term 'SUCCESS', otherwise it will treat it as a failure.
+        let $syscmd='CHGDTAARA (*LDA (951 10)) VALUE(''IN-PROCESS'')'
+        let #rtnstat = 100
+        call system using $syscmd #rtnstat
+    #end-if
+
+
+    input $database_name 'Database Name (Optional, Press ENTER to continue)'
+
+    input $prcs_process_instance 'Process Instance (Optional, Press ENTER to continue)'
+    if not isnull($prcs_process_instance)
+
+        let #prcs_process_instance = to_number($prcs_process_instance)
+        input $prcs_oprid 'Operator ID (Optional, Press ENTER to continue)'
+
+        input $prcs_run_cntl_id 'Run Control (Optional, Press ENTER to continue)'
+    else
+        let #prcs_process_instance = 0
+    end-if
+
+    if #prcs_process_instance > 0
+        let #prcs_first_time = {True}
+        do Get-Language-Codes
+        do GetTimeZones
+        let #prcs_run_status = #prcs_run_status_processing
+        do Update-Prcs-Run-Status
+        let #prcs_run_status = #prcs_run_status_successful
+    end-if
+
+    #ifdef debugx
+        show 'Exiting PRCSAPI.SQC: Get-Run-Control-Parms'
+        #ifdef debugy
+            show ' Output $prcs_process_instance: ' $prcs_process_instance
+        #end-if
+        show ' Output #prcs_process_instance: ' #prcs_process_instance
+        show ' Output $prcs_oprid           : ' $prcs_oprid
+        show ' Output $prcs_run_cntl_id     : ' $prcs_run_cntl_id
+    #end-if
+
+! Call Procedure to update Client INFO.
+
+    do Set-Client-Info
+do Get_Database_Type
+end-procedure
+
+
+begin-procedure Update-Prcs-Run-Status
+    #ifdef debugx
+        show 'Entering PRCSAPI.SQC: Update-Prcs-Run-Status'
+    #end-if
+    !*******************************************************************
+    !  We need to indicate that we're in Update-Prcs-Run-Status because*
+    !  if there is an error that goes to SQL-Error (sqlerr.sqc), that  *
+    !  will try to call back here.  If the error came from here, though*
+    !  it would be an infinite loop in all likelihood.  So, we set the *
+    !  indication to prevent the call back here.                       *
+    !*******************************************************************
+    let $prcs_in_update_prcs_run_stat = {Yes}
+
+    if #prcs_process_instance > 0
+        do Update-Process-Status
+    end-if
+
+    let $prcs_in_update_prcs_run_stat = ''
+
+    #ifdef debugx
+        show 'Exiting PRCSAPI.SQC: Update-Prcs-Run-Status'
+    #end-if
+end-procedure
+
+
+begin-procedure Update-Process-Status
+    #ifdef debugx
+        show 'Entering PRCSAPI.SQC: Update-Process-Status'
+    #end-if
+
+    do Get-Current-DateTime
+    do Commit-Transaction
+    
+    let $sql-statement = 'PRCSAPI.SQC,Update-Process-Status,Update,PSPrcsRqst'
+    let $prcs_run_status = to_char(#prcs_run_status)
+    if #prcs_run_status = #prcs_run_status_processing
+    
+      ! Get the last message sequence number just before inserting into PS_MESSAGE_LOG
+      ! This is to fix the ICE: 1321720000
+      do Get-Last-Message-Seq
+
+      begin-SQL On-Error=SQL-Error
+        UPDATE PSPRCSRQST
+         SET RUNSTATUS = $prcs_run_status,
+           BEGINDTTM = {DateTimeIn-Prefix}$SysDateTime{DateTimeIn-Suffix}
+         WHERE PRCSINSTANCE = #prcs_process_instance
+      end-sql
+
+      begin-SQL On-Error=SQL-Error
+        UPDATE PSPRCSQUE
+         SET RUNSTATUS = $prcs_run_status
+         WHERE PRCSINSTANCE = #prcs_process_instance
+      end-sql
+
+    else
+      begin-SQL On-Error=SQL-Error
+        UPDATE PSPRCSRQST
+         SET RUNSTATUS = $prcs_run_status,
+           PRCSRTNCD = #prcs_rc,
+           CONTINUEJOB = #prcs_continuejob,
+           ENDDTTM = {DateTimeIn-Prefix}$SysDateTime{DateTimeIn-Suffix}
+         WHERE PRCSINSTANCE = #prcs_process_instance
+      end-sql
+
+      begin-SQL On-Error=SQL-Error
+        UPDATE PSPRCSQUE
+         SET RUNSTATUS = $prcs_run_status,
+           PRCSRTNCD = #prcs_rc,
+           CONTINUEJOB = #prcs_continuejob
+         WHERE PRCSINSTANCE = #prcs_process_instance
+      end-sql
+
+      do Process-Message-Log(#prcs_process_instance)
+
+    end-if
+
+
+    do Commit-Transaction
+
+
+    let $sql-statement = ''
+
+    if #prcs_first_time = {True}
+        let #prcs_first_time = {False}
+        do Get-PrcsRqst-Info
+        do Get-Last-Message-Seq
+        do Commit-Transaction
+    end-if
+
+! OS/400 specific code to tell system that SQR completed successfully
+    if #prcs_run_status = #prcs_run_status_successful
+        #ifdef OS400
+            let $syscmd='CHGDTAARA (*LDA (951 10)) VALUE(''SUCCESS   '')'
+            let #rtnstat = 100
+            call system using $syscmd #rtnstat
+        #end-if
+    end-if
+
+    #ifdef debugx
+        show 'Exiting PRCSAPI.SQC: Update-Process-Status'
+    #end-if
+end-procedure
+
+
+begin-procedure Get-PrcsRqst-Info
+    #ifdef debugx
+        show 'Entering PRCSAPI.SQC: Get-PrcsRqst-Info'
+    #end-if
+
+    let $sql-statement = 'PRCSAPI.SQC,Get-PrcsRqst-Info,Select,PSPrcsRqst'
+
+begin-SELECT On-Error=SQL-Error
+JOBINSTANCE             &JobInstance
+PRCSJOBSEQ              &PrcsJobSeq
+OUTDESTTYPE             &OutDestType
+FROM  PSPRCSRQST
+WHERE PRCSINSTANCE = #prcs_process_instance
+end-SELECT
+
+    let $sql-statement = ''
+
+    move &JobInstance   to #prcs_job_instance
+    move &PrcsJobSeq    to #prcs_job_sequence
+    move &OutDestType   to $OutDestType
+    let #prcs_outdest_type = to_number($OutDestType)
+
+    #ifdef debugx
+      show 'Exiting PRCSAPI.SQC: Get-PrcsRqst-Info'
+      show ' Output #prcs_job_instance (PSPRCSRQST.JOBINSTANCE): ' #prcs_job_instance
+      show ' Output #prcs_job_sequence (PSPRCSRQST.PRCSJOBSEQ) : ' #prcs_job_sequence
+      show ' Output $OutDestType       (PSPRCSRQST.OUTDESTTYPE): ' $OutDestType
+    #end-if
+end-procedure
+
+!  This is a deprecated function.  The function calls the new routine Get-PrcsRqst-Info
+begin-procedure Get-Job-Instance
+    #ifdef debugx
+        show 'Entering PRCSAPI.SQC: Get-Job-Instance'
+    #end-if
+
+    do Get-PrcsRqst-Info
+
+    #ifdef debugx
+      show 'Exiting PRCSAPI.SQC: Get-Job-Instance'
+    #end-if
+end-procedure
+
+
+begin-procedure Get-Last-Message-Seq
+    #ifdef debugx
+        show 'Entering PRCSAPI.SQC: Get-Last-Message-Seq'
+    #end-if
+
+    let $sql-statement = 'PRCSAPI.SQC,Get-Last-Message-Seq,Select,PSMessageLog'
+
+    let #last_message_sequence = 0
+    let #message_seq = 0
+
+begin-SELECT On-Error=SQL-Error
+MAX(MESSAGE_SEQ)        &MessageSeq
+FROM  PS_MESSAGE_LOG
+WHERE PROCESS_INSTANCE = #prcs_process_instance
+end-SELECT
+
+    let $sql-statement = ''
+
+    move &MessageSeq    to #last_message_sequence
+    let #message_seq = #last_message_sequence
+
+    #ifdef debugx
+      show 'Exiting PRCSAPI.SQC: Get-Last-Message-Seq'
+      show ' Output #last_message_sequence (PS_MESSAGE_LOG.MESSAGE_SEQ): ' #last_message_sequence
+    #end-if
+end-procedure
+
+
+begin-procedure Process-Message-Log(:#prcs_instance)
+    #ifdef debugx
+        show 'Entering PRCSAPI.SQC: Process-Message-Log'
+    #end-if
+
+    do Check-Message-Parms
+
+    let #_message_seq = #_message_seq + 1
+
+    do Insert-Message-Log(#prcs_instance, #_prcs_message_set_nbr, #_prcs_message_nbr, #_message_seq)
+
+    if length($_prcs_message_parm1) > 0
+        let #parameter_seq = 1
+        do Insert-Message-Log-Parm(#prcs_instance, #_message_seq, #parameter_seq, $_prcs_message_parm1)
+    end-if
+
+    if length($_prcs_message_parm2) > 0
+        let #parameter_seq = 2
+        do Insert-Message-Log-Parm(#prcs_instance, #_message_seq, #parameter_seq, $_prcs_message_parm2)
+    end-if
+
+    if length($_prcs_message_parm3) > 0
+        let #parameter_seq = 3
+        do Insert-Message-Log-Parm(#prcs_instance, #_message_seq, #parameter_seq, $_prcs_message_parm3)
+    end-if
+
+    if length($_prcs_message_parm4) > 0
+        let #parameter_seq = 4
+        do Insert-Message-Log-Parm(#prcs_instance, #_message_seq, #parameter_seq, $_prcs_message_parm4)
+    end-if
+
+    if length($_prcs_message_parm5) > 0
+        let #parameter_seq = 5
+        do Insert-Message-Log-Parm(#prcs_instance, #_message_seq, #parameter_seq, $_prcs_message_parm5)
+    end-if
+
+    do Commit-Transaction
+
+    #ifdef debugx
+        show 'Exiting PRCSAPI.SQC: Process-Message-Log'
+    #end-if
+end-procedure
+
+begin-procedure Check-Message-Parms
+    #ifdef debugx
+        show 'Entering PRCSAPI.SQC: Check-Message-Parms'
+    #end-if
+
+    if #prcs_message_set_nbr = 0 and #prcs_message_nbr = 0
+      and (isnull($prcs_message_parm1) or $prcs_message_parm1 = ' ')
+        if #prcs_run_status = #prcs_run_status_successful
+            let #prcs_message_set_nbr = #prcs_msg_set_nbr
+            let #prcs_message_nbr = #prcs_msg_nbr_successful
+        end-if
+        if #prcs_run_status = #prcs_run_status_unsuccessful
+            let #prcs_message_set_nbr = #prcs_msg_set_nbr
+            let #prcs_message_nbr = #prcs_msg_nbr_unsuccessful
+        end-if
+    end-if
+
+    #ifdef debugx
+        show ' Run Status    : ' #prcs_run_status
+        show ' Message Set   : ' #prcs_message_set_nbr
+        show ' Message Number: ' #prcs_message_nbr
+    #end-if
+
+    if $prcs_message_parm1 != ' '
+        do Parse-Message-Parms ($prcs_message_parm1, $prcs_message_parm2, $prcs_message_parm3,
+                                $prcs_message_parm4, $prcs_message_parm5)
+    end-if
+
+end-procedure
+
+
+begin-procedure Parse-Message-Parms (:$parm1, :$parm2, :$parm3, :$parm4, :$parm5)
+    #ifdef debugx
+        show 'Entering PRCSAPI.SQC: Parse-Message-Parms'
+        show ' Input $parm1: ' $parm1
+        show ' Input $parm2: ' $parm2
+        show ' Input $parm3: ' $parm3
+        show ' Input $parm4: ' $parm4
+        show ' Input $parm5: ' $parm5
+    #end-if
+
+    if isnull($parm1)
+        let $parm1 = ' '
+    end-if
+    if isnull($parm2)
+        let $parm2 = ' '
+    end-if
+    if isnull($parm3)
+        let $parm3 = ' '
+    end-if
+    if isnull($parm4)
+        let $parm4 = ' '
+    end-if
+    if isnull($parm5)
+        let $parm5 = ' '
+    end-if
+
+    let $temp_prcs_message = $parm1
+    let #temp_sql_error_len = length($temp_prcs_message)
+    if #temp_sql_error_len > 30
+        let $parm1 = substr($temp_prcs_message, 1, 30)
+        let #temp_sql_error_len = #temp_sql_error_len - 30
+        if #temp_sql_error_len <= 30
+            let $parm2 = substr($temp_prcs_message, 31, #temp_sql_error_len)
+        else
+            let $parm2 = substr($temp_prcs_message, 31, 30)
+            let #temp_sql_error_len = #temp_sql_error_len - 30
+            if #temp_sql_error_len <= 30
+                let $parm3 = substr($temp_prcs_message, 61, #temp_sql_error_len)
+            else
+                let $parm3 = substr($temp_prcs_message, 61, 30)
+                let #temp_sql_error_len = #temp_sql_error_len - 30
+                if #temp_sql_error_len <= 30
+                    let $parm4 = substr($temp_prcs_message, 91, #temp_sql_error_len)
+                else
+                    let $parm4 = substr($temp_prcs_message, 91, 30)
+                    let #temp_sql_error_len = #temp_sql_error_len - 30
+                    if #temp_sql_error_len <= 30
+                        let $parm5 = substr($temp_prcs_message, 121, #temp_sql_error_len)
+                    else
+                        let $parm5 = substr($temp_prcs_message, 121, 30)
+                    end-if
+                end-if
+            end-if
+        end-if
+    end-if
+
+    if length($parm2) > 30
+        let $parm2 = substr($parm2, 1, 30)
+    end-if
+    if length($parm3) > 30
+        let $parm3 = substr($parm3, 1, 30)
+    end-if
+    if length($parm4) > 30
+        let $parm4 = substr($parm4, 1, 30)
+    end-if
+    if length($parm5) > 30
+        let $parm5 = substr($parm5, 1, 30)
+    end-if
+
+    #ifdef debugx
+        show 'Exiting PRCSAPI.SQC: Check-Message-Parms'
+        show ' Output $parm1: ' $parm1
+        show ' Output $parm2: ' $parm2
+        show ' Output $parm3: ' $parm3
+        show ' Output $parm4: ' $parm4
+        show ' Output $parm5: ' $parm5
+    #end-if
+end-procedure
+
+
+begin-procedure Insert-Message-Log(#prcs_instance, #message_set_nbr, #message_nbr, #message_seq)
+
+    #ifdef debugx
+        show 'Entering PRCSAPI.SQC: Insert-Message-Log'
+    #end-if
+
+    if (isnull($_prcs_message_job) or $_prcs_message_job = ' ')
+        let $_prcs_message_job = $_prcs_jobid
+    end-if
+
+    if (isnull($_prcs_message_pgmname) or $_prcs_message_pgmname = ' ')
+        let $_prcs_message_pgmname = $_prcs_pgmname
+    end-if
+
+    if (#prcs_message_severity = 0)
+        let #message_severity = #_message_severity_warning
+    end-if
+
+begin-sql on-error=SQL-Error
+    INSERT INTO PS_MESSAGE_LOG (
+      PROCESS_INSTANCE,
+      MESSAGE_SEQ,
+      JOBID,
+      PROGRAM_NAME,
+      MESSAGE_SET_NBR,
+      MESSAGE_NBR,
+      MESSAGE_SEVERITY,
+      DTTM_STAMP_SEC)
+    VALUES (
+      #prcs_instance,
+      #message_seq,
+      $_prcs_message_job,
+      $_prcs_message_pgmname,
+      #message_set_nbr,
+      #message_nbr,
+      #message_severity,
+      {DateTimeIn-Prefix}$_SysDateTime{DateTimeIn-Suffix})
+end-sql
+
+    #ifdef debugx
+        show 'Exiting PRCSAPI.SQC: Insert-Message-Log'
+    #end-if
+
+end-procedure
+
+begin-procedure Insert-Message-Log-Parm(#prcs_instance, #message_seq, #parm_seq, $message_parm)
+
+    #ifdef debugx
+        show 'Entering PRCSAPI.SQC: Insert-Message-Log-Parm'
+    #end-if
+
+begin-sql on-error=SQL-Error
+    INSERT INTO PS_MESSAGE_LOGPARM (
+      PROCESS_INSTANCE,
+      MESSAGE_SEQ,
+      PARM_SEQ,
+      MESSAGE_PARM)
+    VALUES (
+      #prcs_instance,
+      #message_seq,
+      #parm_seq,
+      $message_parm)
+end-sql
+
+    #ifdef debugx
+        show 'Exiting PRCSAPI.SQC: Insert-Message-Log-Parm'
+    #end-if
+
+end-procedure
+
+!***********************************************************************
+!procedure : Set-Client-Info
+!purpose   : When running from process schedular the client information
+!            needs to be update to match the OPRID.  This function is
+!            broken down in subsections based on platfom.
+!
+!***********************************************************************
+
+begin-procedure Set-Client-Info
+#ifdef DB2
+!***** Not supported
+#endif
+#ifdef DB2400
+!***** Not supported
+#endif
+#ifdef DB2UNIX
+!***** Not supported
+#endif
+#ifdef DB2ALL
+!***** Not supported
+#endif
+#ifdef DB2DDCS
+!***** Not supported
+#endif
+#ifdef INFORMIX
+!***** Not supported
+#endif
+
+#ifdef MICROSOFT
+begin-SELECT On-Error=SQL-Error
+substring(@@version,30,4)
+  do MS-Set-Client-Info
+from PSCLOCK
+where substring(@@version,30,4) <> '7.00'
+end-SELECT
+#endif
+
+#ifdef ORACLE
+let $connect_update=$prcs_oprid||','|| to_char(#sqr-pid)
+begin-sql
+BEGIN
+    dbms_application_info.set_client_info($connect_update);;
+END;;
+end-sql
+#endif
+
+#ifdef SYBASE
+let $connect_update=$prcs_oprid||','|| to_char(#sqr-pid)
+begin-sql
+set clientname $connect_update
+end-sql
+#endif
+
+end-procedure ! Set-Client-Info
+
+!***********************************************************************
+!procedure : MS-Set-Client-Info
+!purpose   : Set Microsoft Client Info (For SQL Server 2000 only)
+!***********************************************************************
+#ifdef MICROSOFT
+begin-procedure MS-Set-Client-Info
+let $connect_update=$prcs_oprid||','|| to_char(#sqr-pid)
+begin-sql
+
+declare @var varbinary(128)
+select @var = convert(varbinary(128), $connect_update)
+set CONTEXT_INFO @var
+end-sql
+end-procedure ! MS-Set-Client-Info
+#endif
+
+
+#include 'prcsdef.sqc'
+#include 'prcslng.sqc'
+#include 'sqlerr.sqc'
+#include 'tranctrl.sqc'
+#include 'curdttim.sqc'
+#include 'ptgbltme.sqc'
+
+#endif   ! PRCSAPI-INCLUDED
+

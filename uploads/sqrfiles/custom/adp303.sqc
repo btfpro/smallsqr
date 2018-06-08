@@ -1,0 +1,1309 @@
+!********************************************************************** 
+! SQR Name:           adp303.sqc  
+! SQR Descr:          ADP Employment Tax, common routines
+! Created by:         drmonroe 
+! Create date:        03/04/2010 
+! Last modified by:   drmonroe
+! Last modified date: 03/04/2013
+!*********************************************************************** 
+
+!Update this definition with the CURRENT date when sending out any new code and send this adp303.sqc too,
+!unless the change/update is to the probiz.sqc, in which case add this definition to the probiz.sqc and just
+!send the probiz.sqc
+!****************************************************************************************************************
+ #define LAST_EXTRACT_UPDATE  20161118 ! we may want to move this to a new sqc 'adptaxdt.sqc' later
+
+!Update these two defines for any major release to indicate the TRANSPORTER spec supported by this code base
+!************************************************************************************************************
+#define TRANSPORTER_SPEC_DATE    20161118
+#define EXTRACT_RELEASE          V4Q2016
+
+!------------------------------------------------------------------------
+#define        adp303_release     2016.11.18         ! yyyy.mm.dd.n  (sync this with pbzqtr.sqr's release version
+#define        adp303_version     ADP303.Nov 18, 2016
+
+! -------------------------------------------------------------------------------
+!     Purpose:  Provides common procedures to Periodic and Quarterly extract
+!     Author:   Dan Monroe                                                  
+!     Date:     February 2004                                               
+! -------------------------------------------------------------------------------
+!     Oct 07,  2010   Quarterl 3rd party includes adp3pspq.sqc now
+!     Oct 19,  2010   FORCE_FILE_HEADER_AND_TRAILER, logic added to make sure we always write only one file header and trailer record
+!     Nov 12,  2010   FORCE_FILE_HEADER_AND_TRAILER, sets the mode to P/Q in the File Header routine too
+!
+!     Jan 28,  2011   New header layout ...\ADP_PeopleSoft\ADP_DEV_Extracts\new_master_release\docs\v3.NewHeaderSpect.txt
+!
+!       1-89  len    "no change to existing" example       req'd  variable
+!    -------  ---    ----------------------  -------       -----  --------
+!      90-99         Extract Release Version V4Q2010	     No   EXTRACT_RELEASE      
+!    100-104  5      SITE_ID		     ADP1	     No	  SITE_ID
+!    105-114 10      ERP System              PSOFT           No	  ERP_SYSTEM 
+!    115-119  5      ERP Release             9.1             No	  ERP_RELEASE
+!    120-129 10      Transporter spec date   20100630        No	  TRANSPORTER_SPEC_DATE
+!    130-139 10	     Client Database         HRTEST1	     No	  $database_name or $database
+!    140-149 10      Extract Operatior       MONROE	     No	  $PRCS_OPRID
+!    150-159 10	     Extract Release Date    20110128        No   ERP_RELEASE (same string as code folder name on \\sandfilsrv8 drive)
+!    160-169 10      Report ID / Pgm Name    PBZQTR          No	  HEADER_REPORT_ID
+!    170-194 25      Email Address                           No   email address if available
+!    195-195  1      blank                                                                  
+!    196-205 10      Tax Update              2011-F          No   Tax update (Rimini starts with 'R')  
+!    206-215 10      PA Act 32 info          2012424R        No   adppaaut.sqc version and Rollup flag
+!
+!    ************ V3Q2011 ********************
+!     Sep 13, 2011   MERGE_FILENAME (RBT1) option
+!     Sep 27, 2011   QUARTERLY_HISTORY option
+!     Oct 20, 2011   MASTER_TAX_HEADER option
+!     Nov 10, 2011   remvoed the Terminating Business (no longer required) flag from the header records
+!     Jan 30, 2012   added Tax_Upate to the end of the 'X' record
+! *********************** Q1 release ****************************************
+!     Mar 23, 2012   THIRD_PARTY_SICK_DED_TBA
+!     Apr 13, 2012   MASTER_TAX_HEADER option fix to quarterly T record count
+!     Apr 24, 2012   Updated file header see: v3.NewHeaderSpect.txt
+!     Aug 09, 2012   include adpaudit.sqc from here (cleaner for quarterly)
+!     Aug 27, 2012   MasterTax  -  create '000' record for each 'H' header
+!     Oct  8, 2012   Client_Nbr fix
+! *********************** Q4 release ****************************************
+!     Dec 10, 2012   quarterly-excel-totals needs to be wrapped with #ifdef ADP_TAX_QUARTERLY, see 20121210
+!     Jan 10, 2013   PEN1 rollup 177 into 162 quarterly 2012 Q4
+!     Apr  3, 2013   ADP_TAX_AMEND_WITH_DETAILS
+!     Jul 10, 2013   PEN1 rollup 180 to 169 quarterly 2013 Q1-4
+!     Jul 11, 2013   remove PEN1 logic for later
+!     Jun  7, 2016   #define COMPANY_REMAP_FROM   W02 , #define COMPANY_REMAP_TO     W21 
+!     Nov 16, 2016   POPULATE_AMENDMENT_FIELDS_IN_FILE_HEADER
+!---------------------------------------------------------------------------------------------------------------------
+
+#define POPULATE_AMENDMENT_FIELDS_IN_FILE_HEADER
+
+#ifdef POPULATE_AMENDMENT_FIELDS_IN_FILE_HEADER
+ #ifdef MVS 
+    #Define Dyn-S   \ 
+    #Define Dyn-E   \ 
+    #Define BOLD_STRING            
+ #else
+    #Define Dyn-S   [ 
+    #Define Dyn-E   ] 
+    #ifndef BOLD_STRING
+      #Define BOLD_STRING            bold
+    #endif
+ #endif 
+#endif
+
+#ifdef ADP_TAX_PERIODIC
+   #define HEADER_REPORT_ID       {PERIODIC_REPORT_ID}
+#else
+   #define HEADER_REPORT_ID       {QUARTERLY_REPORT_ID}
+#endif
+#define ERP_SYSTEM               PSOFT   
+#define ERP_RELEASE              {PeopleSoft_Version}
+
+ #ifndef SUBTOTAL_COMPANY
+  #ifndef SUBTOTAL_FEIN
+   #ifndef SUBTOTAL_ADP_COMPID_EXTRACT
+    #define SUBTOTAL_COMPANY
+   #endif
+  #endif
+ #endif
+
+#ifdef PROCESS_1099s
+  #define SKIP_EE_DETAILS_PRINT_ADPQ210
+  #define SKIP_TAX_AND_WAGE_BREAKDOWN
+  #define STRIPPED_PBZQTR_REPORT   !June 2012
+#endif
+
+#ifdef ADP_TAX_QUARTERLY
+   #ifndef MAX_BOX1_ERRORS
+    #define MAX_BOX1_ERRORS 2000
+   #endif
+
+  #ifndef FILTER_LIMIT
+   #define FILTER_LIMIT 1000
+  #endif
+#endif
+
+#ifdef COBRA
+  #include 'adpcobra.sqc'  !retrieve-cobra-amounts 
+#endif
+
+#ifndef WAREHOUSE_SUFFIX
+  #define WAREHOUSE_SUFFIX
+#endif
+
+#ifndef NOLOCK_SQL
+  #define NOLOCK_SQL
+#endif
+
+#if {SITE_ID} <> 'PDP1'
+ #if {SITE_ID} <> 'AGN1'
+     #define SUBTRACT_3PSP
+ #endif
+#endif
+
+#ifndef WC_RATE_FACTOR
+   #define WC_RATE_FACTOR 1000000     !default multiplier for Wyoming rate
+#endif
+
+#if {SITE_ID} = 'PLP1' !Philips
+  #define BALANCE_TO_BOX1_SUMMARY_LINE
+#endif
+
+#ifdef ADP_TAX_QUARTERLY
+ #if {SITE_ID} = 'YRC1'
+  #define EMPLID_LEVEL_3PSP
+ #endif
+#endif
+
+!#if {SITE_ID} = 'CMG1'
+  #define REPORT_MOH_FOR_ALL_PAYGROUPS
+!#endif
+
+!allow for a Wyoming Workers comp LOCALITY of something other than WY0001
+!------------------------------------------------------------------------
+#ifndef WY_WORKERS_COMP_LOCALITY_OVERRIDE
+   #define WY_WORKERS_COMP_CD WY0001
+#else
+   #define WY_WORKERS_COMP_CD {WY_WORKERS_COMP_LOCALITY_OVERRIDE}
+#endif
+
+#if {SITE_ID} = 'AFI1'
+   #define SUBTOTAL_FEIN_EXTRACT
+#endif
+
+#ifdef USE_TEMP_TABLE_FOR_OUTPUT
+
+  #if {SITE_ID} = 'PMT1'
+   #include 'z_adpqout.sqc'          !4/14/05 added
+  #else
+   #include 'adpqout.sqc'          !4/14/05 added
+  #endif
+
+#else
+ #ifdef EXCEL_FIXED_PERIODIC_FILENAME
+  #if {SITE_ID} = 'PMT1'
+   #include 'z_adpexcel.sqc'          !4/14/05 added
+  #else
+   #include 'adpexcel.sqc'          !4/14/05 added
+  #endif
+ #else
+  #ifdef EXCEL_FIXED_QUARTERLY_FILENAME
+    #if {SITE_ID} = 'PMT1'
+     #include 'z_adpexcel.sqc'          !4/14/05 added
+    #else
+     #include 'adpexcel.sqc'          !4/14/05 added
+    #endif
+  #endif
+ #endif
+
+#endif
+
+ #ifdef CANADA_TOO
+   #if {SITE_ID} <> 'PLP1'
+     #include 'adpcanad.sqc'
+   #endif
+ #endif
+ 
+#ifdef ADD_GL_CODE
+   #include 'adptaxgl.sqc'             !determine-gl-number
+#endif
+
+! -----------------------------------------------------------------
+
+ #if {PeopleSoft_Version} < '8'
+
+ #ifdef INFORMIX                       !Informix Database engine
+    #define ln       LINEN
+    #define pg       PAGEN
+    #define emp_rec  EMPL_RCDN
+    #define chk_num  CHECKN
+    #define addl     ADDLN
+  #endif
+
+ #ifdef DB2ALL
+   #define ln       LINE#
+   #define pg       PAGE#
+   #define chk_num  CHECK#
+   #define emp_rec  EMPL_RCD#
+   #define addl     ADDL#
+
+ #endif
+
+ #ifdef MICROSOFT                      !SQL Server engine
+   #define ln       LINE#
+   #define pg       PAGE#
+   #define chk_num  CHECK#
+   #define emp_rec  EMPL_RCD#
+   #define addl     ADDL#
+ #endif
+
+ #ifdef SQLBASE                        !SQL Base (Standalone P/S)
+   #define ln       LINE#
+   #define pg       PAGE#
+   #define chk_num  CHECK#
+   #define emp_rec  EMPL_RCD#
+   #define addl     ADDL#
+ #endif
+
+ #ifdef ORACLE                         !Oracle
+   #define ln       LINE#
+   #define pg       PAGE#
+   #define chk_num  CHECK#
+   #define emp_rec  EMPL_RCD#
+   #define addl     ADDL#
+ #endif
+
+ #ifdef SYBASE                         !Sybase
+   #define ln       LINE#
+   #define pg       PAGE#
+   #define chk_num  CHECK#
+   #define emp_rec  EMPL_RCD#
+   #define addl     ADDL#
+ #endif
+
+ #ifndef ln
+   #define ln       LINE#
+ #endif
+
+ #ifndef pg
+   #define pg       PAGE#
+ #endif
+
+ #ifndef chk_num
+   #define chk_num  CHECK#
+ #endif
+
+ #ifndef addl
+   #define addl     ADDL#
+ #endif
+
+#else
+    #define ln       LINE_NUM
+    #define pg       PAGE_NUM
+    #define emp_rec  EMPL_RCD
+    #define chk_num  PAYCHECK_NBR
+    #define addl     ADDL_NBR
+
+    #define DUP_CANADIAN_PENSION t
+
+ #endif
+
+ #if {PeopleSoft_Version} < '7.51'
+   #define POSTAL    ZIP
+ #else
+   #define POSTAL   POSTAL
+ #endif
+
+!defaults in case probiz.sqc has not been setup for Qtr/W-2s
+!--------------------------------------------------------------
+#ifndef DIRECT_MAIL
+ #define DIRECT_MAIL  M    !M - Mail to employee, P - Pull for special processing.
+#endif
+
+#ifndef PRINT_IPAY
+ #define PRINT_IPAY   P    !N - W-2 available on iPay only, P - W-2 printed only
+#endif
+
+#ifndef SORT_OPTION
+ #define SORT_OPTION  A    !A thru Z, + MEANS CUSTOM  (JCP)
+#endif
+
+#ifndef Online_Posting_Indicator
+  #define Online_Posting_Indicator Y
+#endif
+
+#ifndef DEDUCTS_AND_EARNINGS_MODE
+ #define DEDUCTS_AND_EARNINGS_MODE     NONE
+#endif
+
+!Oct 21, 2009 this section moved up from bottom so we pick up the adp303p and adp303q VERSION text into the file headers
+!-------------------------------------------------------------------------------------------------------------------------
+#ifdef ADP_TAX_PERIODIC
+  #include 'adp303p.sqc'
+  #ifdef THIRD_PARTY_SICK_DED
+   #ifdef THIRD_PARTY_SICK_PERIODIC
+     #include 'adp3psp.sqc'
+   #endif
+  #endif
+#endif
+
+!5/18/2010 for the Q2, 2010 changes
+!----------------------------------
+#include 'adpq210.sqc'
+
+#ifdef ADP_TAX_QUARTERLY
+  #ifndef SKIP_TAX_AND_WAGE_AUDITS
+     #ifndef ADP_TAX_AMEND
+      #include 'adpaudit.sqc'
+     #endif
+  #endif
+  #include 'adp303q.sqc'
+  #ifdef INCLUDE_W2C
+   #if {SITE_ID} = 'PMT1'
+    #include 'z_adpw2c.sqc'          !4/14/05 added
+   #else
+      #ifndef ADP_TAX_AMEND_WITH_DETAILS
+         #include 'adpw2c.sqc'          !4/14/05 added
+      #else
+         #include 'adpw2cd.sqc'
+      #endif
+   #endif
+  #endif
+ #ifdef THIRD_PARTY_SICK_DED
+  #ifdef THIRD_PARTY_SICK_DED_TBA
+    #include 'adp3ptba.sqc'
+  #else
+    #include 'adp3pspq.sqc'
+  #endif
+ #endif
+#endif
+
+!***************************************************
+begin-procedure init-adp303-procedure
+
+  let $CORPORATE_NAME = '{CORPORATE_NAME}'
+
+  show 'init-adp303-procedure: Include file for ADP specs, adp303 Release: {adp303_release}, Version: {adp303_version}'
+
+  #ifdef SUBTOTAL_FEIN_EXTRACT
+        show 'SUBTOTAL_FEIN_EXTRACT'
+  #endif
+  #ifdef SUBTOTAL_FEIN
+        show 'SUBTOTAL_FEIN'
+  #endif
+  #ifdef SUBTOTAL_ADP_COMPID_EXTRACT
+        show 'SUBTOTAL_ADP_COMPID_EXTRACT'
+  #endif
+  #ifdef SUBTOTAL_SRC_BANK_ID_EXTRACT
+        show 'SUBTOTAL_SRC_BANK_ID_EXTRACT'
+  #endif
+  #ifdef SUBTOTAL_BUSINESS_UNIT_EXTRACT
+        show 'SUBTOTAL_BUSINESS_UNIT_EXTRACT'
+  #endif
+  #ifdef USE_TEMP_TABLE_FOR_OUTPUT
+        show 'USE_TEMP_TABLE_FOR_OUTPUT'
+  #endif
+
+  !Totals indexes
+  let #DomesticInx = 0
+  let #ExpatInx    = 1
+  let #FEINInx     = 2
+  let #GrandInx    = 3
+
+  #ifdef ADP_TAX_PERIODIC
+    let $extract_mode = 'P'
+
+    do Init-adp303p
+
+    #ifdef NEW_TRANSPORTER
+     #debugd show 'NEW_TRANSPORTER definition has been enabled.'
+    #endif
+    #ifdef THIRD_PARTY_SICK_PERIODIC
+     #debugd show 'THIRD_PARTY_SICK_PERIODIC       :  {THIRD_PARTY_SICK_PERIODIC}'
+    #endif
+    #ifdef CALC_MOH_EMPLOYER_CREDIT
+     #debugd show 'CALC_MOH_EMPLOYER_CREDIT enabled (adp303)'
+    #endif   
+
+  #endif
+  
+  show  ' '
+
+  #ifdef ADP_TAX_QUARTERLY
+     let $extract_mode = 'Q'
+
+     #ifdef STOCK_OPTION_SELECTION
+      #debugd show 'STOCK_OPTION_SELECTION          :  {STOCK_OPTION_SELECTION}'
+     #endif
+     #ifdef Meals_employer_conv_selection
+      #debugd show 'Meals_employer_conv_selection   :  {Meals_employer_conv_selection}'
+     #endif
+     #ifdef Moving_exp_3rdParty_selection
+      #debugd show 'Moving_exp_3rdParty_selection   :  {Moving_exp_3rdParty_selection}'
+     #endif
+     #ifdef Qual_transportation_selection
+      #debugd show 'Qual_transportation_selection   :  {Qual_transportation_selection}'
+     #endif
+     #ifdef Severence_pay_selection
+      #debugd show 'Severence_pay_selection         :  {Severence_pay_selection}'
+     #endif
+     #ifdef Meal_Allowances_selection
+      #debugd show 'Meal_Allowances_selection       :  {Meal_Allowances_selection}'
+     #endif
+     #ifdef THIRD_PARTY_SICK_EMPLOYER
+      #debugd show 'THIRD_PARTY_SICK_EMPLOYER       :  {THIRD_PARTY_SICK_EMPLOYER}'
+     #endif
+     #ifdef APPEND_SUFFIX
+      #debugd show 'APPEND_SUFFIX enabled (only valid for 2007 and beyond)'
+     #endif
+     #ifdef SKIP_TAX_AND_WAGE_AUDITS
+      #debugd show 'SKIP_TAX_AND_WAGE_AUDITS'
+     #endif
+     #ifdef POPULATE_AMENDMENT_FIELDS_IN_FILE_HEADER
+        show 'POPULATE_AMENDMENT_FIELDS_IN_FILE_HEADER'
+        do POPULATE-AMENDMENT-FIELDS-IN-FILE-HEADER
+     #endif
+     
+    #debugd show 'Max # of Filtered character warnings = {FILTER_LIMIT}'
+
+     #ifndef FILTER_LIMIT
+       #define FILTER_LIMIT 1000
+     #endif
+     
+     create-array name=filtered size={FILTER_LIMIT}
+      field=EMPLID:char
+      field=FILTER_TYPE:char
+      field=FILTER_CHAR:char
+      field=ORIG_STRING:char
+      field=NEW_STRING:char
+
+    #if {SITE_ID} = 'PRD1'
+      create-array name=Purdue_mail_drop size=1000
+          field=MAIL_DROP:char
+    #endif
+
+    do init-quarterly-arrays  !in adp303q.sqc
+
+    create-array name=Box1_Errors size={MAX_BOX1_ERRORS}
+       field=Company:char
+       field=Emplid:char
+       field=Box1:number
+       field=Total_for_box1:number
+       #ifdef General_Box99_error_enabled
+       field=General_Box99_error:char
+       #endif
+
+   #debugd show 'DEDUCTS_AND_EARNINGS_MODE = {DEDUCTS_AND_EARNINGS_MODE}'
+    #if {DEDUCTS_AND_EARNINGS_MODE} = 'BALANCE_TO_BOX1'
+     #debugd show 'Balance to Box 1 Enabled, {DEDUCTS_AND_EARNINGS_MODE}'
+      #ifdef BALANCE_TO_BOX1_SUMMARY_LINE
+       #debugd show 'BALANCE_TO_BOX1_SUMMARY_LINE enabled.'
+      #endif
+    #endif
+
+     #if {SITE_ID} = 'PFZ1'
+       do init-PFZ1
+     #endif
+
+  #endif
+
+  #ifdef THIRD_PARTY_SICK_DED
+    #ifdef ADP_TAX_QUARTERLY
+      do Init-3PSP
+    #else
+         #ifdef THIRD_PARTY_SICK_PERIODIC
+           do Init-3PSP
+         #endif
+    #endif
+  #endif
+
+  #ifdef USE_TEMP_TABLE_FOR_OUTPUT
+      show 'Calling Init-Pbzqout from Write-File-Header-Rec...'
+      do init-pbzqout
+  #else
+     #ifdef ADP_TAX_PERIODIC
+      show 'Periodic run'
+      #ifdef EXCEL_FIXED_PERIODIC_FILENAME
+          do periodic-excel-output
+      #endif
+     #else
+      show 'Quarterly run'
+      #ifdef EXCEL_FIXED_QUARTERLY_FILENAME
+       #debugd show 'creating excel file.'
+        do quarterly-excel-output
+      #endif
+     #endif
+  #endif
+
+  do init-adpq210
+
+ #debugd show '-------------------------------------------------------------------------------------------'
+  
+end-procedure
+
+begin-procedure Write-File-Header-Rec   
+
+ let $CORPORATE_NAME = '{CORPORATE_NAME}'
+ #ifdef ADP_TAX_PERIODIC
+    let $extract_mode = 'P'
+ #else
+    let $extract_mode = 'Q'
+ #endif
+ 
+ if rtrim($File_Header_rec_written,' ') = ''
+    let $File_Header_rec_written = 't'
+    
+    show 'Write-File-Header-Rec...., extract mode (P/Q) = ' $extract_mode ' ' $File_Header_rec_written
+     
+    let #Stock_Options_QTD_Company = 0
+    let #Stock_Options_YTD_Company = 0
+    let #Meals_employer_conv_QTD_Company = 0
+    let #Meals_employer_conv_YTD_Company = 0
+    let #Qual_transportation_QTD_Company = 0
+    let #Qual_transportation_YTD_Company = 0
+    let #Severence_pay_QTD_Company = 0
+    let #Severence_pay_YTD_Company = 0
+    let #Moving_exp_3rdParty_QTD_Company = 0
+    let #Moving_exp_3rdParty_YTD_Company = 0
+    let #Meal_Allowances_QTD_Company = 0
+    let #Meal_Allowances_YTD_Company = 0
+
+  let #cur_tot = 0
+  #ifndef SUBTOTAL_COMPANY
+   #ifdef SUBTOTAL_FEIN
+    let #cur_tot = 2               
+   #endif
+   #ifdef SUBTOTAL_ADP_COMPID_EXTRACT
+    let #cur_tot = 2
+   #endif
+   #ifdef SUBTOTAL_SRC_BANK_ID_EXTRACT
+    let #cur_tot = 2
+   #endif
+   #ifdef SUBTOTAL_BUSINESS_UNIT_EXTRACT
+    let #cur_tot = 2
+   #endif
+  #endif
+  
+  if rtrim($extract_mode,' ') = 'P'
+   let $Trans_ver = 'T' || '{Periodic_Extract_Specs}'
+  else
+   let $Trans_ver = 'T' || '{Quarterly_Extract_Specs}'
+  end-if
+
+  Do Convert-to-DTU-Date($AsofToday, $cur_dt_DTU)
+  let $cur_Mo           = substr($cur_dt_DTU,6,2)
+  let $cur_Day          = substr($cur_dt_DTU,9,2)
+  let $cur_Yr           = substr($cur_dt_DTU,1,4)
+  LET $cur_dt_DTU       = $cur_Yr || $cur_Mo || $cur_Day
+
+  let $cur_hr           = substr($AsofNow,1,2)
+  let $cur_min          = substr($AsofNow,4,2)
+  let $cur_sec          = substr($AsofNow,7,2)
+
+  let $cur_12hr         = substr($asofNow,10,2)           !PM/AM
+  if rtrim($cur_12hr,' ') = 'PM' AND ($cur_hr < '12')
+    move $cur_hr to #cur_hr
+    add 12 to #cur_hr
+    do Format-Number(#cur_hr,$cur_hr, '99')
+  end-if
+
+  LET $cur_tm           = $cur_hr || $cur_Min || $cur_sec
+
+ #debugd show 'Full current time string ' $asofnow
+ #debugd show '             time string ' $cur_tm
+  move '   ' to $run_nbr
+  move '   ' to $prior_nbr
+
+  #ifdef ADP_TAX_PERIODIC
+   if rtrim($extract_mode,' ') = 'P'
+    let $RptQtr = ''
+    let $RptYear = ''
+    #ifdef PBZ_ADP_TABLE_BUILT
+      do get-sequence-number
+    #else
+      stop
+    #endif
+   end-if
+  #endif
+   
+  do get-tax-update3
+   
+  let $database_name_trimmed = rtrim($database_name,' ') !use $database_name if it exists, else use $database
+  let $database_trimmed      = rtrim($database,' ')
+  if $database_name_trimmed <> ''
+   let $client_database = $database_name_trimmed
+  else
+   let $client_database = $database_trimmed
+  end-if
+  #ifdef CLIENT_EMAIL_ADDRESS_FOR_UPDATES
+   let $email_address = '{CLIENT_EMAIL_ADDRESS_FOR_UPDATES}'
+  #else
+   do get_email_address_of_oprid
+  #endif
+  
+  #ifdef ADJUST_QUARTERLY_WAGES_PA_EIT
+    let $ADJUST_QUARTERLY_WAGES_PA_EIT_flag = 'R'
+  #else
+    let $ADJUST_QUARTERLY_WAGES_PA_EIT_flag = 'N'
+  #endif
+  #ifdef adppaloc_release
+    let $PA_Act_32_Data = '{adppaloc_release}'  || $ADJUST_QUARTERLY_WAGES_PA_EIT_flag
+  #else
+    let $PA_Act_32_Data = 'adppaaut '  || $ADJUST_QUARTERLY_WAGES_PA_EIT_flag
+  #endif
+  let $Program_Versions = ''
+  let $Program_Versions = $Program_Versions || substr(rpad('{EXTRACT_RELEASE}',10,' '),1,10)
+  let $Program_Versions = $Program_Versions || substr(rpad('{SITE_ID}',5,' '),1,5)
+  let $Program_Versions = $Program_Versions || substr(rpad('{ERP_SYSTEM}',10,' '),1,10)
+  let $Program_Versions = $Program_Versions || substr(rpad('{ERP_RELEASE}',5,' '),1,5)
+  let $Program_Versions = $Program_Versions || substr(rpad('{TRANSPORTER_SPEC_DATE}',10,' '),1,10)
+  let $Program_Versions = $Program_Versions || substr(rpad($client_database,10,' '),1,10)
+  let $Program_Versions = $Program_Versions || substr(rpad($PRCS_OPRID,10,' '),1,10)
+  let $Program_Versions = $Program_Versions || substr(rpad('{LAST_EXTRACT_UPDATE}',10,' '),1,10)
+  let $Program_Versions = $Program_Versions || substr(rpad('{HEADER_REPORT_ID}',10,' '),1,10)
+  let $Program_Versions = $Program_Versions || substr(rpad($email_address,25,' '),1,25)
+  let $Program_Versions = $Program_Versions || ' '
+  let $Program_Versions = $Program_Versions || substr(rpad($Tax_Update,10,' '),1,10)
+  let $Program_Versions = $Program_Versions || substr(rpad($PA_Act_32_Data,10,' '),1,10)
+
+  
+ #debugd show 'Writing file header record, time: ' $AsofNow
+ #debugd show '           Corportate name : ' $CORPORATE_NAME
+ #debugd show '           Extract specs   : ' $Trans_ver
+ #debugd show '           Extract mode    : ' $extract_mode
+ #debugd show '           Sequence number : ' $run_nbr
+ #debugd show '           Program versions: ' $Program_Versions
+ #debugd show '           email address   : ' $email_address
+ #debugd show '           Tax Update      : ' $Tax_Update      
+ #debugd show '           PA_Act_32_Data  : ' $PA_Act_32_Data      
+
+ #ifdef POPULATE_AMENDMENT_FIELDS_IN_FILE_HEADER
+   if $extract_mode <> 'Q'  
+     let $ATS_info = ''
+   end-if
+ #endif
+
+  
+  let $rectp = 'X'
+  Write 1 FROM         $rectp:1
+                       $blank:1
+                   $Trans_ver:5
+                $extract_mode:1
+                       $RptYear:4              !Quarterly: Year not relevant
+                       $RptQtr:1               !Quarterly: Quarter not relevant
+                  $cur_dt_DTU:8                !YYYYMMDD
+                      $cur_tm:6                !HHMMSS
+              $CORPORATE_NAME:50
+                     $run_nbr:5
+                   $prior_nbr:5
+                       $blank:2
+          $program_versions:127
+    #ifdef POPULATE_AMENDMENT_FIELDS_IN_FILE_HEADER
+                   $ATS_info:30
+    #endif
+
+  add 1 to #reccnt
+
+ end-if
+ 
+ 
+end-procedure
+
+begin-procedure get_email_address_of_oprid
+
+  let $email_Address = ''
+ #debugd show 'get_email_address_of_oprid: ' $PRCS_OPRID
+
+begin-select
+EM.EMAILID
+
+  #debugd show 'get_email_address_of_oprid, email address = '  &EM.EMAILID
+   let $email_address = rtrim(&EM.EMAILID,' ')
+   
+   From PSOPRDEFN EM
+     where EM.OPRID = $PRCS_OPRID
+     
+end-select
+end-procedure
+
+!***************************************************
+begin-procedure Write-Company-Header-Rec   ! <-------- needs $extract_mode ('P' Periodic, 'Q' Quarterly)
+
+  show 'Write-Company-Header-Rec...' $Extract_CompID
+
+  #ifdef SUBTOTAL_FEIN_EXTRACT
+  
+      !June 30, 2010 added
+      !---------------------
+      if rtrim($extract_mode,' ') = 'P'
+        move $TaxBalance_Check_Dt_DTU to $AsofDate_DTU
+        do convert-from-dtu-date($AsofDate_DTU, $AsofDate)
+      else
+        move $Qtr_End_Native to $AsofDate
+      end-if
+      !---------------------
+      
+      let $Company = rtrim($Extract_CompID,' ')       !this has been moved to here out of adpqout.sqc (log-E, log-W...) for speed Sept 24, 2009
+      do get-company-data
+
+      let #Current_out_Extract_FEIN = &CT.FEDERAL_EIN
+      if #Current_out_Extract_FEIN <> 0
+        move #Current_out_Extract_FEIN to $Current_out_Extract_FEIN 099999999
+      else
+        move ' ' to $Current_out_Extract_FEIN
+        show 'Warning: Write-Company-Header-Rec: Blank FEIN for Company ' $Company ' through '  $AsOfDate
+        show ' '
+      end-if
+
+      show 'Write-Company-Header-Rec: SUBTOTAL_FEIN_EXTRACT, FEIN for Company ' $Company ' = ' &CT.FEDERAL_EIN ' formatted to ' $Current_out_Extract_FEIN ' through '  $AsOfDate
+
+  #endif
+  
+  !-------------------- Periodic Header ------------------------
+  #ifdef ADP_TAX_PERIODIC
+    #ifdef CUSTOM_PERIODIC_LOGIC_ENABLED  
+      do custom-company-level-logic-periodic !probiz.sqc
+    #endif    
+  
+    let $liab_dt_DTU = $CkDt_Yr || $CkDt_Mo || $CkDt_Day
+    let $Startofyear_dtu = $CkDt_Yr || '-01-01'
+    do convert-from-dtu-date($Startofyear_dtu, $Startofyear)
+  #else
+    let $liab_dt_DTU = ''
+  #endif
+
+  let $rectp = 'H'
+
+  #if {SITE_ID} = 'LAN1'    !for Lanier always rollup to LWI301 added 1/9/04
+   move $Extract_CompID to $Lanier_Extract_CompID
+   move 'LWI301' to $Extract_CompID
+  #endif
+
+  #ifdef ADP_TAX_QUARTERLY
+    #ifdef CUSTOM_QUARTERLY_LOGIC_ENABLED  
+      do custom-company-level-logic-quarterly !probiz.sqc
+    #endif    
+    let $Direct_Mail = '{DIRECT_MAIL}'        !use global default first
+    do Custom-Direct-Mail-Company-Level
+  #endif
+
+  !12/15/04 Boise , MRR and RR should be mapped to the same header record (Mike K)
+  !--------------------------------------------------------------------------------
+  #if {SITE_ID} = 'BCD1'
+      move $Extract_CompID to $Boise_Extract_CompID
+      if rtrim($Extract_CompID,' ') = 'MRR'
+        let $Extract_CompID = 'RR'
+      end-if
+      if rtrim($Extract_CompID,' ') = 'MRRRR'
+        let $Extract_CompID = 'RRRR'
+      end-if
+  #endif
+
+  !4/11/05 - Per Dinah Sales & David Lafferty
+  !--------------------------------------------------------------------------------
+  #if {SITE_ID} = 'SQC1'
+      move $Extract_CompID to $Five_Star_Extract_CompID
+      if rtrim($Extract_CompID,' ') = 'LTA'
+        let $Extract_CompID = 'STR'
+      end-if
+  #endif
+
+  #ifdef COMPANY_REMAP_FROM
+      move $Extract_CompID to $Save_Orig_Extract_CompID
+      if rtrim($Extract_CompID,' ') = rtrim('{COMPANY_REMAP_FROM}',' ')
+        let $Extract_CompID = rtrim('{COMPANY_REMAP_TO}',' ')
+      end-if
+      #ifdef ADP_TAX_QUARTERLY
+        if $SelectEmplid <> ''
+          show 'adp303.sqc, company remap logic (COMPANY_REMAP_FROM). new extract_CompID ' $Extract_CompID ' orig ' $Save_Orig_Extract_CompID ' Definitions: from= {COMPANY_REMAP_FROM} to= {COMPANY_REMAP_TO}'
+        end-if
+      #endif
+  #endif
+
+  let $KJDA_Header_Company = 'f'
+  #ifdef KJDA_PS_DELIVERED
+    #if {SITE_ID} = 'HWL1'
+      
+     #debugd show 'HWL1, Looking for KJDA company, FEIN: {Honeywell_KJDA_FEIN}'
+      
+      if rtrim($extract_mode,' ') = 'P'
+        move $payline_pay_end_dt to $AsofDate
+      else
+        move $Qtr_End_Native to $AsofDate
+      end-if
+
+      let $Company = RTRIM($Extract_CompID,' ')
+      do get-company-data
+
+      let #honeywell_fein = &CT.FEDERAL_EIN
+      if #honeywell_fein <> 0
+       move #honeywell_fein to $honeywell_fein 099999999
+      else
+       move ' ' to $honeywell_fein
+      end-if
+
+      evaluate $honeywell_fein
+        when = '{Honeywell_KJDA_FEIN}'  !Per Melissa Akre, 12/5/05
+                let $KJDA_Header_Company = 't'
+                break                            
+        when-other
+      end-evaluate
+
+      if $KJDA_Header_Company = 't'
+       #debugd show 'HWL1: KJDA company     ' $Extract_CompID
+      else
+       #debugd show 'HWL1: Non-KJDA company ' $Extract_CompID
+      end-if
+
+     #debugd show 'HWL1:              AsofDate ' $AsofDate
+     #debugd show 'HWL1:       &CT.FEDERAL_EIN ' &CT.FEDERAL_EIN
+     #debugd show 'HWL1:                  FEIN ' $honeywell_fein
+      
+    #endif
+   #endif
+
+!   #ifdef KJDA
+    #if {SITE_ID} = 'PJN1'
+      !see if this $Extract_Compid is a KJDA company
+      !if rtrim($Extract_CompID,' ') = 'PJI' or rtrim($Extract_CompID,' ') = 'PJU'
+      !or rtrim($Extract_CompID,' ') = 'PPI' or rtrim($Extract_CompID,' ') = 'PJF' !added 1/4/06
+         let $KJDA_Header_Company = 't'
+      !end-if   
+  
+      if $KJDA_Header_Company = 't'
+       #debugd show 'PJN1: KJDA company ' $Extract_CompID
+      else
+       #debugd show 'PJN1: Non-KJDA company ' $Extract_CompID
+      end-if
+    #endif
+!  #endif
+
+  
+  !10/8/2012 Change by DMonroe / ADP
+  !  let $Extract_CompID = '{Client_Nbr}' || '-' || $Extract_CompID       ! Added by Govindarao part of SVM customization
+  ! to
+  #ifdef MASTER_TAX_HEADER
+     #ifdef Client_Nbr
+       move $Extract_CompID to $Save_Extract_CompID
+       let $Extract_CompID      = '{Client_Nbr}' || '-' || $Extract_CompID
+       show 'adp303.sqc: Header modified to to Client_Nbr ({Client_Nbr}).  Extract_CompID: ' $Extract_CompID 
+     #endif
+  #endif
+
+  #ifdef ADP_TAX_PERIODIC
+   #ifdef MASTER_TAX_HEADER
+     if #WRITE-FILE-HEADER-MASTER-TAX  < 1
+       do WRITE-FILE-HEADER-MASTER-TAX  !in adpmtp.sqc
+       add 1 to #WRITE-FILE-HEADER-MASTER-TAX 
+     end-if
+     #ifndef USE_TEMP_TABLE_FOR_OUTPUT
+       do WRITE-PAYROLL-HEADER-MASTER-TAX  !in adpmtp.sqc
+     #endif
+   #endif
+  #endif
+
+  
+  #ifdef USE_TEMP_TABLE_FOR_OUTPUT
+    move $Extract_CompID to $Current_out_Extract_CompID !Honeywell,SR 1-19611072
+    if rtrim($extract_mode,' ') = 'P'
+     MOVE $liab_dt_DTU to $Current_out_Liab_dt
+     show 'adp303.sqc: Header will output via PBZPOUT_D table. Saving $Current_out_Liab_dt = ' $Current_out_Liab_dt ', Current_out_Extract_CompID = ' $Current_out_Extract_CompID
+    end-if
+    goto wait_for_h_rec
+  #endif
+  
+
+  
+  Write 1 FROM         $rectp:1
+                       $blank:1
+              $Extract_CompID:14
+                 $liab_dt_DTU:8
+                     $blank:3
+                     $blank:3
+                $CompanyName:50                !from 'get-company-data'
+                $blank:1                       !prior to 2011 was a 'N' for 'Terminating Business' requirement
+         !             $blank:157
+
+    add 1 to #reccnt
+    add 1 to #company_trailer_reccnt
+
+wait_for_h_rec:
+
+   let $first_tax_for_emplid = 't'        !added 4/9/04 to get the E record out again after EVERY H record
+
+   if rtrim($adp_w2_records,' ') = 't'
+     do Get-W2_REPORTING_CO
+   end-if
+
+!10/8/2012 Added by DMonroe / ADP
+  #ifdef MASTER_TAX_HEADER
+   #ifdef Client_Nbr
+     move $Save_Extract_CompID to $Extract_CompID 
+   #endif
+  #endif
+  
+  #if {SITE_ID} = 'LAN1'
+   move $Lanier_Extract_CompID to $Extract_CompID
+  #endif
+
+  #if {SITE_ID} = 'BCD1'
+   move $Boise_Extract_CompID to $Extract_CompID
+  #endif
+
+  #if {SITE_ID} = 'SQC1'
+   move $Five_Star_Extract_CompID to $Extract_CompID
+  #endif
+
+
+  #ifdef COMPANY_REMAP_FROM
+   move $Save_Orig_Extract_CompID to $Extract_CompID
+  #endif
+  
+!  #ifdef ADP_TAX_QUARTERLY
+!   #if {SITE_ID} = 'PEN1'
+!    move $PEN1_Extract_CompID to $Extract_CompID
+!   #endif
+!  #endif
+  
+  #ifdef ADP_TAX_PERIODIC
+     #ifdef COBRA
+         do retrieve-cobra-amounts  
+     #endif
+  #endif
+  
+  #ifdef ADP_TAX_QUARTERLY
+      do init-employer-data
+  #endif
+
+end-procedure
+
+begin-procedure Get-W2_REPORTING_CO
+
+  move ' ' to $A.W2_REPORTING_CO
+
+ #ifdef  enable_performance_monitor
+    do Get-Current-Time
+    let $display_dt0 = $display_dt
+ #endif
+begin-select
+A.W2_REPORTING_CO
+
+  move &A.W2_REPORTING_CO  to $A.W2_REPORTING_CO
+  move &A.W2_REPORTING_CO  to $W2CA.W2_REPORTING_CO
+
+FROM  PS_W2_COMPANY A
+WHERE A.CALENDAR_YEAR   = #RptYear
+  AND A.COMPANY         = $Current_company  !10/26/06, was   AND A.W2_REPORTING_CO = $Current_company
+
+#ifdef SELECT_WITH_UR
+ with ur
+#end-if
+end-select
+
+ 
+  if $SelectEmplid <> ''
+   #debugd show 'After Get-W2_REPORTING_CO, W-2 REPORTING COMPANY = ' $A.W2_REPORTING_CO
+   #debugd show '                                 for     COMPANY = ' $Current_Company
+  end-if
+ 
+  #ifdef  enable_performance_monitor
+     do Get-Current-Time
+     move 'Get-W2_REPORTING_CO' to $debug-proc1
+     move 'PS_W2_COMPANY'    to $debug-table1
+     do log-delta-time
+  #endif
+  
+end-procedure
+
+!***************************************************
+begin-procedure Write-Company-Trailer-Rec
+
+  #ifdef show_selects
+  #debugd show 'Write-Company-Trailer-Rec...'
+  #endif
+  
+  let $rectp = 'T'
+
+  #ifndef USE_TEMP_TABLE_FOR_OUTPUT
+
+   add 1 to #reccnt
+   
+!   #ifdef MASTER_TAX_HEADER
+!     #ifndef ADP_TAX_PERIODIC
+!       add 1 to #Company_trailer_reccnt  !add to quarterly for MT like normal, but don't add to the trailer count here for the periodic
+!     #endif
+!   #else
+      add 1 to #Company_trailer_reccnt
+!   #endif
+   
+   let #T = #Company_trailer_Total_Tax * 100
+   do Format-Number(#T,$taxes, '999999999999999mi')
+   do Format-Number(#Company_trailer_reccnt,$reccnt, '999999999999')
+
+   Write 1 FROM  $rectp:1
+                 $blank:1
+                $reccnt:12
+                 $blank:2
+                 $taxes:16
+
+     if #company_trailer_reccnt > 0
+       #ifdef ADP_TAX_QUARTERLY                !20121210
+        #ifdef EXCEL_FIXED_QUARTERLY_FILENAME
+         move $Header_rec_compid to $existing_company
+         do quarterly-excel-totals
+        #endif
+       #endif                                  !20121210
+     end-if
+
+  let #company_trailer_reccnt = 0
+  let #Company_trailer_Total_Tax = 0
+
+!  #ifdef ADP_TAX_PERIODIC
+!   #ifdef MASTER_TAX_HEADER
+!     #ifndef USE_TEMP_TABLE_FOR_OUTPUT
+!       do WRITE-PAYROLL-TRAILER
+!     #endif
+!   #endif
+!  #endif
+
+
+ #endif
+
+
+end-procedure
+
+!***************************************************
+begin-procedure Write-File-Trailer-Rec
+
+ show ' Write-File-Trailer-Rec: header ' $File_Header_rec_written ', trailer ' $File_Trailer_rec_written
+ 
+ if rtrim($File_Header_rec_written,' ') = ''  !make sure there's a file header before the trailer
+    do Write-File-Header-Rec
+ end-if
+ 
+ if rtrim($File_Trailer_rec_written,' ') = '' !and only write one file trailer no matter what
+    let $File_Trailer_rec_written = 't'
+
+ #ifdef USE_TEMP_TABLE_FOR_OUTPUT
+  #ifdef ADP_TAX_QUARTERLY
+   show 'output-pbzqtr'
+   do Output-pbzqtr
+  #endif
+  #ifdef ADP_TAX_PERIODIC
+   show 'output_pbzper'
+   do Output-pbzper
+  #endif
+ #endif
+
+ #ifdef MERGE_FILENAME
+  do  process_MERGE_FILENAME  !this needs to be called right before writing the FILE TRAILER from the adp303.sqc.
+ #endif
+
+ #ifdef ADP_TAX_QUARTERLY
+  #ifdef QUARTERLY_HISTORY
+   do close_ADP_QTR_HIST
+  #endif
+ #endif
+ 
+ add 1 to #reccnt
+ do Format-Number(#reccnt, $reccnt,  '999999999999')
+
+ if rtrim($extract_mode,' ') = 'Q'
+   let #T = #Hash_QTD_Total_Tax * 100
+ else
+   let #T = #Hash_Cur_Total_Tax * 100
+ end-if
+
+ do Format-Number(#T,$taxes, '999999999999999mi')
+#debugd show 'outputting final (F) rec...'
+
+ let $rectp = 'F'
+ Write 1 FROM  $rectp:1
+                $blank:1
+               $reccnt:12
+                $blank:2
+                $taxes:16
+
+  !Cleanup sort tables upon exit
+  #ifdef USE_TEMP_TABLE_FOR_OUTPUT
+  
+   #ifndef TEST_EMPLID
+    #debugd show 'Cleaning up temp sort tables.'
+     do cleanup-pbzqout
+   #else
+    #debugd show 'Not Cleaning up temp sort tables (for debugging).'
+   #endif
+
+  #else
+  
+    if rtrim($extract_mode,' ') = 'P'
+     #ifdef EXCEL_FIXED_PERIODIC_FILENAME
+       #ifdef ADP_TAX_PERIODIC
+         do periodic-excel-close
+       #endif
+     #endif
+    else
+     #ifdef EXCEL_FIXED_QUARTERLY_FILENAME
+       #ifdef ADP_TAX_QUARTERLY
+         do quarterly-excel-close
+       #endif
+     #endif
+    end-if
+  
+  #endif
+ end-if
+ 
+end-procedure
+
+!---------------------------------------------------------------------------------------
+!2/21/06, implement our own get-tax-reporting routine to elimiante dependence on this!
+!#include 'taxrnctl.sqc'   !Get-Tax-Reporting-Run-Controls
+!---------------------------------------------------------------------------------------
+begin-procedure Get-Tax-Reporting-Run-Controls-ADP
+
+    LET $Employ_Type   = 'R' !default to Regular employee
+    
+ #ifdef  enable_performance_monitor
+    do Get-Current-Time
+    let $display_dt0 = $display_dt
+ #endif
+ 
+begin-SELECT
+TX.EMPLOYMENT_TYPE
+TX.BALANCE_YEAR
+TX.BALANCE_QTR
+
+  LET $Employ_Type   = rtrim(&TX.EMPLOYMENT_TYPE,' ')
+  let #TX.BALANCE_YEAR = &TX.BALANCE_YEAR
+  let #TX.BALANCE_QTR  = &TX.BALANCE_QTR
+
+  FROM PS_TAXRPT_RUNCTL TX
+
+#ifdef SELECT_WITH_UR
+ with ur
+#end-if
+end-select
+
+ #ifdef  enable_performance_monitor
+    do Get-Current-Time
+    move 'Get-Tax-Reporting-Run-Controls-ADP' to $debug-proc1
+    move 'PS_TAXRPT_RUNCTL'    to $debug-table1
+    do log-delta-time
+ #endif
+ 
+end-procedure
+
+
+begin-procedure get-tax-update3  !place in file header
+
+BEGIN-SELECT
+UPD3.TAX_UPDT
+
+  let $Tax_update =  rtrim(&UPD3.TAX_UPDT,' ')
+
+  FROM PS_TAX_UPDATE UPD3
+   WHERE UPD3.DT_ENTERED = (SELECT MAX(UPD32.DT_ENTERED)
+        FROM PS_TAX_UPDATE UPD32
+          WHERE UPD32.DT_ENTERED <= $AsOfToday)
+                       
+end-select
+
+end-procedure
+
+!               For PeopleSoft ET clients, add this definition to your configuration file (probiz.sqc)
+#ifdef POPULATE_AMENDMENT_FIELDS_IN_FILE_HEADER
+
+begin-procedure NO-ATS-INFO-TABLE
+ show 'No ATS info table: PS_{Client_Table_Prefix}QTR_ATS_INFO{Client_Table_Suffix}'
+end-procedure
+
+begin-procedure POPULATE-AMENDMENT-FIELDS-IN-FILE-HEADER
+  let $ATS_info = ''
+    
+  let $Chk1  = 'ATS.{Client_Field_Prefix}QTR_SUBTYPE{Client_Field_Suffix}'
+  let $Chk2  = 'ATS.{Client_Field_Prefix}QTR_SPCL_INS{Client_Field_Suffix}'
+  let $Chk3  = 'ATS.{Client_Field_Prefix}QTR_ASC_DT{Client_Field_Suffix}'
+
+begin-select on-error=NO-ATS-INFO-TABLE
+{Dyn-S}$Chk1{Dyn-E}  &ATS.{Client_Field_Prefix}QTR_SUBTYPE{Client_Field_Suffix}=char  
+{Dyn-S}$Chk2{Dyn-E}  &ATS.{Client_Field_Prefix}QTR_SPCL_INS{Client_Field_Suffix}=char
+{Dyn-S}$Chk3{Dyn-E}  &ATS.{Client_Field_Prefix}QTR_ASC_DT{Client_Field_Suffix}=date
+
+    let $ATS_subtype = rtrim(&ATS.{Client_Field_Prefix}QTR_SUBTYPE{Client_Field_Suffix},' ')
+    let $ATS_Spcl_ins = &ATS.{Client_Field_Prefix}QTR_SPCL_INS{Client_Field_Suffix}
+    if rtrim(&ATS.{Client_Field_Prefix}QTR_ASC_DT{Client_Field_Suffix},' ') <> ''
+       let $ATS_Asc_dt = datetostr(&ATS.{Client_Field_Prefix}QTR_ASC_DT{Client_Field_Suffix},'yyyymmdd')
+    else
+       let $ATS_Asc_dt = '        '
+    end-if
+
+    show ''
+    show 'ATS_subtype = ' $ATS_subtype ', ATS AscDate ' $ATS_Asc_Dt ', ATS SpecIns ' $ATS_Spcl_ins ' for Oprid/runcontrol ' $PRCS_OPRID '/' $PRCS_RUN_CNTL_ID
+    
+    if $ATS_subtype = 'Q'
+      let $ATS_info = ' '
+    else
+      if $ATS_subtype <>  'A'
+        let $ATS_Reason_Codes = ''
+      else
+        !build reason string
+        do build-reason-code-string
+      end-if
+      let $ATS_info = $ATS_subtype || $ATS_Asc_dt || rpad($ATS_Reason_Codes,20,' ') || $ATS_Spcl_ins
+    end-if
+
+    FROM PS_{Client_Table_Prefix}QTR_ATS_INFO{Client_Table_Suffix} ATS
+     WHERE ATS.OPRID       = $PRCS_OPRID
+       AND ATS.RUN_CNTL_ID = $PRCS_RUN_CNTL_ID
+
+#ifdef SELECT_WITH_UR
+ with ur
+#end-if
+end-select
+
+  show 'ATS Info = ' $ATS_info !ATS INFO (30 total)  File Subtype (1), Amendment Ascertained Date (8), Amendment Reason Code (20), Amendment Special Instructions (1)
+  show ''
+  
+end-procedure
+
+begin-procedure NO-ATS-REAS-TABLE
+ show 'No ATS ReasCd table: PS_{Client_Table_Prefix}QTR_ATS_REAS{Client_Table_Suffix}'
+end-procedure
+
+begin-procedure build-reason-code-string
+    
+  let $ATS_Reason_Codes = ''
+  let $Chk4  = 'ATSR.{Client_Field_Prefix}QTR_REAS_CD{Client_Field_Suffix}'
+  let $1A = ''
+  let #reason_code = 0
+  
+begin-select on-error=NO-ATS-REAS-TABLE
+{Dyn-S}$Chk4{Dyn-E}  &ATSR.{Client_Field_Prefix}QTR_REAS_CD{Client_Field_Suffix}=char  
+
+    add 1 to #reason_code
+    let $reason_code = substr(&ATSR.{Client_Field_Prefix}QTR_REAS_CD{Client_Field_Suffix},1,2)
+    let $ATS_Reason_Codes = $ATS_Reason_Codes || $reason_code
+    if $reason_code = '1A'
+      let $1A = 't'
+    end-if
+    
+    FROM PS_{Client_Table_Prefix}QTR_ATS_REAS{Client_Table_Suffix} ATSR
+     WHERE ATSR.OPRID       = $PRCS_OPRID
+       AND ATSR.RUN_CNTL_ID = $PRCS_RUN_CNTL_ID
+        ORDER BY ATSR.{Client_Field_Prefix}QTR_REAS_CD{Client_Field_Suffix}
+        
+#ifdef SELECT_WITH_UR
+ with ur
+#end-if
+end-select
+
+    if #reason_code = 0
+      show 'ERROR: reason code(s) must be selected.  stopping program'
+      Move 5 to #Return-Status
+      stop
+    end-if
+    if #reason_code = 1 and $1A = 't'
+      show 'ERROR: Additional reason codes must be selected.  Code 1A can not be the only reason code.  stopping program'
+      Move 5 to #Return-Status
+      stop
+    end-if
+    if #reason_code > 10 
+      show 'ERROR: Too many reason codes selected.  Maximum is 10 reason codes.  stopping program'
+      Move 5 to #Return-Status
+      stop
+    end-if
+    
+end-procedure
+
+#endif
+
+#if {SITE_ID} = 'PFZ1'
+  #ifdef USE_ERNCD_CATEGORIES
+    #include 'getcatearns.sqc'
+  #endif
+#endif
+
+#ifdef ADP_TAX_PERIODIC
+ #ifdef MASTER_TAX_HEADER
+   #include 'adpmtp.sqc'
+ #endif
+#endif
+
+!------------------------- end of adp303.sqc  ---------------------

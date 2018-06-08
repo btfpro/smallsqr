@@ -1,0 +1,3737 @@
+!***********************************************************************
+!  FGPY002:  Create TSP Interface Files/Reports                       *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!  Confidentiality Information:                                        *
+!                                                                      *
+!                                                                      *
+! This module contains confidential and proprietary information        *
+! of Oracle; it is not to be copied, reproduced, or transmitted        *
+! in any form, by any means, in whole or in part, nor is it to         *
+! be used for any purpose other than that for which it is              *
+! expressly provided under the applicable license agreement.           *
+!                                                                      *
+! Copyright (C) 2006 Oracle. All Rights Reserved.                      *
+!                                                                      *
+!***********************************************************************
+!----------------------------------------------------------------------
+!
+!                $Date:  2006/06/26:14:05:36                           !
+!             $Release:  HR9                                           !
+!            $Revision:  102                                           !
+!                                                                      *
+!***********************************************************************
+#include 'setenv.sqc'    !Set environment
+#include 'setup07.sqc'
+
+begin-setup
+
+ Declare-Layout TSP_LAYOUT
+  Orientation = PORTRAIT
+  Max-Columns = 550
+  Max-Lines   = 735
+  Line-Height = 1   ! Define a 1 by 1 point grid for
+  Char-Width  = 1   ! precise print positioning
+ End-Declare
+
+ Declare-Printer HP-definition
+  Type = HPLASERJET
+  Font = 5
+  Point-Size = 1
+ End-Declare
+
+ Declare-Report TSP_REPORT
+  Printer-Type = HPLASERJET
+  LayOut = TSP_LAYOUT
+ End-Declare
+
+ Declare-Variable
+  integer #vest-code
+! date $out-birthdate
+ End-declare
+
+end-setup
+
+begin-report
+
+  do Init-Report
+
+  if $gvt_tsp_rpt_only = 'N'
+
+      display 'Starting TSP Interface for Run ID - ' noline
+      display $Run_IDdisplay
+      display ' '
+      display 'TSP Voucher - ' noline
+      display $gvt_tsp_seq_yr noline
+      display ' - ' noline
+      display $gvt_tsp_seq_no 0000
+
+      do Open-tsp-file
+      do Retrieve-pay-cal-data
+      do Update-TSP-Investment-Elections
+      do Load-company-array
+      do Create-emp-data-rcds
+      do Process-tsp-deductions
+      If &VER.GVT_TSP_VERSION = 'N'
+          do Process-lost-earnings
+      End-if
+      do Create-extract-file
+      do Close-tsp-file
+      do Update-pay-calendar
+      do Update-tsp-voucher
+      do Delete-R-GVT-TSP-SORT
+      do Print-tsp-report
+      do clean-voucher-detail-action
+      do Insert-voucher-detail-recs
+
+  else
+
+      display 'Starting TSP Reprint for TSP Voucher - ' noline
+      display $gvt_tsp_seq_yr noline
+      display ' - ' noline
+      display $gvt_tsp_seq_no 0000
+
+      do retrieve-voucher-detail-recs
+      do get-Pay-Run-id
+      do Retrieve-pay-cal-data
+      do Retrieve-header-recd-data
+      if $gvt_tsp_seq_yr < '10'
+         let $gvt_tsp_seq_yr = '0' || $gvt_tsp_seq_yr
+      end-if
+
+  end-if
+
+  do Print-tsp-report
+
+  do Delete-run-control
+
+  do Stdapi-Term
+
+end-report
+
+!***********************************************************************
+begin-procedure Init-Report
+!
+!Description: Initializes data for the begining of the report
+!             processing.
+!***********************************************************************
+
+move 'FGPY002' to $ReportID
+move 'Thrift Savings Plan Interface Summary Report' to $ReportTitle
+
+do Init_printer
+do Init-DateTime
+do Init-Number
+do Get-Current-DateTime
+do Stdapi-Init
+
+if $Prcs_Process_Instance = ''
+
+  display 'Thift Board Interface requires'
+  display 'submission through the Process Scheduler'
+
+  STOP
+
+else
+
+  do select-parameters
+
+  do Get-TSP-Parameters
+
+  do Get-TSP-Version
+
+end-if
+
+let #col1 = 30
+let #col2 = 52
+let #col3 = 74
+let #col4 = 96
+
+let #Emp-data-rec-count     = 0
+let #Reg-payment-rec-count  = 0
+let #Late-payment-rec-count = 0
+let #Neg-adjust-rec-count   = 0
+
+let $blanks18 = '                  '
+let $blanks42 = '                                          '
+
+
+end-procedure     !Init-Report
+
+
+!**********************************************************************
+begin-procedure Open-tsp-file
+!
+!Description:  Opens the TSP Interface Output file fow writing.
+!**********************************************************************
+
+let $gvt_tsp_int_file = '{IMPORTPREFIX}' || $gvt_tsp_int_file
+         || '{IMPORTSUFFIX}'
+
+open $gvt_tsp_int_file as 1 for-writing record=250:vary
+
+end-procedure     !Open-tsp-file
+
+
+!**********************************************************************
+begin-procedure Retrieve-pay-cal-data
+!
+!Description:  Using the RunID entered on the run control panel,
+!              access the PAY_CALENDAR table to retrieve the Pay end date
+!**********************************************************************
+
+let $SQL-STATEMENT = 'FGPY002, Retrieve-pay-cal-data'
+
+BEGIN-SELECT On-Error=SQL-Error
+
+B1.COMPANY
+B1.PAYGROUP
+B1.PAY_END_DT
+B1.PAY_BEGIN_DT
+B1.CHECK_DT
+B1.PAY_CONFIRM_RUN
+
+    let $date_work = datetostr(&B1.CHECK_DT,'YYYYMMDD')
+
+    if &VER.GVT_TSP_VERSION = 'N'
+        let $out-effdt = substr($date_work,1,8)
+    else
+        let $out-effdt = substr($date_work,3,6)
+    end-if
+
+FROM PS_PAY_CALENDAR B1
+
+WHERE B1.RUN_ID = $Run_ID
+
+END-SELECT
+
+IF &B1.PAY_CONFIRM_RUN <> 'Y'
+
+    DISPLAY 'Pay Run Must be confirmed' noline
+    DISPLAY ' prior to running TSP Interface'
+
+    STOP
+
+END-IF
+
+end-procedure    !Retrieve-pay-cal-data
+
+
+!**********************************************************************
+begin-procedure Load-company-array
+!
+!Description:  Load company data that will be accessed later in the
+!        program.
+!**********************************************************************
+
+create-array name=company_array size = 500
+             field=company:char
+             field=gvt_agy_loc_code:char
+             field=gvt_agy_tsp_id:char
+
+let #I = 0
+
+let $SQL-STATEMENT = 'FGPY002, Load-company-array'
+
+BEGIN-SELECT On-Error=SQL-Error
+
+J1.COMPANY
+J1.GVT_AGY_LOC_CODE
+J1.GVT_AGY_TSP_ID
+
+    put &J1.COMPANY into company_array(#I) company
+    put &J1.GVT_AGY_LOC_CODE into company_array(#I) GVT_AGY_LOC_CODE
+    put &J1.GVT_AGY_TSP_ID into company_array(#I) GVT_AGY_TSP_ID
+
+    let #I = #I + 1
+
+FROM PS_COMPANY_TBL J,
+     PS_GVT_INTRFC_INFO J1
+
+WHERE J.EFF_STATUS = 'A'
+AND   J.EFFDT      = (SELECT MAX(JA.EFFDT)
+                      FROM PS_COMPANY_TBL JA
+                      WHERE JA.COMPANY  = J.COMPANY
+                      AND JA.EFF_STATUS = 'A'
+                      AND JA.EFFDT     <= &B1.PAY_END_DT)
+AND   J1.COMPANY   = J.COMPANY
+AND   J1.EFFDT     = J.EFFDT
+
+END-SELECT
+
+end-procedure  !Load-company-array
+
+
+!**********************************************************************
+begin-procedure Create-emp-data-rcds
+!
+!Description:  Process every record in GVT_JOB with a TSP_UPD_IND = 'R'
+!              to determine whether a new emp data record needs to
+!              be created.  If a new record is needed, update/insert a
+!              record in GVT_TSP_01_HIST, insert the record into the
+!              sort table, and set the TSP_UPD_IND to 'P' for processed
+!              on GVT_JOB.
+!**********************************************************************
+
+let $out-rcdno = $emp-data-rcdno
+
+#IFDEF DB2ALL
+
+  move 'A' to $last_emplid   !initialize lower then the lowest key
+
+#ELSE
+
+  move '0' to $last_emplid   !initialize lower then the lowest key
+
+#END-IF
+
+move 1 to #not_done
+
+while #not_done
+
+    move 0 to #row_counter
+
+    do Create-emp-data-rcds-sub1
+
+end-while
+
+end-procedure    !Create-emp-data-rcds
+
+
+!**********************************************************************
+begin-procedure Create-emp-data-rcds-sub1
+!**********************************************************************
+
+let $SQL-STATEMENT = 'FGPY002, Create-emp-data-rcds-sub1'
+
+BEGIN-SELECT On-Error=SQL-Error
+
+D1.EMPLID
+D1.EMPL_RCD
+D1.EFFDT
+D1.EFFSEQ
+D1.COMPANY
+D1.GVT_SUB_AGENCY
+D1.GVT_POI
+D1.GVT_RETIRE_PLAN
+D1.GVT_TYPE_OF_APPT
+D1.GVT_NOA_CODE
+D1.GVT_TSP_UPD_IND
+D4NID.NATIONAL_ID
+D4.BIRTHDATE
+D4.NAME
+D4.ADDRESS1
+D4.ADDRESS2
+D4.ADDRESS3
+D4.CITY
+D4.STATE
+D4.POSTAL
+D5.HIRE_DT
+D5.REHIRE_DT
+D5.GVT_SCD_TSP
+
+    add 1 to #row_counter
+    let $birthdate = &D4.BIRTHDATE
+
+    if #row_counter > 300 and &D1.EMPLID <> $last_emplid
+        exit-select     !Leave select to execute a commit
+    else
+        move &D1.EMPLID to $last_emplid
+        do Determine-tsp-codes
+        let $company = &D1.COMPANY
+
+        do Retrieve-tsp-id
+        do Retrieve-tsp-emp-data-rcd
+
+        if $tsp-status <> 'I' and
+           $sepcode <> 'R'
+
+            if $01_hist_rcd_exist = 'Y'
+                do compare-tsp-data
+
+                if $emp-data-changed = 'Y'
+                    do move-data-to-out-vars
+                    do update-tsp-emp-data-rcd
+                    do insert-into-work-tbl
+                end-if
+            else
+                do move-data-to-out-vars
+                do create-tsp-emp-data-rcd
+                do insert-into-work-tbl
+            end-if
+
+        end-if
+
+
+            do Update-tsp-flag-on-gvt-job
+
+    end-if
+
+FROM PS_GVT_JOB D1,
+     PS_GVT_PERS_DATA D4,
+     PS_GVT_PERS_NID D4NID,
+     PS_GVT_EMPLOYMENT D5
+
+WHERE D1.EMPLID > $last_emplid
+AND   D1.GVT_RETIRE_PLAN IN ('1','6','C','E','K','L','M','N','R','T')
+AND   D1.GVT_TSP_UPD_IND IN ('R')
+AND   D1.GVT_STATUS_TYPE IN ('COM','COR')
+AND   EXISTS (SELECT 'X'
+              FROM  PS_PAY_CALENDAR CAL1
+              WHERE CAL1.RUN_ID = $Run_ID
+              AND D1.COMPANY    = CAL1.COMPANY
+              AND D1.PAYGROUP   = CAL1.PAYGROUP)
+AND   D1.EFFDT = (SELECT MAX(D2.EFFDT)
+                  FROM PS_GVT_JOB D2
+                  WHERE  D2.EMPLID        = D1.EMPLID
+                  AND  D2.EMPL_RCD        = D1.EMPL_RCD
+                  AND  D2.GVT_STATUS_TYPE IN ('COM','COR')
+                  AND  D2.EFFDT           <= &B1.PAY_END_DT)
+                  AND  D1.EFFSEQ          =(SELECT MAX(D3.EFFSEQ)
+                                            FROM  PS_GVT_JOB D3
+                                            WHERE D3.EMPLID          = D1.EMPLID
+                                            AND   D3.EMPL_RCD        = D1.EMPL_RCD
+                                            AND   D3.GVT_STATUS_TYPE IN ('COM','COR')
+                                            AND   D3.EFFDT           = D1.EFFDT)
+AND   D4.EMPLID              = D1.EMPLID
+AND   D4.EMPL_RCD            = D1.EMPL_RCD
+AND   D4.EFFDT               = D1.EFFDT
+AND   D4.EFFSEQ              = D1.EFFSEQ
+AND   D4NID.EMPLID           = D1.EMPLID
+AND   D4NID.EMPL_RCD         = D1.EMPL_RCD
+AND   D4NID.EFFDT            = D1.EFFDT
+AND   D4NID.EFFSEQ           = D1.EFFSEQ
+AND   D4NID.COUNTRY          = 'USA'
+AND   D4NID.NATIONAL_ID_TYPE = 'PR'
+AND   D5.EMPLID              = D1.EMPLID
+AND   D5.EMPL_RCD            = D1.EMPL_RCD
+AND   D5.EFFDT               = D1.EFFDT
+AND   D5.EFFSEQ              = D1.EFFSEQ
+
+ORDER BY D1.EMPLID
+
+END-SELECT
+
+if #row_counter < 300
+
+    move 0 to #not_done    !Less than 300 rows means we're done
+
+end-if
+
+end-procedure    !Create-emp-data-rcds-sub1
+
+
+!**********************************************************************
+begin-procedure move-data-to-out-vars
+!
+!Description:
+!
+!**********************************************************************
+
+let  $out-ssn           = rtrim(&D4NID.NATIONAL_ID,' ')
+let  $out-birthdate     = $birthdate
+let  $out-name          = &D4.NAME
+let  $out-ssnprv        = ' '
+let  $out-doberr        = ''
+let  $out-address1      = &D4.ADDRESS1
+let  $out-address2      = &D4.ADDRESS2
+let  $out-address3      = &D4.ADDRESS3
+let  $out-city          = rtrim(&D4.CITY, ' ')
+let  $out-state         = rtrim(&D4.STATE, ' ')
+let  $out-zip           = &D4.POSTAL
+let  $out-tsp-status    = $tsp-status
+let  $out-tsp-sdate     = $tsp-sdate
+let  $out-agy-tsp-id    = $gvt_agy_tsp_id
+let  $out-sub-agency    = &D1.GVT_SUB_AGENCY
+let  $out-poi           = &D1.GVT_POI
+let  $out-agy-loc-code  = $gvt_agy_loc_code
+let  $out-gvt-scd-tsp   = &D5.GVT_SCD_TSP
+let  $out-vest-code     = #vest-code
+let  $out-vest-code     = substr($out-vest-code,1,1)
+let  $out-retire-plan   = &D1.GVT_RETIRE_PLAN
+let  $out-sepcode       = $sepcode
+let  $out-sepdate       = $sepdate
+let  $out-deptprv       = ' '
+let  $out-agyprv        = ' '
+
+end-procedure    !move-data-to-out-vars
+
+!**********************************************************************
+begin-procedure determine-tsp-codes
+!
+!Description:  Determines the values of several fields that exist on
+!              the tsp employee data record type (01).
+!**********************************************************************
+
+let $savings_plan_exist = 'N'
+let $tsp-status = ' '
+let $tsp_basic_plan_exists = 'N'
+let $sepcode = ' '
+let $sepdate = ''
+let $birthdate = ''
+let $tsp-sdate = ''
+let #vest-code = 0
+
+!***** Determine Status Code
+
+let $SQL-STATEMENT = 'FGPY002, determine-tsp-codes'
+
+BEGIN-SELECT On-Error=SQL-Error
+
+K1.EFFDT
+K1.COVERAGE_BEGIN_DT
+K1.COVERAGE_ELECT
+K1.PLAN_TYPE
+
+    let $savings_plan_exist = 'Y'
+
+FROM PS_SAVINGS_PLAN K1
+
+WHERE K1.EMPLID    = &D1.EMPLID
+AND K1.EMPL_RCD    = &D1.EMPL_RCD
+AND EXISTS (SELECT 'X'
+            FROM PS_DEDUCTION_TBL DED1
+            WHERE DED1.GVT_REPORTING_CD IN ('TB','TS')
+            AND K1.PLAN_TYPE = DED1.PLAN_TYPE
+            AND DED1.EFFDT = (SELECT MAX(DED2.EFFDT)
+                              FROM  PS_DEDUCTION_TBL DED2
+                              WHERE DED2.DEDCD  = DED1.DEDCD
+                              AND   DED2.EFFDT <= &B1.PAY_END_DT))
+AND K1.EFFDT =
+      (SELECT MAX(K2.EFFDT)
+       FROM  PS_SAVINGS_PLAN K2
+       WHERE K2.EMPLID    = K1.EMPLID
+       AND   K2.EMPL_RCD  = K1.EMPL_RCD
+       AND   K2.PLAN_TYPE = K1.PLAN_TYPE
+       AND   K2.EFFDT     <= &B1.PAY_END_DT)
+AND EXISTS (SELECT 'X'
+            FROM PS_SAVINGS_PLAN K3
+            WHERE K3.EMPLID    = K1.EMPLID
+            AND   K3.EMPL_RCD  = K1.EMPL_RCD
+            AND   K3.PLAN_TYPE = K1.PLAN_TYPE
+            AND  (K3.COVERAGE_ELECT IN ('W','T')
+            OR    K3.FLAT_DED_AMT      > 0
+            OR    K3.PCT_GROSS         > 0
+            OR    K3.FLAT_DED_AMT_ATAX > 0
+            OR    K3.PCT_GROSS_ATAX    > 0))
+
+END-SELECT
+
+BEGIN-SELECT On-Error=SQL-Error
+
+L1.EFFDT
+L1.COVERAGE_ELECT_DT
+L1.COVERAGE_ELECT
+L1.EMPLID
+L1.EMPL_RCD
+L1.PLAN_TYPE
+
+  let $tsp_basic_plan_exists = 'Y'
+
+FROM PS_RTRMNT_PLAN L1
+
+WHERE L1.EMPLID    = &D1.EMPLID
+  AND L1.EMPL_RCD  = &D1.EMPL_RCD
+  AND EXISTS (SELECT 'X'
+              FROM PS_DEDUCTION_TBL DED3
+              WHERE DED3.GVT_REPORTING_CD IN ('TB','TS')
+                AND L1.PLAN_TYPE = DED3.PLAN_TYPE
+                AND DED3.EFFDT = (SELECT MAX(DED4.EFFDT)
+                                  FROM PS_DEDUCTION_TBL DED4
+                                  WHERE  DED4.DEDCD  = DED3.DEDCD
+                                    AND  DED4.EFFDT <= &B1.PAY_END_DT))
+  AND L1.EFFDT =
+      (SELECT MAX(L2.EFFDT)
+       FROM PS_RTRMNT_PLAN L2
+       WHERE  L2.EMPLID     = L1.EMPLID
+         AND  L2.EMPL_RCD   = L1.EMPL_RCD
+         AND  L2.PLAN_TYPE  = L1.PLAN_TYPE
+         AND  L2.EFFDT     <= &B1.PAY_END_DT)
+
+END-SELECT
+
+ EVALUATE &D1.GVT_RETIRE_PLAN                !FERS
+
+       WHEN =  'C'
+       WHEN = 'E'
+       WHEN = 'K'
+       WHEN = 'L'
+       WHEN = 'M'
+       WHEN = 'N'
+       WHEN = 'R'
+       WHEN = 'T'
+
+      if $savings_plan_exist = 'Y'  and              !FERS active
+          $tsp_basic_plan_exists = 'Y' and
+           &K1.COVERAGE_ELECT <> 'T'
+               let $tsp-status = 'Y'
+               let $tsp-sdate  = &K1.EFFDT
+      end-if
+
+      if $savings_plan_exist = 'Y'  and             !FERS termination
+         $tsp_basic_plan_exists = 'Y' and
+         &K1.COVERAGE_ELECT = 'T'
+               let $tsp-status = 'T'
+               let $tsp-sdate  = &K1.EFFDT
+      end-if
+
+      if $savings_plan_exist = 'Y'  and             !FERS not eligible for match
+          $tsp_basic_plan_exists = 'N' and
+          &K1.COVERAGE_ELECT<> 'T'
+                let $tsp-status = 'W'
+                let $tsp-sdate  = &K1.EFFDT
+      end-if
+
+        if $savings_plan_exist = 'Y'  and             !FERS left prior to being
+          $tsp_basic_plan_exists= 'N' and           !eligible for match
+             &K1.COVERAGE_ELECT = 'T'
+                let $tsp-status = 'S'
+                let $tsp-sdate  = &K1.EFFDT
+      end-if
+
+      if $savings_plan_exist = 'N'  and         !  FERS not contributing
+          $tsp_basic_plan_exists = 'Y' and     !but eligible for match
+            &K1.COVERAGE_ELECT<> 'T'
+           let $tsp-status = 'E'
+           let $tsp-sdate  = &L1.EFFDT
+      end-if
+
+      if $savings_plan_exist = 'N'  and         ! FERS Ineligible
+          $tsp_basic_plan_exists = 'N'   and
+               &K1.COVERAGE_ELECT<> 'T'
+           let $tsp-status = 'I'
+           if &D5.REHIRE_DT =  ''
+               let $tsp-sdate  = &D5.HIRE_DT
+           else
+              let $tsp-sdate  = &D5.REHIRE_DT
+           end-if
+       end-if
+
+
+       BREAK
+        WHEN = '1'
+        WHEN = '6'
+
+    if  $savings_plan_exist = 'Y' and             !CSRS elect to contribute
+         &K1.COVERAGE_ELECT <> 'T'
+                let $tsp-status = 'Y'
+                let $tsp-sdate  = &K1.EFFDT
+      end-if
+      if  $savings_plan_exist = 'Y' and           !CSRS elect to terminate
+         &K1.COVERAGE_ELECT = 'T'
+               let $tsp-status = 'T'
+               let $tsp-sdate  = &K1.EFFDT
+       end-if
+
+      BREAK
+        WHEN-OTHER
+      BREAK
+ END-EVALUATE
+
+!***** Determine SEPCODE
+evaluate &D1.GVT_NOA_CODE
+
+    when = '350'
+        let $sepcode = 'D'
+        let $sepdate = &D1.EFFDT
+        break
+
+    when = '352'
+        let $sepcode = 'T'
+        let $sepdate = &D1.EFFDT
+        break
+
+    when = '300'
+    when = '301'
+    when = '302'
+    when = '303'
+    when = '304'
+    when = '312'
+    when = '317'
+    when = '330'
+    when = '351'
+    when = '353'
+    when = '355'
+    when = '356'
+    when = '357'
+    when = '385'
+    when = '390'
+        let $sepcode = 'S'
+        let $sepdate = &D1.EFFDT
+        break
+
+end-evaluate  !&D1.GVT_NOA_CODE
+
+!***** Determine VEST Code
+
+!***** FERS emps only
+if (&D1.GVT_RETIRE_PLAN = 'K' or &D1.GVT_RETIRE_PLAN = 'L' or
+    &D1.GVT_RETIRE_PLAN = 'M' or &D1.GVT_RETIRE_PLAN = 'N')
+
+    if (&D1.GVT_TYPE_OF_APPT = '30' or &D1.GVT_TYPE_OF_APPT = '32' or
+        &D1.GVT_TYPE_OF_APPT = '34' or &D1.GVT_TYPE_OF_APPT = '36' or
+        &D1.GVT_TYPE_OF_APPT = '40' or &D1.GVT_TYPE_OF_APPT = '42' or
+        &D1.GVT_TYPE_OF_APPT = '44' or &D1.GVT_TYPE_OF_APPT = '46' or
+        &D1.GVT_TYPE_OF_APPT = '55')
+
+       let #vest-code = 2
+
+    else
+
+       let #vest-code = 3
+
+    end-if
+
+end-if
+
+end-procedure   !determine-tsp-codes
+
+
+!**********************************************************************
+begin-procedure Retrieve-tsp-id
+!
+!Description:  Retrieves the TSP ID associated with the company.
+!**********************************************************************
+
+let #I = 0
+
+while #I <> 500
+
+    get $array_comp from company_array(#I) company
+
+    if $array_comp = $company
+        get $gvt_agy_loc_code from company_array(#I) gvt_agy_loc_code
+        get $gvt_agy_tsp_id from company_array(#I) gvt_agy_tsp_id
+        let #I = 500
+    else
+        let #I = #I + 1
+    end-if
+
+end-while
+
+end-procedure   !Retrieve-tsp-id
+
+
+!**********************************************************************
+begin-procedure Retrieve-tsp-emp-data-rcd
+!
+!Description:  Retrieve the TSP emp data record for the employee from
+!              GVT_TSP_01_HIST. The data retrieved will be compared
+!              with the data retrieved from GVT_JOB, GVT_PERS_DATA, and
+!              GVT_EMPLOYMENT to determine if a new 01 rec needs to be
+!              created.
+!**********************************************************************
+
+let $01_hist_rcd_exist = 'N'
+
+let $SQL-STATEMENT = 'FGPY002, Retrieve-tsp-emp-data-rcd'
+
+BEGIN-SELECT On-Error=SQL-Error
+
+G1.SSN
+G1.BIRTHDATE
+G1.PAY_END_DT
+G1.NAME
+G1.GVT_TSP_SSNPRV
+G1.GVT_TSP_DOBERR
+G1.ADDRESS1
+G1.ADDRESS2
+G1.ADDRESS3
+G1.CITY
+G1.STATE
+G1.ZIP
+G1.GVT_TSP_STATUS
+G1.STATUS_DT
+G1.GVT_AGY_TSP_ID
+G1.GVT_SUB_AGENCY
+G1.GVT_POI
+G1.GVT_AGY_LOC_CODE
+G1.GVT_SCD_TSP
+G1.GVT_TSP_VEST
+G1.GVT_RETIRE_PLAN
+G1.GVT_TSP_SEPCODE
+G1.GVT_TSP_SEPDATE
+G1.GVT_TSP_DEPTPRV
+G1.GVT_TSP_AGYPRV
+
+    let $01_hist_rcd_exist = 'Y'
+
+FROM PS_GVT_TSP_01_HIST G1
+
+WHERE G1.EMPLID    = &D1.EMPLID
+AND   G1.EMPL_RCD  = &D1.EMPL_RCD
+
+END-SELECT
+
+end-procedure    !Retrieve-tsp-emp-data-rcd
+
+!**********************************************************************
+begin-procedure Compare-tsp-data
+!
+!Description:  Compare current data with data that was last sent to
+!              the thrift board.
+!**********************************************************************
+
+let $emp-data-changed = 'N'
+
+if $tsp-status <> &G1.GVT_TSP_STATUS
+    let $emp-data-changed = 'Y'
+    let $out-tsp-status   = $tsp-status
+    let $out-tsp-sdate    = $tsp-sdate
+else
+    let $out-tsp-status   = &G1.GVT_TSP_STATUS
+    let $out-tsp-sdate    = &G1.GVT_TSP_STATUS
+end-if
+
+if &D1.GVT_SUB_AGENCY <> &G1.GVT_SUB_AGENCY
+    let $emp-data-changed = 'Y'
+    let $out-sub-agency   = &D1.GVT_SUB_AGENCY
+    let $out-agyprv       = &G1.GVT_SUB_AGENCY
+else
+    let $out-sub-agency   = &G1.GVT_SUB_AGENCY
+    let $out-agyprv       = &G1.GVT_TSP_AGYPRV
+end-if
+
+if $gvt_agy_tsp_id <> &G1.GVT_AGY_TSP_ID
+    let $emp-data-changed = 'Y'
+    let $out-agy-tsp-id   = $gvt_agy_tsp_id
+    let $out-deptprv      = &G1.GVT_AGY_TSP_ID
+else
+    let $out-agy-tsp-id   = &G1.GVT_AGY_TSP_ID
+    let $out-deptprv      = &G1.GVT_TSP_DEPTPRV
+end-if
+
+if &D1.GVT_POI <> &G1.GVT_POI
+    let $emp-data-changed = 'Y'
+    let $out-poi          = &D1.GVT_POI
+else
+    let $out-poi          = &G1.GVT_POI
+end-if
+
+if $gvt_agy_loc_code  <> &G1.GVT_AGY_LOC_CODE
+    let $emp-data-changed = 'Y'
+    let $out-agy-loc-code = $gvt_agy_loc_code
+else
+    let $out-agy-loc-code = &G1.GVT_AGY_LOC_CODE
+end-if
+
+if &D5.GVT_SCD_TSP <> &G1.GVT_SCD_TSP
+    let $emp-data-changed = 'Y'
+    let $out-gvt-scd-tsp  = &D5.GVT_SCD_TSP
+else
+    let $out-gvt-scd-tsp  = &G1.GVT_SCD_TSP
+end-if
+
+if #vest-code <> &G1.GVT_TSP_VEST
+    let $emp-data-changed = 'Y'
+    let $out-vest-code    = to_char(#vest-code)
+else
+    let $out-vest-code    = to_char(&G1.GVT_TSP_VEST)
+    let #vest-code        = &G1.GVT_TSP_VEST
+end-if
+
+let $out-vest-code = substr($out-vest-code,1,1)
+
+if &D1.GVT_RETIRE_PLAN <> &G1.GVT_RETIRE_PLAN
+    let $emp-data-changed = 'Y'
+    let $out-retire-plan  = &D1.GVT_RETIRE_PLAN
+else
+    let $out-retire-plan  = &G1.GVT_RETIRE_PLAN
+end-if
+
+if $sepcode <> &G1.GVT_TSP_SEPCODE and
+    not(isnull(&G1.GVT_TSP_SEPCODE))
+    let $emp-data-changed = 'Y'
+    let $out-sepcode      = $sepcode
+    let $out-sepdate      = $sepdate
+else
+    let $out-sepcode      = &G1.GVT_TSP_SEPCODE
+    let $out-sepdate      = &G1.GVT_TSP_SEPDATE
+end-if
+
+if &D4NID.NATIONAL_ID <> &G1.SSN
+     let $emp-data-changed = 'Y'
+    let $out-ssn          = rtrim(&D4NID.NATIONAL_ID,' ')
+    let $out-ssnprv       = &G1.SSN
+else
+    let $out-ssn          = &G1.SSN
+    let $out-ssnprv       = &G1.GVT_TSP_SSNPRV
+end-if
+
+if &D4.BIRTHDATE  <> &G1.BIRTHDATE
+     let $emp-data-changed = 'Y'
+    let $out-birthdate    = &D4.BIRTHDATE
+    let $out-doberr       = &G1.BIRTHDATE
+else
+    let $out-birthdate    = &G1.BIRTHDATE
+    let $out-doberr       = &G1.GVT_TSP_DOBERR
+end-if
+
+if &D4.NAME <> &G1.NAME
+    let $emp-data-changed = 'Y'
+    let $out-name         = &D4.NAME
+else
+    let $out-name         = &G1.NAME
+end-if
+
+if &D4.ADDRESS1 <> &G1.ADDRESS1 and not(isnull(&D4.ADDRESS1))
+    let $emp-data-changed = 'Y'
+    let $out-address1     = &D4.ADDRESS1
+else
+    let $out-address1     = &G1.ADDRESS1
+end-if
+
+if &D4.ADDRESS2 <> &G1.ADDRESS2 and not(isnull(&D4.ADDRESS2))
+    let $emp-data-changed = 'Y'
+    let $out-address2     = &D4.ADDRESS2
+else
+    let $out-address2     = &G1.ADDRESS2
+end-if
+
+if &D4.ADDRESS3 <> &G1.ADDRESS3 and not(isnull(&D4.ADDRESS3))
+    let $emp-data-changed = 'Y'
+    let $out-address3     = &D4.ADDRESS3
+else
+    let $out-address3     = &G1.ADDRESS3
+end-if
+
+if &D4.CITY <> &G1.CITY and not(isnull(&D4.CITY))
+    let $emp-data-changed = 'Y'
+    let $out-city         = rtrim(&D4.CITY, ' ')
+else
+    let $out-city         = rtrim(&G1.CITY, ' ')
+end-if
+
+if &D4.STATE <> &G1.STATE and not(isnull(&D4.STATE))
+    let $emp-data-changed = 'Y'
+    let $out-state        = rtrim(&D4.STATE, ' ')
+else
+    let $out-state        = rtrim(&G1.STATE, ' ')
+end-if
+
+if &D4.POSTAL <> &G1.ZIP and not(isnull(&D4.POSTAL))
+    let $emp-data-changed = 'Y'
+    let $out-zip          = &D4.POSTAL
+else
+    let $out-zip          = &G1.ZIP
+end-if
+
+end-procedure   !Compare-tsp-data
+
+
+!**********************************************************************
+begin-procedure Update-tsp-emp-data-rcd
+!
+!Description:  When data values have changed the system will update the
+!              TSP_01_HIST record with the new values.
+!**********************************************************************
+
+if isnull($out-address1)
+  let $out-address1 = ' '
+end-if
+
+if isnull($out-address2)
+  let $out-address2 = ' '
+end-if
+
+if isnull($out-address3)
+ let $out-address3 = ' '
+end-if
+
+if isnull($out-city)
+ let $out-city = ' '
+end-if
+
+if isnull($out-state)
+ let $out-state = ' '
+end-if
+
+if isnull($out-zip)
+ let $out-zip = ' '
+else
+ if not isblank($out-zip)
+  let $out-zip = rtrim($out-zip,' ')
+ end-if
+end-if
+
+let #tsp-vest-code = edit(#vest-code,'9')
+
+let $SQL-STATEMENT = 'FGPY002, Update-tsp-emp-data-rcd'
+
+BEGIN-SQL On-Error=SQL-Error
+
+UPDATE PS_GVT_TSP_01_HIST
+  SET SSN              = $out-ssn,
+      BIRTHDATE        = $out-birthdate,
+      PAY_END_DT       = &B1.PAY_END_DT,
+      NAME             = $out-name,
+      GVT_TSP_SSNPRV   = $out-ssnprv,
+      GVT_TSP_DOBERR   = $out-doberr,
+      ADDRESS1         = $out-address1,
+      ADDRESS2         = $out-address2,
+      ADDRESS3         = $out-address3,
+      CITY             = $out-city,
+      STATE            = $out-state,
+      ZIP              = $out-zip,
+      GVT_TSP_STATUS   = $out-tsp-status,
+      STATUS_DT        = $out-tsp-sdate,
+      GVT_AGY_TSP_ID   = $out-agy-tsp-id,
+      GVT_SUB_AGENCY   = $out-sub-agency,
+      GVT_POI          = $out-poi,
+      GVT_AGY_LOC_CODE = $out-agy-loc-code,
+      GVT_SCD_TSP      = $out-gvt-scd-tsp,
+      GVT_TSP_VEST     = #tsp-vest-code,
+      GVT_RETIRE_PLAN  = $out-retire-plan,
+      GVT_TSP_SEPCODE  = $out-sepcode,
+      GVT_TSP_SEPDATE  = $out-sepdate,
+      GVT_TSP_DEPTPRV  = $out-deptprv,
+      GVT_TSP_AGYPRV   = $out-agyprv
+
+  WHERE EMPLID    = &D1.EMPLID
+  AND   EMPL_RCD  = &D1.EMPL_RCD
+
+END-SQL
+
+end-procedure   !Update-tsp-emp-data-rcd
+
+
+!**********************************************************************
+begin-procedure Create-tsp-emp-data-rcd
+!
+!Description: If a TSP employee data history record does not exist then
+!             create one.
+!**********************************************************************
+
+if isnull($out-address1)
+  let $out-address1 = ' '
+end-if
+
+if isnull($out-address2)
+  let $out-address2 = ' '
+end-if
+
+if isnull($out-address3)
+ let $out-address3 = ' '
+end-if
+
+if isnull($out-city)
+ let $out-city = ' '
+end-if
+
+if isnull($out-state)
+ let $out-state = ' '
+end-if
+
+if isnull($out-zip)
+ let $out-zip = ' '
+else
+ if not isblank($out-zip)
+  let $out-zip = rtrim($out-zip,' ')
+ end-if
+end-if
+
+let #vest-code = edit(#vest-code,'9')
+
+let $SQL-STATEMENT = 'FGPY002, Create-tsp-emp-data-rcd'
+
+#IFDEF DB2ALL
+    if ISNULL($out-doberr)
+        let $out-doberr = $AsOfToday
+        let $doberr-change = 'Y'
+    else
+        let $doberr-change = 'N'
+    end-if
+
+    if ISNULL($out-birthdate)
+        let $out-birthdate = $AsOfToday
+        let $birthdate-change = 'Y'
+    else
+        let $birthdate-change = 'N'
+    end-if
+
+    if ISNULL($out-sepdate)
+        let $out-sepdate = $AsOfToday
+        let $sepdate-change = 'Y'
+    else
+        let $sepdate-change = 'N'
+    end-if
+
+    if ISNULL($out-gvt-scd-tsp)
+        let $out-gvt-scd-tsp = $AsOfToday
+        let $scd-tsp-change = 'Y'
+    else
+        let $scd-tsp-change = 'N'
+    end-if
+#END-IF
+
+BEGIN-SQL On-Error=SQL-Error
+
+INSERT INTO PS_GVT_TSP_01_HIST
+
+         (EMPLID,
+          EMPL_RCD,
+          SSN,
+          BIRTHDATE,
+          PAY_END_DT,
+          NAME,
+          GVT_TSP_SSNPRV,
+          GVT_TSP_DOBERR,
+          ADDRESS1,
+          ADDRESS2,
+          ADDRESS3,
+          CITY,
+          STATE,
+          ZIP,
+          GVT_TSP_STATUS,
+          STATUS_DT,
+          GVT_AGY_TSP_ID,
+          GVT_SUB_AGENCY,
+          GVT_POI,
+          GVT_AGY_LOC_CODE,
+          GVT_SCD_TSP,
+          GVT_TSP_VEST,
+          GVT_RETIRE_PLAN,
+          GVT_TSP_SEPCODE,
+          GVT_TSP_SEPDATE,
+          GVT_TSP_DEPTPRV,
+          GVT_TSP_AGYPRV)
+
+  VALUES (&D1.EMPLID,
+          &D1.EMPL_RCD,
+          $out-ssn,
+          $out-birthdate,
+          &B1.PAY_END_DT,
+          $out-name,
+          $out-ssnprv,
+          $out-doberr,
+          $out-address1,
+          $out-address2,
+          $out-address3,
+          $out-city,
+          $out-state,
+          $out-zip,
+          $out-tsp-status,
+          $out-tsp-sdate,
+          $out-agy-tsp-id,
+          $out-sub-agency,
+          $out-poi,
+          $out-agy-loc-code,
+          $out-gvt-scd-tsp,
+          #vest-code,
+          $out-retire-plan,
+          $out-sepcode,
+          $out-sepdate,
+          $out-deptprv,
+          $out-agyprv
+          )
+END-SQL
+
+#IFDEF DB2ALL
+    if $doberr-change = 'Y'
+        do Update-tsp-emp-data-rcd-dob
+    end-if
+
+    if $birthdate-change = 'Y'
+        do Update-tsp-emp-data-rcd-bd
+    end-if
+    if $sepdate-change = 'Y'
+        do Update-tsp-emp-data-rcd-sep
+    end-if
+
+    if $scd-tsp-change = 'Y'
+        do Update-tsp-emp-data-rcd-scd
+    end-if
+
+#END-IF
+
+end-procedure   !Create-tsp-emp-data-rcd
+
+
+!***********************************************************************
+begin-procedure Update-tsp-emp-data-rcd-dob
+!
+!Description:  Update changed date value from DB2 insert
+!***********************************************************************
+
+let $SQL-STATEMENT = 'FGPY002, Update-tsp-emp-data-rcd-db2'
+
+BEGIN-SQL On-Error=SQL-Error
+
+UPDATE PS_GVT_TSP_01_HIST
+  SET GVT_TSP_DOBERR = NULL
+  WHERE EMPLID    = &D1.EMPLID
+  AND   EMPL_RCD  = &D1.EMPL_RCD
+
+END-SQL
+
+end-procedure   !Update-tsp-emp-data-rcd-dob
+
+
+!***********************************************************************
+begin-procedure Update-tsp-emp-data-rcd-bd
+!
+!Description:  Update changed date value from DB2 insert
+!***********************************************************************
+
+let $SQL-STATEMENT = 'FGPY002, Update-tsp-emp-data-rcd-bd'
+
+BEGIN-SQL On-Error=SQL-Error
+
+UPDATE PS_GVT_TSP_01_HIST
+  SET BIRTHDATE = NULL
+  WHERE EMPLID    = &D1.EMPLID
+  AND   EMPL_RCD  = &D1.EMPL_RCD
+
+END-SQL
+
+end-procedure   !Update-tsp-emp-data-rcd-bd
+
+
+!***********************************************************************
+begin-procedure Update-tsp-emp-data-rcd-sep
+!
+!Description:  Update changed date value from DB2 insert
+!***********************************************************************
+
+let $SQL-STATEMENT = 'FGPY002, Update-tsp-emp-data-rcd-sep'
+
+BEGIN-SQL On-Error=SQL-Error
+
+UPDATE PS_GVT_TSP_01_HIST
+  SET GVT_TSP_SEPDATE = NULL
+  WHERE EMPLID    = &D1.EMPLID
+  AND   EMPL_RCD  = &D1.EMPL_RCD
+
+END-SQL
+
+end-procedure   !Update-tsp-emp-data-rcd-sep
+
+
+!***********************************************************************
+begin-procedure Update-tsp-emp-data-rcd-scd
+!
+!Description:  Update changed date value from DB2 insert
+!***********************************************************************
+
+let $SQL-STATEMENT = 'FGPY002, Update-tsp-emp-data-rcd-scd'
+
+BEGIN-SQL On-Error=SQL-Error
+
+UPDATE PS_GVT_TSP_01_HIST
+  SET GVT_SCD_TSP = NULL
+  WHERE EMPLID    = &D1.EMPLID
+  AND   EMPL_RCD  = &D1.EMPL_RCD
+
+END-SQL
+
+end-procedure   !Update-tsp-emp-data-rcd-scd
+
+
+!**********************************************************************
+begin-procedure Insert-into-work-tbl
+!
+!Description:  As TSP records are created, format the data and insert
+!              it into the work table.
+!**********************************************************************
+
+let #fund-c-amt = 0
+let #fund-f-amt = 0
+let #fund-g-amt = 0
+let #fund-s-amt = 0
+let #fund-i-amt = 0
+
+!**** Initialize fields that will be used for record type (11)
+let #ea-g-no        = 0
+let $ea-g-char      = ' '
+let #ea-f-no        = 0
+let $ea-f-char      = ' '
+let #ea-c-no        = 0
+let $ea-c-char      = ' '
+let #ea-s-no        = 0
+let $ea-s-char      = ' '
+let #ea-i-no        = 0
+let $ea-i-char      = ' '
+let #ea-tot-no      = 0
+let $ea-tot-char    = ' '
+
+let $pra-g-char     = '000000 '
+let $pra-f-char     = '000000 '
+let $pra-c-char     = '000000 '
+let $pra-s-char     = '000000 '
+let $pra-i-char     = '000000 '
+let $pra-tot-char   = '000000 '
+
+let #gb-g-no        = 0
+let $gb-g-char      = ' '
+let #gb-f-no        = 0
+let $gb-f-char      = ' '
+let #gb-c-no        = 0
+let $gb-c-char      = ' '
+let #gb-s-no        = 0
+let $gb-s-char      = ' '
+let #gb-i-no        = 0
+let $gb-i-char      = ' '
+let #gb-tot-no      = 0
+let $gb-tot-char    = ' '
+
+let #gm-g-no        = 0
+let $gm-g-char      = ' '
+let #gm-f-no        = 0
+let $gm-f-char      = ' '
+let #gm-c-no        = 0
+let $gm-c-char      = ' '
+let #gm-s-no        = 0
+let $gm-s-char      = ' '
+let #gm-i-no        = 0
+let $gm-i-char      = ' '
+let #gm-tot-no      = 0
+let $gm-tot-char    = ' '
+
+!**** Initialize fields that will be used for record types (21,41)
+let #ea-adj-g-no   = 0
+let $ea-adj-g-char = ' '
+let #ea-adj-f-no   = 0
+let $ea-adj-f-char = ' '
+let #ea-adj-c-no   = 0
+let $ea-adj-c-char = ' '
+let #ea-adj-s-no   = 0
+let $ea-adj-s-char = ' '
+let #ea-adj-i-no   = 0
+let $ea-adj-i-char = ' '
+let #ea-adj-tot-no   = 0
+let $ea-adj-tot-char = ' '
+
+let $pra-adj-g-char = '000000 '
+let $pra-adj-f-char = '000000 '
+let $pra-adj-c-char = '000000 '
+let $pra-adj-s-char = '000000 '
+let $pra-adj-i-char = '000000 '
+let $pra-adj-tot-char = '000000 '
+
+let #gb-adj-g-no   = 0
+let $gb-adj-g-char = ' '
+let #gb-adj-f-no   = 0
+let $gb-adj-f-char = ' '
+let #gb-adj-c-no   = 0
+let $gb-adj-c-char = ' '
+let #gb-adj-s-no   = 0
+let $gb-adj-s-char = ' '
+let #gb-adj-i-no   = 0
+let $gb-adj-i-char = ' '
+let #gb-adj-tot-no   = 0
+let $gb-adj-tot-char = ' '
+
+let #gm-adj-g-no   = 0
+let $gm-adj-g-char = ' '
+let #gm-adj-f-no   = 0
+let $gm-adj-f-char = ' '
+let #gm-adj-c-no   = 0
+let $gm-adj-c-char = ' '
+let #gm-adj-s-no   = 0
+let $gm-adj-s-char = ' '
+let #gm-adj-i-no   = 0
+let $gm-adj-i-char = ' '
+let #gm-adj-tot-no   = 0
+let $gm-adj-tot-char = ' '
+
+!if RTRIM($out-birthdate, ' ') <> ''
+!    if &VER.GVT_TSP_VERSION = 'N'
+!        let $sort-birthdate = datetostr($out-birthdate,'YYYYMMDD')
+!    else
+!        let $sort-birthdate = datetostr($out-birthdate,'YYMMDD')
+!    end-if
+!end-if
+
+let $out-ssn = rtrim($out-ssn,' ')
+
+!let $out-sort-data = $out-ssn || $sort-birthdate || $out-effdt || $out-rcdno
+let $out-sort-data = $out-ssn || $out-effdt || $out-rcdno
+
+
+evaluate $out-rcdno
+
+    when = $emp-data-rcdno     !Employee Data Record
+
+        let $tsp-trans_cd = 'D'
+
+        let #tot-rcnt-data = #tot-rcnt-data + 1
+
+        let $name = $out-name
+        do rotate-name   !Returns $LastName, $FirstName, $MidInitial
+
+        if RTRIM($out-doberr, ' ') <> ''
+            do Format-DateTime($out-doberr, $out, {DEFDATE}, '', '')
+            let $out1 = substr($out,1,2)
+            let $out2 = substr($out,4,2)
+            if &VER.GVT_TSP_VERSION = 'N'
+                let $out3 = substr($out,7,4)
+            else
+                let $out3 = substr($out,9,2)
+            end-if
+            let $out-doberr = $out3 || $out1 || $out2
+        end-if
+        if RTRIM($out-birthdate, ' ') <> ''
+            do Format-DateTime($out-birthdate, $out, {DEFDATE}, '', '')
+            let $out1 = substr($out,1,2)
+            let $out2 = substr($out,4,2)
+            if &VER.GVT_TSP_VERSION = 'N'
+                let $out3 = substr($out,7,4)
+            else
+                let $out3 = substr($out,9,2)
+            end-if
+            let $out-birthdate = $out3 || $out1 || $out2
+        end-if
+        if RTRIM($out-tsp-sdate, ' ') <> ''
+            do Format-DateTime($out-tsp-sdate, $out, {DEFDATE}, '', '')
+            let $out1 = substr($out,1,2)
+            let $out2 = substr($out,4,2)
+            if &VER.GVT_TSP_VERSION = 'N'
+                let $out3 = substr($out,7,4)
+            else
+                let $out3 = substr($out,9,2)
+            end-if
+            let $out-tsp-sdate = $out3 || $out1 || $out2
+       end-if
+       if RTRIM($out-gvt-scd-tsp, ' ') <> ''
+           do Format-DateTime($out-gvt-scd-tsp, $out,{DEFDATE}, '', '')
+           let $out1 = substr($out,1,2)
+           let $out2 = substr($out,4,2)
+            if &VER.GVT_TSP_VERSION = 'N'
+               let $out3 = substr($out,7,4)
+            else
+               let $out3 = substr($out,9,2)
+            end-if
+            let $out-gvt-scd-tsp = $out3 || $out1 || $out2
+       end-if
+       if RTRIM($out-sepdate, ' ') <> ''
+           do Format-DateTime($out-sepdate, $out,{DEFDATE}, '', '')
+           let $out1 = substr($out,1,2)
+           let $out2 = substr($out,4,2)
+            if &VER.GVT_TSP_VERSION = 'N'
+                let $out3 = substr($out,7,4)
+            else
+                let $out3 = substr($out,9,2)
+            end-if
+            let $out-sepdate = $out3 || $out1 || $out2
+       end-if
+
+       uppercase $LastName
+       uppercase $FirstName
+       uppercase $MidInitial
+       uppercase $out-address1
+       uppercase $out-address2
+       uppercase $out-address3
+       uppercase $out-city
+
+       if length($out-address1) > 25
+            let $tmp1 = $out-address1
+            let $out-address1 = substr($tmp1, 1, 25)
+            let $out-address2 = rtrim(substr($tmp1, 26, 10), ' ') || ' ' || $out-address2
+       End-if
+       if length($out-address2) > 25
+            let $tmp2 = $out-address2
+            let $out-address2 = substr($tmp2, 1, 25)
+            let $out-address3 = rtrim(substr($tmp2, 26, 10), ' ') || ' ' || $out-address3
+       End-if
+       if length($out-address3) > 25
+            let $out-address3 = substr($out-address3, 1, 25)
+       End-if
+
+       if &VER.GVT_TSP_VERSION = 'N'
+           let $out-data =
+           RPAD($LastName, 17, ' ')               ||
+           RPAD($FirstName, 12, ' ')              ||
+           RPAD($MidInitial, 12, ' ')             ||
+           RPAD($out-ssnprv, 9, ' ')              ||
+           RPAD($out-doberr, 8, ' ')              ||
+           RPAD($out-address1, 25, ' ')           ||
+           RPAD($out-address2, 25, ' ')           ||
+           RPAD($out-address3, 25, ' ')           ||
+           RPAD($out-city, 20, ' ')               ||
+           RPAD($out-state, 3, ' ')               ||
+           RPAD(translate($out-zip,'-','') 9,' ') ||
+           RPAD($out-tsp-status, 1, ' ')          ||
+           RPAD($out-tsp-sdate, 8, ' ')           ||
+           RPAD($out-agy-tsp-id, 2, ' ')          ||
+           RPAD($out-sub-agency, 2, ' ')          ||
+           RPAD($out-poi, 4, ' ')                 ||
+           RPAD($out-agy-loc-code, 8, ' ')        ||
+           RPAD($out-gvt-scd-tsp, 8, ' ')         ||
+           RPAD($out-vest-code, 1, ' ')           ||
+           RPAD($out-retire-plan, 1, ' ')         ||
+           RPAD($out-sepcode, 1, ' ')             ||
+           RPAD($out-sepdate, 8, ' ')             ||
+           RPAD($out-deptprv, 2, ' ')             ||
+           RPAD($out-agyprv, 2, ' ')
+     else
+           let $out-data =
+           RPAD($LastName, 17, ' ')               ||
+           RPAD($FirstName, 12, ' ')              ||
+           RPAD($MidInitial, 12, ' ')             ||
+           RPAD($out-ssnprv, 9, ' ')              ||
+           RPAD($out-doberr, 6, ' ')              ||
+           RPAD($out-address1, 25, ' ')           ||
+           RPAD($out-address2, 25, ' ')           ||
+           RPAD($out-address3, 25, ' ')           ||
+           RPAD($out-city, 20, ' ')               ||
+           RPAD($out-state, 3, ' ')               ||
+           RPAD(translate($out-zip,'-','') 9,' ') ||
+           RPAD($out-tsp-status, 1, ' ')          ||
+           RPAD($out-tsp-sdate, 6, ' ')           ||
+           RPAD($out-agy-tsp-id, 2, ' ')          ||
+           RPAD($out-sub-agency, 2, ' ')          ||
+           RPAD($out-poi, 4, ' ')                 ||
+           RPAD($out-agy-loc-code, 8, ' ')        ||
+           RPAD($out-gvt-scd-tsp, 6, ' ')         ||
+           RPAD($out-vest-code, 1, ' ')           ||
+           RPAD($out-retire-plan, 1, ' ')         ||
+           RPAD($out-sepcode, 1, ' ')             ||
+           RPAD($out-sepdate, 6, ' ')             ||
+           RPAD($out-deptprv, 2, ' ')             ||
+           RPAD($out-agyprv, 2, ' ')
+    end-if
+
+    when = $curr-pay-rcdno                      !Regular Payments
+
+
+        let $tsp-trans_cd = 'P'
+
+        if $out-sort-data <> $last-out-sort-data
+            let #tot-rcnt-reg = #tot-rcnt-reg + 1
+        end-if
+
+        !**** distribute deduction amt across the funds
+        if #fund-c-pct > 0
+            let #fund-c-amt = #ded_cur * (#fund-c-pct / 100)
+            let #fund-c-amt = round(#fund-c-amt,2)
+        end-if
+        if #fund-f-pct > 0
+            let #fund-f-amt =  #ded_cur * (#fund-f-pct / 100)
+            let #fund-f-amt = round(#fund-f-amt,2)
+        end-if
+        if #fund-g-pct > 0
+            let #fund-g-amt =  #ded_cur * (#fund-g-pct / 100)
+            let #fund-g-amt = round(#fund-g-amt,2)
+        end-if
+        if #fund-s-pct > 0
+            let #fund-s-amt =  #ded_cur * (#fund-s-pct / 100)
+            let #fund-s-amt = round(#fund-s-amt,2)
+        end-if
+        if #fund-i-pct > 0
+            let #fund-i-amt =  #ded_cur * (#fund-i-pct / 100)
+            let #fund-i-amt = round(#fund-i-amt,2)
+        end-if
+
+        let #round-diff = round(#ded_cur - (#fund-c-amt + #fund-f-amt + #fund-g-amt + #fund-s-amt + #fund-i-amt),2)
+
+        if #round-diff >= 0.01 or #round-diff <= -0.01
+            do correct-rounding-error
+        end-if
+
+        if #fund-c-pct > 0
+            let $investment_opt = 'C'
+            let #investment_pct = #fund-c-pct
+            let #ded_cur = #fund-c-amt
+            do insert-pay-tsp-rcd
+        end-if
+        if #fund-f-pct > 0
+            let $investment_opt = 'F'
+            let #investment_pct = #fund-f-pct
+            let #ded_cur = #fund-f-amt
+            do insert-pay-tsp-rcd
+        end-if
+        if #fund-g-pct > 0
+            let $investment_opt = 'G'
+            let #investment_pct = #fund-g-pct
+            let #ded_cur = #fund-g-amt
+            do insert-pay-tsp-rcd
+        end-if
+        if #fund-s-pct > 0
+            let $investment_opt = 'S'
+            let #investment_pct = #fund-s-pct
+            let #ded_cur = #fund-s-amt
+            do insert-pay-tsp-rcd
+        end-if
+        if #fund-i-pct > 0
+            let $investment_opt = 'I'
+            let #investment_pct = #fund-i-pct
+            let #ded_cur = #fund-i-amt
+            do insert-pay-tsp-rcd
+        end-if
+
+
+    when =$late-pay-recdno                           !Late Payment
+        let $tsp-trans_cd = 'L'
+
+
+        if $out-sort-data <> $last-out-sort-data
+           let #tot-rcnt-late = #tot-rcnt-late + 1
+        end-if
+
+
+        !**** distribute deduction amt across the funds
+        if #fund-c-pct > 0
+            let #fund-c-amt = #ded_cur  * (#fund-c-pct / 100)
+            let #fund-c-amt = round(#fund-c-amt,2)
+
+        end-if
+        if #fund-f-pct > 0
+            let #fund-f-amt = #ded_cur  * (#fund-f-pct / 100)
+            let #fund-f-amt = round(#fund-f-amt,2)
+        end-if
+        if #fund-g-pct > 0
+            let #fund-g-amt = #ded_cur  * (#fund-g-pct / 100)
+            let #fund-g-amt = round(#fund-g-amt,2)
+        end-if
+        if #fund-s-pct > 0
+            let #fund-s-amt = #ded_cur  * (#fund-s-pct / 100)
+            let #fund-s-amt = round(#fund-s-amt,2)
+        end-if
+        if #fund-i-pct > 0
+            let #fund-i-amt = #ded_cur  * (#fund-i-pct / 100)
+            let #fund-i-amt = round(#fund-i-amt,2)
+        end-if
+
+        let #round-diff = round(#ded_cur  - (#fund-c-amt + #fund-f-amt + #fund-g-amt + #fund-s-amt + #fund-i-amt),2)
+
+        if #round-diff >= 0.01 or #round-diff <= -0.01
+            do correct-rounding-error
+        end-if
+
+        if #fund-c-pct > 0
+            let $investment_opt = 'C'
+            let #investment_pct = #fund-c-pct
+            let #ded_cur = #fund-c-amt
+            do insert-pay-tsp-rcd
+        end-if
+        if #fund-f-pct > 0
+            let $investment_opt = 'F'
+            let #investment_pct = #fund-f-pct
+            let #ded_cur = #fund-f-amt
+            do insert-pay-tsp-rcd
+        end-if
+        if #fund-g-pct > 0
+            let $investment_opt = 'G'
+            let #investment_pct = #fund-g-pct
+            let #ded_cur = #fund-g-amt
+            do insert-pay-tsp-rcd
+        end-if
+        if #fund-s-pct > 0
+            let $investment_opt = 'S'
+            let #investment_pct = #fund-s-pct
+            let #ded_cur = #fund-s-amt
+            do insert-pay-tsp-rcd
+        end-if
+        if #fund-i-pct > 0
+            let $investment_opt = 'I'
+            let #investment_pct = #fund-i-pct
+            let #ded_cur = #fund-i-amt
+            do insert-pay-tsp-rcd
+        end-if
+
+
+
+when = $neg-adj-rcdno                       !Negative Adjustment
+
+        let $tsp-trans_cd = 'N'
+
+        if $out-sort-data <> $last-out-sort-data
+            let #tot-rcnt-adj = #tot-rcnt-adj + 1
+        end-if
+
+        !**** distribute deduction amt across the funds
+        if #fund-c-pct > 0
+            let #fund-c-amt = #ded_cur_refund * (#fund-c-pct / 100)
+            let #fund-c-amt = round(#fund-c-amt,2)
+
+        end-if
+        if #fund-f-pct > 0
+            let #fund-f-amt = #ded_cur_refund  * (#fund-f-pct / 100)
+            let #fund-f-amt = round(#fund-f-amt,2)
+        end-if
+        if #fund-g-pct > 0
+            let #fund-g-amt = #ded_cur_refund  * (#fund-g-pct / 100)
+            let #fund-g-amt = round(#fund-g-amt,2)
+        end-if
+        if #fund-s-pct > 0
+            let #fund-s-amt = #ded_cur_refund  * (#fund-s-pct / 100)
+            let #fund-s-amt = round(#fund-s-amt,2)
+        end-if
+        if #fund-i-pct > 0
+            let #fund-i-amt = #ded_cur_refund  * (#fund-i-pct / 100)
+            let #fund-i-amt = round(#fund-i-amt,2)
+        end-if
+
+        let #round-diff = round(#ded_cur_refund  - (#fund-c-amt + #fund-f-amt + #fund-g-amt + #fund-s-amt + #fund-i-amt),2)
+
+        if #round-diff >= 0.01 or #round-diff <= -0.01
+            do correct-rounding-error
+        end-if
+
+        if #fund-c-pct > 0
+            let $investment_opt = 'C'
+            let #investment_pct = #fund-c-pct
+            let #ded_cur = #fund-c-amt
+            do insert-pay-tsp-rcd
+        end-if
+        if #fund-f-pct > 0
+            let $investment_opt = 'F'
+            let #investment_pct = #fund-f-pct
+            let #ded_cur = #fund-f-amt
+            do insert-pay-tsp-rcd
+        end-if
+        if #fund-g-pct > 0
+            let $investment_opt = 'G'
+            let #investment_pct = #fund-g-pct
+            let #ded_cur = #fund-g-amt
+            do insert-pay-tsp-rcd
+        end-if
+        if #fund-s-pct > 0
+            let $investment_opt = 'S'
+            let #investment_pct = #fund-s-pct
+            let #ded_cur = #fund-s-amt
+            do insert-pay-tsp-rcd
+        end-if
+        if #fund-i-pct > 0
+            let $investment_opt = 'I'
+            let #investment_pct = #fund-i-pct
+            let #ded_cur = #fund-i-amt
+            do insert-pay-tsp-rcd
+        end-if
+
+end-evaluate
+
+if $out-rcdno = $curr-pay-rcdno
+
+!**** Determine to which extract buckets the data from the current ded belong.
+    if $reporting_cd = 'TB'
+
+        let #gb-g-no         = #fund-g-amt
+        let #gb-f-no         = #fund-f-amt
+        let #gb-c-no         = #fund-c-amt
+        let #gb-s-no         = #fund-s-amt
+        let #gb-i-no         = #fund-i-amt
+        let #gb-tot-no       = #fund-g-amt + #fund-f-amt + #fund-c-amt + #fund-s-amt + #fund-i-amt
+        let #gb-grand-total  = #gb-grand-total + #gb-tot-no
+        let #agy-basic-reg-g = #agy-basic-reg-g + #fund-g-amt
+        let #agy-basic-reg-f = #agy-basic-reg-f + #fund-f-amt
+        let #agy-basic-reg-c = #agy-basic-reg-c + #fund-c-amt
+        let #agy-basic-reg-s = #agy-basic-reg-s + #fund-s-amt
+        let #agy-basic-reg-i = #agy-basic-reg-i + #fund-i-amt
+
+    else
+
+        if $ded_class  = 'B'
+
+            let #ea-g-no           = #fund-g-amt
+            let #ea-f-no           = #fund-f-amt
+            let #ea-c-no           = #fund-c-amt
+            let #ea-s-no           = #fund-s-amt
+            let #ea-i-no           = #fund-i-amt
+            let #ea-tot-no         = #fund-g-amt + #fund-f-amt + #fund-c-amt + #fund-s-amt + #fund-i-amt
+            let #ea-grand-total    = #ea-grand-total + #ea-tot-no
+            let #emp-contrib-reg-g = #emp-contrib-reg-g + #fund-g-amt
+            let #emp-contrib-reg-f = #emp-contrib-reg-f + #fund-f-amt
+            let #emp-contrib-reg-c = #emp-contrib-reg-c + #fund-c-amt
+            let #emp-contrib-reg-s = #emp-contrib-reg-s + #fund-s-amt
+            let #emp-contrib-reg-i = #emp-contrib-reg-i + #fund-i-amt
+
+        else
+
+            let #gm-g-no         = #fund-g-amt
+            let #gm-f-no         = #fund-f-amt
+            let #gm-c-no         = #fund-c-amt
+            let #gm-s-no         = #fund-s-amt
+            let #gm-i-no         = #fund-i-amt
+            let #gm-tot-no       = #fund-g-amt + #fund-f-amt + #fund-c-amt + #fund-s-amt + #fund-i-amt
+            let #gm-grand-total  = #gm-grand-total + #gm-tot-no
+            let #agy-contrib-reg-g = #agy-contrib-reg-g + #fund-g-amt
+            let #agy-contrib-reg-f = #agy-contrib-reg-f + #fund-f-amt
+            let #agy-contrib-reg-c = #agy-contrib-reg-c + #fund-c-amt
+            let #agy-contrib-reg-s = #agy-contrib-reg-s + #fund-s-amt
+            let #agy-contrib-reg-i = #agy-contrib-reg-i + #fund-i-amt
+
+       end-if
+
+    end-if
+
+
+    do Retrieve-tsp-id
+
+    if $out-sort-data = $last-out-sort-data
+        let #ea-g-no    = #ea-g-no    + #last-ea-g-no
+        let #ea-f-no    = #ea-f-no    + #last-ea-f-no
+        let #ea-c-no    = #ea-c-no    + #last-ea-c-no
+        let #ea-s-no    = #ea-s-no    + #last-ea-s-no
+        let #ea-i-no    = #ea-i-no    + #last-ea-i-no
+        let #ea-tot-no  = #ea-tot-no  + #last-ea-tot-no
+
+        let #pra-g-no   = #pra-g-no   + #last-pra-g-no
+        let #pra-f-no   = #pra-f-no   + #last-pra-f-no
+        let #pra-c-no   = #pra-c-no   + #last-pra-c-no
+        let #pra-s-no   = #pra-s-no   + #last-pra-s-no
+        let #pra-i-no   = #pra-i-no   + #last-pra-i-no
+        let #pra-tot-no = #pra-tot-no + #last-pra-tot-no
+
+        let #gb-g-no    = #gb-g-no    + #last-gb-g-no
+        let #gb-f-no    = #gb-f-no    + #last-gb-f-no
+        let #gb-c-no    = #gb-c-no    + #last-gb-c-no
+        let #gb-s-no    = #gb-s-no    + #last-gb-s-no
+        let #gb-i-no    = #gb-i-no    + #last-gb-i-no
+        let #gb-tot-no  = #gb-tot-no  + #last-gb-tot-no
+
+        let #gm-g-no    = #gm-g-no    + #last-gm-g-no
+        let #gm-f-no    = #gm-f-no    + #last-gm-f-no
+        let #gm-c-no    = #gm-c-no    + #last-gm-c-no
+        let #gm-s-no    = #gm-s-no    + #last-gm-s-no
+        let #gm-i-no    = #gm-i-no    + #last-gm-i-no
+        let #gm-tot-no  = #gm-tot-no  + #last-gm-tot-no
+    End-if
+
+    let #last-ea-g-no    = #ea-g-no
+    let #last-ea-f-no    = #ea-f-no
+    let #last-ea-c-no    = #ea-c-no
+    let #last-ea-s-no    = #ea-s-no
+    let #last-ea-i-no    = #ea-i-no
+    let #last-ea-tot-no  = #ea-tot-no
+
+    let #last-pra-g-no   = #pra-g-no
+    let #last-pra-f-no   = #pra-f-no
+    let #last-pra-c-no   = #pra-c-no
+    let #last-pra-s-no   = #pra-s-no
+    let #last-pra-i-no   = #pra-i-no
+    let #last-pra-tot-no = #pra-tot-no
+
+    let #last-gb-g-no    = #gb-g-no
+    let #last-gb-f-no    = #gb-f-no
+    let #last-gb-c-no    = #gb-c-no
+    let #last-gb-s-no    = #gb-s-no
+    let #last-gb-i-no    = #gb-i-no
+    let #last-gb-tot-no  = #gb-tot-no
+
+    let #last-gm-g-no    = #gm-g-no
+    let #last-gm-f-no    = #gm-f-no
+    let #last-gm-c-no    = #gm-c-no
+    let #last-gm-s-no    = #gm-s-no
+    let #last-gm-i-no    = #gm-i-no
+    let #last-gm-tot-no  = #gm-tot-no
+
+    do Format-Number(#gm-g-no, $gm-g-char,   '0999V99mi')
+    let $temp1 =  substr($gm-g-char,6,2)
+    do overpunch($temp1, $temp2)
+    let $gm-g-char = substr($gm-g-char,1,5) || rtrim($temp2,' ')
+
+    do Format-Number(#gm-f-no, $gm-f-char,   '0999V99mi')
+    let $temp1 =  substr($gm-f-char,6,2)
+    do overpunch($temp1, $temp2)
+    let $gm-f-char = substr($gm-f-char,1,5) || rtrim($temp2,' ')
+
+    do Format-Number(#gm-c-no, $gm-c-char,   '0999V99mi')
+    let $temp1 =  substr($gm-c-char,6,2)
+    do overpunch($temp1, $temp2)
+    let $gm-c-char = substr($gm-c-char,1,5) || rtrim($temp2,' ')
+
+    do Format-Number(#gm-tot-no, $gm-tot-char,  '0999V99mi')
+    let $temp1 =  substr($gm-tot-char,6,2)
+    do overpunch($temp1, $temp2)
+    let $gm-tot-char = substr($gm-tot-char,1,5) || rtrim($temp2,' ')
+
+    do Format-Number(#gb-g-no, $gb-g-char,   '0999V99mi')
+    let $temp1 =  substr($gb-g-char,6,2)
+    do overpunch($temp1, $temp2)
+    let $gb-g-char = substr($gb-g-char,1,5) || rtrim($temp2,' ')
+
+    do Format-Number(#gb-f-no, $gb-f-char,   '0999V99mi')
+    let $temp1 =  substr($gb-f-char,6,2)
+    do overpunch($temp1, $temp2)
+    let $gb-f-char = substr($gb-f-char,1,5) || rtrim($temp2,' ')
+
+    do Format-Number(#gb-c-no, $gb-c-char,   '0999V99mi')
+    let $temp1 =  substr($gb-c-char,6,2)
+    do overpunch($temp1, $temp2)
+    let $gb-c-char = substr($gb-c-char,1,5) || rtrim($temp2,' ')
+
+    do Format-Number(#gb-tot-no, $gb-tot-char,  '0999V99mi')
+    let $temp1 =  substr($gb-tot-char,6,2)
+    do overpunch($temp1, $temp2)
+    let $gb-tot-char = substr($gb-tot-char,1,5) || rtrim($temp2,' ')
+
+    do Format-Number(#ea-g-no, $ea-g-char,   '0999V99mi')
+    let $temp1 =  substr($ea-g-char,6,2)
+    do overpunch($temp1, $temp2)
+    let $ea-g-char = substr($ea-g-char,1,5) || rtrim($temp2,' ')
+
+    do Format-Number(#ea-f-no, $ea-f-char,   '0999V99mi')
+    let $temp1 =  substr($ea-f-char,6,2)
+    do overpunch($temp1, $temp2)
+    let $ea-f-char = substr($ea-f-char,1,5) || rtrim($temp2,' ')
+
+    do Format-Number(#ea-c-no, $ea-c-char,   '0999V99mi')
+    let $temp1 =  substr($ea-c-char,6,2)
+    do overpunch($temp1, $temp2)
+    let $ea-c-char = substr($ea-c-char,1,5) || rtrim($temp2,' ')
+
+    do Format-Number(#ea-tot-no, $ea-tot-char,  '0999V99mi')
+    let $temp1 =  substr($ea-tot-char,6,2)
+    do overpunch($temp1, $temp2)
+    let $ea-tot-char = substr($ea-tot-char,1,5) || rtrim($temp2,' ')
+
+    if &VER.GVT_TSP_VERSION = 'N'
+
+        let $out-data =
+          $blanks18                            ||
+          rtrim($ea-tot-char,' ')              ||
+          $blanks42                            ||
+          rtrim($gb-tot-char,' ')              ||
+          $blanks18                            ||
+          rtrim($gm-tot-char,' ')              ||
+          rtrim($gvt_agy_tsp_id,' ')           ||
+          rtrim(&O1.GVT_SUB_AGENCY,' ')
+    else
+        let $out-data =
+          rtrim($ea-g-char,' ')                ||
+          rtrim($ea-f-char,' ')                ||
+          rtrim($ea-c-char,' ')                ||
+          rtrim($ea-tot-char,' ')              ||
+          rtrim($pra-g-char,' ')               ||
+          rtrim($pra-f-char,' ')               ||
+          rtrim($pra-c-char,' ')               ||
+          rtrim($pra-tot-char,' ')             ||
+          rtrim($gb-g-char,' ')                ||
+          rtrim($gb-f-char,' ')                ||
+          rtrim($gb-c-char,' ')                ||
+          rtrim($gb-tot-char,' ')              ||
+          rtrim($gm-g-char,' ')                ||
+          rtrim($gm-f-char,' ')                ||
+          rtrim($gm-c-char,' ')                ||
+          rtrim($gm-tot-char,' ')              ||
+          rtrim($gvt_agy_tsp_id,' ')           ||
+          rtrim(&O1.GVT_SUB_AGENCY,' ')
+    end-if
+
+end-if
+
+if $out-rcdno = $neg-adj-rcdno or $out-rcdno = $late-pay-rcdno
+
+!**** Determine to which extract buckets the data from the current ded belong.
+    if $reporting_cd  = 'TB'
+
+        let #gb-adj-g-no        = #fund-g-amt
+        let #gb-adj-f-no        = #fund-f-amt
+        let #gb-adj-c-no        = #fund-c-amt
+        let #gb-adj-s-no        = #fund-s-amt
+        let #gb-adj-i-no        = #fund-i-amt
+        let #gb-adj-tot-no      = #fund-g-amt + #fund-f-amt + #fund-c-amt + #fund-s-amt + #fund-i-amt
+        let #gb-adj-grand-total = #gb-adj-grand-total + #gb-adj-tot-no
+
+        if $out-rcdno = $late-adj-rcdno
+            let #agy-basic-reg-g = #agy-basic-reg-g + #fund-g-amt
+            let #agy-basic-reg-f = #agy-basic-reg-f + #fund-f-amt
+            let #agy-basic-reg-c = #agy-basic-reg-c + #fund-c-amt
+            let #agy-basic-reg-s = #agy-basic-reg-s + #fund-s-amt
+            let #agy-basic-reg-i = #agy-basic-reg-i + #fund-i-amt
+        else  !41
+            let #agy-basic-neg-g = #agy-basic-neg-g + #fund-g-amt
+            let #agy-basic-neg-f = #agy-basic-neg-f + #fund-f-amt
+            let #agy-basic-neg-c = #agy-basic-neg-c + #fund-c-amt
+            let #agy-basic-neg-s = #agy-basic-neg-s + #fund-s-amt
+            let #agy-basic-neg-i = #agy-basic-neg-i + #fund-i-amt
+        end-if
+
+    else
+
+        if $ded_class = 'B'
+
+            let #ea-adj-g-no        = #fund-g-amt
+            let #ea-adj-f-no        = #fund-f-amt
+            let #ea-adj-c-no        = #fund-c-amt
+            let #ea-adj-s-no        = #fund-s-amt
+            let #ea-adj-i-no        = #fund-i-amt
+            let #ea-adj-tot-no      = #fund-g-amt + #fund-f-amt + #fund-c-amt + #fund-s-amt = #fund-i-amt
+            let #ea-adj-grand-total = #ea-adj-grand-total + #ea-adj-tot-no
+
+            if $out-rcdno = $late-adj-rcdno
+               let #emp-contrib-reg-g = #emp-contrib-reg-g + #fund-g-amt
+               let #emp-contrib-reg-f = #emp-contrib-reg-f + #fund-f-amt
+               let #emp-contrib-reg-c = #emp-contrib-reg-c + #fund-c-amt
+               let #emp-contrib-reg-s = #emp-contrib-reg-s + #fund-s-amt
+               let #emp-contrib-reg-i = #emp-contrib-reg-i + #fund-i-amt
+            else     !**** 41
+               let #emp-contrib-neg-g = #emp-contrib-neg-g + #fund-g-amt
+               let #emp-contrib-neg-f = #emp-contrib-neg-f + #fund-f-amt
+               let #emp-contrib-neg-c = #emp-contrib-neg-c + #fund-c-amt
+               let #emp-contrib-neg-s = #emp-contrib-neg-s + #fund-s-amt
+               let #emp-contrib-neg-i = #emp-contrib-neg-i + #fund-i-amt
+            end-if
+
+        else   !***Non-Tax
+
+            let #gm-adj-g-no        = #fund-g-amt
+            let #gm-adj-f-no        = #fund-f-amt
+            let #gm-adj-c-no        = #fund-c-amt
+            let #gm-adj-s-no        = #fund-s-amt
+            let #gm-adj-i-no        = #fund-i-amt
+            let #gm-adj-tot-no      = #fund-g-amt + #fund-f-amt + #fund-c-amt + #fund-s-amt + #fund-i-amt
+            let #gm-adj-grand-total = #gm-adj-grand-total + #gm-adj-tot-no
+
+            if $out-rcdno = $late-pay-rcdno
+                let #agy-contrib-reg-g = #agy-contrib-reg-g + #fund-g-amt
+                let #agy-contrib-reg-f = #agy-contrib-reg-f + #fund-f-amt
+                let #agy-contrib-reg-c = #agy-contrib-reg-c + #fund-c-amt
+                let #agy-contrib-reg-s = #agy-contrib-reg-s + #fund-s-amt
+                let #agy-contrib-reg-i = #agy-contrib-reg-i + #fund-i-amt
+            else
+                let #agy-contrib-neg-g = #agy-contrib-neg-g + #fund-g-amt
+                let #agy-contrib-neg-f = #agy-contrib-neg-f + #fund-f-amt
+                let #agy-contrib-neg-c = #agy-contrib-neg-c + #fund-c-amt
+                let #agy-contrib-neg-s = #agy-contrib-neg-s + #fund-s-amt
+                let #agy-contrib-neg-i = #agy-contrib-neg-i + #fund-i-amt
+            end-if
+
+        end-if
+
+    end-if
+
+
+    do Retrieve-tsp-id
+
+    if $out-sort-data = $last-out-sort-data
+        let #ea-adj-g-no    = #ea-adj-g-no    + #last-ea-adj-g-no
+        let #ea-adj-f-no    = #ea-adj-f-no    + #last-ea-adj-f-no
+        let #ea-adj-c-no    = #ea-adj-c-no    + #last-ea-adj-c-no
+        let #ea-adj-s-no    = #ea-adj-s-no    + #last-ea-adj-s-no
+        let #ea-adj-i-no    = #ea-adj-i-no    + #last-ea-adj-i-no
+        let #ea-adj-tot-no  = #ea-adj-tot-no  + #last-ea-adj-tot-no
+
+        let #pra-adj-g-no   = #pra-adj-g-no   + #last-pra-adj-g-no
+        let #pra-adj-f-no   = #pra-adj-f-no   + #last-pra-adj-f-no
+        let #pra-adj-c-no   = #pra-adj-c-no   + #last-pra-adj-c-no
+        let #pra-adj-s-no   = #pra-adj-s-no   + #last-pra-adj-s-no
+        let #pra-adj-i-no   = #pra-adj-i-no   + #last-pra-adj-i-no
+        let #pra-adj-tot-no = #pra-adj-tot-no + #last-pra-adj-tot-no
+
+        let #gb-adj-g-no    = #gb-adj-g-no    + #last-gb-adj-g-no
+        let #gb-adj-f-no    = #gb-adj-f-no    + #last-gb-adj-f-no
+        let #gb-adj-c-no    = #gb-adj-c-no    + #last-gb-adj-c-no
+        let #gb-adj-s-no    = #gb-adj-s-no    + #last-gb-adj-s-no
+        let #gb-adj-i-no    = #gb-adj-i-no    + #last-gb-adj-i-no
+        let #gb-adj-tot-no  = #gb-adj-tot-no  + #last-gb-adj-tot-no
+
+        let #gm-adj-g-no    = #gm-adj-g-no    + #last-gm-adj-g-no
+        let #gm-adj-f-no    = #gm-adj-f-no    + #last-gm-adj-f-no
+        let #gm-adj-c-no    = #gm-adj-c-no    + #last-gm-adj-c-no
+        let #gm-adj-s-no    = #gm-adj-s-no    + #last-gm-adj-s-no
+        let #gm-adj-i-no    = #gm-adj-i-no    + #last-gm-adj-i-no
+        let #gm-adj-tot-no  = #gm-adj-tot-no  + #last-gm-adj-tot-no
+    End-if
+
+    let #last-ea-adj-g-no    = #ea-adj-g-no
+    let #last-ea-adj-f-no    = #ea-adj-f-no
+    let #last-ea-adj-c-no    = #ea-adj-c-no
+    let #last-ea-adj-s-no    = #ea-adj-s-no
+    let #last-ea-adj-i-no    = #ea-adj-i-no
+    let #last-ea-adj-tot-no  = #ea-adj-tot-no
+
+    let #last-pra-adj-g-no   = #pra-adj-g-no
+    let #last-pra-adj-f-no   = #pra-adj-f-no
+    let #last-pra-adj-c-no   = #pra-adj-c-no
+    let #last-pra-adj-s-no   = #pra-adj-s-no
+    let #last-pra-adj-i-no   = #pra-adj-i-no
+    let #last-pra-adj-tot-no = #pra-adj-tot-no
+
+    let #last-gb-adj-g-no    = #gb-adj-g-no
+    let #last-gb-adj-f-no    = #gb-adj-f-no
+    let #last-gb-adj-c-no    = #gb-adj-c-no
+    let #last-gb-adj-s-no    = #gb-adj-s-no
+    let #last-gb-adj-i-no    = #gb-adj-i-no
+    let #last-gb-adj-tot-no  = #gb-adj-tot-no
+
+    let #last-gm-adj-g-no    = #gm-adj-g-no
+    let #last-gm-adj-f-no    = #gm-adj-f-no
+    let #last-gm-adj-c-no    = #gm-adj-c-no
+    let #last-gm-adj-s-no    = #gm-adj-s-no
+    let #last-gm-adj-i-no    = #gm-adj-i-no
+    let #last-gm-adj-tot-no  = #gm-adj-tot-no
+
+    do Format-Number(#gm-adj-g-no, $gm-adj-g-char,   '0999V99mi')
+    let $temp1 =  substr($gm-adj-g-char,6,2)
+    do overpunch($temp1, $temp2)
+    let $gm-adj-g-char = substr($gm-adj-g-char,1,5) || rtrim($temp2,' ')
+
+    do Format-Number(#gm-adj-f-no, $gm-adj-f-char,   '0999V99mi')
+    let $temp1 =  substr($gm-adj-f-char,6,2)
+    do overpunch($temp1, $temp2)
+    let $gm-adj-f-char = substr($gm-adj-f-char,1,5) || rtrim($temp2,' ')
+
+    do Format-Number(#gm-adj-c-no, $gm-adj-c-char,   '0999V99mi')
+    let $temp1 =  substr($gm-adj-c-char,6,2)
+    do overpunch($temp1, $temp2)
+    let $gm-adj-c-char = substr($gm-adj-c-char,1,5) || rtrim($temp2,' ')
+
+    do Format-Number(#gm-adj-tot-no, $gm-adj-tot-char,  '0999V99mi')
+    let $temp1 =  substr($gm-adj-tot-char,6,2)
+    do overpunch($temp1, $temp2)
+    let $gm-adj-tot-char = substr($gm-adj-tot-char,1,5) || rtrim($temp2,' ')
+
+    do Format-Number(#gb-adj-g-no, $gb-adj-g-char,   '0999V99mi')
+    let $temp1 =  substr($gb-adj-g-char,6,2)
+    do overpunch($temp1, $temp2)
+    let $gb-adj-g-char = substr($gb-adj-g-char,1,5) || rtrim($temp2,' ')
+
+    do Format-Number(#gb-adj-f-no, $gb-adj-f-char,   '0999V99mi')
+    let $temp1 =  substr($gb-adj-f-char,6,2)
+    do overpunch($temp1, $temp2)
+    let $gb-adj-f-char = substr($gb-adj-f-char,1,5) || rtrim($temp2,' ')
+
+    do Format-Number(#gb-adj-c-no, $gb-adj-c-char,   '0999V99mi')
+    let $temp1 =  substr($gb-adj-c-char,6,2)
+    do overpunch($temp1, $temp2)
+    let $gb-adj-c-char = substr($gb-adj-c-char,1,5) || rtrim($temp2,' ')
+
+    do Format-Number(#gb-adj-tot-no, $gb-adj-tot-char,  '0999V99mi')
+    let $temp1 =  substr($gb-adj-tot-char,6,2)
+    do overpunch($temp1, $temp2)
+    let $gb-adj-tot-char = substr($gb-adj-tot-char,1,5) || rtrim($temp2,' ')
+
+    do Format-Number(#ea-adj-g-no, $ea-adj-g-char,   '0999V99mi')
+    let $temp1 =  substr($ea-adj-g-char,6,2)
+    do overpunch($temp1, $temp2)
+    let $ea-adj-g-char = substr($ea-adj-g-char,1,5) || rtrim($temp2,' ')
+
+    do Format-Number(#ea-adj-f-no, $ea-adj-f-char,   '0999V99mi')
+    let $temp1 =  substr($ea-adj-f-char,6,2)
+    do overpunch($temp1, $temp2)
+    let $ea-adj-f-char = substr($ea-adj-f-char,1,5) || rtrim($temp2,' ')
+
+    do Format-Number(#ea-adj-c-no, $ea-adj-c-char,   '0999V99mi')
+    let $temp1 =  substr($ea-adj-c-char,6,2)
+    do overpunch($temp1, $temp2)
+    let $ea-adj-c-char = substr($ea-adj-c-char,1,5) || rtrim($temp2,' ')
+
+    do Format-Number(#ea-adj-tot-no, $ea-adj-tot-char,  '0999V99mi')
+    let $temp1 =  substr($ea-adj-tot-char,6,2)
+    do overpunch($temp1, $temp2)
+    let $ea-adj-tot-char = substr($ea-adj-tot-char,1,5) || rtrim($temp2,' ')
+
+   do Format-Number(#pra-adj-g-no, $pra-adj-g-char,   '0999V99mi')
+    let $temp1 =  substr($pra-adj-g-char,6,2)
+    do overpunch($temp1, $temp2)
+    let $pra-adj-g-char = substr($pra-adj-g-char,1,5) || rtrim($temp2,' ')
+
+    do Format-Number(#pra-adj-f-no, $pra-adj-f-char,   '0999V99mi')
+    let $temp1 =  substr($pra-adj-f-char,6,2)
+    do overpunch($temp1, $temp2)
+    let $pra-adj-f-char = substr($pra-adj-f-char,1,5) || rtrim($temp2,' ')
+
+    do Format-Number(#pra-adj-c-no, $pra-adj-c-char,   '0999V99mi')
+    let $temp1 =  substr($pra-adj-c-char,6,2)
+    do overpunch($temp1, $temp2)
+    let $pra-adj-c-char = substr($pra-adj-c-char,1,5) || rtrim($temp2,' ')
+
+    do Format-Number(#pra-adj-tot-no, $pra-adj-tot-char,  '0999V99mi')
+    let $temp1 =  substr($pra-adj-tot-char,6,2)
+    do overpunch($temp1, $temp2)
+    let $pra-adj-tot-char = substr($pra-adj-tot-char,1,5) || rtrim($temp2,' ')
+
+    if &VER.GVT_TSP_VERSION = 'N'
+
+        let $out-data =
+          $blanks18                            ||
+          rtrim($ea-adj-tot-char,' ')          ||
+          $blanks42                            ||
+          rtrim($gb-adj-tot-char,' ')          ||
+          $blanks18                            ||
+          rtrim($gm-adj-tot-char,' ')          ||
+          rtrim($gvt_agy_tsp_id,' ')           ||
+          rtrim(&O1.GVT_SUB_AGENCY,' ')
+    else
+        let $out-data =
+          $ea-adj-g-char         ||
+          $ea-adj-f-char         ||
+          $ea-adj-c-char         ||
+          $ea-adj-tot-char       ||
+          $pra-adj-g-char        ||
+          $pra-adj-f-char        ||
+          $pra-adj-c-char        ||
+          $pra-adj-tot-char      ||
+          $gb-adj-g-char         ||
+          $gb-adj-f-char         ||
+          $gb-adj-c-char         ||
+          $gb-adj-tot-char       ||
+          $gm-adj-g-char         ||
+          $gm-adj-f-char         ||
+          $gm-adj-c-char         ||
+          $gm-adj-tot-char       ||
+          $gvt_agy_tsp_id        ||
+          &O1.GVT_SUB_AGENCY
+    end-if
+
+end-if
+
+!**** Insert or Update record into work table.
+
+let $SQL-STATEMENT = 'FGPY002, Insert-into-work-tbl'
+
+
+
+ if $out-sort-data = $last-out-sort-data
+
+
+
+    BEGIN-SQL On-Error=SQL-Error
+
+    UPDATE PS_R_GVT_TSP_SORT
+      SET GVT_TSP_DATA = $out-data
+       WHERE GVT_TSP_SORT_DATA = $out-sort-data
+
+
+    END-SQL
+
+Else             !**** Different sort data value.
+
+let $SQL-STATEMENT = 'FGPY002, Insert-into-work-tbl after else'
+    BEGIN-SQL On-Error=SQL-Error
+
+    INSERT INTO PS_R_GVT_TSP_SORT
+
+            (GVT_TSP_SORT_DATA,
+             GVT_TSP_DATA)
+
+       VALUES ($out-sort-data,
+              $out-data)
+
+    END-SQL
+
+end-if
+
+let $last-out-sort-data = $out-sort-data
+
+end-procedure   !Insert-into-work-tbl
+
+
+!**********************************************************************
+begin-procedure Correct-rounding-error
+!
+!Description:
+!
+!
+!**********************************************************************
+
+if #fund-c-pct > 0
+     let #fund-c-amt = #fund-c-amt + #round-diff
+else
+     if #fund-f-pct > 0
+         let #fund-f-amt = #fund-f-amt + #round-diff
+     else
+         if #fund-g-pct > 0
+             let #fund-g-amt = #fund-g-amt + #round-diff
+         else
+             if #fund-s-pct > 0
+                 let #fund-s-amt = #fund-s-amt + #round-diff
+             else
+                 if #fund-i-pct > 0
+                    let #fund-i-amt = #fund-i-amt + #round-diff
+                 end-if
+             end-if
+         end-if
+     end-if
+end-if
+
+end-procedure   !Correct-rounding-error
+
+
+!**********************************************************************
+begin-procedure Insert-pay-tsp-rcd
+!
+!Description:
+!
+!
+!**********************************************************************
+
+let $ded_cur = edit(#ded_cur,'99999999.99')
+
+let $SQL-STATEMENT = 'FGPY002, Insert-pay-tsp-rcd'
+
+BEGIN-SQL On-Error=SQL-Error
+
+INSERT INTO PS_GVT_PAY_TSP
+ (COMPANY,
+  PAYGROUP,
+  PAY_END_DT,
+  OFF_CYCLE,
+  PAGE_NUM,
+  LINE_NUM,
+  SEPCHK,
+  PLAN_TYPE,
+  BENEFIT_PLAN,
+  DEDCD,
+  DED_CLASS,
+  INVESTMENT_OPT,
+  GVT_TSP_TRANS_CD,
+  INVESTMENT_PCT,
+  DED_CUR)
+  VALUES
+  ($company,
+   $paygroup,
+   $pay_end_dt,
+   $off_cycle,
+   #page_nbr,
+   #line_nbr,
+   #sepchk,
+   $plan_type,
+   $benefit_plan,
+   $dedcd,
+   $ded_class,
+   $investment_opt,
+   $tsp-trans_cd,
+   #investment_pct,
+   #ded_cur)
+
+END-SQL
+
+end-procedure   !Insert-pay-tsp-rcd
+
+
+!**********************************************************************
+begin-procedure Update-tsp-flag-on-gvt-job
+!
+!Description: Set the GVT_TSP_UPD_IND flag to 'P' (Processed) for
+!       each record that was process and had a GVT_TSP_UPD_IND =
+!       'R' (Ready to Process).
+!**********************************************************************
+
+let $SQL-STATEMENT = 'FGPY002, Update-tsp-flag-on-gvt-job'
+
+BEGIN-SQL On-Error=SQL-Error
+
+UPDATE PS_GVT_JOB
+  SET GVT_TSP_UPD_IND = 'P'
+  WHERE EMPLID   = &D1.EMPLID
+    AND EMPL_RCD = &D1.EMPL_RCD
+    AND EFFDT    = &D1.EFFDT
+    AND EFFSEQ   = &D1.EFFSEQ
+
+END-SQL
+
+end-procedure   !Update-tsp-flag-on-gvt-job
+
+
+!**********************************************************************
+begin-procedure Process-tsp-deductions
+!
+!Description:
+!
+!
+!**********************************************************************
+
+do Retrieve-header-recd-data
+
+let $last-out-sort-data = ' '
+
+#IFDEF DB2ALL
+
+  move 'A' to $last_emplid   !initialize lower then the lowest key
+
+#ELSE
+
+  move '0' to $last_emplid   !initialize lower then the lowest key
+
+#END-IF
+
+move 1 to #not_done
+
+while #not_done
+
+    move 0 to #row_counter
+
+    do process-tsp-deductions-on-cycle
+
+end-while
+
+#IFDEF DB2ALL
+
+  move 'A' to $last_emplid   !initialize lower then the lowest key
+
+#ELSE
+
+  move '0' to $last_emplid   !initialize lower then the lowest key
+
+#END-IF
+
+if $off_cycle_ded = 'Y'
+
+    move 1 to #not_done
+
+    while #not_done
+
+        move 0 to #row_counter
+
+        do process-tsp-deductions-off-cycle
+
+    end-while
+
+end-if
+
+end-procedure    !Process-tsp-deductions
+
+
+!**********************************************************************
+begin-procedure Process-tsp-deductions-on-cycle
+!**********************************************************************
+
+let $SQL-STATEMENT =  'FGPY002, Process-tsp-deductions-on-cycle'
+
+BEGIN-SELECT ON-ERROR=SQL-Error
+
+A1A.COMPANY
+A1A.PAYGROUP
+A1A.PAY_END_DT
+A1A.OFF_CYCLE
+A1A.PAGE_NUM
+A1A.LINE_NUM
+A1A.SEPCHK
+A1A.PLAN_TYPE
+A1A.BENEFIT_PLAN
+A1A.DEDCD
+A1A.DED_CLASS
+A1A.DED_CUR
+A1A.DED_CUR_REFUND
+A2A.EMPLID
+A2A.EMPL_RCD
+A2A.CHECK_DT
+A2A.PAYCHECK_STATUS
+A3A.GVT_REPORTING_CD
+
+  add 1 to #row_counter
+  let $out-rcdno = ' '
+
+  if #row_counter > 300 and &A2A.EMPLID <> $last_emplid
+      exit-select     !Leave select to execute a commit
+  else
+        do reset-variables
+
+        let $company        = rtrim(&A1A.COMPANY,' ')
+        let $paygroup       = rtrim(&A1A.PAYGROUP,' ')
+        let $pay_end_dt     = rtrim(&A1A.PAY_END_DT,' ')
+        let $off_cycle      = rtrim(&A1A.OFF_CYCLE,' ')
+        let #page_nbr       = &A1A.PAGE_NUM
+        let #line_nbr       = &A1A.LINE_NUM
+        let #sepchk         = &A1A.SEPCHK
+        let $plan_type      = rtrim(&A1A.PLAN_TYPE,' ')
+        let $benefit_plan   = rtrim(&A1A.BENEFIT_PLAN,' ')
+        let $dedcd          = rtrim(&A1A.DEDCD,' ')
+        let $ded_class      = rtrim(&A1A.DED_CLASS,' ')
+        let $emplid         = rtrim(&A2A.EMPLID,' ')
+        let #empl_rcd_nbr   = &A2A.EMPL_RCD
+        let $check_dt       = rtrim(&A2A.CHECK_DT,' ')
+        let #ded_cur        = &A1A.DED_CUR
+        let #ded_cur_refund = &A1A.DED_CUR_REFUND
+        let $reporting_cd   = rtrim(&A3A.GVT_REPORTING_CD,' ')
+        let $paycheck_status = rtrim(&A2A.PAYCHECK_STATUS,' ')
+
+      do retrieve-emp-data     !From GVT_TSP_01_HIST
+      do Retrieve-investment-elections
+      do determine-pay-begin-dt  !For current company/paygroup/pay end dt/run id
+
+!**** Determine what record type this tsp ded belongs to.
+       if #ded_cur_refund < 0
+          let $out-rcdno = $neg-adj-rcdno
+      else
+          if &A2A.CHECK_DT < &F1.PAY_BEGIN_DT    !Negative Adjustment Deduction
+              let $out-rcdno = $late-pay-rcdno
+          else
+              let $out-rcdno = $curr-pay-rcdno
+          end-if
+       end-if
+
+      do Insert-into-work-tbl
+      move $emplid to $last_emplid
+
+  end-if
+
+FROM PS_PAY_DEDUCTION A1A,
+     PS_PAY_CHECK A2A,
+     PS_DEDUCTION_TBL A3A,
+     PS_PAY_CALENDAR A4A
+WHERE A4A.RUN_ID           = $run_id
+AND   A4A.GVT_TSP_RUN      = 'N'
+AND   A4A.PAY_CONFIRM_RUN  = 'Y'
+AND   A2A.EMPLID   > $last_emplid
+AND   A2A.OFF_CYCLE        = 'N'
+AND   A2A.COMPANY          = A4A.COMPANY
+AND   A2A.PAYGROUP         = A4A.PAYGROUP
+AND   A2A.PAY_END_DT       = A4A.PAY_END_DT
+AND   A1A.COMPANY          = A2A.COMPANY
+AND   A1A.PAYGROUP         = A2A.PAYGROUP
+AND   A1A.PAY_END_DT       = A2A.PAY_END_DT
+AND   A1A.OFF_CYCLE        = A2A.OFF_CYCLE
+AND   A1A.PAGE_NUM         = A2A.PAGE_NUM
+AND   A1A.LINE_NUM         = A2A.LINE_NUM
+AND   A1A.SEPCHK           = A2A.SEPCHK
+AND   A3A.GVT_DIST_DEST    =  'S'
+AND   A3A.GVT_REPORTING_CD IN ('TB','TS')
+AND   A3A.PLAN_TYPE        = A1A.PLAN_TYPE
+AND   A3A.DEDCD            = A1A.DEDCD
+AND   A3A.EFFDT            = (SELECT MAX(A4A.EFFDT)
+                              FROM  PS_DEDUCTION_TBL A4A
+                              WHERE A4A.PLAN_TYPE = A3A.PLAN_TYPE
+                              AND   A4A.DEDCD     = A3A.DEDCD
+                              AND   A4A.EFFDT    <= A1A.PAY_END_DT)
+
+ORDER BY A2A.EMPLID
+
+END-SELECT
+
+if #row_counter < 300
+
+    move 0 to #not_done    !Less than 300 rows means we're done
+
+end-if
+
+end-procedure    !Process-tsp-deductions-on-cycle
+
+!**********************************************************************
+begin-procedure Process-tsp-deductions-off-cycle
+!**********************************************************************
+!R-MSMITH-84586 negative processing logic edited
+let $SQL-STATEMENT = 'FGPY002, Process-tsp-deductions-off-cycle'
+
+BEGIN-SELECT ON-ERROR=SQL-Error
+
+A1B.COMPANY
+A1B.PAYGROUP
+A1B.PAY_END_DT
+A1B.OFF_CYCLE
+A1B.PAGE_NUM
+A1B.LINE_NUM
+A1B.SEPCHK
+A1B.PLAN_TYPE
+A1B.BENEFIT_PLAN
+A1B.DEDCD
+A1B.DED_CLASS
+A1B.DED_SLSTX_CLASS
+A1B.DED_CUR
+A1B.DED_CUR_REFUND
+A2B.EMPLID
+A2B.EMPL_RCD
+A2B.CHECK_DT
+A2B.PAYCHECK_STATUS
+A3B.GVT_REPORTING_CD
+
+  add 1 to #row_counter
+  let $out-rcdno = ' '
+
+  if #row_counter > 300 and &A2B.EMPLID <> $last_emplid
+      exit-select     !Leave select to execute a commit
+  else
+      do reset-variables
+      let $company        = rtrim(&A1B.COMPANY,' ')
+      let $paygroup       = rtrim(&A1B.PAYGROUP,' ')
+      let $pay_end_dt     = rtrim(&A1B.PAY_END_DT,' ')
+      let $off_cycle      = rtrim(&A1B.OFF_CYCLE,' ')
+      let #page_nbr       = &A1B.PAGE_NUM
+      let #line_nbr       = &A1B.LINE_NUM
+      let #sepchk         = &A1B.SEPCHK
+      let $plan_type      = rtrim(&A1B.PLAN_TYPE,' ')
+      let $benefit_plan   = rtrim(&A1B.BENEFIT_PLAN,' ')
+      let $dedcd          = rtrim(&A1B.DEDCD,' ')
+      let $ded_class      = rtrim(&A1B.DED_CLASS,' ')
+      let $ded_slstax_cls = rtrim(&A1B.DED_SLSTX_CLASS,' ')
+      let $emplid         = rtrim(&A2B.EMPLID,' ')
+      let #empl_rcd_nbr   = &A2B.EMPL_RCD
+      let $check_dt       = rtrim(&A2B.CHECK_DT,' ')
+      let #ded_cur        = &A1B.DED_CUR
+      let #ded_cur_refund = &A1B.DED_CUR_REFUND
+      let $reporting_cd   = rtrim(&A3B.GVT_REPORTING_CD,' ')
+      let $paycheck_status = rtrim(&A2B.PAYCHECK_STATUS,' ')
+
+      do retrieve-emp-data
+      do Retrieve-investment-elections
+      do determine-pay-begin-dt  !For current company/paygroup/pay end dt/run id
+
+
+      if #ded_cur_refund < 0
+         let $out-rcdno = $neg-adj-rcdno
+      else
+           if $check_dt < &F1.PAY_BEGIN_DT
+               let $out-rcdno = $late-pay-rcdno
+           else
+               let $out-rcdno = $curr-pay-rcdno
+           end-if
+       end-if
+
+
+       do Insert-into-work-tbl
+       do update-pay-deduction
+       move $emplid to $last_emplid
+    end-if
+FROM PS_PAY_DEDUCTION A1B,
+     PS_PAY_CHECK A2B,
+     PS_DEDUCTION_TBL A3B,
+     PS_PAY_CALENDAR A4B
+
+WHERE A4B.RUN_ID           = $run_id
+AND   A4B.GVT_TSP_RUN      = 'N'
+AND   A2B.EMPLID           > $last_emplid
+AND   A2B.OFF_CYCLE        = 'Y'
+AND   A2B.PAYCHECK_STATUS  IN ('F','R')
+AND   A2B.COMPANY          = A4B.COMPANY
+AND   A2B.PAYGROUP         = A4B.PAYGROUP
+AND   A2B.PAY_END_DT      <= A4B.PAY_END_DT
+AND   A1B.COMPANY          = A2B.COMPANY
+AND   A1B.PAYGROUP         = A2B.PAYGROUP
+AND   A1B.PAY_END_DT       = A2B.PAY_END_DT
+AND   A1B.OFF_CYCLE        = A2B.OFF_CYCLE
+AND   A1B.PAGE_NUM         = A2B.PAGE_NUM
+AND   A1B.LINE_NUM         = A2B.LINE_NUM
+AND   A1B.SEPCHK           = A2B.SEPCHK
+AND   A1B.GVT_TSP_SEQ_NO   = 0
+AND   A3B.GVT_DIST_DEST    = 'S'
+AND   A3B.GVT_REPORTING_CD IN ('TB','TS')
+AND   A3B.PLAN_TYPE        = A1B.PLAN_TYPE
+AND   A3B.DEDCD            = A1B.DEDCD
+AND   A3B.EFFDT            = (SELECT MAX(A4B.EFFDT)
+                              FROM  PS_DEDUCTION_TBL A4B
+                              WHERE A4B.PLAN_TYPE = A3B.PLAN_TYPE
+                              AND   A4B.DEDCD     = A3B.DEDCD
+                              AND   A4B.EFFDT    <= A1B.PAY_END_DT)
+
+ORDER BY A2B.EMPLID
+
+END-SELECT
+
+if #row_counter < 300
+
+    move 0 to #not_done    !Less than 300 rows means we're done
+
+end-if
+
+end-procedure    !Process-tsp-deductions-off-cycle
+
+!**********************************************************************
+begin-procedure reset-variables
+!**********************************************************************
+
+let $company        = ''
+let $paygroup       = ''
+let $pay_end_dt     = ''
+let $off_cycle      = ''
+let #page_nbr       = 0
+let #line_nbr       = 0
+let #sepchk         = 0
+let $plan_type      = ''
+let $benefit_plan   = ''
+let $dedcd          = ''
+let $ded_class      = ''
+let $ded_slstax_cls = ''
+let $emplid         = ''
+let #empl_rcd_nbr   = 0
+let $check_dt       = ''
+let #ded_cur        = 0
+let #ded_cur_refund = 0
+let $reporting_cd   = ''
+
+end-procedure    !reset-variables
+
+!**********************************************************************
+begin-procedure update-pay-deduction
+!**********************************************************************
+
+BEGIN-SQL
+
+UPDATE PS_PAY_DEDUCTION
+
+SET   GVT_TSP_SEQ_YR  = #tsp_yr,
+      GVT_TSP_SEQ_NO  = #tsp_seq
+
+WHERE COMPANY         = $company
+AND   PAYGROUP        = $paygroup
+AND   PAY_END_DT      = $pay_end_dt
+AND   OFF_CYCLE       = $off_cycle
+AND   PAGE_NUM        = #page_nbr
+AND   LINE_NUM        = #line_nbr
+AND   SEPCHK          = #sepchk
+AND   PLAN_TYPE       = $plan_type
+AND   BENEFIT_PLAN    = $benefit_plan
+AND   DEDCD           = $dedcd
+AND   DED_CLASS       = $ded_class
+AND   DED_SLSTX_CLASS = $ded_slstax_cls
+
+END-SQL
+
+end-procedure     !update-pay-deduction
+
+
+!**********************************************************************
+begin-procedure determine-pay-begin-dt
+!
+!Description:
+!**********************************************************************
+
+let $SQL-STATEMENT = 'FGPY002, determine-pay-begin-dt'
+
+BEGIN-SELECT On-Error=SQL-Error
+
+F1.PAY_BEGIN_DT
+
+FROM  PS_PAY_CALENDAR F1
+WHERE F1.RUN_ID     = $Run_ID
+AND   F1.COMPANY    = $company
+AND   F1.PAYGROUP   = $paygroup
+AND   F1.PAY_END_DT = $pay_end_dt
+
+END-SELECT
+
+end-procedure
+
+
+
+
+
+
+
+
+
+
+!**********************************************************************
+begin-procedure Process-lost-earnings
+!
+!Description:  Reads adjustment records and includes them in the
+!              extract file totals as part of the late payment records.
+!
+!**********************************************************************
+
+let $SQL-STATEMENT = 'FGPY002, Process-lost-earnings'
+
+BEGIN-SELECT On-Error=SQL-Error
+
+LE.EMPLID
+LE.EMPL_RCD
+LE.EFFDT
+LE.COMPANY
+LE.PAYGROUP
+LE.GVT_TSP_AC_ADJ
+LE.GVT_TSP_AM_ADJ
+LE.GVT_TSP_EC_ADJ
+
+  Do Format-lost-earnings-record
+
+  Do Insert-gvt-sort-data
+
+  Do Update-adjustment-earnings
+
+FROM PS_GVT_TSP_ADJUST LE
+WHERE LE.COMPANY = &B1.COMPANY
+AND   LE.PAYGROUP = &B1.PAYGROUP
+AND   LE.EFFDT <= &B1.PAY_END_DT
+AND   LE.GVT_TSP_UPD_IND = 'R'
+
+END-SELECT
+
+end-procedure           !Process-lost-earnings
+
+
+
+
+
+!**********************************************************************
+begin-procedure Format-lost-earnings-record
+!
+!Description:  Format lost earnings adjustment record for output.
+!**********************************************************************
+
+let $SQL-STATEMENT = 'FGPY002, Format-lost-earnings-record'
+
+let #le-ac-no        = &LE.GVT_TSP_AC_ADJ
+let $le-ac-char      = ' '
+
+let #le-am-no        = &LE.GVT_TSP_AM_ADJ
+let $le-am-char      = ' '
+
+let #le-ec-no        = &LE.GVT_TSP_EC_ADJ
+let $le-ec-char      = ' '
+
+BEGIN-SELECT On-Error=SQL-Error
+
+LE1.SSN
+LE1.BIRTHDATE
+LE1.GVT_SUB_AGENCY
+
+  let $le-ssn = RTRIM(&LE1.SSN,' ')
+  let $le-birthdate = &LE1.BIRTHDATE
+  if RTRIM($le-birthdate, ' ') <> ''
+      do Format-DateTime($le-birthdate, $out, {DEFDATE}, '', '')
+      let $out1 = substr($out,1,2)
+      let $out2 = substr($out,4,2)
+      let $out3 = substr($out,7,4)
+      let $le-birthdate = $out3 || $out1 || $out2
+  end-if
+  let $le-gvt-sub-agency = &LE1.GVT_SUB_AGENCY
+
+FROM PS_GVT_TSP_01_HIST LE1
+
+WHERE LE1.EMPLID    = &LE.EMPLID
+AND   LE1.EMPL_RCD  = &LE.EMPL_RCD
+
+End-SELECT
+
+let $le-effdt = &LE.EFFDT
+do Format-DateTime($le-effdt, $out, {DEFDATE}, '', '')
+let $out1 = substr($out,1,2)
+let $out2 = substr($out,4,2)
+let $out3 = substr($out,7,4)
+let $le-effdt = $out3 || $out1 || $out2
+
+let $le-out-sort-data = $le-ssn || $le-birthdate || $le-effdt || $late-pay-rcdno
+
+let #ea-grand-total    = #ea-grand-total + #le-ac-no
+let #gb-grand-total    = #gb-grand-total + #le-am-no
+let #gm-grand-total    = #gm-grand-total + #le-ec-no
+
+
+do Format-Number(#le-am-no, $le-am-char,   '0999V99mi')
+let $temp1 =  substr($le-am-char,6,2)
+do overpunch($temp1, $temp2)
+let $le-am-char = substr($le-am-char,1,5) || rtrim($temp2,' ')
+
+do Format-Number(#le-ac-no, $le-ac-char,   '0999V99mi')
+let $temp1 =  substr($le-ac-char,6,2)
+do overpunch($temp1, $temp2)
+let $le-ac-char = substr($le-ac-char,1,5) || rtrim($temp2,' ')
+
+do Format-Number(#le-ec-no, $le-ec-char,   '0999V99mi')
+let $temp1 =  substr($le-ec-char,6,2)
+do overpunch($temp1, $temp2)
+let $le-ec-char = substr($le-ec-char,1,5) || rtrim($temp2,' ')
+
+let $company = &LE.COMPANY
+
+Do Retrieve-tsp-id
+
+let $le-out-data =
+    $blanks18                            ||
+    rtrim($le-ec-char,' ')               ||
+    $blanks42                            ||
+    rtrim($le-ac-char,' ')               ||
+    $blanks18                            ||
+    rtrim($le-am-char,' ')               ||
+    rtrim($gvt_agy_tsp_id,' ')           ||
+    rtrim($le-gvt-sub-agency,' ')
+
+end-procedure           !Format-lost-earnings-record
+
+
+!**********************************************************************
+begin-procedure Insert-gvt-sort-data
+!
+!Description:  Insert lost earnings into Sort record for output.
+!**********************************************************************
+
+let $SQL-STATEMENT = 'FGPY002, Insert-gvt-sort-data'
+
+BEGIN-SQL On-Error=SQL-Error
+
+INSERT INTO PS_R_GVT_TSP_SORT
+       (GVT_TSP_SORT_DATA,
+        GVT_TSP_DATA)
+VALUES ($le-out-sort-data,
+              $le-out-data)
+
+END-SQL
+
+end-procedure           !Insert-gvt-sort-data
+
+
+!**********************************************************************
+begin-procedure Update-adjustment-earnings
+!
+!Description:  Update adjustment record with voucher sequence number
+!              and set indicator to processed.
+!**********************************************************************
+
+let $SQL-STATEMENT = 'FGPY002, Update-adjustment-earnings'
+
+begin-SQL On-Error=SQL-Error
+
+UPDATE PS_GVT_TSP_ADJUST
+
+  SET GVT_TSP_UPD_IND = 'P',
+      GVT_TSP_SEQ_YR = &RUN_CNTL_FG.GVT_TSP_SEQ_YR,
+      GVT_TSP_SEQ_NO = &RUN_CNTL_FG.GVT_TSP_SEQ_NO
+
+  WHERE EMPLID   = &LE.EMPLID
+  AND   EMPL_RCD = &LE.EMPL_RCD
+  AND   EFFDT    = &LE.EFFDT
+
+end-SQL
+
+end-procedure     !Update-adjustment-earnings
+
+
+
+
+
+
+
+
+!**********************************************************************
+begin-procedure Create-extract-file
+!
+!Description:  Writes records to the TSP extract file.
+!**********************************************************************
+
+!**** Write out the header record
+
+ if $gvt_tsp_seq_yr < '10'
+    let $gvt_tsp_seq_yr = '0' || $gvt_tsp_seq_yr
+ end-if
+
+let $out-data =
+  'DHDR'                                     ||
+  $gvt_tsp_seq_yr                            ||
+  lpad($gvt_tsp_seq_no,4,'0')                ||
+  $out-effdt                                 ||
+  rpad(&C1.GVT_AGY_LOC_CODE, 8, '')          ||
+  rpad(&C1.CONTACT_PERSON, 30, ' ')          ||
+  substr(&C1.CONTACT_PHONE,1,3)              ||
+  substr(&C1.CONTACT_PHONE,5,3)              ||
+  substr(&C1.CONTACT_PHONE,9,4)              ||
+  '                '
+write 1 from  $out-data:80
+
+let $SQL-STATEMENT = 'FGPY002, Create-extract-file'
+
+BEGIN-SELECT On-Error=SQL-Error
+
+P1.GVT_TSP_SORT_DATA
+P1.GVT_TSP_DATA
+
+  if &VER.GVT_TSP_VERSION = 'N'
+      write 1 from &P1.GVT_TSP_SORT_DATA:27
+                   &P1.GVT_TSP_DATA:223
+      let $record_type = substr(&P1.GVT_TSP_SORT_DATA,26,2)
+  else
+      write 1 from &P1.GVT_TSP_SORT_DATA:23
+                   &P1.GVT_TSP_DATA:227
+      let $record_type = substr(&P1.GVT_TSP_SORT_DATA,22,2)
+  end-if
+
+  evaluate $record_type
+
+      when = $emp-data-rcdno
+          let #Emp-data-rec-count     = #Emp-data-rec-count + 1
+      when = $curr-pay-rcdno
+          let #Reg-payment-rec-count  = #Reg-payment-rec-count +1
+      when = $neg-adj-rcdno
+           let #Neg-adjust-rec-count   = #Neg-adjust-rec-count + 1
+      when = $late-pay-rcdno
+          let #Late-payment-rec-count = #Late-payment-rec-count + 1
+
+
+  end-evaluate
+
+FROM PS_R_GVT_TSP_SORT P1
+
+ORDER BY P1.GVT_TSP_SORT_DATA
+
+END-SELECT
+
+
+!**** Format Trailer record data
+
+do Format-Number(#gb-grand-total, $gb-grand-total-char,'099999999999V99mi')
+let $temp1 =  substr($gb-grand-total-char,14,2)
+do overpunch($temp1, $temp2)
+let $gb-grand-total-char = substr($gb-grand-total-char,1,13) || rtrim($temp2,' ')
+
+do Format-Number(#ea-grand-total, $ea-grand-total-char,'099999999999V99mi')
+let $temp1 =  substr($ea-grand-total-char,14,2)
+do overpunch($temp1, $temp2)
+let $ea-grand-total-char = substr($ea-grand-total-char,1,13) || rtrim($temp2,' ')
+
+do Format-Number(#gm-grand-total, $gm-grand-total-char,'099999999999V99mi')
+let $temp1 =  substr($gm-grand-total-char,14,2)
+do overpunch($temp1, $temp2)
+let $gm-grand-total-char = substr($gm-grand-total-char,1,13) || rtrim($temp2,' ')
+
+do Format-Number(#gb-adj-grand-total, $gb-adj-grand-total-char,'099999999999V99mi')
+let $temp1 =  substr($gb-adj-grand-total-char,14,2)
+do overpunch($temp1, $temp2)
+let $gb-adj-grand-total-char = substr($gb-adj-grand-total-char,1,13) || rtrim($temp2,' ')
+
+do Format-Number(#ea-adj-grand-total, $ea-adj-grand-total-char,'099999999999V99mi')
+let $temp1 =  substr($ea-adj-grand-total-char,14,2)
+do overpunch($temp1, $temp2)
+let $ea-adj-grand-total-char = substr($ea-adj-grand-total-char,1,13) || rtrim($temp2,' ')
+
+do Format-Number(#gm-adj-grand-total, $gm-adj-grand-total-char,'099999999999V99mi')
+let $temp1 =  substr($gm-adj-grand-total-char,14,2)
+do overpunch($temp1, $temp2)
+let $gm-adj-grand-total-char = substr($gm-adj-grand-total-char,1,13) || rtrim($temp2,' ')
+
+do Format-Number(#gm-adj-grand-total, $gm-adj-grand-total-char,'099999999999V99mi')
+let $temp1 =  substr($gm-adj-grand-total-char,14,2)
+do overpunch($temp1, $temp2)
+let $gm-adj-grand-total-char = substr($gm-adj-grand-total-char,1,13) || rtrim($temp2,' ')
+
+do Format-Number(#tot-rcnt-data,$tot-rcnt-data,'09999999mi')
+let $temp1 =  substr($tot-rcnt-data,8,2)
+do overpunch($temp1, $temp2)
+let $tot-rcnt-data-char = substr($tot-rcnt-data,1,7) || rtrim($temp2,' ')
+
+do Format-Number(#tot-rcnt-reg, $tot-rcnt-reg,'09999999mi')
+let $temp1 =  substr($tot-rcnt-reg,8,2)
+do overpunch($temp1, $temp2)
+let $tot-rcnt-reg-char = substr($tot-rcnt-reg,1,7) || rtrim($temp2,' ')
+
+let #tot-rcnt-late-and-adj = #tot-rcnt-adj + #tot-rcnt-late
+
+do Format-Number(#tot-rcnt-late-and-adj, $tot-rcnt-lt-adj,'09999999mi')
+let $temp1 = substr($tot-rcnt-lt-adj,8,2)
+do overpunch($temp1, $temp2)
+let $tot-rcnt-lt-adj-ch = substr($tot-rcnt-lt-adj,1,7) || rtrim($temp2,' ')
+
+!**** Write out the trailer record
+let $out-data = 'TRLR'          ||
+  $ea-grand-total-char          ||
+  '0000000000000{'              ||
+  $gb-grand-total-char          ||
+  $gm-grand-total-char          ||
+  $ea-adj-grand-total-char      ||
+  '0000000000000{'              ||
+  $gb-adj-grand-total-char      ||
+  $gm-adj-grand-total-char      ||
+  $tot-rcnt-data-char           ||
+  $tot-rcnt-reg-char            ||
+  $tot-rcnt-lt-adj-ch           ||
+  '0000000000{'
+
+  write 1 from  $out-data:200
+
+end-procedure   !Create-extract-file
+
+
+!**********************************************************************
+begin-procedure Retrieve-header-recd-data
+!
+!Description: Retrieves data that is writtent to the TSP interface
+!             file Header Record.
+!**********************************************************************
+
+let $SQL-STATEMENT = 'FGPY002, Retrieve-header-recd-data'
+
+BEGIN-SELECT On-Error=SQL-Error
+
+C1.GVT_AGY_LOC_CODE
+C1.GVT_AGY_TSP_ID
+C1.GVT_AGY_TSP_ACCT
+C1.CONTACT_PERSON
+C1.CONTACT_PHONE
+C1.GVT_DESCR70
+C1.GVT_ADDRESS1
+C1.GVT_ADDRESS2
+C1.GVT_ADDRESS3
+C1.GVT_ADDRESS4
+C1.GVT_ADDRESS_CITY
+C1.GVT_ADDRESS_STATE
+C1.GVT_ADDRESS_ZIP
+C1.GVT_FTS_INDIC
+
+    let $print_agy_loc_cd  = rtrim(&C1.GVT_AGY_LOC_CODE,' ')
+    let $print_agy_acct_no = rtrim(&C1.GVT_AGY_TSP_ACCT,' ')
+    let $print_agy_contact = rtrim(&C1.CONTACT_PERSON,' ')
+    let $print_agy_phone1  = substr(&C1.CONTACT_PHONE,1,3)
+    let $print_agy_phone2  = substr(&C1.CONTACT_PHONE,5,3)
+    let $print_agy_phone3  = substr(&C1.CONTACT_PHONE,9,4)
+    let $print_agy_descr   = rtrim(&C1.GVT_DESCR70,' ')
+    let $print_agy_addr1   = rtrim(&C1.GVT_ADDRESS1,' ')
+    let $print_agy_addr2   = rtrim(&C1.GVT_ADDRESS2,' ')
+    let $print_agy_addr3   = rtrim(&C1.GVT_ADDRESS3,' ')
+    let $print_agy_addr4   = rtrim(&C1.GVT_ADDRESS4,' ')
+    let $print_agy_city    = rtrim(&C1.GVT_ADDRESS_CITY,' ')
+    let $print_agy_state   = rtrim(&C1.GVT_ADDRESS_STATE,' ')
+    let $print_agy_zip     = rtrim(&C1.GVT_ADDRESS_ZIP,' ')
+    let $city_state_zip    = $print_agy_city       ||
+                             ','                   ||
+                             $print_agy_state      ||
+                             ' '                   ||
+                             $print_agy_zip
+
+FROM PS_COMPANY_TBL C,
+     PS_GVT_INTRFC_INFO C1
+
+WHERE C.COMPANY    = &B1.COMPANY
+AND   C.EFF_STATUS = 'A'
+AND   C.EFFDT      = (SELECT MAX(CA.EFFDT)
+                       FROM  PS_COMPANY_TBL CA
+                       WHERE CA.COMPANY    = C.COMPANY
+                       AND   CA.EFF_STATUS = 'A'
+                       AND   CA.EFFDT     <= &B1.PAY_END_DT)
+AND   C1.COMPANY   = C.COMPANY
+AND   C1.EFFDT     = C.EFFDT
+
+END-SELECT
+
+end-procedure    !Retrieve-header-recd-data
+
+
+!**********************************************************************
+begin-procedure Retrieve-emp-data
+!
+!Description: Retrieves employee data from the GVT_TSP_01_HIST table.
+!**********************************************************************
+
+let $SQL-STATEMENT = 'FGPY002, Retrieve-emp-data'
+
+BEGIN-SELECT On-Error=SQL-Error
+
+O1.SSN
+O1.BIRTHDATE
+O1.GVT_SUB_AGENCY
+
+  let $out-birthdate  = &O1.BIRTHDATE
+  let $out-ssn        = &O1.SSN
+  let $out-sub-agency = &O1.GVT_SUB_AGENCY
+
+FROM PS_GVT_TSP_01_HIST O1
+
+WHERE O1.EMPLID    = $emplid
+AND   O1.EMPL_RCD  = #empl_rcd
+
+END-SELECT
+
+end-procedure   !Retrieve-emp-data
+
+
+!**********************************************************************
+begin-procedure Retrieve-investment-elections
+!
+!Description: Retrieves employee tsp investment elections from
+!             GVT_TSP_INV_DTA
+!**********************************************************************
+
+let $elections-found = 'N'
+
+let #fund-c-pct = 0
+let #fund-f-pct = 0
+let #fund-g-pct = 0
+let #fund-s-pct = 0
+let #fund-i-pct = 0
+
+let $SQL-STATEMENT = 'FGPY002, Retrieve-investment-elections'
+
+BEGIN-SELECT On-Error=SQL-Error
+
+P1.INVESTMENT_OPT
+P1.INVESTMENT_PCT
+
+    let $elections-found = 'Y'
+    let $INV_OPT = RTRIM(&P1.INVESTMENT_OPT, ' ')
+
+    evaluate $INV_OPT
+
+        when = 'C'
+            let #fund-c-pct = &P1.INVESTMENT_PCT
+        when = 'F'
+            let #fund-f-pct = &P1.INVESTMENT_PCT
+        when = 'G'
+            let #fund-g-pct = &P1.INVESTMENT_PCT
+        when = 'S'
+            let #fund-s-pct = &P1.INVESTMENT_PCT
+        when = 'I'
+            let #fund-i-pct = &P1.INVESTMENT_PCT
+
+    end-evaluate     !&P1.INVESTMENT_OPT
+
+FROM PS_GVT_TSP_INV_DTA P1
+
+WHERE P1.EMPLID  = $emplid
+AND P1.EMPL_RCD  = #empl_rcd_nbr
+AND P1.EFFDT     = (SELECT MAX(P2.EFFDT)
+                    FROM  PS_GVT_TSP_INV_DTA P2
+                    WHERE P2.EMPLID     = P1.EMPLID
+                    AND   P2.EMPL_RCD   = P1.EMPL_RCD
+                    AND   P2.EFFDT     <= &B1.PAY_END_DT)
+
+END-SELECT
+
+!**** If no investment options exist then allocate 100% to fund G
+if $elections-found = 'N'
+    let #fund-g-pct = 100
+end-if
+
+end-procedure   !Retrieve-investment-elections
+
+
+!**********************************************************************
+begin-procedure Close-tsp-file
+!
+!Description: Closes the interface extract file.
+!**********************************************************************
+
+close 1
+
+end-procedure     !Close-tsp-files
+
+
+!**********************************************************************
+begin-procedure Update-pay-calendar
+!
+!Description: Updates the TSP run indicator to 'Y'.
+!**********************************************************************
+
+let $SQL-STATEMENT = 'FGPY002, Update-pay-calendar'
+
+begin-SQL On-Error=SQL-Error
+
+UPDATE PS_PAY_CALENDAR
+
+  SET GVT_TSP_RUN = 'Y'
+
+  WHERE RUN_ID = $Run_ID
+
+end-SQL
+
+end-procedure     !Update-pay-calendar
+
+
+!**********************************************************************
+begin-procedure Update-tsp-voucher
+!
+!Description: Updates the TSP Voucher with record counts for the 4
+!             TSP record types that this interface creates.
+!**********************************************************************
+
+let $SQL-STATEMENT = 'FGPY002, Update-tsp-voucher'
+
+begin-SQL On-Error=SQL-Error
+
+UPDATE PS_GVT_TSP_VOUCHER
+
+SET   GVT_TSP_DATA_RECS  = #Emp-data-rec-count,
+      GVT_TSP_PYMNT_RECS = #Reg-payment-rec-count,
+      GVT_TSP_LATE_RECS  = #Late-payment-rec-count,
+      GVT_TSP_NEG_RECS   = #Neg-adjust-rec-count,
+      GVT_TSP_PAY_SUB    = 'Y',
+      PAY_BEGIN_DT       = &B1.PAY_BEGIN_DT,
+      PAY_END_DT         = &B1.PAY_END_DT,
+      CHECK_DT           = &B1.CHECK_DT
+
+WHERE COMPANY        = &B1.COMPANY
+AND   GVT_TSP_SEQ_YR = &RUN_CNTL_FG.GVT_TSP_SEQ_YR
+AND   GVT_TSP_SEQ_NO = &RUN_CNTL_FG.GVT_TSP_SEQ_NO
+
+end-SQL
+
+end-procedure     !Update-tsp-voucher
+
+
+!**********************************************************************
+begin-procedure Delete-R-GVT-TSP-SORT
+!
+!Description: Deletes all records from the TSP sort work table after
+!             all of the records have been extracted and written to
+!             TSP Interface file.
+!**********************************************************************
+
+let $SQL-STATEMENT = 'FGPY002, Delete-R-GVT-TSP-SORT'
+
+BEGIN-SQL On-Error=SQL-Error
+
+DELETE from PS_R_GVT_TSP_SORT
+
+END-SQL
+
+end-procedure     !Delete-R-GVT-TSP-SORT
+
+
+!**********************************************************************
+begin-procedure Print-tsp-report
+!
+!Description:  Prints the TSP Interface report which contains totals by
+!              fund and contribution type.
+!**********************************************************************
+
+let #tsp_yr = to_number($gvt_tsp_seq_yr)
+let #tsp_seq = to_number($gvt_tsp_seq_no)
+
+if $gvt_tsp_rpt_only = 'N'
+
+    let $gvt_tsp_company = rtrim(&B1.COMPANY,' ')
+
+end-if
+
+let $SQL-STATEMENT = 'FGPY002, Print-tsp-report'
+
+BEGIN-SELECT On-Error=SQL-Error
+
+V1.GVT_TSP_PAY_SUB
+V1.GVT_TSP_EFT_DEP
+V1.GVT_TSP_MEDIA_TYPE
+V1.GVT_TSP_REEL_NO
+V1.GVT_TSP_REEL_DT
+V1.GVT_TSP_REEL_BKUP
+V1.GVT_TSP_REEL_BU_DT
+
+FROM PS_GVT_TSP_VOUCHER V1
+
+WHERE COMPANY        = $gvt_tsp_company
+AND   GVT_TSP_SEQ_YR = #tsp_yr
+AND   GVT_TSP_SEQ_NO = #tsp_seq
+
+END-SELECT
+
+
+let #total-rec-count = #tot-rcnt-data + #tot-rcnt-reg + #tot-rcnt-late +
+         #tot-rcnt-adj
+
+let   #emp-contrib-reg-tot = #emp-contrib-reg-g +
+                             #emp-contrib-reg-f +
+                             #emp-contrib-reg-c +
+                             #emp-contrib-reg-s +
+                             #emp-contrib-reg-i
+
+let   #agy-basic-reg-tot  = #agy-basic-reg-g +
+                            #agy-basic-reg-f +
+                            #agy-basic-reg-c +
+                            #agy-basic-reg-s +
+                            #agy-basic-reg-i
+
+let   #agy-contrib-reg-tot   = #agy-contrib-reg-g +
+                               #agy-contrib-reg-f +
+                               #agy-contrib-reg-c +
+                               #agy-contrib-reg-s +
+                               #agy-contrib-reg-i
+
+let   #total-reg-g = #emp-contrib-reg-g +
+                     #agy-contrib-reg-g +
+                     #agy-basic-reg-g
+
+let   #total-reg-f = #emp-contrib-reg-f +
+                     #agy-contrib-reg-f +
+                     #agy-basic-reg-f
+
+let   #total-reg-c = #emp-contrib-reg-c +
+                     #agy-contrib-reg-c +
+                     #agy-basic-reg-c
+
+let   #total-reg-s = #emp-contrib-reg-s +
+                     #agy-contrib-reg-s +
+                     #agy-basic-reg-s
+
+let   #total-reg-i = #emp-contrib-reg-i +
+                     #agy-contrib-reg-i +
+                     #agy-basic-reg-i
+
+let   #total-all-reg = #total-reg-g +
+                       #total-reg-f +
+                       #total-reg-c +
+                       #total-reg-s +
+                       #total-reg-i
+
+let   #emp-contrib-neg-tot = #emp-contrib-neg-g +
+                             #emp-contrib-neg-f +
+                             #emp-contrib-neg-c +
+                             #emp-contrib-neg-s +
+                             #emp-contrib-neg-i
+
+let   #agy-basic-neg-tot =   #agy-basic-neg-g +
+                             #agy-basic-neg-f +
+                             #agy-basic-neg-c +
+                             #agy-basic-neg-s +
+                             #agy-basic-neg-i
+
+let   #agy-contrib-neg-tot = #agy-contrib-neg-g +
+                             #agy-contrib-neg-f +
+                             #agy-contrib-neg-c +
+                             #agy-contrib-neg-s +
+                             #agy-contrib-neg-i
+
+let   #total-neg-g = #emp-contrib-neg-g +
+                     #agy-contrib-neg-g +
+                     #agy-basic-neg-g
+
+let   #total-neg-f = #emp-contrib-neg-f +
+                     #agy-contrib-neg-f +
+                     #agy-basic-neg-f
+
+let   #total-neg-c = #emp-contrib-neg-c +
+                     #agy-contrib-neg-c +
+                     #agy-basic-neg-c
+
+let   #total-neg-s = #emp-contrib-neg-s +
+                     #agy-contrib-neg-s +
+                     #agy-basic-neg-s
+
+let   #total-neg-i = #emp-contrib-neg-i +
+                     #agy-contrib-neg-i +
+                     #agy-basic-neg-i
+
+let   #total-all-neg = #total-neg-g +
+                       #total-neg-f +
+                       #total-neg-c +
+                       #total-neg-s +
+                       #total-neg-i
+
+let #total = #emp-contrib-reg-tot + #agy-contrib-reg-tot +
+             #emp-contrib-neg-tot + #agy-contrib-neg-tot +
+             #agy-basic-neg-tot   + #agy-basic-reg-tot
+
+if &VER.GVT_TSP_VERSION = 'N'
+    Do Print-TSP-2-Form-Post-2000
+else
+    Do Print-TSP-2-Form-Pre-2000
+end-if
+
+end-procedure     !Print-tsp-report
+
+!******************************************
+begin-procedure clean-voucher-detail-action
+!******************************************
+
+let $SQL-STATEMENT = 'FGPY002, clean-voucher-detail-action'
+
+begin-sql On-Error=SQL-Error
+
+DELETE FROM PS_GVT_TSP_VCH_DET
+
+WHERE COMPANY = &B1.COMPANY
+
+AND   GVT_TSP_SEQ_YR = &RUN_CNTL_FG.GVT_TSP_SEQ_YR
+AND   GVT_TSP_SEQ_NO = &RUN_CNTL_FG.GVT_TSP_SEQ_NO
+
+end-sql
+
+end-procedure     !clean-voucher-detail-action
+
+!**********************************************************************
+begin-procedure Insert-voucher-detail-recs
+!
+!Description:  Inserts 3 records into the GVT_TSP_VCH_DET table.
+!              One for each fund type (C,F,G)
+!              Post 5/1/2000 fund types (S,I) are added
+!**********************************************************************
+
+let $fund = 'C'
+
+while $fund <> ' '
+
+    evaluate $fund
+
+        when = 'C'
+            let #gvt-tsp-rec-ee    = #emp-contrib-reg-c
+            let #gvt-tsp-rec-agy-b = #agy-basic-reg-c
+            let #gvt-tsp-rec-agy-m = #agy-contrib-reg-c
+            let #gvt-tsp-neg-ee    = #emp-contrib-neg-c
+            let #gvt-tsp-neg-agy-b = #agy-basic-neg-c
+            let #gvt-tsp-neg-agy-m = #agy-contrib-neg-c
+            break
+        when = 'F'
+            let #gvt-tsp-rec-ee    = #emp-contrib-reg-f
+            let #gvt-tsp-rec-agy-b = #agy-basic-reg-f
+            let #gvt-tsp-rec-agy-m = #agy-contrib-reg-f
+            let #gvt-tsp-neg-ee    = #emp-contrib-neg-f
+            let #gvt-tsp-neg-agy-b = #agy-basic-neg-f
+            let #gvt-tsp-neg-agy-m = #agy-contrib-neg-f
+            break
+        when = 'G'
+            let #gvt-tsp-rec-ee    = #emp-contrib-reg-g
+            let #gvt-tsp-rec-agy-b = #agy-basic-reg-g
+            let #gvt-tsp-rec-agy-m = #agy-contrib-reg-g
+            let #gvt-tsp-neg-ee    = #emp-contrib-neg-g
+            let #gvt-tsp-neg-agy-b = #agy-basic-neg-g
+            let #gvt-tsp-neg-agy-m = #agy-contrib-neg-g
+        when = 'S'
+            let #gvt-tsp-rec-ee    = #emp-contrib-reg-s
+            let #gvt-tsp-rec-agy-b = #agy-basic-reg-s
+            let #gvt-tsp-rec-agy-m = #agy-contrib-reg-s
+            let #gvt-tsp-neg-ee    = #emp-contrib-neg-s
+            let #gvt-tsp-neg-agy-b = #agy-basic-neg-s
+            let #gvt-tsp-neg-agy-m = #agy-contrib-neg-s
+        when = 'I'
+            let #gvt-tsp-rec-ee    = #emp-contrib-reg-i
+            let #gvt-tsp-rec-agy-b = #agy-basic-reg-i
+            let #gvt-tsp-rec-agy-m = #agy-contrib-reg-i
+            let #gvt-tsp-neg-ee    = #emp-contrib-neg-i
+            let #gvt-tsp-neg-agy-b = #agy-basic-neg-i
+            let #gvt-tsp-neg-agy-m = #agy-contrib-neg-i
+
+    end-evaluate     !$fund
+
+let $SQL-STATEMENT = 'FGPY002, Insert-voucher-detail-recs'
+
+BEGIN-SQL On-Error=SQL-Error
+
+INSERT INTO PS_GVT_TSP_VCH_DET
+  (COMPANY,
+   GVT_TSP_SEQ_YR,
+   GVT_TSP_SEQ_NO,
+   INVESTMENT_OPT,
+   GVT_TSP_REC_EE,
+   GVT_TSP_REC_AGY_B,
+   GVT_TSP_REC_AGY_M,
+   GVT_TSP_NEG_EE,
+   GVT_TSP_NEG_AGY_B,
+   GVT_TSP_NEG_AGY_M)
+  VALUES (&B1.COMPANY,
+          &RUN_CNTL_FG.GVT_TSP_SEQ_YR,
+          &RUN_CNTL_FG.GVT_TSP_SEQ_NO,
+          $fund,
+          #gvt-tsp-rec-ee,
+          #gvt-tsp-rec-agy-b,
+          #gvt-tsp-rec-agy-m,
+          #gvt-tsp-neg-ee,
+          #gvt-tsp-neg-agy-b,
+          #gvt-tsp-neg-agy-m)
+END-SQL
+
+    evaluate $fund
+
+        when = 'C'
+            let $fund = 'F'
+            break
+        when = 'F'
+            let $fund = 'G'
+            break
+        when = 'G'
+            let $fund = 'S'
+            break
+        when = 'S'
+            let $fund = 'I'
+            break
+        when = 'I'
+            let $fund = ' '
+
+    end-evaluate     !$fund
+
+    If &VER.GVT_TSP_VERSION <> 'N' and $fund = 'S'
+        let $fund = ' '
+    End-if
+
+end-while     !$fund <> 'I'
+
+end-procedure   !Insert-voucher-detail-recs
+
+
+!**********************************************************************
+begin-procedure Retrieve-voucher-detail-recs
+!
+!Description:
+!
+!**********************************************************************
+
+let #tsp_yr = to_number($gvt_tsp_seq_yr)
+let #tsp_seq = to_number($gvt_tsp_seq_no)
+
+let $SQL-STATEMENT = 'FGPY002, Retrieve-voucher-detail-recs - First BEGIN-SELECT'
+
+BEGIN-SELECT On-Error=SQL-Error
+
+Z1.COMPANY
+Z1.GVT_TSP_SEQ_YR
+Z1.GVT_TSP_SEQ_NO
+Z1.INVESTMENT_OPT
+Z1.GVT_TSP_REC_EE
+Z1.GVT_TSP_REC_AGY_B
+Z1.GVT_TSP_REC_AGY_M
+Z1.GVT_TSP_NEG_EE
+Z1.GVT_TSP_NEG_AGY_B
+Z1.GVT_TSP_NEG_AGY_M
+
+    let $INV_OPT = RTRIM(&Z1.INVESTMENT_OPT, ' ')
+
+    evaluate $INV_OPT
+        when = 'C'
+            let #emp-contrib-reg-c =  &Z1.GVT_TSP_REC_EE
+            let #agy-basic-reg-c   =  &Z1.GVT_TSP_REC_AGY_B
+            let #agy-contrib-reg-c =  &Z1.GVT_TSP_REC_AGY_M
+            let #agy-basic-neg-c   =  &Z1.GVT_TSP_NEG_EE
+            let #agy-basic-neg-c   =  &Z1.GVT_TSP_NEG_AGY_B
+            let #agy-contrib-neg-c =  &Z1.GVT_TSP_NEG_AGY_M
+            break
+        when = 'F'
+            let #emp-contrib-reg-f =  &Z1.GVT_TSP_REC_EE
+            let #agy-basic-reg-f   =  &Z1.GVT_TSP_REC_AGY_B
+            let #agy-contrib-reg-f =  &Z1.GVT_TSP_REC_AGY_M
+            let #agy-basic-neg-f   =  &Z1.GVT_TSP_NEG_EE
+            let #agy-basic-neg-f   =  &Z1.GVT_TSP_NEG_AGY_B
+            let #agy-contrib-neg-f =  &Z1.GVT_TSP_NEG_AGY_M
+            break
+        when = 'G'
+            let #emp-contrib-reg-g =  &Z1.GVT_TSP_REC_EE
+            let #agy-basic-reg-g   =  &Z1.GVT_TSP_REC_AGY_B
+            let #agy-contrib-reg-g =  &Z1.GVT_TSP_REC_AGY_M
+            let #agy-basic-neg-g   =  &Z1.GVT_TSP_NEG_EE
+            let #agy-basic-neg-g   =  &Z1.GVT_TSP_NEG_AGY_B
+            let #agy-contrib-neg-g =  &Z1.GVT_TSP_NEG_AGY_M
+        when = 'S'
+            let #emp-contrib-reg-s =  &Z1.GVT_TSP_REC_EE
+            let #agy-basic-reg-s   =  &Z1.GVT_TSP_REC_AGY_B
+            let #agy-contrib-reg-s =  &Z1.GVT_TSP_REC_AGY_M
+            let #agy-basic-neg-s   =  &Z1.GVT_TSP_NEG_EE
+            let #agy-basic-neg-s   =  &Z1.GVT_TSP_NEG_AGY_B
+            let #agy-contrib-neg-s =  &Z1.GVT_TSP_NEG_AGY_M
+        when = 'I'
+            let #emp-contrib-reg-i =  &Z1.GVT_TSP_REC_EE
+            let #agy-basic-reg-i   =  &Z1.GVT_TSP_REC_AGY_B
+            let #agy-contrib-reg-i =  &Z1.GVT_TSP_REC_AGY_M
+            let #agy-basic-neg-i   =  &Z1.GVT_TSP_NEG_EE
+            let #agy-basic-neg-i   =  &Z1.GVT_TSP_NEG_AGY_B
+            let #agy-contrib-neg-i =  &Z1.GVT_TSP_NEG_AGY_M
+
+    end-evaluate     !&Z1.INVESTMENT_OPT
+
+FROM  PS_GVT_TSP_VCH_DET Z1
+WHERE Z1.COMPANY        = $gvt_tsp_company
+AND   Z1.GVT_TSP_SEQ_YR = #tsp_yr
+AND   Z1.GVT_TSP_SEQ_NO = #tsp_seq
+
+END-SELECT
+
+let $SQL-STATEMENT = 'FGPY002, Retrieve-voucher-detail-recs - Second BEGIN-SELECT'
+
+BEGIN-SELECT On-Error=SQL-Error
+
+Z2.GVT_TSP_DATA_RECS
+Z2.GVT_TSP_PYMNT_RECS
+Z2.GVT_TSP_LATE_RECS
+Z2.GVT_TSP_NEG_RECS
+Z2.PAY_END_DT
+    let #tot-rcnt-data   = &Z2.GVT_TSP_DATA_RECS
+    let #tot-rcnt-reg    = &Z2.GVT_TSP_PYMNT_RECS
+    let #tot-rcnt-late   = &Z2.GVT_TSP_LATE_RECS
+    let #tot-rcnt-adj    = &Z2.GVT_TSP_NEG_RECS
+    let #total-rec-count = #tot-rcnt-data + #tot-rcnt-reg + #tot-rcnt-late +
+                           #tot-rcnt-adj
+
+FROM PS_GVT_TSP_VOUCHER Z2
+
+WHERE Z2.COMPANY        = $gvt_tsp_company
+AND   Z2.GVT_TSP_SEQ_YR = #tsp_yr
+AND   Z2.GVT_TSP_SEQ_NO = #tsp_seq
+
+END-SELECT
+
+let $SQL-STATEMENT = 'FGPY002, Retrieve-voucher-detail-recs - Third BEGIN-SELECT'
+
+BEGIN-SELECT On-Error=SQL-Error
+
+Z3A.GVT_AGY_TSP_ACCT
+
+    let $print_agy_acct_no = rtrim(&Z3A.GVT_AGY_TSP_ACCT,' ')
+
+FROM PS_COMPANY_TBL Z3,
+     PS_GVT_INTRFC_INFO Z3A
+
+WHERE Z3.COMPANY    = $gvt_tsp_company
+AND   Z3.EFF_STATUS = 'A'
+AND   Z3.EFFDT      = (SELECT MAX(Z3B.EFFDT)
+                       FROM PS_COMPANY_TBL Z3B
+                       WHERE Z3B.COMPANY  = Z3.COMPANY
+                       AND Z3B.EFF_STATUS = 'A'
+                       AND Z3B.EFFDT     <= $AsOfToday)
+AND   Z3A.COMPANY   = Z3.COMPANY
+AND   Z3A.EFFDT     = Z3.EFFDT
+
+END-SELECT
+
+end-procedure   !Retrieve-voucher-detail-recs
+
+
+!**********************************************************************
+begin-procedure Delete-run-control
+!
+!Description: Deletes the run control record that the program was run
+!             with.
+!**********************************************************************
+
+let $SQL-STATEMENT = 'FGPY002, Delete-run-control'
+
+BEGIN-SQL On-Error=SQL-Error
+
+DELETE from PS_GVT_RUN_CNTL
+
+WHERE OPRID       = $Prcs_OprID
+  AND RUN_CNTL_ID = $Prcs_Run_Cntl_ID
+
+END-SQL
+
+end-procedure     !Delete-run-control
+
+
+!** NEW FOR 2000 FORMAT
+!**********************************************************************
+begin-procedure Get-TSP-Version
+!
+!Description:  Retrieve the version of TSP to be run for output.
+!              N = Post 5/1/2000
+!              O = Pre  5/1/2000
+!**********************************************************************
+
+let #tsp_yr = to_number($gvt_tsp_seq_yr)
+let #tsp_seq = to_number($gvt_tsp_seq_no)
+
+let $SQL-STATEMENT = 'FGPY002, Get-TSP-Version'
+
+BEGIN-SELECT On-Error=SQL-Error
+
+VER.GVT_TSP_VERSION
+
+FROM PS_GVT_TSP_VOUCHER VER
+
+WHERE COMPANY        = $gvt_tsp_company
+AND   GVT_TSP_SEQ_YR = #tsp_yr
+AND   GVT_TSP_SEQ_NO = #tsp_seq
+
+END-SELECT
+
+if &VER.GVT_TSP_VERSION = 'N'
+    let $emp-data-rcdno = '06'
+    let $curr-pay-rcdno = '16'
+    let $neg-adj-rcdno  = '26'
+    let $late-pay-rcdno = '46'
+else
+    let $emp-data-rcdno = '01'
+    let $curr-pay-rcdno = '11'
+    let $neg-adj-rcdno  = '21'
+    let $late-pay-rcdno = '41'
+end-if
+
+end-procedure     !Get-TSP-Version
+
+!*****************************
+begin-procedure Get-Pay-Run-ID
+!*****************************
+
+let $SQL-STATEMENT = 'FGPY002, Get-Pay-Run-ID'
+
+let $D = &Z2.Pay_end_dt
+
+BEGIN-SELECT On-Error=SQL-Error
+
+PP.RUN_ID
+ Let $Run_Id = &PP.RUN_ID
+
+FROM PS_PAY_CALENDAR PP
+
+WHERE PP.PAY_END_DT = &Z2.PAY_END_DT
+
+END-SELECT
+
+end-procedure    !Get-Pay-Run-ID
+
+
+#Include 'fgrunctl.sqc'  !Get run control parameter values
+#include 'fggetval.sqc'  !Get values mask routines
+#Include 'tranctrl.sqc'  !Common Transaction Control Procedures
+#include 'fgovrpch.sqc'  !Over Punch routine
+#Include 'reset.sqc'     !Reset printer
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'curdttim.sqc'  !Routines to get current date/time
+#Include 'useprntr.sqc'  !
+#Include 'stdapi.sqc'    !Routines to Update Run Status
+#Include 'rotname3.sqc'  !Convert $Name to its 3 components
+#Include 'fgtspupd.sqc'  !GVT Routine to sync tsp elections
+#Include 'fgpytspf.sqc'  !Prints TSP-2 form

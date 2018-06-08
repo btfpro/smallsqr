@@ -1,0 +1,298 @@
+!**********************************************************************!
+!  gpusfdli:  Federal Liability By State                (USA)          !
+!**********************************************************************!
+!                                                                      !
+!               Confidentiality Information:                           !
+!                                                                      !
+!                                                                      !
+! This module contains confidential and proprietary information        !
+! of Oracle; it is not to be copied, reproduced, or transmitted        !
+! in any form, by any means, in whole or in part, nor is it to         !
+! be used for any purpose other than that for which it is              !
+! expressly provided under the applicable license agreement.           !
+!                                                                      !
+! Copyright (C) 2006 Oracle. All Rights Reserved.                      !
+!                                                                      !
+!**********************************************************************!
+!                                                                      !
+!                $Date:  2006/02/06:08:15:41                           !
+!             $Release:  HR9                                           !
+!            $Revision:  101                                           !
+!                                                                      !
+!**********************************************************************!
+
+#Include 'setenv.sqc'   !Set environment
+#Include 'setup31.sqc'  !Printer and page-size initialization
+#Include 'usarpt.sqc'   !Get USA variables
+
+Begin-Report
+  Do Init-Report
+  Do Stdapi-Term
+  Do delete-tmp
+End-Report
+
+Begin-Procedure Init-Report
+  Move 'GPUSFDLI' To $ReportID
+  Move 'Federal Liability by State' To $ReportTitle
+  Do Init-DateTime
+  Do Init-Number
+  Do Stdapi-Init
+  Do Array-Initialization
+  Do Select-Parameters
+  Do Payroll-Report-Initialization
+End-Procedure
+
+Begin-Procedure Array-Initialization
+  Create-Array name=OtherTaxes size=10
+    field=TaxType:Char
+    field=GPUS_TAX_GRS:number
+    field=GPUS_TAX_AMT:number
+    field=ER_Match:number
+  Create-Array name=Totals size=5
+    field=TotalName:Char field=total:number:4 field=startCol:number:4
+  Put 'Grand Total'              Into Totals(1) TotalName
+  Put 'Company Total'            Into Totals(2) TotalName
+  Put 'Pay Period Total'         Into Totals(3) TotalName
+  Put 'Payment Date Total'       Into Totals(4) TotalName
+  Put  36 Into Totals(0) startCol(0)       !federal withholding
+  Put  71 Into Totals(0) startCol(1)       !OASDI/Medicare - EE
+  Put  85 Into Totals(0) startCol(2)       !OASDI/Medicare - ER
+  Put 105 Into Totals(0) startCol(3)       !total 'federal liability'
+End-Procedure
+
+Begin-Heading 9
+  #Include 'gpushgrc.sqc'
+  #Include 'stdhdg01.sqc'
+  print 'Pay Period End  ' (4,1)
+  do Format-DateTime($PayEndDate, $out, {DEFDATE}, '', '')
+  print $out ()
+    if $Company <> $priorCompany
+    do Get-Company-Data
+    move $Company to $priorCompany
+    move ''       to $priorPayGroup  !for use in Standard Heading #6
+  end-if
+  print 'W2 Rpt Company'   (3,1,15)
+  print $Company           (0,17,4)
+  print $CompanyName       (0,21)
+
+  print 'Payment Date'      (5,1,15)
+  do Format-DateTime($AsOfDate, $out, {DEFDATE}, '', '')
+  print $out               (0,17)
+  Print '  State              <------ WITHHOLDING ------> '  (+2,1)
+  Print '<------------  OASDI/MEDICARE  ----------------> '  ()
+  Print 'State EIN             Taxable Gross       Tax    '  (+1,1)
+  Print ' Type   Taxable Gross       Tax         Employer '  ()
+  Print '    Total Liability '                               ()
+End-Heading
+
+Begin-Procedure Report
+
+Begin-Select
+FD.GPUS_YE_RPT_CO        () On-Break Print=Never Level=1 Procedure=Company-Change
+FD.PRD_END_DT            () On-Break Print=Never Level=2 Procedure=PayEndDate-Change
+FD.PYMT_DT               () On-Break Print=Never Level=3 Procedure=CheckDate-Change
+FD.STATE                 () On-Break Print=Never Level=4 Procedure=State-Change
+FD.GPUS_TAX_RPT_TYPE
+FD.GPUS_TAX_CATEGORY
+Sum(FD.GPUS_TAX_GRS) &FD.GPUS_TAX_GRS
+Sum(FD.GPUS_TAX_AMT) &FD.GPUS_TAX_AMT
+
+  Do Process-Record
+
+From PS_GPUS_FDLI_TMP FD
+Where FD.PROCESS_INSTANCE = #prcs_process_instance - 1
+  And FD.STATE <> ' '
+
+Group By FD.GPUS_YE_RPT_CO,FD.PRD_END_DT,FD.PYMT_DT,FD.STATE,FD.GPUS_TAX_RPT_TYPE ,FD.GPUS_TAX_CATEGORY
+Order By FD.GPUS_YE_RPT_CO,FD.PRD_END_DT,FD.PYMT_DT,FD.STATE,FD.GPUS_TAX_RPT_TYPE ,FD.GPUS_TAX_CATEGORY
+End-Select
+  Move 1 To #changeLevel
+  Move 'Y' To $End
+  Do Print-Totals
+End-Procedure
+
+Begin-Procedure Process-Record
+  If &FD.Gpus_Ye_Rpt_Co <> $priorCompany
+    Move &FD.Gpus_Ye_Rpt_Co to $Company
+    Move &FD.Gpus_Ye_Rpt_Co to $priorCompany
+    Do Get-Company-Data  !for Federal_EIN, SUT Rate
+  End-If
+
+  Move &FD.Prd_End_Dt To $PayEndDate
+  Move &FD.Pymt_Dt    To $AsOfDate
+  Let $state = Rtrim(&FD.STATE , ' ')
+
+  Evaluate &FD.Gpus_Tax_Category
+    When = '01'
+                                                                   ! Withholding Employee Income Tax
+      Add &FD.GPUS_TAX_GRS   To #WithholdingGross
+      Add &FD.GPUS_TAX_AMT   To #WithholdingTax
+    When = '07'                                                                 ! Earned Income Credit
+      Add &FD.GPUS_TAX_AMT To #EIC
+    When = '04'
+      If #MediEIndex = 0
+        Add 1 To #OtherTaxCount
+        Move #OtherTaxCount To #MediEIndex
+        Put 'MEDIE' &FD.GPUS_TAX_GRS &FD.GPUS_TAX_AMT 0
+          Into OtherTaxes(#MediEIndex) TaxType GPUS_TAX_GRS GPUS_TAX_AMT ER_Match
+      Else
+        Array-Add &FD.GPUS_TAX_GRS &FD.GPUS_TAX_AMT 0
+          To OtherTaxes(#MediEIndex) GPUS_TAX_GRS GPUS_TAX_AMT ER_Match
+      End-If
+
+    When = '05'
+      If #MediRIndex = 0
+        Add 1 To #OtherTaxCount
+        Move #OtherTaxCount To #MediRIndex
+        Put 'MEDIR' &FD.GPUS_TAX_GRS 0 &FD.GPUS_TAX_AMT
+          Into OtherTaxes(#MediRIndex) TaxType GPUS_TAX_GRS GPUS_TAX_AMT ER_Match
+      Else
+        Array-Add &FD.GPUS_TAX_GRS 0 &FD.GPUS_TAX_AMT
+          To OtherTaxes(#MediRIndex) GPUS_TAX_GRS GPUS_TAX_AMT ER_Match
+      End-If
+    When = '02'                                                                 ! OASDI EE - Old Age Survivor
+      If #DisEIndex = 0                                                       !            Disability Income EE
+        Add 1 To #OtherTaxCount
+        Move #OtherTaxCount To #DisEIndex
+        Put 'OASDE' &FD.GPUS_TAX_GRS &FD.GPUS_TAX_AMT 0
+           Into OtherTaxes(#DisEIndex)
+                TaxType GPUS_TAX_GRS GPUS_TAX_AMT ER_Match
+      Else
+          Array-Add &FD.GPUS_TAX_GRS &FD.GPUS_TAX_AMT 0
+            To OtherTaxes(#DisEIndex)
+                GPUS_TAX_GRS GPUS_TAX_AMT ER_Match
+      End-If
+    When = '03'                                                                 ! OASDI ER - Old Age Survivor
+      If #DisRIndex = 0                                                      !            Disability Income ER
+        Add 1 To #OtherTaxCount
+        Move #OtherTaxCount To #DisRIndex
+        Put 'OASDR' &FD.GPUS_TAX_GRS 0 &FD.GPUS_TAX_AMT
+           Into OtherTaxes(#DisRIndex)
+                TaxType GPUS_TAX_GRS GPUS_TAX_AMT ER_Match
+      Else
+          Array-Add &FD.GPUS_TAX_GRS 0 &FD.GPUS_TAX_AMT
+            To OtherTaxes(#DisRIndex)
+                GPUS_TAX_GRS GPUS_TAX_AMT ER_Match
+      End-If
+  End-Evaluate
+End-Procedure
+
+Begin-Procedure Company-Change
+  Move 2 To #changeLevel
+  Do Print-Totals
+End-Procedure
+
+Begin-Procedure PayEndDate-Change
+  Move 3 To #changeLevel
+  Do Print-Totals
+End-Procedure
+
+Begin-Procedure CheckDate-Change
+  Move 4 To #changeLevel
+  Do Print-Totals
+End-Procedure
+
+
+Begin-Procedure State-Change
+  If #current-line > 56                                           ! ensure enough lines for the tax authority
+    New-Page
+  End-If
+
+  If $state <> $priorState
+    Move $state To $priorState
+
+    Do Get-State-Tax-Data
+  End-If
+
+  Print $StateName         (1,1)
+  Print $StateEin   (2,1)
+  Do Format-Number(#WithholdingGross, $out, 'B99,999,999.99mi')
+  Print $out        (1,21)
+  Do Format-Number(#WithholdingTax, $out, 'B9,999,999.99mi')
+  Print $out        (0,36)
+  Add #WithholdingTax To #TotalLiability
+  If #EIC <> 0
+    Print '(EIC)'   (2,27)
+    Do Format-Number(#EIC, $out, 'B9,999,999.99mi')
+    Print $out      (0,36)
+    Add #EIC To #TotalLiability
+    Array-Add #EIC To Totals(4) total(0)
+  End-If
+  Move 1 to #i
+  While #i <= #OtherTaxCount
+    Get $TaxType #GPUS_TAX_GRS #GPUS_TAX_AMT #ER_Match
+      From OtherTaxes(#i)
+          TaxType GPUS_TAX_GRS GPUS_TAX_AMT ER_Match
+    If #GPUS_TAX_GRS <> 0 Or #GPUS_TAX_AMT <> 0
+      Print $TaxType     (#i,51)
+      Do Format-Number(#GPUS_TAX_GRS, $out, 'B99,999,999.99mi')
+      Print $out         (0,56)
+      Do Format-Number(#GPUS_TAX_AMT, $out, 'B9,999,999.99mi')
+      Print $out         (0,71)
+      Do Format-Number(#ER_Match, $out, 'B9,999,999.99mi')
+      Print $out         (0,85)
+      Array-Add #GPUS_TAX_AMT #ER_Match To Totals(4) total(1) total(2)
+      Add #GPUS_TAX_AMT To #TotalLiability
+      Add #ER_Match To #TotalLiability
+    End-If
+    Add 1 To #i
+  End-While
+  Do Format-Number(#TotalLiability, $out, 'B9,999,999.99mi')
+  Print $out           (1,105)
+  Array-Add #WithholdingTax #TotalLiability
+            To Totals(4) total(0) total(3)
+  Move 0 To #TotalLiability
+  Move 0 To #WithholdingGross
+  Move 0 To #WithholdingTax
+  Move 0 To #EIC
+  Move 0 To #OtherTaxCount
+  Move 0 To #MediEIndex
+  Move 0 To #MediRIndex
+  Move 0 To #DisEIndex
+  Move 0 To #DisRIndex
+  Move 0 To #OtherTaxIndex
+  Next-Listing need=3 skiplines=1
+End-Procedure
+
+Begin-Procedure Print-Totals
+  Do State-Change
+  Move 4 To #totalRow
+  While #totalRow >= #changeLevel
+    Move #totalRow To #rollRow
+    Subtract 1 From #rollRow
+    Get $TotalName From Totals(#totalRow) TotalName
+    Print $TotalName (+2,11)
+    Move 0 To #i
+    While #i <= 3
+      Get #total From Totals(#totalRow) total(#i)
+      Get #startCol From Totals(0) startCol(#i)
+      Do Format-Number(#total, $out, 'B9,999,999.99mi')
+      Print $out (0,#startCol)
+      Array-Add #total To Totals(#rollRow) total(#i)
+      Put 0 Into Totals(#totalRow) total(#i)
+      Add 1 To #i
+    End-While
+    Subtract 1 From #totalRow
+  End-While
+  If $End = 'Y'
+    Do Reset
+  End-If
+  New-Page
+End-Procedure
+
+Begin-Procedure delete-tmp
+Begin-Sql
+Delete From PS_GPUS_FDLI_TMP
+  Where PROCESS_INSTANCE   = #prcs_process_instance - 1
+End-Sql
+End-Procedure
+
+#Include 'gpuscodt.sqc'  !Get-Company-Data procedure
+#Include 'reset1.sqc'    !Reset printer procedure
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'stdapi.sqc'    !Update Process API
+#Include 'gpuspctl.sqc'  !Process Scheduler Run Control
+#Include 'gpusstdt.sqc'  !Get-State-Tax-Data procedure
+#Include 'gpuspint.sqc'  !Report Initialization and Timing

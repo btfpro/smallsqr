@@ -1,0 +1,799 @@
+!***********************************************************************
+! GEXBNWW8:  This program evaluates BRM employees to the appropriate   *
+!            hours worked ranges based on their benefit program.        *
+!            Depending on the level of benefits which the EE evaluates
+!            to, this program may insert a JOB row to trigger benefit
+!            changes based on the actual hours worked in the previous 
+!            year.
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module is the confidential and proprietary information of       *
+! Giant Eagle, Inc.; it is not to be copied, reproduced, or transmitted*
+! in any form, by any means, in whole or in part, nor is it to be used *
+! for any purpose other than that for which it is expressly provided   *
+! without the written permission of Giant Eagle.                       *
+!                                                                      *
+!                                                                      *
+!***********************************************************************
+!***********************************************************************
+!                         MODIFICATION HISTORY                         *
+!***********************************************************************
+!  ID#     INITIALS    DATE           DESCRIPTION OF THE CHANGE        *  
+!***********************************************************************
+!  GBNC032   SXK       06/23/1998     INITIAL CREATION                 *
+!            SXK       09/22/1998      Added New Mobius ReportID       *
+!                                                                      *
+!  HR10306   GBD       08/26/2002     Added Empl_Rcd field to Earnings *
+!                                     Balance table lookup.            *
+!        VENDTKK       02/02/2009  Added INCLUDE GETPOSNM.SQC to pull  *
+!                  	           JOBTITLE from POSITION_DATA.DESCR   *
+!				   field instead of JOBCODE_TBL.DESCR  *
+!***********************************************************************
+
+
+#include 'setenv.sqc' !Set environment
+
+begin-setup
+
+#include 'setup32a.sqc'
+
+declare-report Report-log
+Printer-Type=HPLASERJET
+  layout=DEFAULT
+end-declare
+
+declare-report Promotion-Report
+Printer-Type=HPLASERJET
+  layout=DEFAULT
+end-declare
+
+end-setup
+
+!*********************************************************************
+!Initial processing, retrieving current dates and calls the main 
+!procedure to do the processing.                                     
+!*********************************************************************
+begin-report
+
+  use-report Report-log
+
+  do Init-DateTime
+  do Init-Number
+  do stdapi-init
+  
+  move 'GEXBNWW8' to $ReportID
+  move 'Benefit Changes based on Actual Hours Worked' to $ReportTitle
+  display $ReportTitle
+
+  do Get-Current-DateTime
+  
+  let $reportdate_mm = substr($reportdate,1,2)
+  let $reportdate_dd = substr($reportdate,4,2)
+  let $reportdate_yy = substr($reportdate,7,2)
+  do MakeYear4Digits ($reportdate_yy)
+
+  let $reportdate_ccyyyy = $reportdate_mm||'/'||$reportdate_dd||'/'||$reportdate_yy
+!  let $curr_mm_dt = $reportdate_mm||'/'||'01'||'/'||$reportdate_yy
+  do format-datetime($reportdate_ccyyyy,$reportdate_ccyy,{DEFMDY},'','NATIVE') 
+!  do format-datetime($curr_mm_dt,$curr_mm_dt_Dbf,{DEFMDY},'','NATIVE') 
+
+  do get-pay-end-dt
+
+  do Report
+  do Commit-Transaction
+  date-time () hh:mi:ss &timeEnded
+  display 'Report Ended: ' noline
+  display &timeEnded
+  do stdapi-term
+
+end-report
+
+!*********************************************************************
+!If this Program is being executed through process scheduler, 
+!the run control parameters and calls the main processing procedure.
+!Otherwise, interrogates the user for the run control parameters and 
+!validates them. If the run control parameters are invalid, stops the
+!execution.
+!*********************************************************************
+begin-procedure Report
+
+date-time () hh:mi:ss &timeBegan
+display 'Report Began: ' noline
+display &timeBegan
+
+move 'N' to $Errorfound
+
+move $reportdate_ccyyyy to $rnctl_date
+
+let $rnctl_mm = substr($rnctl_Date,1,2)
+let $rnctl_dd = substr($rnctl_Date,4,2)
+let $rnctl_yyyy = substr($rnctl_Date,7,4)       
+let $rnctl_yy  = substr($rnctl_date,9,2)
+move $rnctl_yyyy to #rnctl_yyyy
+move $rnctl_yy to #rnctl_yy
+
+do process-employee-data
+
+Report-Exit:
+
+
+  date-time () hh:mi:ss &timeProcess
+  display #InputTran 99999 noline
+  display ' Transactions Processed: ' 
+  display #job_inserts 99999 noline
+  display ' Transactions Inserted into JOB: ' noline
+
+  display &timeProcess
+
+end-procedure
+
+!*********************************************************************
+!Prints the header information in the report log.
+!*********************************************************************
+
+begin-heading 8 for-reports=(report-log)
+
+do get-bp-description
+
+unstring $reporttitle by '(' into $reporttitle $temp_right
+
+concat '(' with $reporttitle
+concat $prev_bp_name with $reporttitle
+concat '-' with $reporttitle
+concat &DES.DESCR with $reporttitle
+concat ')' with $reporttitle
+!SXK 09/22/1998 Begin
+let $ReportID = 'BNWW8LOG'
+!SXK 09/22/1998 End
+ #Include 'stdhdg01.sqc'
+
+!  date-time () DD-MON-YYYY &curr_Date 
+!  print &curr_Date ()
+  position (-1)
+  print 'Report Log' () center bold
+
+  position (+3)
+  print 'Trans#' (,1) bold
+  print 'Emplid' (,18) bold
+  print 'Message' (,50) bold
+  print '-' (+1,1,127) fill
+ 
+
+end-heading
+
+!*********************************************************************
+!Prints the header information in the Promotion Report
+!*********************************************************************
+
+begin-heading 8 for-reports=(Promotion-report)
+
+do get-bp-description
+
+unstring $reporttitle by '(' into $reporttitle $temp_right
+
+concat '(' with $reporttitle
+concat $prev_bp_name with $reporttitle
+concat '-' with $reporttitle
+concat &DES.DESCR with $reporttitle
+concat ')' with $reporttitle
+!SXK 09/22/1998 Begin
+let $ReportID = 'BNWW8PRM'
+!SXK 09/22/1998 End
+ #Include 'stdhdg01.sqc'
+
+  position (-1)
+
+  print 'Employees that should be Promoted to REG FT' () center bold
+  position (+1)
+  print 'Use the Effective Date listed on the report to insert a Promotion Row' () center bold
+  position (+2)
+
+  print 'Emplid' (,4) bold
+  print 'Employee Name' (,22) bold
+  print 'Job Title' (,45) bold
+  print 'Acct CD' (,65)
+  print 'Status'   (,85) bold
+  print 'Hours Worked' (,95) bold
+  print 'Service Date'  (,115) bold
+  print 'Effective Date' (,130) bold
+
+  print '-' (+1,1,155) fill
+ 
+end-heading
+
+!*********************************************************************
+!Prints the footer in the report log
+!*********************************************************************
+
+begin-footing 2 for-reports=(Report-log)
+page-number (1,155) 'Page '  
+last-page () ' of ' '.'
+
+end-footing
+
+!*********************************************************************
+!Prints the footer in the promotion Report
+!*********************************************************************
+
+begin-footing 2 for-reports=(promotion-Report)
+page-number (1,155) 'Page '  
+last-page () ' of ' '.'
+
+end-footing
+
+!*********************************************************************
+!Determines previous month's number of weeks to find out the weekly 
+!hours worked for each employee. Calls the main benefits participation
+!logic
+!*********************************************************************
+
+Begin-Procedure Process-Employee-Data
+
+move 'N' to $errorfound
+move 'N' to $found
+!*******************************************
+!Added logic to go to GEX_SQR_PROCESS table and retrieves all the 
+!benefit programs that need to be run through this SQR
+!*******************************************
+
+  do Retrieve-benefit-pgms
+
+  if $ben_pgm_found = 'N'
+     display 'No Benefit Programs found for Process:GEXBNWW8'
+  end-if
+
+end-procedure
+
+!*********************************************************************
+!Gets the pay end date of the previous pay cycle.
+!*********************************************************************
+
+Begin-Procedure get-pay-end-dt
+
+move 'N' to $found
+
+begin-select on-error=sql-error-found('Get-Pay-End-Dt')
+PAY.PAY_BEGIN_DT
+PAY.PAY_END_DT
+
+  move &PAY.PAY_END_DT to $pay_end_Dt
+  move &PAY.PAY_BEGIN_DT to $pay_begin_dt
+  display 'Pay End Date:' noline
+  display $pay_end_Dt
+  move 'Y' to $found
+  exit-select
+
+FROM PS_PAY_CALENDAR PAY
+
+WHERE PAY.PAY_CONFIRM_RUN = 'Y'
+  AND PAY.PAY_END_DT = (SELECT MAX(PAY_END_DT)
+		      FROM PS_PAY_CALENDAR
+		     WHERE PAY_END_DT <= $reportdate_ccyy
+		       AND PAY_CONFIRM_RUN = 'Y')
+
+end-select
+
+if $found = 'N'
+   do error-found
+   print 'No Previously confirmed Pay Cycle as of:' (,34)
+   print $reportdate_ccyy ()
+   stop
+end-if
+
+end-procedure
+
+!*********************************************************************
+!Retrieves each employee who participated in Benefit Program and
+!calls necessary procedures to process further. 
+!********************************************************************* 
+
+begin-procedure process-benefit-partic
+
+do get-service-eligibility   
+
+if $min_months_found = 'N'
+   goto exit-program
+end-if
+
+move 'N' to $errorfound
+move 'N' to $beninfo_found
+
+if $log_printed = 'Y'
+   use-report report-log
+   new-page
+end-if
+if $promo_printed = 'Y'
+   use-report promotion-report
+   new-page
+end-if
+move $bp_name to $prev_bp_name
+use-report report-log
+
+begin-select on-error=sql-error-found('process-benefit-partic')
+B.EMPLID  &emplid
+B.EMPL_RCD
+to_char(B.EFFDT,'MM/DD/YYYY') &b.effdt
+D.EMPL_RCD
+D.EFFDT
+D.EFFSEQ
+D.ELIG_CONFIG1
+D.ELIG_CONFIG2
+D.COMPANY
+D.DEPTID
+D.ACCT_CD
+D.JOBCODE
+D.REG_TEMP
+D.GEX_VOLUN_LOW_HRS
+D.EMPL_STATUS
+D.Position_nbr 			!VENDTKK  ITG#56786   5-Jan-2009
+E.GEX_VCN_SENIOR_DT
+E.REHIRE_DT		
+E.SERVICE_DT
+PS.NAME
+
+   move 'Y' to $beninfo_found
+   move 'N' to $skip_employee_processing
+
+   move &emplid to $emplid
+   move &B.EMPL_RCD to #empl_rcd
+   move &D.COMPANY to $company
+
+   display $emplid
+
+   move 'W07' to $bp_name      !Use W07 now onwards in the program
+
+   do evaluate-service-eligibility
+
+   if $service_elig_found = 'Y'
+
+      do get-accumulator
+
+      if $spcl_accum_found = 'Y'
+	 display 'Start Date:' noline
+	 display &b.effdt
+
+	 move &b.effdt to $start_date
+
+	 do format-datetime(&b.effdt,$BP_Start_date,{DEFMDY},'','NATIVE') 
+	 do find-REHIRE-action-for-employee
+
+	 let $start_yy = substr($start_date,7,4)
+	 do convert-to-dtu-date($pay_end_dt,$pay_End_Dt_dtu)
+	 let $end_yy = substr($pay_end_dt_dtu,1,4)
+	 
+	 let $start_month = substr($start_date,1,2)
+
+	 let #start_month = to_number($start_month)
+	 let #end_month = to_number(substr($pay_end_dt_dtu,6,2))
+	 let $end_month = substr($pay_end_dt_dtu,6,2)
+
+	 display 'Start Month:' noline
+	 display #start_month
+	 display 'End Month:' noline
+	 display #end_Month
+
+	 display 'Start Year:' noline
+	 display $start_yy
+	 display 'End Year:' noline
+	 display $end_YY
+
+	 do calculate-balance-hours
+
+	 move #week_hrs to $week_hrs
+  
+	 if ($errorfound = 'N') 
+	    display 'process elig rules'
+	    move 'N' to $atleast_one_found
+	    let $effdt_dbf = $pay_end_dt
+	    do process-elig-rules
+
+	    if $errorfound = 'N'
+	       do evaluate-config-value
+	    end-if
+	 end-if
+      end-if
+     
+     end-if
+
+     add 1 to #inputtran
+
+FROM PS_BEN_PROG_PARTIC B,
+     PS_JOB D,
+     PS_EMPLOYMENT E,
+     PS_BEN_DEFN_PGM BEN,
+     PS_PERSONAL_DATA PS
+
+WHERE B.BENEFIT_PROGRAM = $BP_name
+  AND B.EMPLID = D.EMPLID
+  AND B.EMPL_RCD = D.EMPL_RCD
+  AND PS.EMPLID = B.EMPLID
+  AND D.EMPLID = E.EMPLID
+  AND D.EMPL_RCD = E.EMPL_RCD
+  AND D.EMPL_STATUS IN ('A','L','P')
+  AND BEN.BENEFIT_PROGRAM = B.BENEFIT_PROGRAM
+  AND B.EFFDT = (SELECT MAX(EFFDT)
+		   FROM PS_BEN_PROG_PARTIC
+		  WHERE EMPLID = B.EMPLID
+		    AND EMPL_RCD = B.EMPL_RCD
+		    AND EFFDT <= $pay_end_dt)
+  AND D.EFFDT = (SELECT MAX(EFFDT)
+		   FROM PS_JOB
+		  WHERE EMPLID = D.EMPLID
+		    AND EMPL_RCD = D.EMPL_RCD
+		    AND EFFDT <= $pay_end_dt)
+  AND D.EFFSEQ = (SELECT MAX(EFFSEQ)
+		   FROM PS_JOB
+		  WHERE EMPLID = D.EMPLID
+		    AND EMPL_RCD = D.EMPL_RCD
+		    AND EFFDT = D.EFFDT)
+  AND BEN.EFFDT = (SELECT MAX(EFFDT)
+		     FROM PS_BEN_DEFN_PGM
+		    WHERE BENEFIT_PROGRAM = $BP_name
+		      AND EFFDT <= $pay_end_Dt)
+ORDER BY D.DEPTID,PS.NAME
+end-SELECT
+
+if $beninfo_found = 'N'
+   do error-found
+   print 'No Benefit Participation information found' (,34)
+end-if
+
+exit-program:
+
+end-procedure
+
+!*********************************************************************
+!Retrieves the service eligibility 
+!*********************************************************************
+
+Begin-Procedure get-service-eligibility
+
+let $elig_rules_id = 'W07P'
+let #min_months = 0
+move 'N' to $min_months_found
+
+begin-select on-error=sql-error-found('Get-Service-Eligibility')
+BAS.MIN_SERVICE_MM
+
+  move &BAS.MIN_SERVICE_MM to #min_months
+  move 'Y' to $min_months_found
+
+  display 'Minimum Months:' noline
+  display #min_months
+
+FROM PS_BAS_ELIG_RULES BAS
+
+WHERE BAS.ELIG_RULES_ID = $elig_rules_id
+  AND BAS.EFF_STATUS = 'A'
+  AND BAS.EFFDT = (SELECT MAX(EFFDT)
+		      FROM PS_BAS_ELIG_RULES
+		     WHERE ELIG_RULES_ID = $elig_rules_id
+		       AND EFFDT <= $pay_end_dt)
+end-select
+
+if $min_months_found = 'N'
+   do error-found
+   print 'No Minimum Service Months eligibility rules found:Benefit Program:W07' (,34)
+end-if
+
+end-procedure
+
+
+!*********************************************************************
+!Finds out the employee's service eligibility by comparing it with
+!the minimum months required for W07
+!*********************************************************************
+
+Begin-Procedure Evaluate-Service-Eligibility
+
+move 'N' to $Service_Elig_found
+
+      move &E.SERVICE_DT to $service_dt
+
+do Convert-To-DTU-Date($service_dt, $service_dt_dtu)
+
+display 'Service Date:' noline
+display $service_dt_dtu
+
+do convert-to-dtu-date($pay_end_dt,$pay_end_dt_dtu)
+
+display 'pay end Date:' noline
+display $pay_end_dt_dtu
+
+do dtu-diff-months($service_dt_dtu,$pay_end_dt_dtu,#diff_months)
+
+if #diff_months >= #min_months
+   move 'Y' to $Service_elig_found
+end-if
+
+end-procedure
+
+!*********************************************************************
+!Retrieves the special accumulator for the benefit program 
+!********************************************************************* 
+
+begin-procedure get-accumulator
+
+move 'N' to $errorfound
+move 'N' to $spcl_accum_found
+
+begin-select on-error=sql-error-found('Get-Accumulator')
+C.ERNCD_SPCL
+C1.FIELDNAME
+C1.FIELDNAME2
+
+   move 'Y' to $spcl_accum_found
+
+   if RTRIM(&C1.FIELDNAME2,' ') <> ''
+      display 'FIELDNAME2 ' noline
+      display &c1.fieldname2
+      Let $RelatedTo2 = 'Y'
+      display '$RelatedTo2 ' noline
+      display $RelatedTo2 
+   end-if
+
+FROM PS_SPCL_EARNS_TBL C,
+     PS_BEN_DEFN_PGM C1
+     
+WHERE C1.BENEFIT_PROGRAM = $BP_name
+  AND C1.GEX_SPCL_ACCUM_CD = C.ERNCD_SPCL
+  AND C1.EFFDT = (SELECT MAX(EFFDT)
+		   FROM PS_BEN_DEFN_PGM
+		  WHERE BENEFIT_PROGRAM = $BP_name
+		    AND EFFDT <= $pay_end_dt)
+  AND C.EFFDT = (SELECT MAX(C3.EFFDT)
+		   FROM PS_SPCL_EARNS_TBL C3
+		  WHERE C3.ERNCD_SPCL = C.ERNCD_SPCL
+		    AND C3.EFFDT <= $pay_end_dt)
+end-SELECT
+
+if $spcl_accum_found = 'N'
+   do error-found
+   print 'No Special Accumulator found for Benefit Program:' (,34)
+   print $bp_name ()
+end-if
+
+end-procedure
+
+!**********************************************************************
+!Finds out if the employee has been rehired after the benefit program
+!enrollment.
+!**********************************************************************
+
+Begin-Procedure find-rehire-action-for-employee
+
+move 'N' to $errorfound
+
+Begin-Select on-error=sql-error-found('Find-Rehire-Action-For-Employee')
+to_char(REH.EFFDT,'MM/DD/YYYY') &reh.effdt
+   display 'REH effective date:' noline
+   display &reh.effdt
+   move &REH.EFFDT to $start_date
+
+FROM PS_JOB REH
+
+WHERE REH.EMPLID = $emplid
+  AND REH.EMPL_RCD = #EMPL_RCD
+  AND REH.ACTION = 'REH'
+  AND REH.ACTION_REASON NOT IN ('REI')
+  AND REH.EFFDT = (SELECT MAX(EFFDT)
+		     FROM PS_JOB
+		    WHERE EMPLID = $emplid
+		      AND EMPL_RCD = #EMPL_RCD
+		      AND ACTION = 'REH'
+		      AND ACTION_REASON NOT IN ('REI')
+		      AND EFFDT >= $BP_Start_date)     ! Effdt of BP Participation
+  AND REH.EFFSEQ = (SELECT MAX(EFFSEQ)
+		      FROM PS_JOB
+		     WHERE EMPLID = $emplid
+		       AND EMPL_RCD = #EMPL_RCD
+		       AND EFFDT = REH.EFFDT)
+
+END-SELECT
+
+end-procedure
+
+!*********************************************************************
+!Retrieves the balance hours for the employee by the company.
+!********************************************************************* 
+
+begin-procedure calculate-balance-hours
+
+let #mtd_hrs = 0
+
+if $start_yy <> $end_yy
+
+   let $range = 'AND ERN.BALANCE_YEAR = '||$start_yy||' '||
+		'AND ERN.BALANCE_PERIOD >= '||$start_month||' '
+
+   do calculate-mtd-hrs
+
+   let $range = 'AND ERN.BALANCE_YEAR > '||$start_yy||' '||
+		'AND ERN.BALANCE_YEAR < '||$end_yy||' '
+
+   do calculate-mtd-hrs
+
+   let $start_month = 0
+
+end-if
+
+let $range = 'AND ERN.BALANCE_YEAR = '||$end_yy||' '||
+		'AND ERN.BALANCE_PERIOD >= '||$start_month||' '||
+		'AND ERN.BALANCE_PERIOD <= '||$end_month||' '
+
+do calculate-mtd-hrs
+
+display 'MTD Hrs:' noline
+display #mtd_hrs
+
+move #mtd_hrs to #week_hrs
+
+if #week_hrs <= 0 
+   do error-found
+   move 'N' to $errorfound
+   print 'No MTD_HRS found in PS_EARNINGS_TBL' (,34)
+   print ':ERNCD=' ()
+   print &C.ERNCD_SPCL ()
+end-if
+   
+
+end-procedure
+
+!*********************************************************************
+!Calculates MTD hours for the employees 
+!*********************************************************************
+
+begin-procedure calculate-mtd-hrs
+
+move 'N' to $errorfound
+move 'N' to $found
+
+display 'Range:' noline
+display $range
+
+display 'Erncd:' noline
+display &C.ERNCD_SPCL
+
+begin-select on-error=sql-error-found('calculate-mtd-hrs')
+SUM(ERN.HRS_MTD) &mtd_hrs
+  
+ if &mtd_hrs > 0  
+   display $range
+   display 'Calculate Sum of MTD Hours proc'
+   display 'Sum of MTD hours: ' noline
+   display &mtd_hrs 
+   add &mtd_hrs to #mtd_hrs
+   move 'Y' to $found
+
+ end-if
+
+FROM PS_EARNINGS_BAL ERN
+
+WHERE ERN.EMPLID = $emplid
+  AND ERN.COMPANY = $company
+  AND ERN.BALANCE_ID = 'CY'
+  AND ERN.SPCL_BALANCE = 'Y'
+  AND ERN.EMPL_RCD = #empl_rcd                     !GBD 08/26/2002 Field Added
+[$range]
+  AND ERN.ERNCD = &C.ERNCD_SPCL
+  AND ERN.HRS_MTD > 0
+end-SELECT
+
+end-procedure
+
+!*********************************************************************
+!Compares the existing job table config2 field and the calculated field
+!and processes further
+!*********************************************************************
+
+begin-procedure Evaluate-config-value
+
+move &D.ELIG_CONFIG2 to $elig_config2_job
+move $ee_config2_val to $elig_config2
+
+let $ee_config2_val_nospaces = rtrim($ee_config2_Val,' ')
+let $ee_config2_job_nospaces = rtrim($elig_config2_job,' ')
+
+display 'Job Config2 Value:'
+display $elig_config2_job
+display 'Pgm Config2 Value:'
+display $ee_config2_val_nospaces
+!display 'Volun Value:'
+!display &d.gex_volun_low_hrs
+!display $ee_config2_val_nospaces
+!display $ee_config2_job_nospaces
+!if $ee_config2_val_nospaces = $ee_Config2_job_nospaces
+
+  let $ee_config2_val_4to7 = substr($ee_config2_val_nospaces,4,7)
+  let $ee_config2_job_4to7 = substr($ee_config2_job_nospaces,4,7)
+
+  do convert-to-dtu-date($pay_end_dt,$pay_end_dt_dtu)
+  do dtu-add-days($pay_end_Dt_dtu,1,$curr_mm_dt_dtu)
+  do convert-from-dtu-date($curr_mm_dt_dtu,$curr_mm_dt_dbf)
+  do format-datetime($reportdate_ccyyyy,$reportdate_ccyy,{DEFMDY},'','NATIVE')   
+
+
+   Evaluate $ee_config2_val_4to7
+     when = 'U000000'
+	 let $elig_config2 = substr($elig_config2,1,3)||$ee_config2_val_4to7
+
+	 do insert-procedure            
+	 add 1 to #job_inserts
+	 do print-promotion-report
+
+   End-Evaluate
+
+end-procedure
+
+!*********************************************************************
+!Prints the promotion report
+!*********************************************************************
+Begin-Procedure Print-Promotion-Report
+
+move 'Y' to $promo_printed
+use-report promotion-report
+
+  move &D.JOBCODE to $jobcode
+  move ' ' to $JobTitleabbrv
+  do get-job-title
+  
+ !VENDTKK Begin   ITG#56786   5-Feb-2009
+
+  Let $Position_Nbr = &D.Position_nbr
+  Do Get-Position-Title			 !getposnm.sqc
+  	 IF $PosNameAbbrv = '' 
+  		Let $JobTitleabbrv = $JobTitleAbbrv
+	 Else
+ 		Let $JobTitleabbrv = $PosNameAbbrv
+	 End-if
+ !VENDTKK End   ITG#56786   5-Feb-2009	
+  
+  move ' ' to $gexactcd_acct_Cd
+  move &D.ACCT_CD to $GEXACTCD_ACCT_CD
+  Do GEXACTCD-Get-Acct-Cd-Info
+  display 'acct Cd:' noline
+  display &d.acct_cd
+
+  display $gexactcd_descrshort
+
+  move 'REG_TEMP' to $FieldName
+  move ' ' to $xlatshortname
+  move &D.REG_TEMP to $FieldValue
+  do Read-Translate-Table
+  move ' ' to $status
+  move $xlatShortName to $status
+  display 'Status:' noline
+  display $status
+
+  let $EmplId_1st3 = substr($EmplId,1,3)
+  let $EmplId_mid2 = substr($EmplId,4,2)
+  let $EmplId_last4 = substr($EmplId,6,4)
+ 
+  String $EmplId_1st3 $EmplID_mid2 $EmplId_last4 by '-' into $EmplId11
+
+  print $emplid11  (+1,1)
+  print &PS.NAME    (,22)
+  print $JobTitleabbrv (,45)
+  print $GEXACTCD_DESCRSHORT (,65) 
+  print $status   (,85)
+  print $week_hrs  (,95)
+  print $service_dt (,115)
+  print $curr_mm_dt_dbf (,130)
+end-procedure
+
+
+#Include 'tranctrl.sqc'  !Common Transaction Control Procedures
+!*#Include 'reset.sqc'     !Reset printer procedure
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'payrnctl.sqc'  !Select-Parameters
+#Include 'stdapi.sqc'    !Get_Run_Control Procedure
+#Include 'datemath.sqc'  !Does the date-math functions
+#Include 'readxlat.sqc'  !Read xlattable
+#Include 'gexbnahp.sqc'  !
+#Include 'getjobtl.sqc'  !Get Job Title
+#include 'gexactcd.sqc'  !Get Acct Cd Description
+#Include 'getposnm.sqc'  !Get-Position-Title    VENDTKK ITG#56786   5-Feb-2009  	

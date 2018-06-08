@@ -1,0 +1,368 @@
+!***********************************************************************
+! TAX909NY:   Create table with Federal wages for NYC residents        *
+!                                                                      *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!                                                                      *
+!                                                                      *
+! This software and related documentation are provided under a         *
+! license agreement containing restrictions on use and                 *
+! disclosure and are protected by intellectual property                *
+! laws. Except as expressly permitted in your license agreement        *
+! or allowed by law, you may not use, copy, reproduce,                 *
+! translate, broadcast, modify, license, transmit, distribute,         *
+! exhibit, perform, publish or display any part, in any form or        *
+! by any means. Reverse engineering, disassembly, or                   *
+! decompilation of this software, unless required by law for           *
+! interoperability, is prohibited.                                     *
+! The information contained herein is subject to change without        *
+! notice and is not warranted to be error-free. If you find any        *
+! errors, please report them to us in writing.                         *
+!                                                                      *
+! Copyright (C) 1988, 2012, Oracle and/or its affiliates.              *
+! All Rights Reserved.                                                 *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+!          $Date:  2012/07/18:11:34:11                        
+!       $Release:  HR9                                        
+!    $Resolution:  872684                                     
+!                                                                      *
+!***********************************************************************
+
+#include 'setenv.sqc'    !Set environment
+begin-setup
+#include 'setupdb.sqc'
+end-setup
+
+begin-report
+
+  do Init-Report
+
+  do clear-table
+
+  do main-loop
+
+  display #kount 9,999,999 noline
+  display ' rows inserted'
+  do Get-Current-DateTime
+  display 'End at ' noline
+  display $SysDateTime
+
+  do Stdapi-Term
+
+end-report
+
+begin-procedure Init-Report
+  do Get-Current-DateTime
+  do Stdapi-Init
+  display 'TAX909NY'
+  display 'Start at: ' noline
+  display $SysDateTime
+
+  let #kount = 0
+
+  do Get-Tax-Reporting-Run-Controls
+  move &TX.Balance_Year to #BALANCE_YEAR
+  move &TX.Balance_Year to $BALANCE_YEAR  9999
+  show 'Balances for Year: ' $BALANCE_YEAR
+
+  do Init-DateTime
+  let $Date_Field = '01/01/' || $BALANCE_YEAR
+  do Format-DateTime($Date_Field, $jan, {DEFDATE},'','native')
+  let $Date_Field = '12/31/' || $BALANCE_YEAR
+  do Format-DateTime($Date_Field, $dec, {DEFDATE},'','native')
+
+end-procedure
+
+
+begin-procedure main-loop
+
+begin-SELECT DISTINCT
+
+A.EMPLID
+A.COMPANY
+
+  MOVE &A.EMPLID TO $EMPLID
+  MOVE &A.COMPANY TO $COMPANY
+
+  move 0 to #TXGRS_YTD
+
+  do GetResidency
+
+  if #CountChange = 0
+
+      if $RESIDENTK = 'Y'
+          do GetFed
+          do Select-EE-DPB-Deductions
+      end-if
+
+  else
+      do CheckEachCheck
+      do Select-EE-DPB-Deductions
+  end-if
+
+  if #TXGRS_YTD > 0
+    do InsertRecord
+    let #kount = #kount + 1
+    display $COMPANY noline
+    display '  ' noline
+    display $EMPLID noline
+    display '  ' noline
+    display #txgrs_ytd   99999999999.99
+  end-if
+
+FROM PS_TAX_BALANCE A
+WHERE TXGRS_YTD > 0
+  AND A.STATE = 'NY'
+  AND A.LOCALITY = 'P0001'
+  AND A.TAX_CLASS = 'H'
+  AND A.BALANCE_ID = 'CY'
+  AND A.BALANCE_YEAR = #BALANCE_YEAR
+
+end-SELECT
+
+end-procedure
+
+
+begin-procedure GetFed
+
+begin-SELECT
+
+J.EMPLID
+J.COMPANY
+J.TXGRS_YTD
+
+        move &J.Txgrs_Ytd       to #TXGRS_YTD
+
+FROM PS_TAX_BALANCE J
+WHERE J.EMPLID = $EMPLID
+  AND J.COMPANY = $COMPANY
+  AND J.STATE = '$U'
+  AND J.TAX_CLASS = 'H'
+  AND J.BALANCE_ID = 'CY'
+  AND J.BALANCE_YEAR = #BALANCE_YEAR
+  AND J.BALANCE_PERIOD = (SELECT MAX(K.BALANCE_PERIOD)
+                                   FROM PS_TAX_BALANCE K
+                                  WHERE K.EMPLID=J.EMPLID
+                                    AND K.COMPANY=J.COMPANY
+                                    AND K.STATE = '$U'
+                                    AND K.TAX_CLASS = 'H'
+                                    AND K.BALANCE_ID = 'CY'
+                                    AND K.BALANCE_YEAR = #BALANCE_YEAR)
+end-SELECT
+
+end-procedure
+
+
+begin-procedure GetResidency
+  move '' to $RESIDENTK
+begin-SELECT
+
+K.STATE
+K.LOCALITY
+K.RESIDENT
+
+  let $STATEK = rtrim(&K.STATE, ' ')
+  let $LOCALITYK = rtrim(&K.LOCALITY, ' ')
+  if $STATEK = 'NY'
+    and $LOCALITYK = 'P0001'
+      move &K.RESIDENT to $RESIDENTK
+  end-if
+
+FROM PS_LOCAL_TAX_DATA K
+WHERE K.EMPLID=$EMPLID
+  AND K.COMPANY=$COMPANY
+  AND K.EFFDT=(SELECT MAX(L.EFFDT)
+          FROM PS_LOCAL_TAX_DATA L
+         WHERE L.EMPLID=K.EMPLID
+           AND L.COMPANY=K.COMPANY
+           AND L.EFFDT<$jan)
+end-SELECT
+
+  move 0   to #CountChange
+
+begin-SELECT DISTINCT
+
+M.STATE
+M.LOCALITY
+M.RESIDENT
+
+  add 1 to #CountChange
+
+FROM PS_LOCAL_TAX_DATA M
+WHERE M.EMPLID=$EMPLID
+  AND M.COMPANY=$COMPANY
+  AND M.EFFDT BETWEEN $jan AND $dec
+end-SELECT
+
+! If no row was found in the local table, do a check against the
+! state table in case the EE's local row was deleted and he now
+! has no locality.  This would also be a case where Residency
+! has changed or the EE moved to a different state.
+
+if #CountChange = 0
+begin-SELECT DISTINCT
+
+S.STATE
+S.RESIDENT
+
+  add 1 to #CountChange
+
+FROM PS_STATE_TAX_DATA S
+WHERE S.EMPLID=$EMPLID
+  AND S.COMPANY=$COMPANY
+  AND S.EFFDT BETWEEN $jan AND $dec
+end-SELECT
+end-if
+
+end-procedure
+
+
+begin-procedure CheckEachCheck
+
+begin-SELECT
+B.PAYGROUP
+B.PAY_END_DT
+B.OFF_CYCLE
+B.PAGE_NUM
+B.LINE_NUM
+B.SEPCHK
+
+  do CheckEachTax
+
+FROM PS_PAY_CHECK B
+WHERE B.COMPANY = $COMPANY
+  AND B.EMPLID  = $EMPLID
+  AND B.CHECK_DT BETWEEN $jan AND $dec
+  AND B.PAYCHECK_STATUS IN ('F','A','R')
+end-SELECT
+
+end-procedure
+
+
+begin-procedure CheckEachTax
+
+begin-SELECT
+C.TAX_CUR
+
+  do CheckEachFed
+
+FROM PS_PAY_TAX C
+WHERE C.COMPANY    = $COMPANY
+  AND C.PAYGROUP   = &B.PAYGROUP
+  AND C.PAY_END_DT = &B.PAY_END_DT
+  AND C.OFF_CYCLE  = &B.OFF_CYCLE
+  AND C.PAGE_NUM   = &B.PAGE_NUM
+  AND C.LINE_NUM   = &B.LINE_NUM
+  AND C.SEPCHK     = &B.SEPCHK
+  AND C.STATE      = 'NY'
+  AND C.LOCALITY   = 'P0001'
+  AND C.TAX_CLASS  = 'H'
+  AND C.RESIDENT   = 'Y'
+end-SELECT
+
+end-procedure
+
+
+begin-procedure CheckEachFed
+
+begin-SELECT
+D.TXGRS_CUR
+
+  add &D.TXGRS_CUR to #TXGRS_YTD
+
+FROM PS_PAY_TAX D
+WHERE D.COMPANY    = $COMPANY
+  AND D.PAYGROUP   = &B.PAYGROUP
+  AND D.PAY_END_DT = &B.PAY_END_DT
+  AND D.OFF_CYCLE  = &B.OFF_CYCLE
+  AND D.PAGE_NUM   = &B.PAGE_NUM
+  AND D.LINE_NUM   = &B.LINE_NUM
+  AND D.SEPCHK     = &B.SEPCHK
+  AND D.STATE      = '$U'
+  AND D.LOCALITY   = ' '
+  AND D.TAX_CLASS  = 'H'
+end-SELECT
+
+end-procedure
+
+
+!
+! This procedure selects the DPB deductions that are not subject to SWT
+!
+
+begin-procedure Select-EE-DPB-Deductions
+
+   move 0 to #DPB-Ded-Ytd
+
+
+begin-Select
+DED1.DED_YTD
+
+  add &DED1.DED_YTD  to  #DPB-Ded-Ytd
+
+FROM  PS_DEDUCTION_BAL DED1, PS_PY_NY_DPB_DED DED2
+WHERE DED1.EMPLID        = $EMPLID
+  AND DED1.COMPANY       = $COMPANY
+  AND DED1.BALANCE_ID    = 'CY'
+  AND DED1.BALANCE_YEAR  = #BALANCE_YEAR
+  AND DED1.DED_YTD      <> 0
+  AND DED1.PLAN_TYPE     = DED2.PLAN_TYPE
+  AND DED1.BENEFIT_PLAN  = DED2.BENEFIT_PLAN
+  AND DED1.DEDCD         = DED2.DEDCD
+  AND DED1.DED_CLASS     = DED2.DED_CLASS
+  AND DED1.BALANCE_PERIOD =
+      (SELECT MAX(DED3.BALANCE_PERIOD)
+       FROM   PS_DEDUCTION_BAL DED3
+       WHERE  DED3.EMPLID      = DED1.EMPLID
+       AND  DED3.COMPANY       = DED1.COMPANY
+       AND  DED3.BALANCE_ID    = DED1.BALANCE_ID
+       AND  DED3.BALANCE_YEAR  = DED1.BALANCE_YEAR
+       AND  DED3.BENEFIT_RCD_NBR = DED1.BENEFIT_RCD_NBR
+       AND  DED3.PLAN_TYPE     = DED1.PLAN_TYPE
+       AND  DED3.BENEFIT_PLAN  = DED1.BENEFIT_PLAN
+       AND  DED3.DEDCD         = DED1.DEDCD
+       AND  DED3.DED_CLASS     = DED1.DED_CLASS)
+
+end-SELECT
+
+  subtract #DPB-Ded-Ytd from #TxGrs_YTD
+
+end-procedure
+
+
+begin-procedure InsertRecord
+  begin-SQL on-error=SQL-error
+    INSERT INTO PS_R_TAX909NY
+               (EMPLID,
+                COMPANY,
+                AMT1)
+      VALUES   ($EMPLID,
+                $COMPANY,
+                #TXGRS_YTD)
+
+  end-SQL
+end-procedure
+
+
+begin-procedure Ignore
+! dummy procedure to avoid SQL error message on delete of empty table
+end-procedure
+
+
+begin-procedure Clear-Table
+
+begin-SQL on-error=Ignore
+  DELETE FROM PS_R_TAX909NY
+end-SQL
+
+end-procedure
+
+
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'taxrnctl.sqc'  !Get-Tax-Reporting-Run-Controls procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'stdapi.sqc'    !Update Process API
+

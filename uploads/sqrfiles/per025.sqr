@@ -1,0 +1,1216 @@
+!********************************************************
+!  PER025.SQR - Revised Workforce Analysis              !
+!********************************************************
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+!                                                                      *
+! This module contains confidential and proprietary information        *
+! of Oracle; it is not to be copied, reproduced, or transmitted        *
+! in any form, by any means, in whole or in part, nor is it to         *
+! be used for any purpose other than that for which it is              *
+! expressly provided under the applicable license agreement.           *
+!                                                                      *
+! Copyright (C) 2006 Oracle. All Rights Reserved.                      *
+!                                                                      *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!                $Date:  2006/01/16:19:52:22                           !
+!             $Release:  HR9                                           !
+!            $Revision:  101                                           !
+!                                                                      *
+!***********************************************************************
+
+
+! Uncomment the following line the have debug values put into the sqr.log
+! #DEFINE DEBUGPER025
+
+#include 'setenv.sqc'   !Set environment
+#include 'hrhl01.sqc'   !Landscape Confidential Header
+
+!----------------------------------------------------------------------
+!---------Program------------------------------------------------------
+!----------------------------------------------------------------------
+!----------------------------------------------------------------------
+Begin-Program
+
+#IFDEF DEBUGPER025
+  DISPLAY 'FLOW: Run Control Establishment: ' NOLINE
+#ENDIF
+
+!**********Begin Incident 554682005 ********
+LET $SQR_name = 'PER025'
+!**********End Incident 554682005 ********
+
+  do Use-Standard-Layout
+  do Init-DateTime
+  do Init-Number
+  do Get-Current-DateTime
+  do Init-Report
+  do Init-Workforce-Array
+
+  ! Set the confidential flag
+  !------------------------------------------------------------
+  LET $Confidential = 'YES'
+
+  LET #i = 0
+
+  IF $OutputCSV  = 'Y'
+      do Open-CSV-File
+  END-IF
+
+  ! Date Dynamic SQL
+  !-----------------------------------------------------------
+
+  IF $date-indicator = '2'
+     DO Format-DateTime($FromDate,$FromFormatted,{DEFCMP},'','')
+     DO Format-DateTime($ThruDate,$ThruFormatted,{DEFCMP},'','')
+     LET $J-DATE-WHERE = ' AND J1.EFFDT BETWEEN ' || $Quote || $FromFormatted || $Quote || ' AND ' || $Quote || $ThruFormatted || $Quote
+     LET $D-DATE-WHERE = ' AND DPT1.EFFDT <= ' || $Quote || $ThruFormatted || $Quote
+     LET $PDE-DATE-WHERE = ' AND PDE1.EFFDT <= ' || $Quote || $ThruFormatted || $Quote
+     LET $E-DATE-WHERE = ' AND E2.EFFDT <= ' || $Quote || $ThruFormatted || $Quote
+     !**************BEGIN RESOLUTION 609634************
+     LET $JT1-DATE-WHERE = ' AND JT1.EFFDT BETWEEN ' || $Quote || $FromFormatted || $Quote || ' AND ' || $Quote || $ThruFormatted || $Quote
+     !**************END RESOLUTION 609634************
+  ELSE
+     LET $J-DATE-WHERE = ' AND J1.EFFDT <= ' || $Quote || $AsOfDate || $Quote
+     LET $D-DATE-WHERE = ' AND DPT1.EFFDT <= ' || $Quote || $AsOfDate || $Quote
+     LET $PDE-DATE-WHERE = ' AND PDE1.EFFDT <= ' || $Quote || $AsOfDate || $Quote
+     LET $E-DATE-WHERE = ' AND E2.EFFDT <= ' || $Quote || $AsOfDate || $Quote
+     !**************BEGIN RESOLUTION 609634************
+     LET $JT1-DATE-WHERE = ' AND JT1.EFFDT <= ' || $Quote || $AsOfDate || $Quote
+     !**************END RESOLUTION 609634************
+ END-IF
+  DISPLAY '$J-DATE-WHERE' NOLINE
+  DISPLAY $J-DATE-WHERE
+  DISPLAY '$D-DATE-WHERE' NOLINE
+  DISPLAY $D-DATE-WHERE
+  DISPLAY '$PDE-DATE-WHERE' NOLINE
+  DISPLAY $PDE-DATE-WHERE
+
+  ! If they want it run for a whole company
+  !------------------------------------------------------------
+  IF $ReportChoice = '1'
+     let $Where-Clause = ' AND J.COMPANY = ' || $Quote || $Company || $Quote
+     do Get-Company-Info
+     do Process-Main
+  END-IF
+  ! If they want it to run for a single establishment
+  !------------------------------------------------------------
+  IF $ReportChoice = '2'
+     let $Where-Clause = 'AND J.ESTABID = ' || $Quote || $Estab || $Quote
+     do Get-Establishment-Info
+     do Process-Main
+  END-IF
+  IF $ReportChoice = '3' or $ReportChoice = '4'
+
+     do Get-Number-Of-Establishments
+     WHILE #i < #count
+         LET $Estab = EstablishmentIDs.theEstab(#i)
+         do Get-Establishment-Info
+         let $Where-Clause =   'AND J.ESTABID = ' || $Quote || $Estab || $Quote
+         do Process-Main
+         ADD 1 to #i
+         IF #i < #count
+             ! We want every establishment to print on a new page...
+             !-----------------------------------------------------
+             NEW-PAGE
+         END-IF
+     END-WHILE
+  END-IF
+
+
+  do Stdapi-Term
+End-Program
+
+!----------------------------------------------------------------------
+!---------Init-Report--------------------------------------------------
+!----------------------------------------------------------------------
+! We need to either ask for the calendar year, or get the information
+! from the process instance (run control panel)
+!----------------------------------------------------------------------
+
+begin-procedure Init-Report
+
+#IFDEF DEBUGPER025
+  DISPLAY 'FLOW: Init-Report'
+#ENDIF
+
+
+  move 'PER025' to $ReportID
+  move 'Workforce Analysis' to $ReportTitle
+
+
+  display $ReportTitle
+
+#IFDEF DEBUGPER025
+  display 'Report ID: ' NOLINE
+  display $ReportID
+#ENDIF
+
+  do Stdapi-Init
+
+  if $prcs_process_instance = ''
+     display ''
+     display 'REPORT CAN NOT BE EXECUTED OUTSIDE OF PEOPLESOFT,PLEASE USE PROCESS SCHEDULER.'
+     display ''
+     STOP QUIET
+  else
+     do Select-Parameters
+  end-if
+
+#IFDEF DEBUGPER025
+  DISPLAY '          Establishment from Run Control Panel:      ' NOLINE
+  DISPLAY $Estab
+  DISPLAY '          As Of Date: ' NOLINE
+  DISPLAY $AsOfDate
+#ENDIF
+
+
+end-procedure
+
+!----------------------------------------------------------------------
+!---------Init-Workforce-Array-----------------------------------------
+!----------------------------------------------------------------------
+! Creates an array to temporarily hold department and jobcode totals
+!
+! This array will hold the jobcodes from one department, which will
+!   then be printed and the array will be cleared to be used for the
+!   next DEPT
+!----------------------------------------------------------------------
+begin-procedure Init-Workforce-Array
+#IFDEF DEBUGPER025
+  DISPLAY 'FLOW: Init-Workforce-Array'
+#ENDIF
+
+CREATE-ARRAY
+   NAME = Workforce-Array
+   SIZE = 1000
+   FIELD = JOBCODE:char
+   FIELD = JOBGROUP:char
+   FIELD = SALARY_GRADE:char
+   FIELD = TOTAL_EMPLOYEES:integer
+   FIELD = TOTAL_MINORITIES:integer
+   FIELD = MALE_TOTAL:integer
+   FIELD = MALE_WHITE:integer
+   FIELD = MALE_BLACK:integer
+   FIELD = MALE_HISPANIC:integer
+   FIELD = MALE_ASIAN:integer
+   FIELD = MALE_NATIVE:integer
+   !************************** Begin Resolution - 582203 *********************
+   FIELD = MALE_PACIFIC:integer
+   !************************** End Resolution - 582203   *********************
+   FIELD = MALE_UNKNOWN:integer
+   FIELD = FEMALE_TOTAL:integer
+   FIELD = FEMALE_WHITE:integer
+   FIELD = FEMALE_BLACK:integer
+   FIELD = FEMALE_HISPANIC:integer
+   FIELD = FEMALE_ASIAN:integer
+   FIELD = FEMALE_NATIVE:integer
+   !************************** Begin Resolution - 582203 *********************
+   FIELD = FEMALE_PACIFIC:integer
+   !************************** End Resolution - 582203   *********************
+   FIELD = FEMALE_UNKNOWN:integer
+   FIELD = UNKNOWN_UNKNOWN:integer
+
+end-procedure Init-Workforce-Array
+
+!----------------------------------------------------------------------
+!---------Get-Values---------------------------------------------------
+!----------------------------------------------------------------------
+! Fetch run control parameters
+!----------------------------------------------------------------------
+begin-procedure Get-Values
+#IFDEF DEBUGPER025
+  DISPLAY 'FLOW: Get-Values'
+#ENDIF
+
+
+   do Get-Date-Indicator
+   IF $date-indicator = '1'
+      do Get-As-Of-Date
+   ELSE
+      do Get-From-Thru-Date
+   END-IF
+
+   do Get-Establishment
+   do Get-Run-Scope
+   do Get-Company
+   do Get-CTL_ESTABID
+   do Get-OUTPUT_CSV
+
+   LET $Quote = ''''
+
+   LET $EntityName = $Company
+
+end-procedure Get-Values
+
+!----------------------------------------------------------------------
+!---------Process-Main-------------------------------------------------
+!----------------------------------------------------------------------
+! This routine will be run for the establishment selected in the
+! run control panel, or for ALL of them if none is specified.
+!----------------------------------------------------------------------
+begin-procedure Process-Main
+
+! Debugging stuff
+!----------------------------------------------------
+#IFDEF DEBUGPER025
+  DISPLAY 'FLOW: Process-Main'
+
+   Display '   Establishment: ' NOLINE
+   Display $Estab
+#ENDIF
+
+
+! Some variables to control the flow of our report
+!----------------------------------------------------
+   LET #PageCount = 1
+   LET $LastDeptID = ''
+   LET $LastJobCode = ''
+   LET #RowCount = 0
+   LET #Started = 1
+
+
+
+Begin-Select
+J.DEPTID
+JT.DESCR
+JT.EEO_JOB_GROUP
+J.SAL_ADMIN_PLAN
+S.MID_RT_ANNUAL
+J.GRADE
+PDE.SEX
+ETH.ETHNIC_GROUP
+COUNT(*)            &TheCount
+
+
+    ! If we're on to a new department, fetch the
+    ! department name
+    !--------------------------------------------
+
+!****************Begin Resolution - 571495 ********************
+    !let $DeptID = RTrim(&J.DEPTID,' ')
+    let $DeptID = &J.DEPTID
+!****************End Resolution   - 571495 ********************
+    DISPLAY '$DeptID: ' NOLINE
+    DISPLAY $DeptID
+    IF $DeptID != $LastDeptID
+        IF $LastDeptID != ''
+
+        !Accum last Job Code of prev department
+        LET $SalaryGrade = $LastSalAdminPlan || '/' || $LastSalGrade
+        PUT $LastJobCode $LastJobGroup $SalaryGrade #Total_Employees #Total_Minorities #Male_Total #Male_White #Male_Black
+        !********************* Begin Resolution - 582203 ************************
+        !#Male_Hispanic #Male_Asian #Male_Native #Male_Unknown #Female_Total #Female_White #Female_Black #Female_Hispanic #Female_Asian
+        !#Female_Native #Female_Unknown #Unknown_Unknown
+        #Male_Hispanic #Male_Asian #Male_Native #Male_Pacific #Male_Unknown #Female_Total #Female_White #Female_Black #Female_Hispanic #Female_Asian
+        #Female_Native #Female_Pacific #Female_Unknown #Unknown_Unknown 
+        !********************* End  Resolution - 582203  ************************
+            INTO Workforce-Array (#RowCount)
+            DO Reset-Job-Count
+            ADD 1 to #RowCount
+            LET $JobCode = RTrim(&JT.DESCR,' ')
+            LET $LastJobCode = $JobCode
+
+            DO Print-Department-Rows
+            ! Output to file if that
+            ! option is selected
+            !-------------------------
+            IF $OutputCSV = 'Y'
+                DO Write-Dept-Rows-To-File
+            END-IF
+        END-IF
+        DO Reset-Department-Count
+        LET $LastDeptID = $DeptID
+    END-IF
+
+
+    ! Check to see if we should still count for
+    ! the same jobcode, or switch to a new JobCode
+    !---------------------------------------------
+    LET $JobCode = RTrim(&JT.DESCR,' ')
+    IF $JobCode != $LastJobCode
+
+        ! Add a row of data to the array for this
+        ! JobCode
+        !----------------------------------------
+
+        LET $SalaryGrade = $LastSalAdminPlan || '/' || $LastSalGrade
+        IF #Started != 1
+            PUT $LastJobCode $LastJobGroup $SalaryGrade #Total_Employees #Total_Minorities #Male_Total #Male_White #Male_Black
+            !********************* Begin Resolution - 582203 ************************
+            !#Male_Hispanic #Male_Asian #Male_Native #Male_Unknown #Female_Total #Female_White #Female_Black #Female_Hispanic #Female_Asian
+            !#Female_Native #Female_Unknown #Unknown_Unknown
+            #Male_Hispanic #Male_Asian #Male_Native #Male_Pacific #Male_Unknown #Female_Total #Female_White #Female_Black #Female_Hispanic #Female_Asian
+            #Female_Native  #Female_Pacific #Female_Unknown #Unknown_Unknown
+            !********************* End  Resolution - 582203  ************************
+            INTO Workforce-Array (#RowCount)
+
+            DO Reset-Job-Count
+            ADD 1 to #RowCount
+        ELSE
+           LET #Started = 0
+        END-IF
+        LET $LastJobCode = $JobCode
+    END-IF
+
+
+   ! Let's add our totals to the current row of
+   ! the array
+   !---------------------------------------------
+
+   ! Total Employees
+   !-----------------------------------------
+   ADD &TheCount to #Total_Employees
+
+   ! Total Male & Total Female
+   !-----------------------------------------
+   IF &PDE.SEX = 'M'
+       ADD &TheCount to #Male_Total
+   END-IF
+   IF &PDE.SEX = 'F'
+       ADD &TheCount to #Female_Total
+   END-IF
+
+   ! Ethnic Categories
+   !-----------------------------------------
+  LET $Ethnic_Group = RTrim(&ETH.ETHNIC_GROUP,' ')
+    
+
+ 
+
+
+  IF $Ethnic_Group <> '1' and $Ethnic_Group <> '6'
+     ADD &TheCount to #Total_Minorities
+  END-IF
+
+  EVALUATE $Ethnic_Group
+      WHEN = '1'                        ! White
+          IF &PDE.SEX = 'M'             !-----------
+              ADD &TheCount to #Male_White
+          END-IF
+          IF &PDE.SEX = 'F'
+              ADD &TheCount to #Female_White
+          END-IF
+          BREAK
+      WHEN = '2'                        ! Black
+          IF &PDE.SEX = 'M'             !-----------
+              ADD &TheCount to #Male_Black
+          END-IF
+          IF &PDE.SEX = 'F'
+              ADD &TheCount to #Female_Black
+          END-IF
+          BREAK
+      WHEN = '3'                        ! Hispanic
+          IF &PDE.SEX = 'M'             !-----------
+              ADD &TheCount to #Male_Hispanic
+          END-IF
+          IF &PDE.SEX = 'F'
+              ADD &TheCount to #Female_Hispanic
+          END-IF
+          BREAK
+      WHEN = '4'                        ! Asian
+          IF &PDE.SEX = 'M'             !-----------
+              ADD &TheCount to #Male_Asian
+          END-IF
+          IF &PDE.SEX = 'F'
+              ADD &TheCount to #Female_Asian
+          END-IF
+          BREAK
+      WHEN = '7'                        ! Pacific Islander
+          IF &PDE.SEX = 'M'             !-----------
+              !********************* Begin Resolution - 582203 ************************
+              !ADD &TheCount to #Male_Asian
+              ADD &TheCount to #Male_Pacific
+              !********************* End  Resolution - 582203  ************************
+          END-IF
+          IF &PDE.SEX = 'F'
+              !********************* Begin Resolution - 582203 ************************
+              !ADD &TheCount to #Female_Asian
+              ADD &TheCount to #Female_Pacific
+              !********************* End  Resolution - 582203  ************************
+          END-IF
+          BREAK          
+      WHEN = '5'                        ! Native American
+          IF &PDE.SEX = 'M'             !-----------
+              ADD &TheCount to #Male_Native
+          END-IF
+          IF &PDE.SEX = 'F'
+              ADD &TheCount to #Female_Native
+          END-IF
+          BREAK
+      WHEN = '6'                        ! Unknown
+          IF &PDE.SEX = 'M'             !-----------
+              ADD &TheCount to #Male_Unknown
+          END-IF
+          IF &PDE.SEX = 'F'
+              ADD &TheCount to #Female_Unknown
+          END-IF
+
+  END-EVALUATE
+
+
+
+
+    ! We need to grab values to use if the next row is
+    ! a different department
+    !---------------------------------------------------
+     LET $LastJobGroup =        RTrim(&JT.EEO_JOB_GROUP,' ')
+     LET $LastSalAdminPlan =    RTrim(&J.SAL_ADMIN_PLAN,' ')
+     LET $LastSalGrade =        RTrim(&J.GRADE,' ')
+
+
+FROM  PS_PERSON P,
+      PS_PERS_DATA_EFFDT PDE,
+      PS_JOB J,
+      PS_JOBCODE_TBL JT,
+      PS_SAL_GRADE_TBL S,
+      PS_DIVERS_ETHNIC DVR,
+      PS_ETHNIC_GRP_TBL ETH
+WHERE J.PER_ORG = 'EMP'
+  AND J.EMPLID     = P.EMPLID
+  AND PDE.EMPLID   = P.EMPLID
+  AND DVR.EMPLID   = P.EMPLID
+    AND DVR.PRIMARY_INDICATOR = 'Y' 
+    AND DVR.SETID = ETH.SETID 
+    AND DVR.ETHNIC_GRP_CD = ETH.ETHNIC_GRP_CD 
+    AND ETH.EFFDT = (SELECT MAX(E2.EFFDT) FROM PS_ETHNIC_GRP_TBL E2 
+                    WHERE E2.SETID = ETH.SETID 
+                    AND E2.ETHNIC_GRP_CD = ETH.ETHNIC_GRP_CD 
+                    [$E-DATE-WHERE])
+  AND J.JOB_INDICATOR = 'P'
+  AND J.EFFSEQ =
+      (SELECT MAX(J2.EFFSEQ)
+       FROM   PS_JOB J2
+       WHERE J2.EMPLID    = J.EMPLID
+         AND J2.EMPL_RCD = J.EMPL_RCD
+         AND J2.EFFDT     = J.EFFDT)
+  AND JT.JOBCODE   = J.JOBCODE
+  AND JT.SETID = J.SETID_JOBCODE
+  AND JT.EFFDT =
+      (SELECT MAX(JT1.EFFDT)
+       FROM   PS_JOBCODE_TBL JT1
+       WHERE  JT1.JOBCODE = JT.JOBCODE
+         AND JT1.SETID = JT.SETID
+         !**************BEGIN RESOLUTION 609634************
+         !AND  JT1.EFFDT  <= J.EFFDT)
+         [$JT1-DATE-WHERE])
+         !**************END RESOLUTION 609634************
+  AND S.SAL_ADMIN_PLAN = J.SAL_ADMIN_PLAN
+  AND S.GRADE          = J.GRADE
+  AND S.SETID = (SELECT SETID
+                 FROM PS_SET_CNTRL_REC
+                 WHERE RECNAME = 'SAL_GRADE_TBL'
+                  AND SETCNTRLVALUE = J.BUSINESS_UNIT)
+  AND PDE.EFFDT = (
+           SELECT MAX(PDE1.EFFDT)
+           FROM PS_PERS_DATA_EFFDT PDE1
+                   WHERE PDE1.EMPLID = PDE.EMPLID
+[$PDE-DATE-WHERE]
+)
+  AND S.EFFDT =
+      (SELECT MAX(S1.EFFDT)
+         FROM PS_SAL_GRADE_TBL S1
+        WHERE S1.SAL_ADMIN_PLAN = S.SAL_ADMIN_PLAN
+          AND S1.GRADE          = S.GRADE
+          AND S1.SETID = S.SETID)
+  AND J.EMPL_STATUS IN ('A','L','S','P')
+  AND J.EEO_CLASS    <> 'E'
+  AND JT.EEO1CODE    <> 'N'
+  AND J.EFFDT =
+      (SELECT MAX(J1.EFFDT)
+       FROM   PS_JOB J1
+       WHERE J1.EMPLID    = J.EMPLID
+         AND J1.EMPL_RCD = J.EMPL_RCD
+[$J-DATE-WHERE]
+       )
+  [$Where-Clause]
+
+GROUP BY  J.DEPTID, JT.DESCR, JT.EEO_JOB_GROUP, J.SAL_ADMIN_PLAN,
+          S.MID_RT_ANNUAL, J.GRADE, PDE.SEX, ETH.ETHNIC_GROUP
+
+End-Select
+
+LET $SalaryGrade = $LastSalAdminPlan || '/' || $LastSalGrade
+PUT $LastJobCode $LastJobGroup $SalaryGrade #Total_Employees #Total_Minorities #Male_Total #Male_White #Male_Black
+!********************* Begin Resolution - 582203 ************************
+!#Male_Hispanic #Male_Asian #Male_Native #Male_Unknown #Female_Total #Female_White #Female_Black #Female_Hispanic #Female_Asian
+!#Female_Native #Female_Unknown #Unknown_Unknown
+#Male_Hispanic #Male_Asian #Male_Native #Male_Pacific #Male_Unknown #Female_Total #Female_White #Female_Black #Female_Hispanic #Female_Asian
+#Female_Native #Female_Pacific #Female_Unknown #Unknown_Unknown
+!********************* End  Resolution - 582203  ************************
+INTO Workforce-Array (#RowCount)
+DO Reset-Job-Count
+ADD 1 to #RowCount
+
+
+DO Print-Department-Rows
+! Output to file if that
+! option is selected
+!-------------------------
+IF $OutputCSV = 'Y'
+    DO Write-Dept-Rows-To-File
+END-IF
+
+#IFDEF DEBUGPER025
+  DISPLAY ' $Where-Clause: ' NOLINE
+  DISPLAY $Where-Clause
+#ENDIF
+
+end-procedure
+
+!----------------------------------------------------------------------
+!---------Fetch-Department-Name----------------------------------------
+!----------------------------------------------------------------------
+! This routine will grab the Department name from the current
+! DEPTID value...
+!----------------------------------------------------------------------
+
+begin-procedure Fetch-Department-Name
+
+#IFDEF DEBUGPER025
+  DISPLAY 'FLOW: Fetch-Department-Name'
+#ENDIF
+
+LET $Department = ''
+
+BEGIN-SELECT
+DPT.DESCR
+
+    let $Department = RTrim (&DPT.DESCR,' ')
+
+FROM PS_DEPT_TBL DPT
+WHERE DPT.DEPTID = $LastDeptID
+AND DPT.EFFDT = (SELECT MAX(DPT1.EFFDT)
+                        FROM PS_DEPT_TBL DPT1
+                        WHERE DPT1.DEPTID = DPT.DEPTID
+[$D-DATE-WHERE]
+                     )
+
+
+END-SELECT
+
+let $LastDeptID = RTrim($LastDeptID,' ')
+let $DepartmentName = $Department
+
+IF NOT ISBLANK($Department)
+   let $Department = $Department || ' (' || $LastDeptID || ')'
+END-IF
+
+#IFDEF DEBUGPER025
+   DISPLAY '   $Department: ' NOLINE
+   DISPLAY $Department
+#ENDIF
+
+end-procedure Fetch-Department-Name
+
+!----------------------------------------------------------------------
+!---------Reset-Department-Count---------------------------------------
+!----------------------------------------------------------------------
+! This routine will clear the array and reset all variables used in
+!   calculating department totals
+!----------------------------------------------------------------------
+begin-procedure Reset-Department-Count
+
+#IFDEF DEBUGPER025
+  DISPLAY 'FLOW: Reset-Department-Count'
+#ENDIF
+
+CLEAR-ARRAY NAME=Workforce-Array
+LET #RowCount = 0
+
+end-procedure Reset-Department-Count
+
+!----------------------------------------------------------------------
+!---------Reset-Job-Count----------------------------------------------
+!----------------------------------------------------------------------
+! This routine will reset all the variables used to count the number
+! of each race for the Jobcode
+!----------------------------------------------------------------------
+begin-procedure Reset-Job-Count
+
+#IFDEF DEBUGPER025
+  DISPLAY 'FLOW: Reset-Job-Count'
+#ENDIF
+
+let #Total_Employees = 0
+let #Total_Minorities = 0
+
+let #Male_Total = 0
+let #Male_White = 0
+let #Male_Black = 0
+let #Male_Hispanic = 0
+let #Male_Asian = 0
+let #Male_Native = 0
+!********************* Begin Resolution - 582203 ************************
+let #Male_Pacific = 0
+!********************* End Resolution - 582203 ************************
+let #Male_Unknown = 0
+
+
+let #Female_Total = 0
+let #Female_White = 0
+let #Female_Black = 0
+let #Female_Hispanic = 0
+let #Female_Asian = 0
+let #Female_Native = 0
+!********************* Begin Resolution - 582203 ************************
+let #Female_Pacific = 0
+!********************* End  Resolution - 582203  ************************
+let #Female_Unknown = 0
+
+
+let #Unknown_Total = 0
+let #Unknown_White = 0
+let #Unknown_Black = 0
+let #Unknown_Hispanic = 0
+let #Unknown_Asian = 0
+let #Unknown_Native = 0
+!********************* Begin Resolution - 582203 ************************
+let #Unknown_Pacific = 0
+!********************* End Resolution - 582203 ************************
+let #Unknown_Unknown = 0
+
+!LET $LastJobGroup = ''
+!LET $LastSalAdminPlan = ''
+!LET $LastSalGrade = ''
+
+end-procedure Reset-Job-Count
+
+!----------------------------------------------------------------------
+!---------Print-Department-Rows----------------------------------------
+!----------------------------------------------------------------------
+! This routine will print the rows in the Workforce-Array - which
+!   represents the jobcodes and totals for one department.
+!----------------------------------------------------------------------
+begin-procedure Print-Department-Rows
+#IFDEF DEBUGPER025
+  DISPLAY 'FLOW: Print-Department-Rows'
+#ENDIF
+
+! Reset total count variables
+!------------------------------------------
+LET #GrandTotalEmployees = 0
+LET #GrandTotalMinorities = 0
+
+LET #GrandTotalUnknownGender = 0
+
+LET #GrandTotalMale = 0
+LET #GrandTotalMaleWhite = 0
+LET #GrandTotalMaleBlack = 0
+LET #GrandTotalMaleHispanic = 0
+LET #GrandTotalMaleAsian = 0
+LET #GrandTotalMaleNative = 0
+!********************* Begin Resolution - 582203 ************************
+LET #GrandTotalMalePacific = 0
+!********************* End  Resolution - 582203  ************************
+LET #GrandTotalMaleUnknown = 0
+
+LET #GrandTotalFemale = 0
+LET #GrandTotalFemaleWhite = 0
+LET #GrandTotalFemaleBlack = 0
+LET #GrandTotalFemaleHispanic = 0
+LET #GrandTotalFemaleAsian = 0
+LET #GrandTotalFemaleNative = 0
+!********************* Begin Resolution - 582203 ************************
+LET #GrandTotalFemalePacific = 0
+!********************* End  Resolution - 582203  ************************
+
+LET #GrandTotalFemaleUnknown = 0
+
+
+! If we're near the end of the page, let's
+! skip to the next page...
+!-------------------------------------------
+IF #current-line > (40 - (#RowCount + 7))
+    IF #RowCount <50 ! We don't want to force the break if there's more rows than lines on a page
+        NEW-PAGE
+        ADD 1 to #PageCount
+    END-IF
+END-IF
+
+LET #PrintCount = 0
+LET $Department = ''
+
+Do Fetch-Department-Name
+
+IF NOT ISBLANK ($Department)
+   ! Print the department name
+   !-------------------------------------------
+   ALTER-PRINTER
+       point-size=12
+       font=4
+
+   IF #current-line < 12
+      PRINT $Department (+1,1) BOLD
+   ELSE
+      PRINT $Department (+3,1) BOLD
+   END-IF
+
+   ! Set the type size back
+   !-------------------------------------------
+   ALTER-PRINTER
+       point-size=7
+
+
+   DO Print-Column-Headings
+
+   WHILE #PrintCount < #RowCount
+
+       IF #current-line = 46
+           LET $Output = $Department || ' continued...'
+           PRINT $Output (+2,1) BOLD
+           DO Print-Column-Headings
+       END-IF
+
+       ALTER-PRINTER
+           point-size=7
+
+       ! Gray Background on every other line
+       !--------------------------------------------
+       IF $PRINT_GRAY != 'FALSE'
+          POSITION (+1,,)
+          LET $PRINT_GRAY = 'FALSE'
+       ELSE
+          GRAPHIC (+1,1,104) box 1 0 15
+          LET $PRINT_GRAY = 'TRUE'
+       END-IF
+
+       LET $Output=Workforce-Array.JOBCODE(#PrintCount)
+       PRINT $Output                               (,1)
+
+       LET $Output=Workforce-Array.JOBGROUP(#PrintCount)
+       PRINT $Output                               (, 20)
+       LET $Output=Workforce-Array.SALARY_GRADE(#PrintCount)
+       PRINT $Output                               (,23)
+       LET $Output=Workforce-Array.TOTAL_EMPLOYEES(#PrintCount)
+       PRINT $Output                               (,29)
+       LET $Output=Workforce-Array.TOTAL_MINORITIES(#PrintCount)
+       PRINT $Output                               (,34)
+
+
+     !********************* Begin Resolution - 582203 ************************
+       LET $Output=Workforce-Array.MALE_TOTAL(#PrintCount)
+       !PRINT $Output                               (,47)
+        PRINT $Output                               (,42)
+       LET $Output=Workforce-Array.MALE_WHITE(#PrintCount)
+       !PRINT $Output                               (,51)
+        PRINT $Output                               (,46)
+       LET $Output=Workforce-Array.MALE_BLACK(#PrintCount)
+       !PRINT $Output                               (,55)
+        PRINT $Output                               (,50)
+       LET $Output=Workforce-Array.MALE_HISPANIC(#PrintCount)
+       !PRINT $Output                               (,59)
+        PRINT $Output                               (,54)
+       LET $Output=Workforce-Array.MALE_ASIAN(#PrintCount)
+       !PRINT $Output                               (,63)
+        PRINT $Output                               (,58)
+       LET $Output=Workforce-Array.MALE_NATIVE(#PrintCount)
+       !PRINT $Output                               (,67)
+        PRINT $Output                               (,62)
+       LET $Output=Workforce-Array.MALE_PACIFIC(#PrintCount)
+       PRINT $Output                               (,66)
+       
+       LET $Output=Workforce-Array.MALE_UNKNOWN(#PrintCount)
+       DISPLAY 'WARNING: There are Male Employees with Unknown Race: ' NOLINE
+       DISPLAY $Output
+
+
+       LET $Output=Workforce-Array.FEMALE_TOTAL(#PrintCount)
+       !PRINT $Output                               (,78)
+        PRINT $Output                               (,73)
+       LET $Output=Workforce-Array.FEMALE_WHITE(#PrintCount)
+       !PRINT $Output                               (,82)
+        PRINT $Output                               (,77)
+       LET $Output=Workforce-Array.FEMALE_BLACK(#PrintCount)
+       !PRINT $Output                               (,86)
+        PRINT $Output                               (,81)
+       LET $Output=Workforce-Array.FEMALE_HISPANIC(#PrintCount)
+       !PRINT $Output                               (,90)
+        PRINT $Output                               (,85)
+       LET $Output=Workforce-Array.FEMALE_ASIAN(#PrintCount)
+       !PRINT $Output                               (,94)
+        PRINT $Output                               (,89)
+       LET $Output=Workforce-Array.FEMALE_NATIVE(#PrintCount)
+       !PRINT $Output                               (,98)
+        PRINT $Output                               (,93)
+       LET $Output=Workforce-Array.FEMALE_PACIFIC(#PrintCount)
+        PRINT $Output                               (,97)
+
+
+       
+       !********************* End  Resolution - 582203  ************************
+       
+       LET $Output=Workforce-Array.FEMALE_UNKNOWN(#PrintCount)
+       DISPLAY 'WARNING: There are Female employees with unknown Race: ' NOLINE
+       DISPLAY $Output
+       
+       LET $Output=Workforce-Array.UNKNOWN_UNKNOWN(#PrintCount)
+       DISPLAY 'WARNING: There are employees with both unknown Gender and Race: ' NOLINE
+       DISPLAY $Output
+        
+
+
+
+       LET #GrandTotalEmployees = #GrandTotalEmployees + Workforce-Array.TOTAL_EMPLOYEES(#PrintCount)
+       LET #GrandTotalMinorities = #GrandTotalMinorities + Workforce-Array.TOTAL_MINORITIES(#PrintCount)
+
+       LET #GrandTotalMale = #GrandTotalMale + Workforce-Array.MALE_TOTAL(#PrintCount)
+       LET #GrandTotalMaleWhite = #GrandTotalMaleWhite + Workforce-Array.MALE_WHITE(#PrintCount)
+       LET #GrandTotalMaleBlack = #GrandTotalMaleBlack + Workforce-Array.MALE_BLACK(#PrintCount)
+       LET #GrandTotalMaleHispanic = #GrandTotalMaleHispanic + Workforce-Array.MALE_HISPANIC(#PrintCount)
+       LET #GrandTotalMaleAsian = #GrandTotalMaleAsian + Workforce-Array.MALE_ASIAN(#PrintCount)
+       LET #GrandTotalMaleNative = #GrandTotalMaleNative + Workforce-Array.MALE_NATIVE(#PrintCount)
+       !********************* Begin Resolution - 582203 ************************
+       LET #GrandTotalMalePacific = #GrandTotalMalePacific + Workforce-Array.MALE_PACIFIC(#PrintCount)
+       !********************* End  Resolution - 582203  ************************
+
+
+
+       LET #GrandTotalFemale = #GrandTotalFemale + Workforce-Array.FEMALE_TOTAL(#PrintCount)
+       LET #GrandTotalFemaleWhite = #GrandTotalFemaleWhite + Workforce-Array.FEMALE_WHITE(#PrintCount)
+       LET #GrandTotalFemaleBlack = #GrandTotalFemaleBlack + Workforce-Array.FEMALE_BLACK(#PrintCount)
+       LET #GrandTotalFemaleHispanic = #GrandTotalFemaleHispanic + Workforce-Array.FEMALE_HISPANIC(#PrintCount)
+       LET #GrandTotalFemaleAsian = #GrandTotalFemaleAsian + Workforce-Array.FEMALE_ASIAN(#PrintCount)
+       LET #GrandTotalFemaleNative = #GrandTotalFemaleNative + Workforce-Array.FEMALE_NATIVE(#PrintCount)
+       !********************* Begin Resolution - 582203 ************************
+       LET #GrandTotalFemalePacific = #GrandTotalFemalePacific + Workforce-Array.FEMALE_PACIFIC(#PrintCount)
+       !********************* End  Resolution - 582203  ************************
+
+
+       ADD 1 to #PrintCount
+
+   END-WHILE
+ELSE
+   PRINT ' ' (+1, 25)
+END-IF
+! We need to avoid division by zero
+!------------------------------------------------
+IF #GrandTotalEmployees != 0
+
+        ! Horizontal Line above totals
+        !-------------------------------------------
+        GRAPHIC (,1,104) HORZ-LINE
+        
+
+        ! Print Totals
+        !----------------------------------------------------------------------
+        PRINT 'Total'                                   (+1,25) BOLD
+        PRINT #GrandTotalEmployees                      (,29)   BOLD EDIT 88888
+        PRINT #GrandTotalMinorities                     (,34)   BOLD EDIT 88888
+
+       !********************* Begin Resolution - 582203 ************************
+        !PRINT #GrandTotalMale                           (,47)   BOLD EDIT 88888
+         PRINT #GrandTotalMale                           (,42)   BOLD EDIT 88888
+        !PRINT #GrandTotalMaleWhite                      (,51)   BOLD EDIT 88888
+         PRINT #GrandTotalMaleWhite                      (,46)   BOLD EDIT 88888
+        !PRINT #GrandTotalMaleBlack                      (,55)   BOLD EDIT 88888
+         PRINT #GrandTotalMaleBlack                      (,50)   BOLD EDIT 88888
+        !PRINT #GrandTotalMaleHispanic                   (,59)   BOLD EDIT 88888
+         PRINT #GrandTotalMaleHispanic                   (,54)   BOLD EDIT 88888
+        !PRINT #GrandTotalMaleAsian                      (,63)   BOLD EDIT 88888
+         PRINT #GrandTotalMaleAsian                      (,58)   BOLD EDIT 88888
+        !PRINT #GrandTotalMaleNative                     (,67)   BOLD EDIT 88888
+         PRINT #GrandTotalMaleNative                     (,62)   BOLD EDIT 88888
+         PRINT #GrandTotalMalePacific                    (,66)   BOLD EDIT 88888
+        
+      
+        !PRINT #GrandTotalFemale                         (,78)   BOLD EDIT 88888
+         PRINT #GrandTotalFemale                         (,73)   BOLD EDIT 88888
+        !PRINT #GrandTotalFemaleWhite                    (,82)   BOLD EDIT 88888
+         PRINT #GrandTotalFemaleWhite                    (,77)   BOLD EDIT 88888
+        !PRINT #GrandTotalFemaleBlack                    (,86)   BOLD EDIT 88888
+         PRINT #GrandTotalFemaleBlack                    (,81)   BOLD EDIT 88888
+        !PRINT #GrandTotalFemaleHispanic                 (,90)   BOLD EDIT 88888
+         PRINT #GrandTotalFemaleHispanic                 (,85)   BOLD EDIT 88888
+        !PRINT #GrandTotalFemaleAsian                    (,94)   BOLD EDIT 88888
+         PRINT #GrandTotalFemaleAsian                    (,89)   BOLD EDIT 88888
+        !PRINT #GrandTotalFemaleNative                   (,98)   BOLD EDIT 88888
+         PRINT #GrandTotalFemaleNative                   (,93)   BOLD EDIT 88888
+         PRINT #GrandTotalFemalePacific                  (,97)   BOLD EDIT 88888
+        !********************* End  Resolution - 582203  ************************
+
+
+
+
+        ! Print Percentages
+        !----------------------------------------------------------------------
+        PRINT ' % of Total'                                             (+1,22) BOLD
+
+!       LET #Total = ((#GrandTotalEmployees / #GrandTotalEmployees) * 100)
+!       PRINT   #Total                                                  (,29)   BOLD EDIT 888.88
+        LET #Total = ((#GrandTotalMinorities / #GrandTotalEmployees) * 100)
+        PRINT   #Total                                                  (,33)   BOLD EDIT 888.88
+
+
+        LET #Total = ((#GrandTotalMale / #GrandTotalEmployees) * 100)
+        !********************* Begin Resolution - 582203 ************************
+        !PRINT   #Total                                                  (,47)   BOLD EDIT 888.88
+         PRINT   #Total                                                  (,42)   BOLD EDIT 888.88
+        LET #Total = ((#GrandTotalMaleWhite / #GrandTotalEmployees) * 100)
+        !PRINT   #Total                                                  (,51)   BOLD EDIT 888.88
+         PRINT   #Total                                                  (,46)   BOLD EDIT 888.88
+        LET #Total = ((#GrandTotalMaleBlack / #GrandTotalEmployees) * 100)
+        !PRINT   #Total                                                  (,55)   BOLD EDIT 888.88
+         PRINT   #Total                                                  (,50)   BOLD EDIT 888.88
+        LET #Total = ((#GrandTotalMaleHispanic / #GrandTotalEmployees) * 100)
+        !PRINT   #Total                                                  (,59)   BOLD EDIT 888.88
+         PRINT   #Total                                                  (,54)   BOLD EDIT 888.88
+        LET #Total = ((#GrandTotalMaleAsian / #GrandTotalEmployees) * 100)
+        !PRINT   #Total                                                  (,63)   BOLD EDIT 888.88
+         PRINT   #Total                                                  (,58)   BOLD EDIT 888.88
+        LET #Total = ((#GrandTotalMaleNative / #GrandTotalEmployees) * 100)
+        !PRINT   #Total                                                  (,67)   BOLD EDIT 888.88
+         PRINT   #Total                                                  (,62)   BOLD EDIT 888.88
+        LET #Total = ((#GrandTotalMalePacific / #GrandTotalEmployees) * 100)
+        PRINT   #Total                                                  (,66)   BOLD EDIT 888.88
+        
+
+        LET #Total = ((#GrandTotalFemale / #GrandTotalEmployees) * 100)
+        !PRINT   #Total                                                  (,78)   BOLD EDIT 888.88
+         PRINT   #Total                                                  (,73)   BOLD EDIT 888.88
+        LET #Total = ((#GrandTotalFemaleWhite / #GrandTotalEmployees) * 100)
+        !PRINT   #Total                                                  (,82)   BOLD EDIT 888.88
+         PRINT   #Total                                                  (,77)   BOLD EDIT 888.88
+        LET #Total = ((#GrandTotalFemaleBlack / #GrandTotalEmployees) * 100)
+        !PRINT   #Total                                                  (,86)   BOLD EDIT 888.88
+         PRINT   #Total                                                  (,81)   BOLD EDIT 888.88
+        LET #Total = ((#GrandTotalFemaleHispanic / #GrandTotalEmployees) * 100)
+        !PRINT   #Total                                                  (,90)   BOLD EDIT 888.88
+         PRINT   #Total                                                  (,85)   BOLD EDIT 888.88
+        LET #Total = ((#GrandTotalFemaleAsian / #GrandTotalEmployees) * 100)
+        !PRINT   #Total                                                  (,94)   BOLD EDIT 888.88
+         PRINT   #Total                                                  (,89)   BOLD EDIT 888.88
+        LET #Total = ((#GrandTotalFemaleNative / #GrandTotalEmployees) * 100)
+        !PRINT   #Total                                                  (,98)   BOLD EDIT 888.88
+         PRINT   #Total                                                  (,93)   BOLD EDIT 888.88
+        LET #Total = ((#GrandTotalFemalePacific / #GrandTotalEmployees) * 100)
+        PRINT   #Total                                                  (,97)   BOLD EDIT 888.88
+        !********************* End Resolution - 582203 ************************
+
+
+
+        ! Horizontal Line below column headings
+        !-------------------------------------------
+        GRAPHIC (-1,1,104) HORZ-LINE
+        
+
+END-IF
+
+LET $PRINT_GRAY = 'TRUE'
+end-procedure Print-Department-Rows
+
+!----------------------------------------------------------------------
+!---------Print-Column-Headings----------------------------------------
+!----------------------------------------------------------------------
+! This routine will print the column headers for each department
+!----------------------------------------------------------------------
+begin-procedure Print-Column-Headings
+
+
+    ALTER-PRINTER
+        point-size = 7
+    ! Horizontal Line above column headings
+    !-------------------------------------------
+    GRAPHIC (+1,1,104) HORZ-LINE
+    
+
+    ! Column Headings
+    !------------------------------------------------
+
+    PRINT ' Job'                                (+1,19) BOLD
+    PRINT 'Salary'                              (,23)   BOLD
+    PRINT 'Total'                               (,28)   BOLD
+    PRINT 'Total'                               (,34)   BOLD
+
+   !********************* Begin Resolution - 582203 ************************
+    !PRINT 'MALE'                                (,58)   BOLD
+     PRINT 'MALE'                                (,55)   BOLD
+    !PRINT 'FEMALE'                              (,89)   BOLD
+     PRINT 'FEMALE'                              (,86)   BOLD
+   !********************* End  Resolution - 582203  ************************ 
+
+    PRINT 'Job Title'                           (+1, 1) BOLD
+    PRINT 'Group'                               (,19) BOLD
+    PRINT 'Grade'                               (,23)   BOLD
+    PRINT ' EEs'                                (,28)   BOLD
+    PRINT 'Min.'                                (,34)   BOLD
+
+
+        ! Smaller type for race columns
+        !---------------------------------
+        ALTER-PRINTER
+            point-size = 6
+
+   !********************* Begin Resolution - 582203 ************************
+   !PRINT 'Total'                               (,47)   BOLD
+    PRINT 'Total'                               (,42)   BOLD
+   !PRINT 'White'                               (,51)   BOLD
+    PRINT 'White'                               (,46)   BOLD
+   !PRINT 'Black'                               (,55)   BOLD
+    PRINT 'Black'                               (,50)   BOLD
+   !PRINT 'Hisp.'                               (,59)   BOLD
+    PRINT 'Hisp.'                               (,54)   BOLD
+   !PRINT 'Asian'                               (,63)   BOLD
+    PRINT 'Asian'                               (,58)   BOLD
+   !PRINT 'Nat. Am'                             (,67)   BOLD
+    PRINT 'Nat. Am'                             (,62)   BOLD
+    PRINT 'Pacific'                             (,66)   BOLD
+   
+
+
+   !PRINT 'Total'                               (,78)   BOLD
+    PRINT 'Total'                               (,73)   BOLD
+   !PRINT 'White'                               (,82)   BOLD
+    PRINT 'White'                               (,77)   BOLD
+   !PRINT 'Black'                               (,86)   BOLD
+    PRINT 'Black'                               (,81)   BOLD
+   !PRINT 'Hisp.'                               (,90)   BOLD
+    PRINT 'Hisp.'                               (,85)   BOLD
+   !PRINT 'Asian'                               (,94)   BOLD
+    PRINT 'Asian'                               (,89)   BOLD
+   !PRINT 'Nat. Am'                             (,98)   BOLD
+    PRINT 'Nat. Am'                             (,93)   BOLD
+    PRINT 'Pacific'                             (,97)   BOLD
+   !********************* End  Resolution - 582203  ************************ 
+
+
+        ! Back to regular type size
+        !---------------------------------
+        ALTER-PRINTER
+            point-size = 7
+
+    ! Horizontal Line below column headings
+    !-------------------------------------------
+    GRAPHIC (,1,104) HORZ-LINE
+    
+
+end-procedure Print-Column-Headings
+
+!----------------------------------------------------------------------
+!---------Open-CSV-File------------------------------------------------
+!----------------------------------------------------------------------
+! This routine will open a file to be used as our output file
+!----------------------------------------------------------------------
+begin-procedure Open-CSV-File
+
+Open '{IMPORTPREFIX}PER025.CSV' As 1
+                              For-Writing
+                              Record=750:Vary
+                              Status=#FileStatus
+IF #FileStatus = -1
+    DISPLAY 'Error opening CSV file'
+    ! Turn off file output, but run report as usual...
+    !------------------------------------------------
+    LET $OutputCSV = 'N'
+END-IF
+
+
+! Print Column Headers if appropriate
+!------------------------------------------------------
+
+IF $IncludeHeaders = 'Y'
+
+    STRING 'Department ID' 'Department Name' 'Job Code' 'Job Group' 'Salary Grade' 'Total Employees' 'Total Minorities' 'Males(Total)' 'White Males'
+           'Black Males' 'Hispanic Males' 'Asian Males' 'Native American Males' 'Males(Race Unknown)' 'Females(Total)'
+           'White Females' 'Black Females' 'Hispanic Females' 'Asian Females' 'Native American Females'
+           'Females(Race Unknown)' 'Gender Unknown' by ',' into $ColumnHeaders
+
+    IF $ReportChoice = '1'
+        let $ColumnHeaders = 'Company ID,Company Name,' || $ColumnHeaders
+    ELSE
+        let $ColumnHeaders = 'Establishment ID,Establishment Name,' || $ColumnHeaders
+    END-IF
+
+
+    WRITE 1 FROM $ColumnHeaders STATUS=#WriteStatus
+    IF #WriteStatus != 0
+        DISPLAY 'Error writing to CSV file.'
+        STOP
+    END-IF
+END-IF
+
+end-procedure Open-CSV-File
+
+
+
+!----------------------------------------------------------------------
+!---------Write-Dept-Rows-To-File--------------------------------------
+!----------------------------------------------------------------------
+! This routine will open a file to be used as our output file
+!----------------------------------------------------------------------
+begin-procedure Write-Dept-Rows-To-File
+
+LET #FileRowCount = 0
+
+! Loop through the array and output the data to the file
+!-------------------------------------------------------
+WHILE #FileRowCount < #RowCount
+
+IF $ReportChoice = '1'
+    let $EntityID = $Company
+ELSE
+    let $EntityID = $Estab
+END-IF
+
+ LET $FileOutput =
+   $EntityID || ',' || $Name || ',' ||
+   $LastDeptID || ',' || $DepartmentName || ',' ||
+   Workforce-Array.JOBCODE(#FileRowCount) || ',' ||
+   Workforce-Array.JOBGROUP(#FileRowCount) || ',' ||
+   Workforce-Array.SALARY_GRADE(#FileRowCount) || ',' ||
+   TO_CHAR(Workforce-Array.TOTAL_EMPLOYEES(#FileRowCount) ) || ',' ||
+   TO_CHAR(Workforce-Array.TOTAL_MINORITIES(#FileRowCount)) || ',' ||
+   TO_CHAR(Workforce-Array.MALE_TOTAL(#FileRowCount)) || ',' ||
+   TO_CHAR(Workforce-Array.MALE_WHITE(#FileRowCount)) || ',' ||
+   TO_CHAR(Workforce-Array.MALE_BLACK(#FileRowCount)) || ',' ||
+   TO_CHAR(Workforce-Array.MALE_HISPANIC(#FileRowCount)) || ',' ||
+   TO_CHAR(Workforce-Array.MALE_ASIAN(#FileRowCount)) || ',' ||
+   TO_CHAR(Workforce-Array.MALE_NATIVE(#FileRowCount)) || ',' ||
+   !*****************************Begin Resolution - 582203 *************************
+   TO_CHAR(Workforce-Array.MALE_PACIFIC(#FileRowCount)) || ',' ||
+   !*****************************End Resolution - 582203 ***************************
+   
+   TO_CHAR(Workforce-Array.MALE_UNKNOWN(#FileRowCount)) || ',' ||
+   TO_CHAR(Workforce-Array.FEMALE_TOTAL(#FileRowCount)) || ',' ||
+   TO_CHAR(Workforce-Array.FEMALE_WHITE(#FileRowCount)) || ',' ||
+   TO_CHAR(Workforce-Array.FEMALE_BLACK(#FileRowCount)) || ',' ||
+   TO_CHAR(Workforce-Array.FEMALE_HISPANIC(#FileRowCount)) || ',' ||
+   TO_CHAR(Workforce-Array.FEMALE_ASIAN(#FileRowCount)) || ',' ||
+   TO_CHAR(Workforce-Array.FEMALE_NATIVE(#FileRowCount)) || ',' ||
+   TO_CHAR(Workforce-Array.FEMALE_UNKNOWN(#FileRowCount)) || ',' ||
+   !**************************** Begin Resolution - 582203**************************
+   TO_CHAR(Workforce-Array.FEMALE_PACIFIC(#FileRowCount)) || ',' ||
+   !*****************************End Resolution - 582203****************************
+   TO_CHAR(Workforce-Array.UNKNOWN_UNKNOWN(#FileRowCount))
+
+WRITE 1 FROM $FileOutput STATUS=#WriteStatus
+
+IF #WriteStatus != 0
+    DISPLAY 'Error writing to CSV file.'
+    STOP
+END-IF
+
+ADD 1 to #FileRowCount
+
+END-WHILE
+
+
+
+end-procedure Write-Dept-Rows-To-File
+
+
+!----------------------------------------------------------------------
+!---------SQCs---------------------------------------------------------
+!----------------------------------------------------------------------
+#include 'stdapi.sqc'      !Routine to update run status
+#include 'rgrnctl1.sqc'    !Get run control parameter values
+#include 'rggetval.sqc'    !Get values mask routines
+#include 'askcalyr.sqc'    !Ask Calendar Year input
+#Include 'curdttim.sqc'    !Get-Current-DateTime procedure
+#Include 'datetime.sqc'    !Routines for date and time formatting
+#Include 'number.sqc'      !Routines to format numbers
+#include 'regutils.sqc'    !US Regulatory routines

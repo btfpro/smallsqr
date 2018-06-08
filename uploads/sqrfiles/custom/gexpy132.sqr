@@ -1,0 +1,987 @@
+!***********************************************************************
+!  GEXPY132:  Corp Department Weekly Charges -                         * 
+!            SORTED BY Manager name, Department Charged,  EMPLID      *
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module is the confidential and proprietary information of       *
+! Giant Eagle, Inc.; it is not to be copied, reproduced,or transmitted *
+! in any form, by any means, in whole or in part, nor is it to be used *
+! for any purpose other than that for which it is expressly provided   *
+! without the written permission of Giant Eagle.                       *
+!                                                                      *
+! Copyright (c) 1997-1998 Giant Eagle,Inc. All Rights Reserved         *
+!***********************************************************************
+!                                                                      *
+! GEXPY132:       Department Weekly Charges (Corp company/paygroups    *
+!                 are selected through the runcntl)                    *          
+!                                                                      *
+! Narrative:      This program creates a weekly report of all employees*  
+!                 employees, their hours worked and what department    *
+!                 was charged.  If JOB.gex_deptid_ovr contains a deptid*
+!                 this deptid must be used on the report as dept chged.*
+!                 If it is not populated, use the dept on the paysheet *
+!                 (pay_oth_earns). Temp table1 is created to hold the  *
+!                 correct dept charged.  Since an employee can have >1 *
+!                 paycheck with duplicate earnings codes, temp table 2 *
+!                 is used for summing up the hours by erncd.  Then temp*
+!                 table2 is used for reporting.                        * 
+!                                                                      *
+! #Debugx Used:	  #debug9 paragraph trace                              *
+!                 #debug8 key variable values                          *
+!                 #debug7 data returned from sql calls                 *
+!                                                                      *
+! SQL Tables:     pay_oth_earns                                        *
+!                 pay_earnings                                         *
+!                 gex_dept_tbl                                         *
+!                 personal_data                                        *
+!                 gex_mgmt_report                                      *
+!                 job                                                  *
+!                 GEX_R1_GEXPY132 (Temp Tbl1)                          *
+!                 GEX_R2_GEXPY132 (Temp Tbl2) Summary of hours by Erncd*
+!                                                                      *
+! Written by:     Sue Mahady                                           *
+!                                                                      *
+! Normally Run:	  Weekly                                               *
+!                                                                      *
+! Runctl Parms:  FOR WHERE CLAUSE:                                     *
+!                   Company                                            *
+!                   Paygroup                                           *                                                             *
+!***********************************************************************
+!                         MODIFICATION HISTORY                         *
+!***********************************************************************
+! INITIALS  DATE      DESCRIPTION OF THE CHANGE                        *
+!***********************************************************************
+! SCM    10/18/2001   Initial Creation                                 *
+!                                                                      *
+! AXL    03/21/2002   Modified on-break logic to address header issues.*
+!                     Prevent rows from showing up earnings = 0.       * 
+!                     Determine default tablespace for userid running  *
+!                     sqr.                                             *
+! SCM    05/06/2002   GL Deptid in Heading was displaying home deptid  *
+!                     instead of deptid charged.  Fixed BU deptid look-*
+!                     up to use charged deptid instead of home deptid. *
+! Manish 08/17/2007   HCM 9.0 Upgrade                                  *
+! DXS    04/14/2008   The $lowest_lvl_mgr_name uses the old name format*
+!                     modified sqc getempnm.sqc                        *
+! ISDVASS 04/30/2008  modified code to pull std hours, if hours are blank in pay_oth_earns
+! ISDVSXP 09/23/2008  ITG 53418,if erncd payment type is 'A' and 'F',hours should be zero
+! ISDVSXP 02/27/2009  S3 12484597 if erncd payment type is 'E',hours should be zero
+! isdvmxr 06/24/2009  S3 12946055 Code fix for jury hours
+! ISDVVXK 10/19/2010  ITG 71439 Modified the code to skip the zero Hours 
+!                     from Printing
+! VENDKXY 07/06/2011  Modified the code skip zero hours to print TobFrCred
+!		      as per ITG 103557
+!***********************************************************************
+
+#Include 'setenv.sqc'    !Set environment
+#Include 'setup01.sqc'   !Printer and page-size initialization
+
+!*********************************************************************
+Begin-Heading 10
+!*********************************************************************
+#debug9 Show 'Begin-Heading'
+
+#Include 'stdhdg02.sqc'
+
+  Do Get-PayGroup-Data
+ 
+  if $Deptid <> $priorDeptid
+    move $Deptid to $priorDeptid
+    do Get-Department-Name  
+  end-if
+
+  Let $X000_temp_out = '   Sorted by ' || $Sort_Display
+  Print $X000_temp_out         (3,)  center
+
+  Let $X000_temp_out = 'Report as of ' || $X000_REPORT_HEADING_ASOFDATE
+  Print $X000_temp_out         (4,)  center
+
+  Print 'Pay Group'                 ( 4,001)
+  Print $PayGroup                   (+0,013)
+  Print $PayGroupName               (+0,+1)
+
+
+  Print 'Manager: '                   (6,1)
+  Print $t2.lowest_lvl_mgrname2       (6,10,25)
+  Print 'HR Dept Charged: '           (6,37)
+  Print $Deptid                       (6,+1,5)
+  Print $DeptName                     (6,+1,30)
+  Print 'PayEnd: '                    (6,103)
+  Print $pay_end_dt                   (6,+1)
+
+  Print 'Business Unit/GL Deptid:'    (+1,37)
+  Print $t2.Bus_Unit2                 (+0,+1,5)
+  Print '/'                           (+0,+1,1)
+  Print $t2.gl_deptid2                (+0,+2,5)
+  Print 'Check Issue: '               (+0,98)
+  Print $check_issue_dt               (+0,+1)
+
+  Print 'EMPLOYEE'             (+2,001)
+  Print 'HOURS'                (+0,043)
+  Print 'EARNINGS'             (+0,055)
+  Print 'HOME'                 (+0,071)
+
+  Print 'NAME'                 (+1,001)
+  Print 'WORKED'               (+0,043)
+  Print 'DESCR'                (+0,055)
+  Print 'DEPARTMENT'           (+0,071)
+
+  Print '-'                    (+1,001,09)  Fill
+  Print '-'                    (+0,040,09)  Fill
+  Print '-'                    (+0,055,08)  Fill
+  Print '-'                    (+0,071,30)  Fill
+  
+End-Heading
+
+!*********************************************************************
+Begin-Report
+!*********************************************************************
+#debug9 Show 'Begin-Report'
+
+  !Do Set-Optimizer-Goal	!Manish,08/08/2007,PY227-Giant Eagle commented on 08/08/2007 for HCM 9.0 Upgrade
+
+  Do Init-DateTime           !datetime.sqc
+  Do Init-Number             !number.sqc
+  Do Get-Current-DateTime    !curdttim.sqc
+  Do Stdapi-Init             !stdapi.sqc
+
+  do Select-Def-Tablespace	!3/21/2002
+  Do P100-Start
+  Do P200-Select-for-Temp-Table1
+  Do P510-Drop-temp-table1
+  Do P511-Drop-temp-table2
+  Do P999-Finish
+
+  Do Reset                   !reset.sqc
+  Do Stdapi-Term             !stdapi.sqc
+
+  Show 'Successful end of report'
+End-Report
+
+Begin-Procedure Set-Optimizer-Goal
+  Begin-SQL
+    Alter Session Set OPTIMIZER_GOAL=RULE;
+  End-SQL
+End-Procedure
+
+!AXL 3/21/2002 New Proc - Begin
+!*********************************************************************
+begin-procedure Select-Def-Tablespace
+!********************************************************************* 
+!  Grab appropriate Table Space
+  
+begin-select on-error=sql-error-found('Select-Def-Tablespace')
+
+DEF.DEFAULT_TABLESPACE
+
+   let $table_space= &DEF.DEFAULT_TABLESPACE
+
+   #debug7 display 'table space: ' noline
+   #debug7 display $table_space
+   
+
+FROM USER_USERS DEF
+
+end-select
+
+end-procedure
+!AXL 3/21/2002 New Proc - End
+
+!*********************************************************************
+Begin-Procedure P100-Start
+!*********************************************************************
+#debug9 Show 'P100-Start'
+
+  Let $ReportID    = 'GEXPY132'
+  Let $ReportTitle = 'Department Weekly Charges'
+
+  Show '$ReportID='    $ReportID
+  Show '$ReportTitle=' $ReportTitle
+          
+  Let $GEXXX901_Company_Alias  = 'PE.COMPANY'
+  Let $GEXXX901_Paygroup_Alias = 'PE.PAYGROUP'
+
+  If $prcs_process_instance = ''
+    do P110-Get-SQRW-Parms
+  Else
+    Do GEXXX922-Select-Parameters
+    Do GEXXX901-Select-Company-Paygroup-Parameters
+    Let $AsOfDate = $GEX_RC_PAY.AsOfDate
+    Let $X000_WHERE_SELECT_ASOFDATE = $GEX_RC_PAY.AsOfDate
+    If Rtrim ($GEX_RC_PAY.AsOfDate, ' ') = ''
+      Let $X000_WHERE_SELECT_ASOFDATE = $AsOfToday
+    End-If
+  End-If
+
+  date-time () HH:MI:SS &timeBegan
+  date-time () MM/DD/YYYY &dateBegan
+  show 'Report Began at ' &timeBegan ' on ' &dateBegan
+
+  Do Format-DateTime($X000_WHERE_SELECT_ASOFDATE, $X000_REPORT_HEADING_ASOFDATE, {DEFDATE}, '', '')
+  
+  Let $Order_Clause = 'pe.deptid, pd.name'
+  Let $X000_ORDER_BY = $Order_Clause
+
+  Show '$GEXXX901_INCLUDE_COMPANY_PAYGROUP_DISPLAY_CRITERIA ='   $GEXXX901_INCLUDE_COMPANY_PAYGROUP_DISPLAY_CRITERIA  
+  Show '$X000_WHERE_SELECT_ASOFDATE ='   $X000_WHERE_SELECT_ASOFDATE
+
+  Do P130-Get-Last-Confirmed-Pay
+  Do Format-DateTime($pay_end_dt, $X000_REPORT_HEADING_PAYENDDT, {DEFDATE}, '', '')
+
+  Do P150-Print-Cover-Page
+
+  Do Get-Calendar-Year-Id                            !getbalid.sqc
+
+!user decided they wanted ALL earnings codes reported.
+!  Let $GEXERNCD_Erncd_Alias = 'poe1.erncd'
+!  Do Get-Non-Productive-Erncds                       !gexerncd.sqc  
+
+  let $tablename1 = 'PS_GEX_R1_GEXPY132'
+  show '*** detail temp tablename 1 is *** :  '  $tablename1
+  let $tablename2 = 'PS_GEX_R2_GEXPY132'
+  show '*** summary temp tablename 2 is *** :  ' $tablename2
+  do P500-create-temp-table1
+  do P501-create-temp-table2
+
+End-Procedure
+
+!*********************************************************************
+Begin-Procedure P110-Get-SQRW-Parms
+!*********************************************************************
+#debug9 Show 'P110-Get-SQRW-Parms'
+ 
+  Do Ask-As-Of-Date
+  Let $X000_WHERE_SELECT_ASOFDATE                 = $AsOfToday
+
+  Let $GEXXX900_INCLUDE_COMPANY_PAYGROUP_CRITERIA = '1=1'   
+  Let $GEXXX900_INCLUDE_COMPANY_DISPLAY_CRITERIA = 'ALL'
+
+  Display 'Enter Company/Paygroup or leave blank to exit.'
+  While 1=1
+    Input $In-Company Maxlen=3 'Company'
+    Uppercase $In-Company
+    If Rtrim($In-Company, ' ') = ''
+      Break
+    Else
+      Input $In-Paygroup Maxlen=3 'Paygroup'
+      Uppercase $In-Paygroup
+      If Rtrim($In-Paygroup, ' ') = ''
+        Let $Include_Condition = '(' || $GEXXX901_Company_Alias || ' = '''  || $In-Company || ''')'
+      Else
+        Let $Include_Condition = '(' || $GEXXX901_Company_Alias || ' = '''  || $In-Company || ''' And ' || $GEXXX901_Paygroup_Alias || ' = '''  || $In-Paygroup || ''')'
+      End-If
+      Add 1 To #GEX_RC_PAYGROUP_ROWS
+      If #GEX_RC_PAYGROUP_ROWS = 1
+        Let $GEXXX901_INCLUDE_COMPANY_PAYGROUP_CRITERIA = '(' || $Include_Condition
+      Else
+        Let $GEXXX901_INCLUDE_COMPANY_PAYGROUP_CRITERIA = $GEXXX901_INCLUDE_COMPANY_PAYGROUP_CRITERIA || ' Or '  || $Include_Condition
+      End-If
+    End-If
+  End-While
+
+  If #GEX_RC_PAYGROUP_ROWS = 0
+    Let $GEXXX901_INCLUDE_COMPANY_PAYGROUP_CRITERIA = '1=1'
+    Let $GEXXX901_INCLUDE_COMPANY_PAYGROUP_DISPLAY_CRITERIA = 'ALL'
+  Else
+    Let $GEXXX901_INCLUDE_COMPANY_PAYGROUP_CRITERIA = $GEXXX901_INCLUDE_COMPANY_PAYGROUP_CRITERIA || ')'
+    Let $GEXXX901_INCLUDE_COMPANY_PAYGROUP_DISPLAY_CRITERIA = $GEXXX901_INCLUDE_COMPANY_PAYGROUP_CRITERIA
+  end-if
+ 
+End-Procedure
+
+!*********************************************************************
+Begin-Procedure P130-Get-Last-Confirmed-Pay
+!*********************************************************************
+#debug9 Show 'P130-Get-Last-Confirmed-Pay'
+Begin-Select Loops=1
+PC.CHECK_DT
+PC.PAY_END_DT  
+
+  Let $pay_end_dt = &PC.PAY_END_DT
+  Let $check_issue_dt = &PC.CHECK_DT
+  Show 'Last confirmed pay end date:  ' $pay_end_dt
+  !let $pay_end_dt = '15-SEP-2001'                            
+  Show 'Using this pay end date for processing:  ' $pay_end_dt     
+
+FROM   PS_PAY_CALENDAR PC
+Where  pc.company = 'GEI'
+  and  pc.paygroup = 'OFF'  
+  and  pc.pay_end_dt         =
+       (Select Max(pay_end_dt)
+       From   ps_pay_calendar pc2
+       Where  pc2.pay_end_dt <= $X000_WHERE_SELECT_ASOFDATE
+        and pc2.company = 'GEI'
+        and pc2.paygroup = 'OFF'
+        And pc2. PAY_CONFIRM_RUN = 'Y')
+  
+End-Select
+End-Procedure
+
+!*********************************************************************
+begin-procedure P150-Print-Cover-Page
+!*********************************************************************
+#debug9 Show 'P150-Print-Cover-Page'
+
+  Print 'RUN CONTROL INFORMATION FOR THIS REPORT RUN:'            (+5,1)
+  Print '$Prcs_OPRID          ='                                  (+2,5)
+  Print $Prcs_OPRID                                               (0,+2)
+  Print '$PRCS_RUN_CNTL_ID    ='                                  (+1,5)
+  Print $PRCS_RUN_CNTL_ID                                         (0,+2)
+
+  Print 'SELECTION CRITERIA FOR THIS REPORT RUN:'                 (+5,2)
+  Print '$GEXXX901_INCLUDE_COMPANY_PAYGROUP_DISPLAY_CRITERIA ='   (+1,5)
+  Print $GEXXX901_INCLUDE_COMPANY_PAYGROUP_DISPLAY_CRITERIA       (0,+2)
+  
+  Print 'Report Run Date :'                                       (+2,5)
+  Print $X000_REPORT_HEADING_ASOFDATE                             (0,+2)
+  
+  Print 'Pay End Date :'                                          (+2,5)
+  Print $X000_REPORT_HEADING_PAYENDDT                             (0,+2)
+    
+  Let $Sort_Display = 'Company, Paygroup, Dpt Mgr, Dpt Charged, Employee Name'
+  Print 'SORT ORDER FOR THIS REPORT RUN:'                     (+4,2)
+  Print $Sort_Display                                         (0,+2)
+
+  Let #PAGE-COUNT = 0
+  NEW-PAGE
+  Let #PAGE-COUNT = 1
+End-Procedure
+
+!*****              MAIN SELECT            ******
+!*********************************************************************
+Begin-Procedure P200-Select-for-Temp-Table1
+!*********************************************************************
+#debug9 Show 'P200-Select-for-Temp-Table1'
+
+  Let $Data-Found-Flag = 'N'
+ 
+Begin-Select
+j.emplid
+j.empl_rcd
+pe.company   
+pe.paygroup  
+j.gex_deptid_ovr
+pd.name
+!pe.company
+!pe.paygroup
+pe.pay_end_dt
+pe.off_cycle
+pe.page_num
+pe.line_num
+pe.addl_nbr
+pe.deptid
+pe.hourly_rt					!AXL 3/21/2002 - Add
+j.empl_type					! ISDVASS   04/30/2008
+j.std_hours           ! ISDVASS   04/30/2008
+sum(pe.reg_hrs) 	&pe.sum_reg_hrs
+sum(pe.reg_earn_hrs) 	&pe.sum_reg_earn_hrs   
+sum(pe.reg_earns) 	&pe.sum_reg_earns
+sum(pe.reg_hrly_earns)	&pe.sum_reg_hrly_earns
+  
+  Let $Data-Found-Flag = 'Y'
+  Let $pe_company      = &pe.company
+  Let $pe_paygroup     = &pe.paygroup  
+  Let $Charge_Deptid   = &pe.deptid
+  Let $Home_Deptid     = &pe.deptid
+  Let $j.Emplid        = &j.emplid
+  Let $j.Name          = &pd.name
+  Let $Deptid_ovr      = &j.gex_deptid_ovr
+
+  If $Deptid_ovr = ' ' or $Deptid_ovr = ''
+  else
+     let $Charge_Deptid = $Deptid_ovr
+  end-if
+
+!*******  For salaried ees, if it is a holiday week, negative hrs are in REG_HRS on PAY_EARNINGS
+!*******  (-8 backed out for holiday day);  reg hours are in OTH_HRS on PAY_OTH_EARNS w/erncd=REG,
+!*******  and 8 hours are in OTH_HRS w/erncd=HOL.
+!*******  If it is a regular week, reg hours are in reg_earn_hrs on PAY_EARNINGS
+
+   let #sum_reg_hrs      = &pe.sum_reg_hrs
+   let #sum_reg_earn_hrs = &pe.sum_reg_earn_hrs
+ !  show '#sum_reg_hrs '  #sum_reg_hrs
+ !  show '#sum_reg_earn_hrs '  #sum_reg_earn_hrs
+   let #sum_reg_earns 	   = &pe.sum_reg_earns		!AXL 3/21/2002
+   let #sum_reg_hrly_earns = &pe.sum_reg_hrly_earns	!AXL 3/21/2002		
+                                       
+  let #oth_hrs_reg = 0
+  let $Mgmt-deptid-found = 'N'
+  Do P205-Get-Deptid-Mgr-Emplid
+  if $Mgmt-deptid-found = 'N'
+   let $lowest_lvl_mgr = 'NO DEPTID'
+   !show '++++++++++++++ no deptid on gex_mgmt_report: ' $Charge_deptid
+  end-if
+  let #total_hrs     = 0
+  let #total_earns   = 0	!3/21/2002
+  let $Erncd = 'REG'                
+  let #total_hrs   = #sum_reg_hrs + #sum_reg_earn_hrs  
+  let #total_earns = #sum_reg_earns + #sum_reg_hrly_earns	!AXL 3/21/2002
+
+ ! show 'inserting REG into TEMP1 TBL-deptid:  ' $Charge_deptid
+ ! show '                    $lowest_lvl_mgr:  ' $lowest_lvl_mgr
+ ! show '                            emplid :  ' &j.emplid
+ ! show '                         #total_hrs:  ' #total_hrs
+ ! show '*************************************************' 
+      
+  Do  P520-Insert-Into-Temp-Table1          !Detail table -holds hours worked by erncd
+           !employee could have both on and off cycle checks with hours so there could be
+           ! >1 paycheck record.  Or they could have a bonus check with earnings and no hours,
+           !so there will be multiple erncd records on this temp table.
+ 
+  Do P215-Get-OTH-Hours
+    
+From   ps_gex_dept_tbl           gdt,
+       ps_personal_data          pd,
+       ps_job                    j,
+       ps_pay_earnings           pe                 !paysheet created
+  
+where  pe.pay_end_dt             = $pay_end_dt
+And    pe.emplid                 = j.emplid
+And    pe.empl_rcd              = j.empl_rcd
+And    pd.emplid                 = pe.emplid
+!AND    J.EMPLID = '195487906'     !ISDVSXP FOR TESTING 09/23/2008
+
+And    j.effdt                   =
+      (Select Max(effdt)
+       From   ps_job
+       Where  emplid             = pe.emplid
+       And    empl_rcd          = pe.empl_rcd
+       And    effdt             <= $pay_end_dt)
+And    j.effseq                  =
+      (Select Max(effseq)
+       From   ps_job
+       Where  emplid             = j.emplid
+       And    empl_rcd          = j.empl_rcd
+       And    effdt              = j.effdt)
+
+And    gdt.deptid                = j.deptid
+And    gdt.effdt                 =
+      (Select Max(effdt)
+       From   ps_gex_dept_tbl
+       Where  deptid             = j.deptid
+       And    effdt             <= $pay_end_dt)
+And    gdt.sequence_number       =
+      (Select Max(sequence_number)
+       From   ps_gex_dept_tbl
+       Where  deptid             = gdt.deptid
+       And    effdt              = gdt.effdt)
+!And    pe.hourly_rt > 0		AXL 3/21/2002  Prevent zero hrly rt 
+
+And   [$GEXXX901_INCLUDE_COMPANY_PAYGROUP_CRITERIA] 
+Group by j.emplid, j.empl_rcd, pe.company, pe.paygroup, j.gex_deptid_ovr, pd.name, 
+         pe.pay_end_dt, pe.off_cycle, pe.page_num, pe.line_num, pe.addl_nbr, pe.deptid,
+         pe.hourly_rt,gdt.business_unit, gdt.department, j.empl_type, j.std_hours
+
+Order by j.emplid 
+End-Select
+
+  do P530-Select-From-Temp-Table1      !select rows from temp1 and insert into summary table2
+  do P550-select-from-temp-table2      !select rows from temp2 for reporting
+
+  do P900-delete-from-temp-table1      !delete rows before dropping temp table1
+  do P901-delete-from-temp-table2      !delete rows before dropping temp table2
+
+  If $Data-Found-Flag = 'N'
+    Print 'NO DATA SELECTED FOR THIS REPORT RUN'	(25,) Center
+  End-If
+End-Procedure
+
+!*********************************************************************
+begin-procedure P205-Get-Deptid-Mgr-Emplid
+!*********************************************************************
+#debug9  show 'P205-Get-Deptid-Mgr-Emplid'
+!****   get lowest level manager emplid(ssn)
+begin-select
+mr.deptid
+mr.gex_ceo
+mr.gex_evp
+mr.gex_svpvp
+mr.gex_dir
+mr.gex_mgr
+mr.gex_sup
+   
+   let $Mgmt-deptid-found = 'Y'
+   let $lowest_lvl_mgr = ' '
+   if &mr.gex_sup = ' ' or &mr.gex_sup = ''
+     if &mr.gex_mgr = ' ' or &mr.gex_mgr = ''
+        if &mr.gex_dir = ' ' or &mr.gex_dir = ''
+            if &mr.gex_svpvp = ' ' or &mr.gex_svpvp = ''
+               if &mr.gex_evp = ' ' or &mr.gex_evp = ''
+                  if &mr.gex_ceo = ' ' or &mr.gex_ceo = ''
+                     let $lowest_lvl_mgr = 'NONEFOUND'
+                     !show '++++++++++++++ mgr not populated on gex_mgmt_report for deptid: ' $Charge_deptid   
+                  else
+                      let $lowest_lvl_mgr = &mr.gex_ceo
+                  end-if
+               else
+                    let $lowest_lvl_mgr = &mr.gex_evp
+               end-if
+            else
+                let $lowest_lvl_mgr = &mr.gex_svpvp
+            end-if
+        else
+            let $lowest_lvl_mgr = &mr.gex_dir
+        end-if
+     else
+         let $lowest_lvl_mgr = &mr.gex_mgr
+     end-if
+   else
+       let $lowest_lvl_mgr = &mr.gex_sup
+   end-if
+                       
+from ps_gex_mgmt_report mr
+
+where mr.deptid = $Charge_Deptid
+
+end-select
+end-procedure
+
+!*********************************************************************
+begin-procedure P215-Get-OTH-Hours
+!*********************************************************************
+#debug9 Show 'P210-Get-OTH-Hours'
+
+begin-SELECT
+!/*+ RULE */
+SUM(POE1.OTH_HRS)   &poe1.sum_oth_hrs
+SUM(POE1.OTH_EARNS) &poe1.sum_oth_earns	 	!AXL 3/21/2002
+POE1.ERNCD
+
+  let #total_hrs = &poe1.sum_oth_hrs
+
+  let $Erncd   = &POE1.ERNCD
+    do getpaymenttype      !isdvsxp
+
+  if #total_hrs = 0 and &j.empl_type = 'S'            !ISDVASS 04/30/2008 isdvsxp 09/23/2008
+    if &ear.payment_type = 'F' OR &ear.payment_type = 'A' OR (&ear.payment_type = 'E' AND &poe1.sum_oth_hrs = 0)           !isdvsxp 10/13/2008 ITG 53418, S3#12484597 02/27/2009
+    !OR &ear.payment_type = 'E' OR &ear.payment_type = 'B'           !isdvsxp 10/13/2008 ITG 53418
+     OR &ear.payment_type = 'B'                                      !isdvmxr 06/24/2009
+       ELSE                                                          !isdvsxp 10/13/2008 ITG 53418
+    Let #total_hrs = &j.std_hours                      !ISDVASS 04/30/2008
+    END-IF                                             !isdvsxp 10/13/2008 ITG 53418
+  end-if                                               !ISDVASS 04/30/2008
+
+  let #total_earns = &poe1.sum_oth_earns
+  
+    !show 'inserting OTH into TEMP TBL-deptid:  ' $Charge_deptid
+    !show '                           emplid :  ' &j.emplid
+    !show '                        #total_hrs:  ' #total_hrs
+    !show '                       &POE1.ERNCD:  ' &POE1.ERNCD
+    !show '*************************************************'   
+    Do  P520-Insert-Into-Temp-Table1       !insert erncds(from pay_oth_earns) to temp table1
+
+FROM    PS_PAY_EARNINGS   PE2,
+        PS_PAY_OTH_EARNS  POE1
+      
+WHERE  PE2.EMPLID            = &J.EMPLID 
+AND    POE1.COMPANY          = &PE.COMPANY
+AND    POE1.COMPANY          = PE2.COMPANY
+AND    POE1.PAYGROUP         = &PE.PAYGROUP
+AND    POE1.PAYGROUP         = PE2.PAYGROUP
+AND    POE1.PAY_END_DT       = $Pay_end_dt
+AND    POE1.PAY_END_DT       = PE2.PAY_END_DT
+And    poe1.off_cycle        = &PE.OFF_CYCLE 
+And    poe1.off_cycle        = PE2.OFF_CYCLE   !get hours for all paychecks (on and off cycle)
+And    poe1.page_num            = PE2.page_num
+And    poe1.page_num            = &pe.page_num
+And    poe1.line_num            = PE2.line_num
+And    poe1.line_num            = &pe.line_num
+AND    poe1.addl_nbr            = pe2.addl_nbr
+and    POE1.ADDL_NBR            = &PE.ADDL_NBR
+!And   [$GEXERNCD_EXCLUDE_ERNCD_CRITERIA]   !non-productive earncds gexerncd.sqc -user decided they wanted some of these
+and POE1.ERNCD not like 'D%'                !exclude deferred comp
+and POE1.ERNCD not like 'L%'                !exclude deferred comp
+GROUP BY POE1.ERNCD
+ORDER BY POE1.ERNCD
+
+end-SELECT
+end-procedure P215-Get-OTH-Hours
+
+
+
+!*********************************************************************
+!Get the payment type for the earncode 
+!*********************************************************************
+Begin-Procedure getpaymenttype
+Begin-Select
+ear.payment_type
+ from ps_earnings_tbl ear where erncd=$Erncd and effdt = (select max(Effdt) from ps_earnings_tbl  where erncd = ear.erncd and effdt <=SYSDATE)
+End-Select
+End-Procedure
+!*********************************************************************
+!Create temporary table1 for holding detail records (>1 per emplid/erncd)
+!*********************************************************************
+begin-procedure P500-create-temp-table1
+begin-sql on-error=ignore-error('drop-temp-table')
+DROP TABLE [$tablename1]
+end-sql 
+
+begin-sql on-error=sql-error-found('P500-create-temp-table1')
+CREATE TABLE [$tablename1](
+       DEPTID           VARCHAR2(10) NOT NULL,              !this id deptid charged
+       EMPLID           VARCHAR2(11) NOT NULL,
+       NAME             VARCHAR2(50) NOT NULL, 
+       COMPANY          VARCHAR2(3)  NOT NULL,
+       PAYGROUP         VARCHAR2(3)  NOT NULL,                   
+       HRS              NUMBER(7,2)  NOT NULL,
+       EARNS            NUMBER(10,2) NOT NULL,	!AXL 3/21/2002
+       OFFCYCLE         VARCHAR2(1)  NOT NULL,
+       ERNCD            VARCHAR2(3)  NOT NULL,
+       HOME_DEPTID      VARCHAR2(10) NOT NULL,
+       LOWEST_LVL_MGR   VARCHAR2(9)  NOT NULL)
+       !TABLESPACE TE7TOOLS001
+       TABLESPACE [$table_space]	!AXL 3/21/2002
+end-sql
+end-procedure
+
+!*********************************************************************
+!Create temporary table2 for holding emplid/erncd summary hours
+!*********************************************************************
+begin-procedure P501-create-temp-table2
+begin-sql on-error=ignore-error('drop-temp-table')
+DROP TABLE [$tablename2]
+end-sql 
+
+begin-sql on-error=sql-error-found('P501-create-temp-table2')
+CREATE TABLE [$tablename2](
+       DEPTID2               VARCHAR2(10) NOT NULL,
+       EMPLID2               VARCHAR2(11) NOT NULL,
+       NAME2                 VARCHAR2(50) NOT NULL, 
+       COMPANY2              VARCHAR2(3)  NOT NULL,
+       PAYGROUP2             VARCHAR2(3)  NOT NULL,                   
+       SUMHRS2               NUMBER(7,2)  NOT NULL,
+       SUMEARNS2             NUMBER(10,2)  NOT NULL,	!AXL 3/21/2002
+       ERNCD_DESCR2          VARCHAR2(10)  NOT NULL,
+       HOME_DEPTID2          VARCHAR2(10) NOT NULL,
+       HOME_DEPTNAME2        VARCHAR2(30) NOT NULL,
+       BUS_UNIT2             VARCHAR2(5)  NOT NULL,
+       GL_DEPTID2            VARCHAR2(10) NOT NULL,
+       LOWEST_LVL_MGRNAME2   VARCHAR2(50))
+       !TABLESPACE TE7TOOLS001
+       TABLESPACE [$table_space]	!AXL 3/21/2002
+end-sql
+end-procedure
+
+!*********************************************************************
+!Drop temporary detail table 1
+!*********************************************************************
+begin-procedure P510-drop-temp-table1
+begin-sql on-error=sql-error-found('P510-drop-temp-table1')
+DROP TABLE [$tablename1]
+end-sql
+end-procedure
+
+!*********************************************************************
+!Drop temporary summary (reporting) table 2  - 1 row per earncd
+!*********************************************************************
+begin-procedure P511-drop-temp-table2
+begin-sql on-error=sql-error-found('P511-drop-temp-table2')
+DROP TABLE [$tablename2]
+end-sql
+end-procedure
+
+!*********************************************************************
+!* Insert into Temp Table1 for departments charged-  detail data -
+!*  multiple rows per earncd (if there is >1 paycheck).
+!*********************************************************************
+begin-procedure P520-Insert-Into-Temp-Table1
+
+begin-sql on-error=sql-error-found('P520-Insert-Into-Temp-Table1')
+INSERT INTO [$tablename1]
+(deptid,    
+emplid,
+name,
+company,   
+paygroup,  
+hrs,
+earns,		!AXL 3/21/2002
+offcycle,
+erncd,
+home_deptid,
+lowest_lvl_mgr   
+)
+VALUES(
+$Charge_deptid,
+&j.emplid,
+&pd.name,
+$pe_company, 
+$pe_paygroup, 
+#total_hrs,
+#total_earns,	!AXL 3/21/2002
+&pe.off_cycle,
+$erncd,
+$home_deptid,
+$lowest_lvl_mgr      
+)
+end-sql
+end-procedure
+
+!*********************************************************************
+!* Insert into Temp Table for departments charged detail data
+!*  1 row per earncd (hours are summed)
+!*********************************************************************
+begin-procedure P521-Insert-Into-Temp-Table2
+
+begin-sql on-error=sql-error-found('P521-Insert-Into-Temp-Table2')
+INSERT INTO [$tablename2]
+	(deptid2,                                     !deptid charged    
+	emplid2,	
+	name2,
+	company2,   
+	paygroup2,  
+	sumhrs2,
+        sumearns2,		!AXL 3/21/2002
+	erncd_descr2,
+	home_deptid2,
+	home_deptname2,
+	bus_unit2,
+	gl_deptid2,
+	lowest_lvl_mgrname2   
+	)	
+	VALUES(	
+	&t1.deptid,
+	&t1.emplid,
+	&t1.name,
+	&t1.company, 
+	&t1.paygroup, 
+	#t1.sumhrs,
+        #t1.sumearns,		!AXl 3/21/2002
+	$et.descrshort,
+	&t1.home_deptid,
+	$deptname,
+	nvl($gdt2_business_unit,' '),    !AXL 3/21/2002
+	nvl($gdt2_department,' '),       !AXL 3/21/2002
+	$lowest_lvl_mgr_name      
+	)
+end-sql
+end-procedure
+
+!*******************************************************************************
+! Select from Temp Table1 for creating summary records and write to temp table 2
+!*******************************************************************************
+begin-procedure P530-Select-From-Temp-Table1
+#debug9 Show 'P530-Select-From-Temp-Table1'
+Begin-Select 
+t1.deptid          
+t1.emplid          
+t1.name            
+t1.home_deptid           
+t1.company    
+t1.paygroup 
+t1.lowest_lvl_mgr      
+t1.erncd           
+sum(t1.hrs)   &t1.sumhrs 
+sum(t1.earns) &t1.sumearns	!AXL 3/21/2002
+
+  
+  Let #t1.sumhrs   = &t1.sumhrs
+  Let #t1.sumearns = &t1.sumearns	!AXL 3/21/2002
+  !show '============= INCOMING TEMP1 EE: ' &t1.emplid
+  !show '           Mgr :  ' &t1.lowest_lvl_mgr
+  !show '         deptid:  ' &t1.deptid
+  !show '        sumhrs :  ' &t1.sumhrs
+  !show '        erncd  :  ' &t1.erncd
+  !show '========================================='
+  if &t1.lowest_lvl_mgr = 'NO DEPTID'  
+    let $lowest_lvl_mgr_name = ' '
+  else
+     if &t1.lowest_lvl_mgr = 'NONEFOUND'
+       let $lowest_lvl_mgr_name = ' '
+     else
+       Let $Emplid      = &t1.lowest_lvl_mgr 
+       Do Get-Employee-Name                              !getempnm.sqc    
+       Let $lowest_lvl_mgr_name  = $Old_Format_Name ! DXS, 04/14/08, Use old format, $Name
+     end-if
+  end-if
+
+  Let $Deptid = &t1.home_deptid
+  Do Get-Department-Name                       !getdptnm.sqc  get home dept name
+  Do P532-Get-Earnings-Descr 
+  Do P534-Get-BU                  
+  Do P521-Insert-Into-Temp-Table2
+
+From   [$tablename1] t1
+group by t1.deptid, t1.emplid, t1.name, t1.home_deptid, t1.company, t1.paygroup, 
+         t1.lowest_lvl_mgr, t1.erncd
+Order By t1.deptid, t1.name, t1.erncd
+
+End-Select
+ 
+end-procedure
+!***********************************************************************************
+! Get earnings code description
+!***********************************************************************************
+begin-procedure P532-Get-Earnings-Descr
+#debug9 Show 'P532-Get-Earnings-Descr'
+   let $et.descrshort = ' '
+Begin-Select
+et.erncd
+et.descrshort
+    let $et.descrshort = &et.descrshort
+
+from ps_earnings_tbl et
+where et.erncd = &t1.erncd
+And   et.effdt                   =
+      (Select Max(effdt)
+       From   ps_earnings_tbl
+       Where  erncd              = et.erncd
+       And    effdt             <= $pay_end_dt)
+
+end-select
+end-procedure
+
+!************************************************* 
+! Get Business Unit and GL Deptid of charged deptid          !SCM changed from home to charged
+!*************************************************
+begin-procedure P534-Get-BU
+#debug9 Show 'P534-Get-BU'
+    
+Begin-Select
+gdt2.business_unit
+gdt2.department
+
+	let $gdt2_business_unit = &gdt2.business_unit
+	let $gdt2_department    = &gdt2.department
+
+from ps_gex_dept_tbl gdt2
+where gdt2.deptid = &t1.deptid                      !SCM 05/06/2002 changed from &t1.home_deptid to dept charged
+And   gdt2.effdt            =
+      (Select Max(effdt)
+       From   ps_gex_dept_tbl g2
+       Where  g2.deptid             = &t1.deptid    !SCM 05/06/2002 changed from &t1.home_deptid to dept charged
+       And    g2.effdt             <= $pay_end_dt)
+
+end-select
+end-procedure
+
+
+!***********************************************************************************
+! Select from Temp Table2 for reporting hours worked summary data (by erncd)
+!***********************************************************************************
+begin-procedure P550-Select-From-Temp-Table2
+#debug9 Show 'P550-Select-From-Temp-Table2'
+
+  Let $Data-Found-Flag = 'N'
+       
+Begin-Select 
+!AXL 3/21/2002 Moved Cmpy/Paygrup to Lvl 1 and 2 Bumped all others down a lvl- Begin
+t2.company2	   ()            On-break  Level=1  Print=never 		   		 
+t2.paygroup2 	   ()            On-break  Level=2  Print=never 
+t2.deptid2         ()            On-break  Level=3  Print=never  After=P560-After-Deptid-Change
+t2.name2           (+1,1,30)     On-break  Level=4  print=change/top-page skiplines=1
+!t2.emplid2         (0,50)        
+t2.home_deptid2    (+0,71,5)     On-break  Level=4  print=change/top-page
+t2.home_deptname2  (+0,77)       On-break  Level=4  print=change/top-page            
+t2.lowest_lvl_mgrname2
+t2.bus_unit2,        
+t2.gl_deptid2,                    
+t2.sumhrs2         (+0,41,9)     edit 9,999.99
+t2.sumearns2			 !AXL 3/21/2002
+t2.erncd_descr2    (+0,56,10)    On-break  Level=5  print=change/top-page                                            
+!AXL 3/21/2002 Moved Cmpy/Paygrup to Lvl 1 and 2 Bumped all others down a lvl- End
+    
+  Let $Data-Found-Flag = 'Y'
+  Let $Company                = &t2.company2
+  Let $Paygroup               = &t2.paygroup2
+  Let $t2.bus_unit2            = &t2.bus_unit2
+  Let $t2.gl_deptid2           = &t2.gl_deptid2
+  Let $t2.lowest_lvl_mgrname2 = &t2.lowest_lvl_mgrname2
+             
+  Let $Deptid                 = &t2.deptid2         ! $deptid = dept charged (in heading)
+  Let #t2.sumhrs2             = &t2.sumhrs2
+  let #sum_deptid_hrs         = #sum_deptid_hrs + #t2.sumhrs2
+  
+  
+
+From   [$tablename2] t2
+where t2.sumearns2  <> 0	!AXL 3/21/2002 supress zero rows
+!and  t2.sumhrs2  <> 0 !ISDVVXK 10/19/2010 supress zero Hours !VENDKXY modified the code as per ITG 103557
+and (t2.sumhrs2  <> 0  or t2.erncd_descr2 = 'TobFrCred' ) !VENDKXY modified the code as per ITG 103557
+Order By t2.company2, t2.paygroup2, t2.lowest_lvl_mgrname2, 
+         t2.deptid2, t2.name2, t2.erncd_descr2
+
+End-Select
+ 
+End-Procedure
+
+!*********************************************************************
+Begin-Procedure P560-After-Deptid-Change
+!*********************************************************************
+#debug9 Show 'P560-After-Deptid-Change'
+  print 'Total Hours Charged to Dept:'    (+2,1)
+  print $Deptid                           (+0,+2)
+  print #sum_deptid_hrs                   (+0,40)  edit 99,999.99
+  New-Page
+  let #sum_deptid_hrs = 0
+End-Procedure
+
+!*********************************************************************
+!DELETE temporary detail table
+!*********************************************************************
+begin-procedure P900-delete-from-temp-table1
+begin-sql 
+DELETE from [$tablename1]
+end-sql
+end-procedure
+
+!*********************************************************************
+!DELETE temporary summary (reporting) table
+!*********************************************************************
+begin-procedure P901-delete-from-temp-table2
+begin-sql 
+DELETE from [$tablename2]
+end-sql
+end-procedure
+
+!*********************************************************************
+!  SQL ignore-Error
+!*********************************************************************
+begin-procedure ignore-Error($Proc_Name) 
+ display 'temp table not dropped...does not exist'
+
+end-procedure
+
+!*********************************************************************
+!Displays the error messages and stops execution
+!********************************************************************* 
+begin-procedure SQL-Error-Found($Proc_Name) 
+!  do error-found
+  display 'SQL Error in ' 
+  display $Proc_Name 
+  display $_sql-error
+  display 'sql-status:' 
+  display #_sql-status 
+
+  STOP
+end-procedure
+ 
+!*********************************************************************
+Begin-Procedure P999-Finish
+!*********************************************************************
+#debug9 Show 'P999-Finish'
+
+  date-time () HH:MI:SS &timeEnded
+  date-time () MM/DD/YYYY &dateEnded
+  show 'Report Ended at ' &timeEnded ' on ' &dateEnded
+End-Procedure
+
+
+#Include 'stdapi.sqc'    !Routines to Update Run Status
+#Include 'askaod.sqc'    !Ask for As-Of-Date parameter
+#Include 'curdttim.sqc'  !Get-Current-DateTime Procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'reset.sqc'     !Reset printer Procedure
+#Include 'getbalid.sqc'  !Get Calendar Year ID
+#Include 'getcodta.sqc'  !Get Company Data
+#Include 'getpgdta.sqc'  !Get Paygroup Data
+#Include 'getdptnm.sqc'  !Get Department name
+#Include 'getempnm.sqc'  !Get Employee Name
+#include 'gexxx950.sqc'  !Get SQRW run controls
+#include 'gexxx900.sqc'  !Get company multiple row table
+#include 'gexxx901.sqc'  !Get company/paygroup multiple row table
+#include 'gexxx902.sqc'  !Get deptid multiple row table
+#include 'gexxx922.sqc'  !Get pay single row run control
+#include 'gexerncd.sqc'  !Get earnings codes to exclude

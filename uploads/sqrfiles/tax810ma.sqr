@@ -1,0 +1,878 @@
+!***********************************************************************
+!  TAX810MA:  Qtrly Wage List - MASSACHUSETTS                          *
+!                                                                      *
+!             NOTE: "#IFDEF TAXTEST" in main SELECT is used for        *
+!                   testing this report against DEMO database          *
+!                                                                      *
+!                   This program does NOT support the "Adjustment      *
+!                   Reason Code" field on the file.                    *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!                                                                      *
+!                                                                      *
+! This software and related documentation are provided under a         *
+! license agreement containing restrictions on use and                 *
+! disclosure and are protected by intellectual property                *
+! laws. Except as expressly permitted in your license agreement        *
+! or allowed by law, you may not use, copy, reproduce,                 *
+! translate, broadcast, modify, license, transmit, distribute,         *
+! exhibit, perform, publish or display any part, in any form or        *
+! by any means. Reverse engineering, disassembly, or                   *
+! decompilation of this software, unless required by law for           *
+! interoperability, is prohibited.                                     *
+! The information contained herein is subject to change without        *
+! notice and is not warranted to be error-free. If you find any        *
+! errors, please report them to us in writing.                         *
+!                                                                      *
+! Copyright (C) 1988, 2009, Oracle and/or its affiliates.              *
+! All Rights Reserved.                                                 *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+!          $Date:  2009/11/19:12:00:10                                 !
+!       $Release:  HR9                                                 !
+!    $Resolution:  766842                                              !
+!                                                                      *
+!***********************************************************************
+
+#include 'setenv.sqc'  !Set environment
+#include 'setup31.sqc' !Printer and page-size initialization
+#include 'usarpt.sqc'  !Get USA variables
+
+begin-report
+  do Init-Report
+
+  do Process-Main
+
+  close 10
+
+  if $RecordWritten = 'Y'
+    display ''
+    display 'Upon successful conclusion of this program, the file will have been'
+    display 'created, as follows:'
+    display ''
+    display ''
+    display '  TAX810MA  contains 275-character records in the format required'
+    display '            for electronic submission of quarterly wages to the'
+    display '            Massachusetts Division of Unemployment Assistance/QUEST'
+    display ''
+    display ''
+    display 'Follow the instructions from the department for preparing and'
+    display 'submitting the file electronically.'
+    display ''
+  else
+    do Print-Summary-Data('NoData')
+  end-if
+
+  do Stdapi-Term
+
+end-report
+
+begin-procedure Init-Report
+  move 'TAX810MA' to $ReportID
+  move 'Massachusetts Quarterly Wage Report' to $ReportTitle
+
+  do Init-DateTime
+  do Init-Number
+  do Get-Current-DateTime
+  do Get-Calendar-Year-Id
+  do Stdapi-Init
+
+  do Initialization
+
+end-procedure
+
+begin-procedure Initialization
+#ifdef TAXTEST
+  move 'CA'              to $State
+#else
+  move 'MA'              to $State
+#endif
+
+  do Get-Tax-Reporting-Run-Controls
+  move &TX.Balance_Year to $RptYear 9999
+  move $PeriodEndDate   to $AsOfDate
+  do Get-Quarter-Dates
+
+  move &TX.Balance_Qtr to $RptQtr
+  evaluate $RptQtr
+     when = '1'
+       let $RptQtrEndMnth = '03'
+     when = '2'
+       let $RptQtrEndMnth = '06'
+     when = '3'
+       let $RptQtrEndMnth = '09'
+     when = '4'
+       let $RptQtrEndMnth = '12'
+  end-evaluate
+
+  display ' '
+  display 'Processing balances for '   noline
+  display $RptQtrYr
+  display ''
+  display 'Creating File for Massachusetts UI Wage Reporting'
+
+  do Open-File
+  do Delete-Work-File
+end-procedure
+
+
+begin-procedure Open-File
+
+  let $FileID = '{IMPORTPREFIX}' || 'TAX810MA' || '{IMPORTSUFFIX}'
+  open $FileID as 10 for-writing record=275:fixed
+
+end-procedure
+
+
+begin-procedure Delete-Work-File
+
+  let $err-statement1 = 'TAX810MA, Delete-Error - DELETE-WORK-FILE'
+  let $err-statement2 = ' '
+
+begin-SQL On-Error=Error-Display
+DELETE FROM PS_R_TAX810MA
+end-SQL
+end-procedure
+
+
+begin-procedure Process-Main
+begin-SELECT
+TEMP_SSN_MASK
+FROM PS_INSTALLATION
+end-SELECT
+
+begin-SELECT
+A.COMPANY
+A.DESCR
+COSTTX.EMPLOYER_ID_SUT
+
+  do Read-Employee-Data
+  do Process-File
+
+FROM PS_COMPANY_TBL A, PS_CO_STATETAX_TBL COSTTX
+WHERE A.EFF_STATUS      = 'A'
+  AND A.TAX_REPORT_TYPE IN ('2','R')   ! W-2 and 1099R
+  AND A.EFFDT =
+  (SELECT MAX(EFFDT)
+     FROM PS_COMPANY_TBL
+     WHERE  COMPANY = A.COMPANY
+       AND  EFFDT  <= $AsOfDate)
+  AND A.COMPANY = COSTTX.COMPANY
+  AND COSTTX.STATE = 'MA'
+  AND COSTTX.EFFDT =
+      (SELECT MAX(EFFDT)
+       FROM   PS_CO_STATETAX_TBL
+       WHERE  COMPANY = COSTTX.COMPANY
+         AND  STATE   = 'MA'
+         AND  EFFDT  <= $AsOfDate)
+ORDER BY COSTTX.EMPLOYER_ID_SUT, A.COMPANY
+end-SELECT
+
+  if #Count_F > 0
+     do Print-File-Tot
+  end-if
+end-procedure
+
+
+begin-procedure Read-Employee-Data
+
+  move 'Y' to $Process
+
+begin-SELECT
+C.COMPANY            () on-break print=never level=1 before=CoStateInfo
+C.EMPLID             () on-break print=never level=2 before=BeforeEmplid
+                                                     after=AfterEmplid
+C.TAX_CLASS
+C.NLGRS_QTD
+C.TXGRS_QTD
+C.TAX_QTD
+D1.NATIONAL_ID       () on-break print=never level=2 save=$SSN
+D.LAST_NAME          () on-break print=never level=2 save=$LName
+D.FIRST_NAME         () on-break print=never level=2 save=$FName
+D.MIDDLE_NAME        () on-break print=never level=2 save=$MName
+
+  move &C.EMPLID       to $EmplID
+
+  if &C.TAX_CLASS = 'H' or
+     &C.TAX_CLASS = 'A'
+    add &C.TXGRS_QTD  to #TAXGRS_QTD
+    add &C.TAX_QTD    to #TAX_QTD
+
+    if &C.TAX_QTD < 0
+      if &C.TAX_CLASS = 'H'
+         move 'MA QTD Tax Withheld is Negative' to $ErMsg
+      else        ! TAX_CLASS = 'A'
+         move 'MA 1042 QTD Tax Withheld is Negative' to $ErMsg
+      end-if
+      move &C.Tax_QTD to #Neg_Tax_QTD
+      do Print-Summary-Data('NegAmt')
+      let $NegAmtReported = 'Y'
+      move 'N' to $Process
+    end-if
+
+    if &C.TXGRS_QTD < 0
+      if &C.TAX_CLASS = 'H'
+         move 'MA QTD W/H Taxable Wages is Negative' to $ErMsg
+      else        ! TAX_CLASS = 'A'
+         move 'MA 1042 QTD W/H Taxable Wages is Negative' to $ErMsg
+      end-if
+      move &C.TxGrs_QTD to #Neg_TxGrs_QTD
+      do Print-Summary-Data('NegAmt')
+      let $NegAmtReported = 'Y'
+      move 'N' to $Process
+    end-if
+
+  end-if
+
+  if &C.TAX_CLASS = 'U'
+    move &C.NLGRS_QTD  to #NLGRS_QTD
+
+    if #NLGRS_QTD < 0
+      move 'MA QTD SUI Wages is Negative' to $ErMsg
+      move &C.NlGrs_QTD to #Neg_NlGrs_QTD
+      do Print-Summary-Data('NegAmt')
+      let $NegAmtReported = 'Y'
+      move 'N' to $Process
+    end-if
+
+  end-if
+
+
+FROM  PS_TAX_BALANCE C, PS_PERSONAL_DT_FST D, PS_PERS_NID D1,
+      PS_INSTALLATION IN1
+WHERE C.COMPANY           = &A.Company
+  AND D.EMPLID            = C.EMPLID
+  AND D.EMPLID            = D1.EMPLID
+  AND D1.COUNTRY          = {NID_COUNTRY}
+  AND D1.NATIONAL_ID_TYPE = $PAYROLL_NID_TYPE
+  AND C.BALANCE_ID        = $Calendar_Year_Id
+  AND C.BALANCE_YEAR      = &TX.Balance_Year
+  AND C.BALANCE_QTR       = &TX.Balance_Qtr
+#ifdef TAXTEST
+  AND C.STATE             = 'CA'
+#else
+  AND C.STATE             = 'MA'
+#endif
+  AND C.LOCALITY          = ' '
+  AND C.BALANCE_PERIOD    =
+      (SELECT MAX(BALANCE_PERIOD)
+       FROM   PS_TAX_BALANCE
+       WHERE  EMPLID        = C.EMPLID
+         AND  COMPANY       = C.COMPANY
+         AND  BALANCE_ID    = C.BALANCE_ID
+         AND  BALANCE_YEAR  = C.BALANCE_YEAR
+         AND  BALANCE_QTR   = C.BALANCE_QTR
+         AND  STATE         = C.STATE
+         AND  LOCALITY      = C.LOCALITY
+         AND  TAX_CLASS     = C.TAX_CLASS)
+  AND ((C.TAX_CLASS = 'U' AND C.NLGRS_QTD <> 0)
+       OR (C.TAX_CLASS = 'H' AND C.TAX_QTD <> 0)
+       OR (C.TAX_CLASS = 'H' AND C.TXGRS_QTD <> 0)
+       OR (IN1.PUBLIC_SECTOR = 'Y'
+          AND C.TAX_CLASS = 'A' AND
+             (C.TXGRS_QTD <> 0 OR C.TAX_QTD <> 0)))
+ORDER BY D1.NATIONAL_ID
+end-SELECT
+end-procedure
+
+
+begin-procedure CoStateInfo
+
+  move &C.COMPANY to $Company
+  do Get-Company-Data
+
+  move 'MA' to $State
+  do Get-State-Tax-Data             !Employer ID
+
+  if RTRIM(&Employer_ID_SUT,' ') = ''
+     let $StateSUT = ' '
+  else
+     let $StateSUT = RTRIM(&Employer_ID_SUT,' ')
+     while INSTR($StateSUT,'-',1) <> 0
+       let #Hyphen = INSTR($StateSUT,'-',1)
+       if #Hyphen > 0
+          let $StateSUT = SUBSTR($StateSUT,1,(#Hyphen - 1)) ||
+                          SUBSTR($StateSUT,(#Hyphen + 1),9)
+       end-if
+     end-while
+     while INSTR($StateSUT,' ',1) <> 0
+       let #Spaces = INSTR($StateSUT,' ',1)
+       if #Spaces > 0
+          let $StateSUT = SUBSTR($StateSUT,1,(#Spaces - 1)) ||
+                          SUBSTR($StateSUT,(#Spaces + 1),9)
+       end-if
+     end-while
+     while INSTR($StateSUT,'.',1) <> 0
+       let #Marks  = INSTR($StateSUT,'.',1)
+       if #Marks  > 0
+          let $StateSUT = SUBSTR($StateSUT,1,(#Marks - 1)) ||
+                          SUBSTR($StateSUT,(#Marks + 1),9)
+       end-if
+     end-while
+  end-if
+
+     let #Max_Lngth = length($StateSUT)
+     if #Max_Lngth > 8
+        let $StateSUT = SUBSTR($StateSUT,1,8)
+        let #Max_Lngth = 8
+        print '****************************************************************************' (+1,1)
+        print '** Warning: State Unemployment ID exceeds 8 digits and has been truncated **' (+1,1)
+        print '** Company:       ' (+1,1)
+        print $Company             (0,13)
+        print '**'                 (0,75)
+        print '** Employer UI ID:' (+1,1)
+        print &Employer_ID_SUT     (0,20)
+        print '**'                 (0,75)
+        print '****************************************************************************' (+1,1)
+        print ' '                  (+1,1)
+     end-if
+
+
+! CHECK FOR ALL NUMERIC
+     move 'N' to $Err-Ind
+     let #Char_Pos  =  1
+
+     while #Char_Pos <= #Max_Lngth
+       let $Test_Char   = SUBSTR($StateSUT, #Char_Pos, 1)
+       let #Which_Digit = INSTR('0123456789', $Test_Char, 1)
+
+       if  #Which_Digit = 0
+           move 'Y' to $Err-Ind
+           break
+       end-if
+
+       add 1 to #Char_Pos
+     end-while
+
+! PRINT ERROR MESSAGE AND ABORT IF EMPLOYER ID INVALID
+     if $Err-Ind = 'Y'
+        display ' '
+        display '*** State Unemployment ID is not numeric, or is missing from Company State Tax Table ***'
+        display 'Company:        ' noline
+        display $Company
+        display 'Employer UI ID: ' noline
+        display &Employer_ID_SUT
+        display '*********************************** Processing stopped *********************************'
+        stop
+     else
+        move $StateSUT to $StateSUT 09999999
+     end-if
+
+end-procedure
+
+
+begin-procedure BeforeEmplid
+
+  move 0 to #NLGRS_QTD
+  move 0 to #TAXGRS_QTD
+  move 0 to #TAX_QTD
+  move 0 to #Hours
+  move '0' to $Officer_Cd
+  move 'Y' to $Process
+
+end-procedure
+
+
+begin-procedure AfterEmplid
+
+  if $Process = 'Y'
+     move $SSN to $S123 xxx       !isolate first 3 digits
+     if $S123 = &Temp_SSN_Mask or RTRIM(&D1.NATIONAL_ID, ' ') = ''
+        move 'N' to $Process
+
+        if  $NegAmtReported = 'N' and $EmplidHdgPrinted = 'N'
+           print '**** Employee invalid SSN ****'       (+1,1)
+           let $EmplidHdgPrinted = 'Y'
+        end-if
+        print $EmplID                      (+1,1,15)
+        let $SSNMsg = 'Invalid SSN: '|| $SSN
+        print $SSNMsg                      (0,98)
+        print '- employee not processed'   (+1,98)
+     end-if
+  end-if
+
+  if $Process = 'Y'
+     do Process-Employee
+  end-if
+
+end-procedure
+
+
+begin-procedure Process-Employee
+
+  let $LastName        = rtrim($LName, ' ')
+  let $FirstName       = rtrim($FName, ' ')
+  let $MidInitial      = {ps-substr}($MName,1,1)
+  uppercase $LastName
+  uppercase $FirstName
+  uppercase $MidInitial
+
+  if #Tax_QTD > 0
+     add 1 to #Count_Tax_QTD
+  end-if
+
+begin-select
+J.OFFICER_CD
+  if &J.Officer_Cd <> 'N'
+    move '1' to $Officer_Cd
+  end-if
+ FROM PS_JOB J
+WHERE J.EMPLID   = $EmplID
+  AND J.COMPANY  = $Company
+  AND J.EFFDT    =
+      (SELECT MAX(EFFDT)
+         FROM PS_JOB
+        WHERE EMPLID    = J.EMPLID
+          AND COMPANY   = J.COMPANY
+          AND EFFDT    <= $AsOfDate)
+  AND J.EFFSEQ   =
+      (SELECT MAX(EFFSEQ)
+         FROM PS_JOB
+        WHERE EMPLID    = J.EMPLID
+          AND COMPANY   = J.COMPANY
+          AND EFFDT     = J.EFFDT)
+end-select
+
+  ! The following are needed by the gethours.sqc:
+  move 'PS_RC_TAX810MA D'  to $TAX810X1
+  move 'PS_RC_TAX810MA D1' to $TAX810X2
+  move 'PS_RC_TAX810MA D2' to $TAX810X3
+  move 'PS_RC_TAX810MA D3' to $TAX810X4
+
+  do Get-Hours
+  if #Hours > 999
+     let #Hours = 999
+  else
+     ! round up the hours to the next whole hour
+     let #Hours = #Hours + .99
+     let #Hours = trunc (#Hours,0)
+  end-if
+
+  let $MonEmpFlg1 = '0'
+  let $MonEmpFlg2 = '0'
+  let $MonEmpFlg3 = '0'
+
+  do Get-Monthly-Employment-Indicator
+
+  do Insert-Work-Record
+
+end-procedure
+
+
+begin-procedure Insert-Work-Record
+
+  let $NlGrs_QTD  = #NLGRS_QTD
+  let $TaxGrs_QTD = #TAXGRS_QTD
+  let $Tax_QTD    = #TAX_QTD
+  let $Hours = #Hours
+
+  let $err-statement1 = 'TAX810MA, Insert-Error - INSERT-WORK-RECORD'
+  let $err-statement2 = 'Key Values: TABLE PS_R_TAX810MA' ||
+                        ', COMPANY ' || $Company ||
+                        ', EMPLID ' || $Emplid ||
+                        ', NATIONAL_ID ' || $SSN ||
+                        ', LAST_NAME ' || $LastName ||
+                        ', FIRST_NAME ' || $FirstName ||
+                        ', MIDDLE_INITIAL ' || $MidInitial ||
+                        ', NLGRS_QTD ' || $NlGrs_QTD ||
+                        ', HRS_QTD ' || $Hours ||
+                        ', EMPLOYER_ID_SUT ' || $StateSUT ||
+                        ', TXGRS_QTD ' || $TxGrs_QTD ||
+                        ', TAX_QTD ' || $Tax_QTD ||
+                        ', OFFICER_CD ' || $Officer_Cd ||
+                        ', UI_MONTH1 ' || $MonEmpFlg1 ||
+                        ', UI_MONTH2 ' || $MonEmpFlg2 ||
+                        ', UI_MONTH3 ' || $MonEmpFlg3
+
+
+begin-SQL on-error=Error-Display
+  INSERT INTO PS_R_TAX810MA
+        (COMPANY,
+         EMPLID,
+         NATIONAL_ID,
+         LAST_NAME,
+         FIRST_NAME,
+         MIDDLE_INITIAL,
+         NLGRS_QTD,
+         HRS_QTD,
+         EMPLOYER_ID_SUT,
+         TXGRS_QTD,
+         TAX_QTD,
+         OFFICER_CD,
+         UI_MONTH1,
+         UI_MONTH2,
+         UI_MONTH3)
+ VALUES ($Company,
+         $EmplID,
+         $SSN,
+         $LastName,
+         $FirstName,
+         $MidInitial,
+         #NLGRS_QTD,
+         #Hours,
+         $StateSUT,
+         #TAXGRS_QTD,
+         #TAX_QTD,
+         $Officer_Cd,
+         $MonEmpFlg1,
+         $MonEmpFlg2,
+         $MonEmpFlg3)
+
+end-SQL
+end-procedure
+
+
+begin-procedure Process-File
+! This procedure only processes 1 company each time because of the way it is called from Main
+
+begin-SELECT
+RR.COMPANY          () on-break print=never level=1 after=After-Company
+RR.NATIONAL_ID
+RR.LAST_NAME
+RR.FIRST_NAME
+RR.MIDDLE_INITIAL
+RR.NLGRS_QTD
+RR.HRS_QTD
+RR.EMPLOYER_ID_SUT
+RR.TXGRS_QTD
+RR.TAX_QTD
+RR.OFFICER_CD
+RR.UI_MONTH1
+RR.UI_MONTH2
+RR.UI_MONTH3
+
+  move &RR.NATIONAL_ID      to $SSN
+  move &RR.LAST_NAME        to $LastName
+  move &RR.FIRST_NAME       to $FirstName
+  move &RR.MIDDLE_INITIAL   to $MidInitial
+  move &RR.EMPLOYER_ID_SUT  to $StateSUT
+
+  move &RR.NLGRS_QTD        to #NlGrs_QTD
+  move &RR.TXGRS_QTD        to #TxGrs_QTD
+  move &RR.TAX_QTD          to #Tax_QTD
+
+  add #NlGrs_QTD            to #Co_NlGrs_QTD
+  add #TxGrs_QTD            to #Co_TxGrs_QTD
+  add #Tax_QTD              to #Co_STW_QTD
+
+  move &RR.HRS_QTD   to #Hours
+  do Format-Number(#Hours, $Hours, '099')
+  move &RR.OFFICER_CD to $Officer_Cd
+  move &RR.UI_MONTH1 to $MonEmpFlg1
+  move &RR.UI_MONTH2 to $MonEmpFlg2
+  move &RR.UI_MONTH3 to $MonEmpFlg3
+
+  do Update-Month-Empl-Count
+  do Write-S-Record
+  move 'Y' to $RecordWritten
+
+FROM  PS_R_TAX810MA RR
+WHERE RR.COMPANY       = &A.Company
+ORDER BY RR.NATIONAL_ID
+
+end-SELECT
+end-procedure
+
+begin-procedure Get-Quarter-Dates
+
+    move &TX.Balance_Year   to $EffYear 9999
+    move &TX.Balance_Qtr    to $EffQuarter 9
+
+    let #EffYear       = to_number($EffYear)
+    let #EffQuarter    = to_number($EffQuarter)
+
+    evaluate $EffQuarter
+        when = '1'
+            move '01'       to $1stmonth
+            move '02'       to $2ndmonth
+            move '03'       to $3rdmonth
+            move '31'       to $Lastday
+            move 'Jan'      to $Month1_Name
+            move 'Feb'      to $Month2_Name
+            move 'Mar'      to $Month3_Name
+            break
+        when = '2'
+            move '04'       to $1stmonth
+            move '05'       to $2ndmonth
+            move '06'       to $3rdmonth
+            move '30'       to $Lastday
+            move 'Apr'      to $Month1_Name
+            move 'May'      to $Month2_Name
+            move 'Jun'      to $Month3_Name
+            break
+        when = '3'
+            move '07'       to $1stmonth
+            move '08'       to $2ndmonth
+            move '09'       to $3rdmonth
+            move '30'       to $Lastday
+            move 'Jul'      to $Month1_Name
+            move 'Aug'      to $Month2_Name
+            move 'Sep'      to $Month3_Name
+            break
+        when-other
+            move '10'       to $1stmonth
+            move '11'       to $2ndmonth
+            move '12'       to $3rdmonth
+            move '31'       to $Lastday
+            move 'Oct'      to $Month1_Name
+            move 'Nov'      to $Month2_Name
+            move 'Dec'      to $Month3_Name
+    end-evaluate
+
+    let $Date_Field         =  $EffYear || $1stMonth || '01'
+    do Format-DateTime($Date_Field, $First_Day_Of_Quarter, {DEFCMP},'','native')
+
+    let $Date_Field         =  $EffYear || $3rdMonth || $Lastday
+    do Format-DateTime($Date_Field, $Last_Day_Of_Quarter, {DEFCMP},'','native')
+
+    let $12thOfMonth1       =  $EffYear || $1stMonth || '12'
+    do Format-DateTime($12thOfMonth1, $12th_Of_1st_Month, {DEFCMP},'','native')
+
+    let $12thOfMonth2       =  $EffYear || $2ndMonth || '12'
+    do Format-DateTime($12thOfMonth2, $12th_Of_2nd_Month, {DEFCMP},'','native')
+
+    let $12thOfMonth3       =  $EffYear || $3rdMonth || '12'
+    do Format-DateTime($12thOfMonth3, $12th_Of_3rd_Month, {DEFCMP},'','native')
+
+end-procedure
+
+begin-procedure Get-Monthly-Employment-Indicator
+
+begin-SELECT
+A1.COMPANY
+A1.PAYGROUP
+A1.PAY_END_DT
+A1.EMPLID
+A1.EMPL_RCD
+A1.EARNS_BEGIN_DT
+A1.EARNS_END_DT
+A1.PAY_LINE_STATUS
+
+   move &A1.EARNS_BEGIN_DT to $EarnsBD
+   move &A1.EARNS_END_DT   to $EarnsED
+
+   do Format-DateTime($EarnsBD, $EarnsBeginDt,{DEFCMP},'','')
+   do Format-DateTime($EarnsED, $EarnsEndDt,{DEFCMP},'','')
+
+   if $EarnsBeginDt <= $12thOfMonth1
+     if $EarnsEndDt >= $12thOfMonth1
+          let $MonEmpFlg1 = '1'
+     end-if
+   end-if
+
+   if $EarnsBeginDt <= $12thOfMonth2
+     if $EarnsEndDt >= $12thOfMonth2
+          let $MonEmpFlg2 = '1'
+     end-if
+   end-if
+
+   if $EarnsBeginDt <= $12thOfMonth3
+     if $EarnsEndDt >= $12thOfMonth3
+          let $MonEmpFlg3 = '1'
+     end-if
+   end-if
+
+ FROM PS_PAY_EARNINGS A1, PS_PAY_CHECK C1
+WHERE A1.COMPANY = $Company
+  AND A1.EMPLID  = $EmplID
+  AND A1.STATE   = 'MA'
+  AND A1.PAY_END_DT BETWEEN $First_Day_Of_Quarter AND $Last_Day_Of_Quarter
+  AND A1.PAY_LINE_STATUS = 'F'
+  AND (($12th_Of_1st_Month BETWEEN A1.EARNS_BEGIN_DT AND A1.EARNS_END_DT)
+    OR ($12th_Of_2nd_Month BETWEEN A1.EARNS_BEGIN_DT AND A1.EARNS_END_DT)
+    OR ($12th_Of_3rd_Month BETWEEN A1.EARNS_BEGIN_DT AND A1.EARNS_END_DT))
+  AND A1.COMPANY = C1.COMPANY
+  AND A1.PAYGROUP = C1.PAYGROUP
+  AND A1.PAY_END_DT = C1.PAY_END_DT
+  AND A1.OFF_CYCLE = C1.OFF_CYCLE
+  AND A1.PAGE_NUM = C1.PAGE_NUM
+  AND A1.LINE_NUM = C1.LINE_NUM
+  AND C1.PAYCHECK_STATUS IN ('F','A','R')
+end-SELECT
+end-procedure
+
+begin-procedure Update-Month-Empl-Count
+
+  if &RR.UI_MONTH1 = '1'
+     Add 1 to #Month1Count
+  end-if
+
+  if &RR.UI_MONTH2 = '1'
+     Add 1 to #Month2Count
+  end-if
+
+  if &RR.UI_MONTH3 = '1'
+     Add 1 to #Month3Count
+  end-if
+
+end-procedure
+
+
+begin-procedure After-Company
+
+  add #Co_STW_QTD    to #Tot_STW_QTD
+  add #Co_NlGrs_QTD  to #Tot_NlGrs_QTD
+  add #Co_TxGrs_QTD  to #Tot_TxGrs_QTD
+  add #Count_S to #Count_F
+
+  move #Month1Count            to $Month1Count   0999999
+  move #Month2Count            to $Month2Count   0999999
+  move #Month3Count            to $Month3Count   0999999
+  add  #Month1Count  to  #TotalMnth1Count
+  add  #Month2Count  to  #TotalMnth2Count
+  add  #Month3Count  to  #TotalMnth3Count
+
+  if $Company <> $LastCompany
+     move $Company     to $LastCompany
+     move $CompanyName to $LastCompanyName
+  end-if
+
+  do Print-Company-Tot
+  add 1 to #Count_E
+
+  move 0 to #Co_STW_QTD
+  move 0 to #Co_NlGrs_QTD
+  move 0 to #Co_TxGrs_QTD
+  move 0 to #Count_S
+  move 0 to #Count_Tax_QTD
+  new-page
+
+  move 0 to #Month1Count
+  move 0 to #Month2Count
+  move 0 to #Month3Count
+
+  let $NegAmtReported = 'N'
+  let $EmplidHdgPrinted = 'N'
+
+end-procedure
+
+begin-procedure Write-S-Record
+
+  let $NlGrs_QTD  = EDIT(#NlGrs_QTD  * 100,'09999999999999')
+  let $TxGrs_QTD  = EDIT(#TxGrs_QTD  * 100,'09999999999999')
+  let $Tax_QTD    = EDIT(#Tax_QTD    * 100,'09999999999999')
+
+  write 10 from 'S':1             !    1
+               $SSN:9             !    2
+          $LastName:20            !   11
+         $FirstName:12            !   31
+        $MidInitial:1             !   43
+                $Sp:2             !   44
+                '0':1             !   46 Adj Reason Code
+                $Sp:3             !   47
+         $NlGrs_QTD:14            !   50
+                $Sp:68            !   64
+             $Hours:3             !  132
+                $Sp:12            !  135
+          $StateSUT:8             !  147 State UI employer number
+                $Sp:7             !  155
+             '0000':4             !  162 Unit/Division Location
+                $Sp:11            !  166
+         $TxGrs_QTD:14            !  177 State Taxable Wages
+           $Tax_QTD:14            !  191 State withholding
+                $Sp:5             !  205
+        $Officer_Cd:1             !  210
+                $Sp:1             !  211
+        $MonEmpFlg1:1             !  212
+        $MonEmpFlg2:1             !  213
+        $MonEmpFlg3:1             !  214
+     $RptQtrEndMnth:2             !  215
+           $RptYear:4             !  217
+                $Sp:54            !  221
+
+  add 1 to #Count_S
+
+end-procedure
+
+
+begin-procedure Print-Company-Tot
+  if #Neg_Amts_Tax_QTD <> 0 or #Neg_Amts_NlGrs_QTD <> 0
+     print '** Total **'          (+2,1,14)
+     print #Neg_Amts_Tax_QTD       (0,16) edit 99,999,999.99mi
+     print #Neg_Amts_NlGrs_QTD     (0,34) edit 99,999,999.99mi
+     print #Neg_Amts_TxGrs_QTD     (0,52) edit 99,999,999.99mi
+
+     move 0 to #Neg_Amts_Tax_QTD
+     move 0 to #Neg_Amts_NlGrs_QTD
+     move 0 to #Neg_Amts_TxGrs_QTD
+  end-if
+
+
+  print '**** Company Total ****'         (+4,1)
+  print 'No Limit Gross QTD '             (+2,1,30)
+  print #Co_NlGrs_QTD                      (,32)   edit 999,999,999.99mi
+
+  print 'State Withholding Wages QTD '     (+2,1,30)
+  print #Co_TxGrs_QTD                      (,32)   edit 999,999,999.99mi
+
+  print 'State Income Tax Withheld QTD'    (+2,1,30)
+  print #Co_STW_QTD                        (,32)   edit 999,999,999.99mi
+
+  print 'Employees Reported'              (+2,1,30)
+  print #Count_S                           (,35)   edit 999,999,999
+
+  print 'Month 1 Count '                  (+2,1,31)
+  print #Month1Count                       (,37)   edit 9,999,999
+
+  print 'Month 2 Count '                  (+2,1,31)
+  print #Month2Count                       (,37)   edit 9,999,999
+
+  print 'Month 3 Count '                  (+2,1,31)
+  print #Month3Count                       (,37)   edit 9,999,999
+
+  print 'Employer UI Number'               (+2,1,31)
+  print $StateSUT                          (,38)
+
+end-procedure
+
+
+begin-procedure Print-File-Tot
+
+  move '' to $LastCompany
+  move '' to $LastCompanyName
+
+  print '**** File Totals ****'            (+3,1)
+  print 'No Limit Gross QTD '             (+2,1,26)
+  print #Tot_NlGrs_QTD                     (,32)   edit 999,999,999.99mi
+
+  print 'State Withholding Wages QTD'      (+2,1,30)
+  print #Tot_TxGrs_QTD                     (,32)   edit 999,999,999.99mi
+
+  print 'State Income Tax Withheld QTD'    (+2,1,30)
+  print #Tot_STW_QTD                       (,32)   edit 999,999,999.99mi
+
+  print 'Employees Reported'              (+2,1,29)
+  print #Count_F                           (,35)   edit 999,999,999
+
+  print 'Month 1 Count '                  (+2,1)
+  print #TotalMnth1Count                    (,37)   edit 9,999,999
+
+  print 'Month 2 Count '                  (+2,1)
+  print #TotalMnth2Count                    (,37)   edit 9,999,999
+
+  print 'Month 3 Count '                  (+2,1)
+  print #TotalMnth3Count                    (,37)   edit 9,999,999
+
+  print 'Employers Reported'              (+2,1,29)
+  print #Count_E                           (,35)   edit 999,999,999
+
+  print 'Output File:  '          (+2,1)
+  print $FileID                  (+1,10)
+
+end-procedure
+
+
+#Include 'taxrnctl.sqc'  !Get-Tax-Reporting-Run-Controls procedure
+#Include 'txrnctl1.sqc'  !Process Scheduler Run Controls
+#Include 'getcodta.sqc'  !Get-Company-Data procedure
+#Include 'getstdta.sqc'  !Get-State-Tax-Data procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'rptsmmca.sqc'  !Print-Summary-Data procedure
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'getbalid.sqc'  !Get-Calendar-Year-Id
+#Include 'gethours.sqc'  !Get-Hours procedure
+#Include 'stdapi.sqc'    !Update Process API
+#Include 'stderror.sqc'  !Routine for error display

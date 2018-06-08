@@ -9,10 +9,12 @@ const readline = require('readline');
 const fs = require('fs');
 var findInFiles = require('find-in-files');
 var excludeFiles = ['setenv.sqc','setup02.sqc','number.sqc','datetime.sqc','curdttim.sqc','stdapi.sqc','datemath.sqc'];
-
+let SQR_FOLDER_PATH = __dirname+'/../uploads/sqrfiles'; // "/Users/voddes/Extras/UD/SQR_Project/SQR_Unix_PRD";
+console.log(SQR_FOLDER_PATH);
+let FILE_NAME = 'bas003.sqr'; // '1.sqr'; // "bas003.sqr";
 
 const traverseProcedure = (parentprocName,fileName,isInclude, procList) => {  //TODO:Needs to be changed to accept list of procudures and chang method accordingly.
-    console.log(procList);
+    console.log("traverse these procedures: ", procList);
     console.log(isInclude);
     console.log(fileName);
     if(!procList || procList.length == 0) {
@@ -20,8 +22,8 @@ const traverseProcedure = (parentprocName,fileName,isInclude, procList) => {  //
     }
     var procAppendTerm = '(';
     procList.forEach(function(procName){
-        procName = procName.replace("do","");
-        procAppendTerm = procAppendTerm +procName.trim()+'|';
+        procName = procName.replace(/do/ig,"");
+        procAppendTerm = procAppendTerm + procName.trim()+'|';
     });
     procAppendTerm = procAppendTerm.replace(/\|$/,')');
 
@@ -32,31 +34,55 @@ const traverseProcedure = (parentprocName,fileName,isInclude, procList) => {  //
     var term = '('+procTerm+'|'+incTerm+')';
     //console.log(term);
     var reGex = {'term': term, 'flags': 'igm'};  //"^Begin-Program[^]*?End-Program$"
-    findInFiles.find(reGex,"/Users/voddes/Extras/UD/SQR_Project/SQR_Unix_PRD",fileName)
+    findInFiles.find(reGex,SQR_FOLDER_PATH,fileName)
         .then(function(results) {
+            let includes = [];
+            let begins = [];
             //console.log(results);
             //var res = results[0];
             for (var result in results) {
                 var res = results[result];
-                var procList = [];
-                for (var itr in res.matches) {
-                    var matchText = res.matches[itr];
-
-                    //TODO:findout and seperate file includes.
-                    //console.log(matchText);
-                    var procedures = new Set(matchText.match(/do\s(\w+)(-?(\w+)?)*/igm)); //
-                    console.log(procedures);
-                    var procName = matchText.match(/^Begin-Procedure\s(\w+)(-?(\w+)?)*/ig)[0].replace('Begin-Procedure ',''); //find proc
-                    procList.delete(procName);  //Delete found proc
-                    if (procedures.size > 0)
-                        traverseProcedure(parentprocName,fileName,false,procedures);
+                // var procList = [];
+                
+                let fileName;
+                res.matches.forEach((matchText) => {
+                    if (matchText.match(/include\s/igm)) {
+                        fileName = matchText.replace(/include\s/igm, '');
+                        fileName = fileName.replace("'", '');
+                        includes.push(fileName);
+                    }
+                    if (matchText.match(/Begin-Procedure\s(\w+)(-?(\w+)?)*/igm)) {
+                        begins.push(matchText);
+                        var procedures = new Set(matchText.match(/do\s(\w+)(-?(\w+)?)*/igm)); //
+                        let beginProcMatch = matchText.match(/^Begin-Procedure\s(\w+)(-?(\w+)?)*/ig);
+                        var procName = beginProcMatch && beginProcMatch[0].replace('Begin-Procedure ', ''); //find proc
+                        procName && procList.delete(procName); // Delete found proc
+                        console.log("proc name: ",procName, "procs: ", procedures);
+                        if (procedures.size > 0) {
+                            traverseProcedure(parentprocName, fileName, false, procedures);
+                        }
+                    }
+                });
+                includes = includes.filter((el) => !excludeFiles.includes(el));
+                if (procList && procList.length !== 0) {
+                    // procList.forEach((procItem) => {
+                        includes.forEach((includeFile) => {
+                            // traverseProcedure(null, includeFile, false, [procItem]);
+                            traverseProcedure(null, includeFile, false, procList);
+                        });
+                    // });
                 }
+                
+                console.log("include files:", includes);
             }
+
+            
+            
 
             /*if (procList && procList!= 0) {
                 if (!isInclude) {
                     var reGex = {'term': "Include.*sqc", 'flags': 'igm'};
-                    findInFiles.find(reGex, "/Users/voddes/Extras/UD/SQR_Project/SQR_Unix_PRD", fileName)//TODO:This can be merged with above find
+                    findInFiles.find(reGex, SQR_FOLDER_PATH, fileName)//TODO:This can be merged with above find
                         .then(function (results) {
                             //console.log(results);
                             for (var result in results) {
@@ -82,7 +108,7 @@ const traverseProcedure = (parentprocName,fileName,isInclude, procList) => {  //
                     //loop each filename to call traverseProcedure
 
                     var reGex = {'term': "Include.*sqc", 'flags': 'igm'};
-                    findInFiles.find(reGex, "/Users/voddes/Extras/UD/SQR_Project/SQR_Unix_PRD", fileName)//TODO:This can be merged with above find
+                    findInFiles.find(reGex, SQR_FOLDER_PATH, fileName)//TODO:This can be merged with above find
                         .then(function (results) {
                         //console.log(results);
                             for (var result in results) {
@@ -115,8 +141,8 @@ const slone = (fileName,dirPath) => {
     var reGex = {'term': "^Begin-Program[^]*?End-Program$", 'flags': 'igm'};
     //var reGex = {'term': "^Begin-Procedure\\sInit-Report[^]*?End-Procedure$", 'flags': 'igm'};
     //findInFiles.find(reGex,dirPath,fileName)
-    fileName = "bas003.sqr";
-    findInFiles.find(reGex,"/Users/voddes/Extras/UD/SQR_Project/SQR_Unix_PRD","bas003.sqr")
+    fileName = fileName || FILE_NAME;
+    findInFiles.find(reGex, SQR_FOLDER_PATH, FILE_NAME)
         .then(function(results) {
 
             for (var result in results) {
@@ -138,7 +164,9 @@ const slone = (fileName,dirPath) => {
         });
 
 }
-slone();
+// slone();
+
+module.exports = slone;
 
 /*const slone = (inputfile,opfile) => new Promise((resolve, reject) => {
 

@@ -1,0 +1,922 @@
+!********************************************************************** 
+! SQR Name:           adp303p.sqc  
+! SQR Descr:          ADP Tax Service Transporter 
+! Created by:         drmonroe 
+! Create date:        03/04/2010 
+! Last modified by:   drmonroe
+! Last modified date: 01/16/2013 
+!*********************************************************************** 
+!----------------------------------------------------------------------------
+!  ADP:     FACS
+!  Purpose: included by adp303.sqc for PERIODIC Tax extract
+!  Author : Dan Monroe
+!  Date   : November 4, 2008
+!
+!  Nov 10, 2008 PAYGROUP_ROLLUP_EXTRACT added
+!  Nov 12,      sort output into the data file
+!  Nov 25,      fix to state code
+!  Dec 30,      fix excel output for PAYGROUP_ROLLUP_EXTRACT
+!  Jan 19, 2009 incorporate fixes for 2/16/09 release
+!  Jan 22, 2009 Write MOH Credit on all MOH records if this feature is enabled
+!  Jun 25, 2009 Fix to MOH on adjustments, MOH adjustments were not being written to extract data file
+!  Jul 22, 2009 HWL1 and PJN1 KJDA - need to work with Temp table for sorting output too... tested @HWL1          
+!  Oct 09, 2009 CUSTOM_PERIODIC_LOGIC_ENABLED
+!  Apr 19, 2011 For subtotaling by FEIN and ADP Compid... take that into account in the YTD query for 'MOH' credits
+!  Apr 28, 2011 fix for MOH
+!  Feb 01, 2012 added CT3 alias for April 19,2011 fix (above)
+!  Feb 29, 2012 PS_ACT_32_CLEAR_COUNTER always blank out position 14 of taxcodes
+!  Jan 03, 2013 New option: CALC_YTD_BALANCES_THROGH_CHECK_DATE
+!                 We need to code up logic to handle the special case when the pay end date is in the prior year
+!                 maybe setting the ‘thru date’ to the current system date instead.. so we will retrieve the YTD’s correctly.
+!  Jan 16, 2013 CALC_YTD_BALANCES_THROGH_CHECK_DATE standard
+!  Jun  6, 2016 AMP1
+!  Jul 27, 2016 debug_Drec
+!-------------------------------------------------------------------------------------------------------------------
+
+#define        adp303p_release     2016.07.27.1         ! yyyy.mm.dd.n  (sync this with pbzqtr.sqr's release version
+#define        adp303p_version     ADP303P.Jul 27, 2016
+
+!#define debug_Drec
+
+!#if {SITE_ID} = 'UHG1'
+#define CALC_YTD_BALANCES_THROGH_CHECK_DATE  ! calc YTD balances for MOH credit through check date, not pay end date
+!#endif
+
+begin-procedure Init-adp303p
+
+ show 'adp303p.sqc Release: {adp303p_release}, Version: {adp303p_version}'
+
+ #define SPECIFIC_TAX_BALANCE_LIMIT 100 ! 2/9/4
+
+ create-array name=specific_balance size={SPECIFIC_TAX_BALANCE_LIMIT}
+      field=taxcode:char
+      field=liability_date:char
+      field=TaxBalance_Tax_Qtd:number
+      field=TaxBalance_Txgrs_Qtd:number
+      field=TaxBalance_Nlgrs_Qtd:number
+      field=TaxBalance_Tax_Ytd:number
+      field=TaxBalance_Txgrs_Ytd:number
+      field=TaxBalance_Nlgrs_Ytd:number
+
+
+ #ifdef PAYGROUP_ROLLUP_EXTRACT
+  
+  #ifndef PAYGROUP_JURISDICTION_LIMIT
+   #define PAYGROUP_JURISDICTION_LIMIT 2000 ! 2/9/4
+  #endif
+  show 'PAYGROUP_JURISDICTION_LIMIT = {PAYGROUP_JURISDICTION_LIMIT}'
+  
+  #ifdef PS_ACT_32_CLEAR_COUNTER
+   show 'PS_ACT_32_CLEAR_COUNTER enabled'
+  #endif
+  
+  #ifdef CALC_YTD_BALANCES_THROGH_CHECK_DATE
+   show 'CALC_YTD_BALANCES_THROGH_CHECK_DATE enabled'
+  #endif
+  
+  create-array name=paygroup_balance size={PAYGROUP_JURISDICTION_LIMIT}
+      field=taxcode:char
+      field=TaxBalance_Tax_Cur:number
+      field=TaxBalance_Txgrs_Cur:number
+      field=TaxBalance_Nlgrs_Cur:number
+      field=TaxBalance_Tax_Qtd:number
+      field=TaxBalance_Txgrs_Qtd:number
+      field=TaxBalance_Nlgrs_Qtd:number
+      field=TaxBalance_Tax_Ytd:number
+      field=TaxBalance_Txgrs_Ytd:number
+      field=TaxBalance_Nlgrs_Ytd:number
+      field=TaxBalance_Male:number
+      field=TaxBalance_Female:number
+      field=TaxBalance_Cnt:number
+      
+ #endif
+ 
+ 
+end-procedure
+
+#ifdef PBZ_ADP_TABLE_BUILT
+begin-procedure get-sequence-number
+
+  let #prior_nbr = 0
+  show 'Retrieving from table: PS_{Client_Table_Prefix}PBZ_ADP{Client_Table_Suffix}'
+ #ifdef  enable_performance_monitor
+    do Get-Current-Time
+    let $display_dt0 = $display_dt
+ #endif
+
+begin-select
+STAT.SEQNUM
+
+  show 'Sequence run number from PS_{Client_Table_Prefix}PBZ_ADP{Client_Table_Suffix}: ' &STAT.SEQNUM
+
+  move &STAT.SEQNUM to #prior_nbr
+  let #run_nbr = #prior_nbr + 1
+  if #run_nbr > 999
+    let #run_nbr = 1
+  end-if
+
+  show 'New Sequence run number: ' #run_nbr
+
+  FROM PS_{Client_Table_Prefix}PBZ_ADP{Client_Table_Suffix} STAT
+
+#ifdef SELECT_WITH_UR
+ with ur
+#end-if
+end-select
+
+ if #prior_nbr > 0       !we have an existing record...
+
+  show 'updating record to table: PS_{Client_Table_Prefix}PBZ_ADP{Client_Table_Suffix}, seq #: ' #run_nbr
+
+begin-sql
+UPDATE PS_{Client_Table_Prefix}PBZ_ADP{Client_Table_Suffix}
+   SET   SEQNUM = #run_nbr
+   WHERE SEQNUM = #prior_nbr
+end-sql
+
+ else                    !first time...
+  let #run_nbr = 1
+  show 'writing initial record to table: PS_{Client_Table_Prefix}PBZ_ADP{Client_Table_Suffix}, seq #: ' #run_nbr
+
+begin-sql
+ INSERT INTO PS_{Client_Table_Prefix}PBZ_ADP{Client_Table_Suffix}
+             ( SEQNUM )
+      VALUES ( #run_nbr )
+end-sql
+ end-if
+
+ do Format-Number(#run_nbr,$run_nbr, '99999')
+ do Format-Number(#prior_nbr,$prior_nbr, '99999')
+
+end-procedure
+#endif
+
+
+begin-procedure Write-ADP-Format-Data-Record
+
+     
+ #ifdef debug_PAYGROUP_ROLLUP_EXTRACT
+    show 'Write-ADP-Format-Data-Record: ' $taxcode ',  TaxBalance_Tax_Cur = ' #TaxBalance_Tax_Cur
+ #endif
+ 
+ !4/11/06.. why bother if taxes and wages are zero, causes D recs to be dups in case of credits sometimes
+  !--------------------------------------------------------------------------------------------------------
+  if #TaxBalance_Tax_Cur <> 0 or #TaxBalance_Nlgrs_Cur <> 0 or #TaxBalance_Txgrs_Cur <> 0
+
+     #if {SITE_ID} = 'AMP1'                                !  *** AMP1 logic for their 'G' company, 027 ***
+      if rtrim($Taxcode,' ') = 'NVS'
+       let $Taxcode = 'NVSF           '
+       if $Current_Company = '027'
+         let $Taxcode = 'NVSG           '
+       end-if
+      end-if
+     #endif
+ 
+     !Reworked 1/22/09  MOH YTD and MOH Credit logic
+     !----------------------------------------------
+     if rtrim($Taxcode,' ') = 'MOH'                                        
+
+        if (#TaxBalance_Tax_YTD_MO_C <> 0) or (#TaxBalance_Txgrs_YTD_MO_C <> 0) or (#TaxBalance_Nlgrs_YTD_MO_C <> 0) 
+         show 'MOH YTD already calculated for ' $Current_Company ', MO-SIT YTD Taxes = ' #TaxBalance_Tax_YTD_MO_C ', Paygroup = ' $Payline_paygroup
+        else
+
+          let $Bal_Locality  = ' '
+          do get-specific-tax-balance
+          do retrieve-tax-balance
+          show 'MOH YTD retrieved for ' $Current_Company ', MOH-SIT YTD Taxes = ' #TaxBalance_Tax_YTD 
+          let #TaxBalance_Tax_YTD_MO_C   = #TaxBalance_Tax_YTD
+          let #TaxBalance_Txgrs_YTD_MO_C = #TaxBalance_Txgrs_YTD
+          let #TaxBalance_NlGrs_YTD_MO_C = #TaxBalance_Nlgrs_YTD
+         
+        end-if
+
+        !output the MOH record before the MOH_CREDIT record
+        !--------------------------------------------------
+        do out-D-rec
+        do init-balances 
+
+        if $company_adjustment <> 't'          !Missouri SIT, not on adjustments
+         #ifdef CALC_MOH_EMPLOYER_CREDIT
+          do CALC-MOH-EMPLOYER-CREDIT
+          if #CALC-MOH-EMPLOYER-CREDIT > 0
+            do output-moh-credit-periodic      !output the MOH_CREDIT record
+            do init-balances
+          end-if
+         #endif
+        end-if
+        
+     end-if
+
+     #ifdef THIRD_PARTY_SICK_PERIODIC
+
+      let #Sick_Pay_Tax_Cur   = 0  
+      let #Sick_Pay_Txgrs_Cur = 0
+      let #Sick_Pay_Nlgrs_Cur = 0
+
+      if ( ($Trimmed_State = '$U') AND    !For now, just the Federal EE taxes
+               ($Trimmed_Tax_Class = 'D'  OR
+                $Trimmed_Tax_Class = 'E'  OR  !added 3/30/6
+                $Trimmed_Tax_Class = 'F'  OR
+                $Trimmed_Tax_Class = 'Q'  OR  !added 3/30/6
+                $Trimmed_Tax_Class = 'H') ) 
+           OR ( ($Trimmed_State <> '$U' AND $Trimmed_Tax_Class = 'H') AND ($Trimmed_Locality = '') ) !and SIT
+                                             
+         do get-3PSP-balances-periodic
+      end-if
+      
+      
+      if #Sick_Pay_Tax_Cur <> 0 or #Sick_Pay_Txgrs_Cur <> 0 or #Sick_Pay_Nlgrs_Cur <> 0
+        #ifdef debug_3psp_periodic
+         show  'Write-ADP-Format-Data-Record: 3PSP data   #Sick_Pay_Tax_Cur   = ' #Sick_Pay_Tax_Cur
+         show  '                                          #Sick_Pay_Txgrs_Cur = ' #Sick_Pay_Txgrs_Cur
+         show  ' calling output-3psp-periodic...          #Sick_Pay_Nlgrs_Cur = ' #Sick_Pay_Nlgrs_Cur
+        #endif
+        do output-3psp-periodic
+      end-if
+      
+      #ifdef debug_3psp_periodic
+         show  'Write-ADP-Format-Data-Record: After 3PSP  #TaxBalance_Tax_Cur   = ' #TaxBalance_Tax_Cur
+         show  '                                          #TaxBalance_Txgrs_Cur = ' #TaxBalance_Txgrs_Cur
+         show  ' calling out-D-rec...                     #TaxBalance_Nlgrs_Cur = ' #TaxBalance_Nlgrs_Cur
+      #endif
+
+    #endif
+        
+    if rtrim($Taxcode,' ') <> 'MOH'  !MOH record already written above
+      do out-D-rec
+      do init-balances  !2/9/04
+    end-if
+    
+  end-if
+   
+
+end-procedure
+
+
+begin-procedure out-D-rec
+
+
+ let $out-D-rec = 't'
+ #ifdef PAYGROUP_ROLLUP_EXTRACT
+   if rtrim($PAYGROUP_ROLLUP_EXTRACT_Sum_Only,' ') = ''
+      do Sum-PAYGROUP_ROLLUP_EXTRACT
+      let $out-D-rec = 'f'
+   end-if
+ #endif
+
+ #ifdef debug_Drec
+   #ifdef USE_TEMP_TABLE_FOR_OUTPUT
+     show 'adp303p.sqc: TEMP TABLE: out-d-rec: ' $Taxcode ' taxes ' $TaxBalance_Tax_Cur ' ' $out-D-rec
+   #else
+     show 'adp303p.sqc: Normal    : out-d-rec: ' $Taxcode ' taxes ' $TaxBalance_Tax_Cur ' ' $out-D-rec
+   #endif   
+ #endif
+ 
+ if $out-D-rec = 't'
+
+     let $State_edit     = substr($Taxcode,1,2)
+     let $taxclass_local = substr($Taxcode,3,13)
+     if $State_edit = 'YY'
+       let $State_edit = 'XX'
+     end-if
+
+
+     #ifdef KJDA_PS_DELIVERED
+         #if {SITE_ID} = 'HWL1'
+           if (substr($TaxCode,4,1) <> ' ') and (substr($TaxCode,1,2) = 'KY') !KY local
+            if rtrim($KJDA_Header_Company,' ') = 't'
+              let $taxclass_local = substr($taxclass_local,1,11) || 'K' || substr($TaxCode,15,1)
+              let $TaxCode = $State_edit || substr($taxclass_local,1,13)
+            end-if
+           end-if
+         #endif
+     #endif
+
+     #if {SITE_ID} = 'PJN1'
+           if  (substr($TaxCode,1,7) =  'KYH111 ') OR (substr($TaxCode,1,9) = 'KYH40222 ')
+            if rtrim($KJDA_Header_Company,' ') = 't'
+              let $taxclass_local = substr($taxclass_local,1,11) || 'K' || substr($TaxCode,15,1)
+              let $TaxCode = $State_edit || substr($taxclass_local,1,13)
+            end-if
+           end-if
+     #endif
+ 
+     #ifdef CUSTOM_PERIODIC_LOGIC_ENABLED
+      do custom-associate-level-logic-periodic-D-rec  !in probiz.sqc
+     #endif
+
+    
+     #ifdef USE_TEMP_TABLE_FOR_OUTPUT
+
+         #ifdef DEBUG_CANADA
+          show 'out-D-rec, Taxcode ' $Taxcode
+          show '           Canada  ' $TaxBalance_Canada
+         #endif
+
+  
+         let $pout_str =  'D' ||
+                     rpad($blank,1,' ') ||
+                     rpad($State_edit,2,' ') ||
+                     rpad($taxclass_local,13,' ') ||
+                     rpad($TaxBalance_Tax_Cur,16,' ') ||
+                     rpad($TaxBalance_Txgrs_Cur,16,' ') ||
+                     rpad($TaxBalance_Nlgrs_Cur,16,' ') ||
+                     rpad($TaxBalance_Gross_Cur,16,' ') ||
+                     rpad($TaxBalance_Tax_Qtd,16,' ') ||
+                     rpad($TaxBalance_Txgrs_Qtd,16,' ') ||
+                     rpad($TaxBalance_Nlgrs_Qtd,16,' ') ||
+                     rpad($zero,16,' ') ||
+                     rpad($TaxBalance_Tax_Ytd,16,' ') ||
+                     rpad($TaxBalance_Txgrs_Ytd,16,' ') ||
+                     rpad($TaxBalance_Nlgrs_Ytd,16,' ') ||
+                     rpad($zero,16,' ') ||
+                     rpad($Canada_TaxBalance_Count,6,' ') ||
+                     rpad($Female_TaxBalance_Count,5,' ') ||
+                     rpad($Male_TaxBalance_Count,5,' ') ||
+                     rpad($Week_Number,2,' ')
+       
+          #ifdef debug_Drec
+            show 'adp303p.sqc: calling log-D-rec-data: ' Extract_CompID ' ' $Payline_paygroup ' ' $Taxcode ' taxes ' $TaxBalance_Tax_Cur ' ' #reccnt edit 999,999
+          #endif
+          do Log-D-rec-data
+
+      #else
+
+       #ifdef PS_ACT_32_CLEAR_COUNTER
+         if substr($TaxCode,1,3) = 'PAH' and substr($TaxCode,14,1) <> ' '
+           let $taxclass_local = substr($taxclass_local,1,11) || ' ' || substr($TaxCode,15,1)
+           let $TaxCode = $State_edit || substr($taxclass_local,1,13)
+         end-if
+       #endif
+
+      ! #ifdef MASTER_TAX_HEADER
+      !    let $MT_STATE     = substr($State_edit,    1, 2)
+      !    let $MT_TAX_CLASS = substr($taxclass_local,3, 1)
+      !    let $MT_LOCALITY  = substr($taxclass_local,4,12)
+      !    let #MT_TAX_CUR =   #TaxBalance_Tax_Cur
+      !    do WRITE-COMPANY-TAX  !$MT_STATE $MT_TAX_CLASS $MT_LOCALITY #MT_TAX_CUR 
+      ! #endif
+
+     
+       Write 1 FROM               'D':1                       !Data record
+                                          $blank:1
+                                     $State_edit:2
+                                $taxclass_local:13
+                            $TaxBalance_Tax_Cur:16            !current w/h
+                          $TaxBalance_Txgrs_Cur:16            !current taxable
+                          $TaxBalance_Nlgrs_Cur:16            !current subject
+                          $TaxBalance_Gross_Cur:16            !current total gross
+
+                          $TaxBalance_Tax_Qtd:16              !QTD w/h
+                          $TaxBalance_Txgrs_Qtd:16            !QTD taxable
+                          $TaxBalance_Nlgrs_Qtd:16            !QTD subject
+                          $Zero:16                            !QTD gross
+
+                          $TaxBalance_Tax_YTD:16              !YTD w/h
+                          $TaxBalance_Txgrs_YTD:16            !YTD taxable
+                          $TaxBalance_Nlgrs_YTD:16            !YTD subject
+                          $Zero:16                            !YTD gross
+
+                          $Canada_TaxBalance_Count:6          !# of employees who paid this tax (used in Canada only)
+                          $Female_TaxBalance_Count:5          !# of employees who paid this tax (used in Canada only)
+                          $Male_TaxBalance_Count:5            !# of employees who paid this tax (used in Canada only)
+                          $Week_Number:2                      !Week number of this payroll
+               !          $space:44                           !the rest of the ADP extra data is optional
+
+                          #ifdef ADD_CR_UNDER_UNIX
+                           #ifdef UNIX
+                             $CR:1
+                           #endif
+                          #endif
+
+           #ifdef debug_Drec
+             show 'adp303p.sqc: Writing D rec: ' $Taxcode ' taxes ' $TaxBalance_Tax_Cur ' ' #reccnt edit 999,999
+           #endif
+ 
+
+           add 1 to #reccnt
+           add 1 to #company_trailer_reccnt
+
+           Add #TaxBalance_Tax_Cur to #Company_trailer_Total_Tax
+           Add #TaxBalance_Tax_Cur to #Hash_cur_Total_Tax
+
+           #ifdef EXCEL_FIXED_PERIODIC_FILENAME
+
+               move $TaxCode to $tc
+               let #cur   = #TaxBalance_Tax_Cur
+               let #txgrs = #TaxBalance_Txgrs_Cur
+               let #nlgrs = #TaxBalance_Nlgrs_Cur
+
+               #ifdef PAYGROUP_ROLLUP_EXTRACT
+                 move $Header_rec_compid       to $Existing_company
+                 move '   '                    to $Existing_paygroup
+                 move $Header_rec_liab_dt_dtu  to $Existing_liabdt
+               #else
+                move $Extract_compid          to $Existing_company
+                move $output_paygroup         to $Existing_paygroup:3 
+                move $TaxBalance_Check_Dt_DTU to $Existing_liabdt
+               #endif
+               
+               do periodic-excel-write
+           #endif
+
+         #endif
+   
+   end-if
+   
+   !only for MOH recs.. make sure it doesn't bleed forward
+   let #t = 0
+   let #TaxBalance_Tax_YTD   = 0
+   let #TaxBalance_Txgrs_YTD = 0
+   let #TaxBalance_Nlgrs_YTD = 0
+   do Format-Number(#t ,$TaxBalance_Tax_YTD,   '999999999999999mi')
+   do Format-Number(#t ,$TaxBalance_Txgrs_YTD, '999999999999999mi')
+   do Format-Number(#t ,$TaxBalance_Nlgrs_YTD, '999999999999999mi')
+
+
+end-procedure
+
+
+begin-procedure get-specific-tax-balance  !Periodic, summing a particular tax for the year (MOH)
+
+  let #QTD_tax_balance_tax   = 0
+  let #QTD_tax_balance_txgrs = 0
+  let #QTD_tax_balance_nlgrs = 0
+  let #YTD_tax_balance_tax   = 0
+  let #YTD_tax_balance_txgrs = 0
+  let #YTD_tax_balance_nlgrs = 0
+
+  let $Bal_State     = substr($taxcode,1,2)
+  let $Bal_Tax_Class = substr($taxcode,3,1)
+
+  #ifdef CALC_YTD_BALANCES_THROGH_CHECK_DATE                 !1/3/2013 option in case of check date at begin of year, end date at end of prior yr
+     move $TaxBalance_Check_Dt to $YTD_Balances_Thru_Date
+  #else
+     move $INPUT_PAY_END_DT    to $YTD_Balances_Thru_Date    !default is pay end date
+  #endif
+
+  #ifdef REPORT_MOH_FOR_ALL_PAYGROUPS
+    #ifdef SUBTOTAL_ADP_COMPID_EXTRACT
+       show 'Acquiring balances for taxcode ' $taxcode ', ADP compid ' $Current_ADP_Compid ', ' $StartOfYear '...' $YTD_Balances_Thru_Date
+    #else
+      #ifdef SUBTOTAL_FEIN_EXTRACT
+       show 'Acquiring balances for taxcode ' $taxcode ', FEIN ' #Current_FEIN ', ' $StartOfYear '...' $YTD_Balances_Thru_Date
+      #else
+       show 'Acquiring balances for taxcode ' $taxcode ', Company ' $Current_Company ', ' $StartOfYear '...' $YTD_Balances_Thru_Date
+      #endif
+    #endif
+    clear-array name=specific_balance
+    let #specific_tax_balances = 0
+  #endif
+ 
+  #ifdef  enable_performance_monitor
+    do Get-Current-Time
+    let $display_dt0 = $display_dt
+  #endif
+
+begin-select
+PT3.NLGRS_CUR
+PT3.TXGRS_CUR
+PT3.TAX_CUR
+PR3.CHECK_DT
+
+      let #PT3_NLGRS_CUR = &PT3.NLGRS_CUR
+      if #PT3_NLGRS_CUR = 0
+       let #nl = &PT3.TXGRS_CUR
+      else
+       let #nl = &PT3.NLGRS_CUR
+      end-if
+
+      let #i = 0
+      let #found_st = 0
+      while #i < #specific_tax_balances
+         get $taxcode_check from specific_balance(#i) taxcode
+         if rtrim($taxcode_check,' ') = rtrim($Taxcode,' ')
+           array-add &PT3.TAX_CUR   to specific_balance(#i) TaxBalance_Tax_YTD
+           array-add &PT3.TXGRS_CUR to specific_balance(#i) TaxBalance_Txgrs_YTD
+           array-add #nl to specific_balance(#i) TaxBalance_Nlgrs_YTD
+           let #found_st = 1
+           break
+         end-if
+         add 1 to #i
+      end-while
+
+     if #found_st = 0 AND #specific_tax_balances < {SPECIFIC_TAX_BALANCE_LIMIT}
+           put $Taxcode into specific_balance(#specific_tax_balances) Taxcode
+           put &PT3.TAX_CUR into specific_balance(#specific_tax_balances) TaxBalance_Tax_YTD
+           put &PT3.TXGRS_CUR into specific_balance(#specific_tax_balances) TaxBalance_Txgrs_YTD
+           put #nl into specific_balance(#specific_tax_balances) TaxBalance_Nlgrs_YTD
+           add 1 to #specific_tax_balances
+     end-if
+
+
+  from PS_PAY_TAX{WAREHOUSE_SUFFIX} PT3, PS_PAY_CALENDAR{WAREHOUSE_SUFFIX} PR3
+        #ifdef SUBTOTAL_ADP_COMPID_EXTRACT
+         , PS_TF_COMPANY_XREF CT2
+        #else
+          #ifdef SUBTOTAL_FEIN_EXTRACT
+           , PS_COMPANY_TBL CT2
+          #endif
+        #endif
+        
+  WHERE PT3.STATE      = $Bal_State           AND
+        PT3.TAX_CLASS  = $Bal_Tax_Class       AND
+        PT3.LOCALITY   = $Bal_Locality        AND
+        PR3.CHECK_DT   >= $Startofyear        AND
+        PR3.CHECK_DT   <= $YTD_Balances_Thru_Date   AND  
+        PR3.COMPANY    = PT3.COMPANY          AND
+        PR3.PAYGROUP   = PT3.PAYGROUP         AND
+        PR3.PAY_END_DT = PT3.PAY_END_DT       
+
+        !4/19/2011 - added for GE01 to pick up the YTD's for all the companies mapped to the current ADP Compid  
+        #ifdef SUBTOTAL_ADP_COMPID_EXTRACT
+           AND PT3.COMPANY = CT2.COMPANY
+           AND CT2.TF_COMPANY = $Current_ADP_Compid
+           AND CT2.EFFDT = (SELECT MAX(CT3.EFFDT)
+                FROM PS_TF_COMPANY_XREF CT3
+                WHERE CT3.COMPANY = CT2.COMPANY
+                  AND CT3.EFFDT  <= $YTD_Balances_Thru_Date)
+        #else
+
+          !4/19/2011 - added for other clients rolling up by FEIN too
+          #ifdef SUBTOTAL_FEIN_EXTRACT
+             AND PT3.COMPANY = CT2.COMPANY
+             AND CT2.FEDERAL_EIN  = #Current_FEIN
+             AND CT2.EFFDT = (SELECT MAX(CT3.EFFDT)
+                  FROM PS_COMPANY_TBL CT3
+                  WHERE CT3.COMPANY = CT2.COMPANY
+                    AND CT3.EFFDT  <= $YTD_Balances_Thru_Date)
+          #else
+            AND PT3.COMPANY = $Current_Company
+          #endif
+
+        #endif
+        
+#ifdef SELECT_WITH_UR
+ with ur
+#end-if
+end-select
+
+  #ifdef  enable_performance_monitor
+     do Get-Current-Time
+     move 'get-specific-tax-balance' to $debug-proc1
+     move 'PS_PAY_TAX'    to $debug-table1
+     do log-delta-time
+  #endif
+
+
+
+end-procedure
+
+begin-procedure retrieve-tax-balance
+
+      #ifdef debug_tax_balance
+        show 'retriving balances for ' $taxcode
+      #endif
+
+      let #i = 0
+      let #found_st = 0
+      while #i < #specific_tax_balances
+         get $taxcode_check from specific_balance(#i) taxcode
+         if rtrim($taxcode_check,' ') = rtrim($Taxcode,' ')
+           get #TaxBalance_Tax_Qtd   from specific_balance(#i) TaxBalance_Tax_Qtd
+           get #TaxBalance_Txgrs_Qtd from specific_balance(#i) TaxBalance_Txgrs_Qtd
+           get #TaxBalance_Nlgrs_Qtd from specific_balance(#i) TaxBalance_Nlgrs_Qtd
+           get #TaxBalance_Tax_YTD   from specific_balance(#i) TaxBalance_Tax_YTD
+           get #TaxBalance_Txgrs_YTD from specific_balance(#i) TaxBalance_Txgrs_YTD
+           get #TaxBalance_Nlgrs_YTD from specific_balance(#i) TaxBalance_Nlgrs_YTD
+           let #found_st = 1
+
+           put ' ' into specific_balance(#i) Taxcode
+           put 0 into specific_balance(#i) TaxBalance_Tax_QTD
+           put 0 into specific_balance(#i) TaxBalance_Txgrs_QTD
+           put 0 into specific_balance(#i) TaxBalance_Nlgrs_QTD
+           put 0 into specific_balance(#i) TaxBalance_Tax_YTD
+           put 0 into specific_balance(#i) TaxBalance_Txgrs_YTD
+           put 0 into specific_balance(#i) TaxBalance_Nlgrs_YTD
+
+           break
+         end-if
+         add 1 to #i
+      end-while
+
+     if #found_st = 0
+       do init-balances
+     else
+
+         let #t = #TaxBalance_Tax_YTD * 100
+         do Format-Number(#t ,$TaxBalance_Tax_YTD, '999999999999999mi')
+         let #t = #TaxBalance_Txgrs_YTD * 100
+         do Format-Number(#t ,$TaxBalance_Txgrs_YTD, '999999999999999mi')
+         let #t = #TaxBalance_Nlgrs_YTD * 100
+         do Format-Number(#t ,$TaxBalance_Nlgrs_YTD, '999999999999999mi')
+
+         #ifdef debug_tax_balance
+          show 'YTD tax   amount retrived ' $TaxBalance_Tax_YTD
+          show 'YTD txgrs amount retrived ' $TaxBalance_Txgrs_YTD
+          show 'YTD nlgrs amount retrived ' $TaxBalance_Nlgrs_YTD
+         #endif
+
+      end-if
+
+
+end-procedure
+
+#ifdef CALC_MOH_EMPLOYER_CREDIT
+
+begin-procedure CALC-MOH-EMPLOYER-CREDIT
+  
+   !------------------------------------
+   !   	 2%	$0 to $5,000
+   !     1%	$5,001 to $10,000
+   !     1/2%	In Excess of $10,000
+   !------------------------------------
+
+   let #CALC-MOH-EMPLOYER-CREDIT = 0
+   
+   if #TaxBalance_Tax_YTD_MO_C >= 0 and #TaxBalance_Tax_YTD_MO_C <= 5000 
+     let #CALC-MOH-EMPLOYER-CREDIT = #TaxBalance_Tax_Cur * 0.02
+   else
+     if #TaxBalance_Tax_YTD_MO_C > 5000 and #TaxBalance_Tax_YTD_MO_C <= 10000 
+       let #CALC-MOH-EMPLOYER-CREDIT = #TaxBalance_Tax_Cur * 0.01
+     else
+       if #TaxBalance_Tax_YTD_MO_C > 10000 
+         let #CALC-MOH-EMPLOYER-CREDIT = #TaxBalance_Tax_Cur * 0.005
+       end-if
+     end-if
+   end-if
+   
+     let #CALC-MOH-EMPLOYER-CREDIT = round(#CALC-MOH-EMPLOYER-CREDIT,2)
+     
+     show 'Credit for MOH, TaxBalance_Tax_YTD_MO_C = ' #TaxBalance_Tax_YTD_MO_C ', = ' #CALC-MOH-EMPLOYER-CREDIT ', based on taxes of ' #TaxBalance_Tax_Cur
+   
+end-procedure
+
+begin-procedure output-moh-credit-periodic
+
+            add #CALC-MOH-EMPLOYER-CREDIT   to #CALC-MOH-EMPLOYER-CREDIT_C
+            add #CALC-MOH-EMPLOYER-CREDIT   to #CALC-MOH-EMPLOYER-CREDIT_Hash
+
+            !Save any D record elements that we need to change to stuff the 3PSP in
+            !----------------------------------------------------------------------
+            move $TaxCode              to $Saved_TaxCode
+            move $TaxBalance_Tax_Cur   to $Saved_TaxBalance_Tax_Cur
+            move $TaxBalance_Txgrs_Cur to $Saved_TaxBalance_Txgrs_Cur
+            move $TaxBalance_Nlgrs_Cur to $Saved_TaxBalance_NLgrs_Cur
+            
+            let #Saved_TaxBalance_Tax_Cur   = #TaxBalance_Tax_Cur
+            let #Saved_TaxBalance_Txgrs_Cur = #TaxBalance_Txgrs_Cur
+            let #Saved_TaxBalance_NLgrs_Cur = #TaxBalance_Nlgrs_Cur
+
+! no negative on credit 10/1/7
+            !let #TaxBalance_Tax_Cur   = 0 - #CALC-MOH-EMPLOYER-CREDIT
+            let #TaxBalance_Tax_Cur   = #CALC-MOH-EMPLOYER-CREDIT
+            let #TaxBalance_Txgrs_Cur = 0
+            let #TaxBalance_Nlgrs_Cur = 0
+            
+            let #t = #TaxBalance_Tax_Cur * 100
+            do Format-Number(#t, $TaxBalance_Tax_Cur,   '999999999999999mi')
+            let #t = #TaxBalance_Txgrs_Cur * 100
+            do Format-Number(#t,$TaxBalance_Txgrs_Cur, '999999999999999mi')
+            let #t = #TaxBalance_Nlgrs_Cur * 100
+            do Format-Number(#t,$TaxBalance_Nlgrs_Cur, '999999999999999mi')
+
+            let $TaxBalance_Gross_Cur = $TaxBalance_Nlgrs_Cur  !Subject and Gross same for now...
+
+            let $TaxCode = 'MOH_CREDIT'
+            let $TaxCode = rpad($TaxCode,15,' ')
+  	      !-------------
+                     
+            #ifdef debug_CALC_MOH_EMPLOYER_CREDIT
+             show  'output-moh-credit-periodic: #TaxBalance_Tax_Cur   = ' #TaxBalance_Tax_Cur ', taxcode = ' $Taxcode
+            #endif
+
+            do Out-D-rec   ! <--------------- this is the 3PSP Data record -------
+
+            !Restore D record fields
+            move $Saved_TaxCode to  $TaxCode
+            move #Saved_TaxBalance_Tax_Cur   to #TaxBalance_Tax_Cur
+            move #Saved_TaxBalance_Txgrs_Cur to #TaxBalance_Txgrs_Cur
+            move #Saved_TaxBalance_Nlgrs_Cur to #TaxBalance_Nlgrs_Cur
+            move $Saved_TaxBalance_Tax_Cur   to $TaxBalance_Tax_Cur
+            move $Saved_TaxBalance_Txgrs_Cur to $TaxBalance_Txgrs_Cur
+            move $Saved_TaxBalance_Nlgrs_Cur to $TaxBalance_Nlgrs_Cur
+        
+         
+end-procedure
+#endif  !CALC_MOH_EMPLOYER_CREDIT
+
+
+
+! This code is due to the NEW Transporter NOT rolling the jurisdiction amounts up within a company.. so the program will need to do it
+! -------------------------------------------------------------------------------------------------------------------------------------
+#ifdef PAYGROUP_ROLLUP_EXTRACT
+begin-procedure Output-PAYGROUP_ROLLUP_EXTRACT  
+
+  move $TaxCode              to $Saved_TaxCode
+  move #TaxBalance_Tax_Cur   to #Saved_TaxBalance_Tax_Cur
+  move #TaxBalance_Txgrs_Cur to #Saved_TaxBalance_Txgrs_Cur
+  move #TaxBalance_Nlgrs_Cur to #Saved_TaxBalance_Nlgrs_Cur
+  move $TaxBalance_Tax_Cur   to $Saved_TaxBalance_Tax_Cur
+  move $TaxBalance_Txgrs_Cur to $Saved_TaxBalance_Txgrs_Cur
+  move $TaxBalance_Nlgrs_Cur to $Saved_TaxBalance_Nlgrs_Cur
+  move #TaxBalance_Tax_Qtd   to #Saved_TaxBalance_Tax_Qtd
+  move #TaxBalance_Txgrs_Qtd to #Saved_TaxBalance_Txgrs_Qtd
+  move #TaxBalance_Nlgrs_Qtd to #Saved_TaxBalance_Nlgrs_Qtd
+  move $TaxBalance_Tax_Qtd   to $Saved_TaxBalance_Tax_Qtd
+  move $TaxBalance_Txgrs_Qtd to $Saved_TaxBalance_Txgrs_Qtd
+  move $TaxBalance_Nlgrs_Qtd to $Saved_TaxBalance_Nlgrs_Qtd
+  move #TaxBalance_Tax_Ytd   to #Saved_TaxBalance_Tax_Ytd
+  move #TaxBalance_Txgrs_Ytd to #Saved_TaxBalance_Txgrs_Ytd
+  move #TaxBalance_Nlgrs_Ytd to #Saved_TaxBalance_Nlgrs_Ytd
+  move $TaxBalance_Tax_Ytd   to $Saved_TaxBalance_Tax_Ytd
+  move $TaxBalance_Txgrs_Ytd to $Saved_TaxBalance_Txgrs_Ytd
+  move $TaxBalance_Nlgrs_Ytd to $Saved_TaxBalance_Nlgrs_Ytd
+ 
+  move $Canada_TaxBalance_Count to $Saved_Canada_TaxBalance_Count
+  move $Female_TaxBalance_Count to $Saved_Female_TaxBalance_Count
+  move $Male_TaxBalance_Count   to $Saved_Male_TaxBalance_Count
+   
+  let $PAYGROUP_ROLLUP_EXTRACT_Sum_Only = 'N'  !signals to the output routine to output, not sum the records
+
+  show ' '
+  show 'Output-PAYGROUP_ROLLUP_EXTRACT:  Outputing Data records.... PAYGROUP_ROLLUP_EXTRACT_Sum_Only = ' $PAYGROUP_ROLLUP_EXTRACT_Sum_Only
+  show '  $Header_rec_compid        = ' $Header_rec_compid
+  show '  $Header_rec_liab_dt_dtu   = ' $Header_rec_liab_dt_dtu
+ 
+  let #pb = 0
+  let $pb_found = 'f'
+  
+  let #ii = 0
+  let $taxcode_zz    = 'ZZZZZZZZZZZZZZZ'
+
+  while (#ii < #paygroup_balance_count)
+
+        let #jj = 0
+        let $sorttest =  $taxcode_zz
+        let #nextinx = 0
+        while (#jj < #paygroup_balance_count)
+         get $taxcode_chk from paygroup_balance(#jj) Taxcode
+         let $sortfield = $taxcode_chk
+
+         if ($sortfield < $sorttest)
+           let #nextinx = #jj
+           move $sortfield to $sorttest
+         end-if
+         add 1 to #jj
+        end-while
+
+        get $taxcode                  from paygroup_balance(#nextinx) taxcode
+        get #TaxBalance_Tax_Cur       from paygroup_balance(#nextinx)  TaxBalance_Tax_Cur
+        get #TaxBalance_Txgrs_Cur     from paygroup_balance(#nextinx)  TaxBalance_Txgrs_Cur
+        get #TaxBalance_Nlgrs_Cur     from paygroup_balance(#nextinx)  TaxBalance_Nlgrs_Cur
+        get #TaxBalance_Tax_Qtd       from paygroup_balance(#nextinx)  TaxBalance_Tax_Qtd
+        get #TaxBalance_Txgrs_Qtd     from paygroup_balance(#nextinx)  TaxBalance_Txgrs_Qtd
+        get #TaxBalance_Nlgrs_Qtd     from paygroup_balance(#nextinx)  TaxBalance_Nlgrs_Qtd
+        get #TaxBalance_Tax_Ytd       from paygroup_balance(#nextinx)  TaxBalance_Tax_Ytd
+        get #TaxBalance_Txgrs_Ytd     from paygroup_balance(#nextinx)  TaxBalance_Txgrs_Ytd
+        get #TaxBalance_Nlgrs_Ytd     from paygroup_balance(#nextinx)  TaxBalance_Nlgrs_Ytd
+        get #PB_Male_Count            from paygroup_balance(#nextinx)  TaxBalance_Male
+        get #PB_Female_Count          from paygroup_balance(#nextinx)  TaxBalance_Female
+        get #PB_Count                 from paygroup_balance(#nextinx)  TaxBalance_Cnt
+
+        put $taxcode_zz into paygroup_balance(#nextinx) taxcode
+
+        let #T = #TaxBalance_Tax_Cur * 100
+        do Format-Number(#t,$TaxBalance_Tax_Cur,   '999999999999999mi')
+        let #T = #TaxBalance_Txgrs_Cur * 100
+        do Format-Number(#t,$TaxBalance_Txgrs_Cur, '999999999999999mi')
+        let #T  = #TaxBalance_Nlgrs_Cur * 100
+        do Format-Number(#t,$TaxBalance_Nlgrs_Cur, '999999999999999mi')
+        let #T = #TaxBalance_Nlgrs_Cur * 100
+        do Format-Number(#t,$TaxBalance_Gross_Cur,   '999999999999999mi')
+     
+        let #T = #TaxBalance_Tax_Qtd * 100
+        do Format-Number(#t,$TaxBalance_Tax_Qtd,   '999999999999999mi')
+        let #T = #TaxBalance_Txgrs_Qtd * 100
+        do Format-Number(#t,$TaxBalance_Txgrs_Qtd, '999999999999999mi')
+        let #T  = #TaxBalance_Nlgrs_Qtd * 100
+        do Format-Number(#t,$TaxBalance_Nlgrs_Qtd, '999999999999999mi')
+
+        let #T = #TaxBalance_Tax_Ytd * 100
+        do Format-Number(#t,$TaxBalance_Tax_Ytd,   '999999999999999mi')
+        let #T = #TaxBalance_Txgrs_Ytd * 100
+        do Format-Number(#t,$TaxBalance_Txgrs_Ytd, '999999999999999mi')
+        let #T  = #TaxBalance_Nlgrs_Ytd * 100
+        do Format-Number(#t,$TaxBalance_Nlgrs_Ytd, '999999999999999mi')
+
+        do Format-Number(#PB_Count,$Canada_TaxBalance_Count,        '999999')
+        do Format-Number(#PB_Female_Count,$Female_TaxBalance_Count, '99999')
+        do Format-Number(#PB_Male_Count,$Male_TaxBalance_Count,     '99999')
+     
+        do out-D-rec
+        add 1 to #ii
+  end-while
+
+  #ifdef debug_PAYGROUP_ROLLUP_EXTRACT 
+     show 'Output-PAYGROUP_ROLLUP_EXTRACT: complete. D records written: ' #paygroup_balance_count
+  #endif
+
+  move $Saved_TaxCode to  $TaxCode
+  move #Saved_TaxBalance_Tax_Cur   to #TaxBalance_Tax_Cur
+  move #Saved_TaxBalance_Txgrs_Cur to #TaxBalance_Txgrs_Cur
+  move #Saved_TaxBalance_Nlgrs_Cur to #TaxBalance_Nlgrs_Cur
+  move $Saved_TaxBalance_Tax_Cur   to $TaxBalance_Tax_Cur
+  move $Saved_TaxBalance_Txgrs_Cur to $TaxBalance_Txgrs_Cur
+  move $Saved_TaxBalance_Nlgrs_Cur to $TaxBalance_Nlgrs_Cur
+  move #Saved_TaxBalance_Tax_Qtd   to #TaxBalance_Tax_Qtd
+  move #Saved_TaxBalance_Txgrs_Qtd to #TaxBalance_Txgrs_Qtd
+  move #Saved_TaxBalance_Nlgrs_Qtd to #TaxBalance_Nlgrs_Qtd
+  move $Saved_TaxBalance_Tax_Qtd   to $TaxBalance_Tax_Qtd
+  move $Saved_TaxBalance_Txgrs_Qtd to $TaxBalance_Txgrs_Qtd
+  move $Saved_TaxBalance_Nlgrs_Qtd to $TaxBalance_Nlgrs_Qtd
+  move #Saved_TaxBalance_Tax_Ytd   to #TaxBalance_Tax_Ytd
+  move #Saved_TaxBalance_Txgrs_Ytd to #TaxBalance_Txgrs_Ytd
+  move #Saved_TaxBalance_Nlgrs_Ytd to #TaxBalance_Nlgrs_Ytd
+  move $Saved_TaxBalance_Tax_Ytd   to $TaxBalance_Tax_Ytd
+  move $Saved_TaxBalance_Txgrs_Ytd to $TaxBalance_Txgrs_Ytd
+  move $Saved_TaxBalance_Nlgrs_Ytd to $TaxBalance_Nlgrs_Ytd
+
+  move $Saved_Canada_TaxBalance_Count to $Canada_TaxBalance_Count
+  move $Saved_Female_TaxBalance_Count to $Female_TaxBalance_Count
+  move $Saved_Male_TaxBalance_Count to $Male_TaxBalance_Count
+
+  let #paygroup_balance_count = 0
+  clear-array name=paygroup_balance
+  let $PAYGROUP_ROLLUP_EXTRACT_Sum_Only = ''
+
+end-procedure
+
+begin-procedure Sum-PAYGROUP_ROLLUP_EXTRACT 
+
+  #ifdef debug_PAYGROUP_ROLLUP_EXTRACT 
+   show 'Sum-PAYGROUP_ROLLUP_EXTRACT: ' $taxcode ' = ' #TaxBalance_Tax_Cur ' ' #TaxBalance_Txgrs_Cur ' ' #TaxBalance_Nlgrs_Cur ' ' #paygroup_balance_count
+  #endif
+  
+  let #pb = 0
+  let $pb_found = 'f'
+  while #pb < #paygroup_balance_count
+   get $taxcode_check from paygroup_balance(#pb) taxcode
+   if rtrim($taxcode_check,' ') = rtrim($taxcode,' ')
+     let $pb_found = 't'
+     break
+   end-if
+   add 1 to #pb
+  end-while
+  
+  if $pb_found = 't'
+   array-add #TaxBalance_Tax_Cur    	 to paygroup_balance(#pb)  TaxBalance_Tax_Cur
+   array-add #TaxBalance_Txgrs_Cur       to paygroup_balance(#pb)  TaxBalance_Txgrs_Cur
+   array-add #TaxBalance_Nlgrs_Cur       to paygroup_balance(#pb)  TaxBalance_Nlgrs_Cur
+   array-add #TaxBalance_Tax_Qtd         to paygroup_balance(#pb)  TaxBalance_Tax_Qtd
+   array-add #TaxBalance_Txgrs_Qtd       to paygroup_balance(#pb)  TaxBalance_Txgrs_Qtd
+   array-add #TaxBalance_Nlgrs_Qtd       to paygroup_balance(#pb)  TaxBalance_Nlgrs_Qtd
+   array-add #TaxBalance_Tax_Ytd         to paygroup_balance(#pb)  TaxBalance_Tax_Ytd
+   array-add #TaxBalance_Txgrs_Ytd       to paygroup_balance(#pb)  TaxBalance_Txgrs_Ytd
+   array-add #TaxBalance_Nlgrs_Ytd       to paygroup_balance(#pb)  TaxBalance_Nlgrs_Ytd
+   array-add #Male_TaxBalance_Count      to paygroup_balance(#pb)  TaxBalance_Male
+   array-add #Female_TaxBalance_Count    to paygroup_balance(#pb)  TaxBalance_Female
+   array-add #TaxBalance_Count           to paygroup_balance(#pb)  TaxBalance_Cnt
+  else
+   put $Taxcode               	 into paygroup_balance(#paygroup_balance_count)  Taxcode           
+   put #TaxBalance_Tax_Cur    	 into paygroup_balance(#paygroup_balance_count)  TaxBalance_Tax_Cur
+   put #TaxBalance_Txgrs_Cur     into paygroup_balance(#paygroup_balance_count)  TaxBalance_Txgrs_Cur
+   put #TaxBalance_Nlgrs_Cur     into paygroup_balance(#paygroup_balance_count)  TaxBalance_Nlgrs_Cur
+   put #TaxBalance_Tax_Qtd       into paygroup_balance(#paygroup_balance_count)  TaxBalance_Tax_Qtd
+   put #TaxBalance_Txgrs_Qtd     into paygroup_balance(#paygroup_balance_count)  TaxBalance_Txgrs_Qtd
+   put #TaxBalance_Nlgrs_Qtd     into paygroup_balance(#paygroup_balance_count)  TaxBalance_Nlgrs_Qtd
+   put #TaxBalance_Tax_Ytd       into paygroup_balance(#paygroup_balance_count)  TaxBalance_Tax_Ytd
+   put #TaxBalance_Txgrs_Ytd     into paygroup_balance(#paygroup_balance_count)  TaxBalance_Txgrs_Ytd
+   put #TaxBalance_Nlgrs_Ytd     into paygroup_balance(#paygroup_balance_count)  TaxBalance_Nlgrs_Ytd
+   put #Male_TaxBalance_Count    into paygroup_balance(#paygroup_balance_count)  TaxBalance_Male
+   put #Female_TaxBalance_Count  into paygroup_balance(#paygroup_balance_count)  TaxBalance_Female
+   put #TaxBalance_Count         into paygroup_balance(#paygroup_balance_count)  TaxBalance_Cnt
+   add 1 to #paygroup_balance_count
+   if #paygroup_balance_count >= {PAYGROUP_JURISDICTION_LIMIT}
+     show 'Increase PAYGROUP_JURISDICTION_LIMIT from {PAYGROUP_JURISDICTION_LIMIT}.'
+     stop
+   end-if
+  end-if
+  
+end-procedure
+#endif
+
+
+begin-procedure init-balances
+
+      move ' ' to $TaxBalance_Tax_Qtd
+      move ' ' to $TaxBalance_Txgrs_Qtd
+      move ' ' to $TaxBalance_Nlgrs_Qtd
+      move ' ' to $TaxBalance_Tax_YTD
+      move ' ' to $TaxBalance_Txgrs_YTD
+      move ' ' to $TaxBalance_Nlgrs_YTD
+      move 0 to #TaxBalance_Tax_Qtd
+      move 0 to #TaxBalance_Txgrs_Qtd
+      move 0 to #TaxBalance_Nlgrs_Qtd
+      move 0 to #TaxBalance_Tax_YTD
+      move 0 to #TaxBalance_Txgrs_YTD
+      move 0 to #TaxBalance_Nlgrs_YTD
+
+end-procedure
+
+! ------------------------------------------------------ end adp303p.sqc --------------------------------------

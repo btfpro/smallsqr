@@ -1,0 +1,1001 @@
+!***********************************************************************
+! GEXBNR1L:  Actual Hours sqr for Akron Meat                           *
+!            This program evaluates employees to the appropriate       *
+!            hours worked ranges based on their benefit program.       *
+!            Depending on the level of benefits which the EE evaluates * 
+!            to, this program may insert a JOB row to trigger benefit  *
+!            changes based on actual hours worked in the CURRENT month.*    
+!***********************************************************************
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module is the confidential and proprietary information of       *
+! Giant Eagle, Inc.; it is not to be copied, reproduced, or transmitted*
+! in any form, by any means, in whole or in part, nor is it to be used *
+! for any purpose other than that for which it is expressly provided   *
+! without the written permission of Giant Eagle.                       *                                                                  
+!***********************************************************************
+!                         MODIFICATION HISTORY                         *
+!***********************************************************************
+!  CSR#   INITIALS  DATE      DESCRIPTION OF THE CHANGE                *  
+!***********************************************************************
+!                                                                      *     
+! HR10397   SCM   12/12/2002  Initial creation- cloned from GEXBNR1K   *
+!                             and GEXBNR1J.                            *
+!                                                                      *
+! HR10451   GBD   02/17/2003  Benefit Program R07 included in process. *
+!                             Set ratification date based on BP.       *
+!                                                                      *
+! HR10306   GBD   03/03/2003  v8.3 Upgrade                             *
+!                                                                      *
+! HR10547   GBD   09/18/2003  Add Fairlawn store 4025 benefit program  *
+!                             and ratification date.                   *
+!                                                                      *
+! HR10761   AXL   09/20/2004  Add Canton store 4387 benefit program    *
+!                             and ratification date.                   *
+!        VENDTKK  02/02/2009  Added INCLUDE GETPOSNM.SQC to pull       *
+!                  	           JOBTITLE from POSITION_DATA.DESCR   *
+!				   field instead of JOBCODE_TBL.DESCR  *  
+!***********************************************************************
+
+#include 'setenv.sqc' !Set environment
+
+begin-setup
+
+#include 'setup32a.sqc'
+
+declare-report Report-log
+  layout=DEFAULT
+end-declare
+
+declare-report audit-report
+  layout=DEFAULT
+end-declare
+
+end-setup
+
+!*********************************************************************
+!Initial processing, retrieving current dates and calls the main 
+!procedure to do the processing.                                     
+!*********************************************************************
+begin-report
+
+  use-report Report-log
+
+  do Init-DateTime
+  do Init-Number
+  do stdapi-init
+  
+  move 'GEXBNR1L' to $ReportID
+  move 'Benefit Changes based on Actual Hours Worked' to $ReportTitle
+  display $ReportTitle
+
+  do Get-Current-DateTime
+  
+  let $reportdate_mm = substr($reportdate,1,2)
+  let $reportdate_dd = substr($reportdate,4,2)
+  let $reportdate_yy = substr($reportdate,7,2)
+ !do MakeYear4Digits ($reportdate_yy)            SCM 10/14/2002 doesnt work. year is in err
+  let $reportdate_yyyy = substr($ASOfToday,8,4) !SCM 10/14/2002  
+
+ !let $reportdate_ccyyyy = $reportdate_mm||'/'||$reportdate_dd||'/'||$reportdate_yy   SCM 10/14/2002
+  let $reportdate_ccyyyy = $reportdate_mm||'/'||$reportdate_dd||'/'||$reportdate_yyyy  !SCM 10/14/2002
+  do format-datetime($reportdate_ccyyyy,$reportdate_ccyy,{DEFMDY},'','NATIVE')
+  show '$reportdate_ccyy (used for action_dt):  ' $reportdate_ccyy
+
+  do edit-pay-calendar 
+
+  do Report
+  !do rollback-transaction                      **debug**remove
+  do Commit-Transaction
+
+  date-time () hh:mi:ss &timeEnded
+  display 'Report Ended: ' noline
+  display &timeEnded
+  do stdapi-term
+
+end-report
+
+!*********************************************************************
+!If this Program is being executed through process scheduler, the run
+!cntl parameters and calls the main processing procedure.  Otherwise,
+!interrogates the user for the run cntl parameters and validates them. 
+!If the run control parameters are invalid, stops the execution.
+!*********************************************************************
+begin-procedure Report
+
+date-time () hh:mi:ss &timeBegan
+display 'Report Began: ' noline
+display &timeBegan
+
+ move 'N' to $Errorfound
+
+  move 1 to #clicker_count_max
+
+!if $prcs_process_instance = ''
+!    input $rnctl_date 'Enter Run Control Date({Prompt-Date}): ' type=char
+!    do format-datetime($rnctl_date,$rnctl_date_dbf,{prompt-mask},'','native')
+!else
+!    do Select-Parameters
+!    if $found = 'N'
+!        goto report-exit
+!    end-if
+!   move &RC.rnctl_date to $rnctl_Date
+!end-if
+
+move $reportdate_ccyyyy to $rnctl_date
+
+let $rnctl_mm = substr($rnctl_Date,1,2)
+let $rnctl_dd = substr($rnctl_Date,4,2)
+let $rnctl_yyyy = substr($rnctl_Date,7,4)       
+let $rnctl_yy  = substr($rnctl_date,9,2)
+move $rnctl_yyyy to #rnctl_yyyy
+move $rnctl_yy to #rnctl_yy
+
+  do process-employee-data
+
+Report-Exit:
+
+
+  date-time () hh:mi:ss &timeProcess
+  display #InputTran 99999 noline
+  display ' Transactions Processed: ' noline
+  display &timeProcess
+
+end-procedure
+
+!*********************************************************************
+!Prints the header information in the report log.
+!*********************************************************************
+
+begin-heading 8 for-reports=(report-log)
+
+do get-bp-description
+
+unstring $reporttitle by '(' into $reporttitle $temp_right
+
+concat '(' with $reporttitle
+concat $prev_bp_name with $reporttitle
+concat '-' with $reporttitle
+concat &DES.DESCR with $reporttitle
+concat ')' with $reporttitle
+let $ReportID = 'BNR1LLOG'
+ #Include 'stdhdg01.sqc'
+
+!  date-time () DD-MON-YYYY &curr_Date 
+!  print &curr_Date ()
+  position (-1)
+  print 'Report Log' () center bold
+
+  position (+3)
+  print 'Trans#' (,1) bold
+  print 'Emplid' (,18) bold
+  print 'Message' (,50) bold
+  print '-' (+1,1,127) fill
+
+end-heading
+
+!*********************************************************************
+!Prints the header information in the audit report.
+!*********************************************************************
+
+begin-heading 8 for-reports=(audit-report)
+
+do get-bp-description
+
+unstring $reporttitle by '(' into $reporttitle $temp_right
+
+concat '(' with $reporttitle
+concat $prev_bp_name with $reporttitle
+concat '-' with $reporttitle
+concat &DES.DESCR with $reporttitle
+concat ')' with $reporttitle
+let $ReportID = 'BNR1LAUD'
+ #Include 'stdhdg01.sqc'
+
+  position (-1)
+
+  print 'Actual Hours SQR Audit Report' () center bold
+  position (+3)
+
+  print 'Emplid' (,1) bold
+  print 'Employee Name' (,16) bold
+  print 'Store#' (,45) bold
+  print 'Status'   (,53) bold
+  print 'Job Code' (,64) bold
+  print 'Job Code Desc' (,73) bold
+  print 'Reg/Tmp'  (,88) bold
+  print 'Service Date' (,96) bold
+  print 'MTD Hours' (,112) bold
+  print 'Message' (,132) bold
+
+  print '-' (+1,1,155) fill
+ 
+end-heading
+
+!*********************************************************************
+!Prints the footer in the report log
+!*********************************************************************
+
+begin-footing 2 for-reports=(Report-log)
+page-number (1,150) 'Page '  
+last-page () ' of ' '.'
+
+end-footing
+
+!*********************************************************************
+!Prints the footer in the audit Low Hours report
+!*********************************************************************
+
+begin-footing 2 for-reports=(audit-Report)
+page-number (1,150) 'Page '  
+last-page () ' of ' '.'
+
+end-footing
+
+!*********************************************************************
+!Determines previous month's number of weeks to find out the weekly 
+!hours worked for each employee. Calls the main benefits participation
+!logic
+!*********************************************************************
+
+Begin-Procedure Process-Employee-Data
+
+move 'N' to $errorfound
+move 'N' to $found
+!********************************************************
+!  01/07/98 - modification
+!  Company and Paygroup set here to use when querying the
+!  Pay Calendar to retrieve the correct check date rows.
+!********************************************************
+ move 'GEI' to $Co_Name
+ move 'RET' to $Pay_Name
+
+! do determine-prev-month-pay-period           !do not need     
+
+!###############################################################
+! Put a STOP command here to test and display dates 
+! without EE processing.
+!###############################################################
+
+! if ($errorfound = 'Y') or ($found = 'N')     !do not need
+!   goto skip-processing                       !do not need
+! end-if                                       !do not need
+!****************************************************************
+!Added logic to go to GEX_SQR_PROCESS table and retrieves all the 
+!benefit programs that need to be run through this SQR
+!****************************************************************
+
+  do Retrieve-benefit-pgms
+
+  if $ben_pgm_found = 'N'
+     display 'No Benefit Programs found for Process: GEXBNR1L'
+  else
+     if $log_printed = 'Y'
+        use-report report-log
+        new-page
+     end-if
+     if $audit_printed = 'Y'
+        use-report audit-report
+        new-page
+     end-if
+  end-if
+
+
+skip-processing:
+
+end-procedure
+
+!*********************************************************************
+!Retrieves each employee who participated in G01 Benefit Program and
+!calls necessary procedures to determine their weekly hours. 
+!********************************************************************* 
+
+begin-procedure process-benefit-partic
+show 'process-benefit-partic para' 
+
+move 'N' to $errorfound
+move 'N' to $beninfo_found
+
+display 'Processing for BP: ' noline
+display $BP_name
+
+if $log_printed = 'Y'
+   use-report report-log
+   new-page
+end-if
+if $audit_printed = 'Y'
+   use-report audit-report
+   new-page
+end-if
+use-report report-log
+move $bp_name to $prev_bp_name
+
+!  selecting D.reg_temp and calling a procedure to select service_date
+begin-select on-error=sql-error-found('process-benefit-partic')
+B.EMPLID  &emplid
+C.ERNCD_SPCL
+C1.FIELDNAME
+C1.FIELDNAME2
+D.EMPL_RCD
+D.EFFDT
+D.EFFSEQ
+D.ELIG_CONFIG1
+D.ELIG_CONFIG2
+D.COMPANY
+D.DEPTID
+D.ACCT_CD
+D.JOBCODE
+D.GEX_VOLUN_LOW_HRS
+D.GEX_INFLATED_HRS
+D.EMPL_STATUS 
+D.REG_TEMP
+D.Position_nbr 			!VENDTKK  ITG#56786   5-Jan-2009
+E.NAME
+
+ 
+   move 'N' to $RelatedTo2
+
+   move 'Y' to $beninfo_found
+   use-report report-log
+   move &emplid to $emplid
+   move &D.COMPANY to $company
+   show '###################################################'
+   show 'processing emplid:  ' $emplid
+
+   Do obtain-service-date
+
+! GBD 02/17/2003 Begin
+!   Let $ratification_dt = '15-DEC-2002'
+
+   Evaluate $BP_name
+    When = 'R09'
+    When = 'R11'
+      Let $ratification_dt = '15-DEC-2002'
+      Break
+    When = 'R07'
+      Let $ratification_dt = '02-MAR-2003'
+      Break
+    when = 'R15'                                    !GBD 09/18/2003
+      Let $ratification_dt = '18-SEP-2003'          !GBD 09/18/2003
+      Break                                         !GBD 09/18/2003
+    when = 'R43'                                    !AXL 09/20/2004
+      Let $ratification_dt = '19-OCT-2003'          !AXL 09/20/2004
+      Break                                         !AXL 09/20/2004
+   End-Evaluate
+
+! GBD 02/17/2003 End
+ 
+   Do format-datetime($ratification_dt,$ratification_dt_cmp,{DEFCMP},'','')  
+   show  '$ratification_dt_cmp ' $ratification_dt_cmp
+   Do Ratification-Dt-Status
+   show '$A_LVL_EE ' $A_LVL_EE
+   If $A_LVL_EE = 'Y'
+      let $allow_extra_one_time = 'Y'
+      Do Find-B-Occurs
+      show '$B_Occurs_Found ' $B_Occurs_Found
+      show '$svc_dt_cmp ' $svc_dt_cmp
+      If $B_Occurs_Found ='Y' or $svc_dt_cmp >= $ratification_dt_cmp
+         let $allow_extra_one_time = 'N'
+      End-if  
+   End-if
+       
+!   do get-status-last-month
+
+   if RTRIM(&C1.FIELDNAME2,' ') <> ''
+      Let $RelatedTo2 = 'Y'
+   end-if
+   if (&D.EMPL_STATUS = 'Q') or 
+      (&D.EMPL_STATUS = 'U') or 
+      (&D.EMPL_STATUS = 'R') or 
+      (&D.EMPL_STATUS = 'T') or 
+      (&D.EMPL_STATUS = 'D')
+      do delete-clicker-table
+   else
+      do calculate-sum-of-mtd-hrs
+
+      move #sum_mtd_hrs to $sum_mtd_hrs 9,999.99
+      show &emplid ' MTD Hours: ' $sum_mtd_hrs
+!      move #week_hrs to $week_hrs
+!     display &emplid  
+!     display 'week hrs: ' noline
+!     display $week_hrs
+
+      if ($errorfound = 'N') 
+!        and (#week_hrs > 0)
+!	display 'process elig rules'
+	 move 'N' to $atleast_one_found
+	 add 1 to #inputtran
+	 do process-elig-rules
+	 if $errorfound = 'N'
+	    do evaluate-config-value
+	 end-if
+      end-if
+   end-if
+
+FROM PS_BEN_PROG_PARTIC B,
+     PS_SPCL_EARNS_TBL C,
+     PS_BEN_DEFN_PGM C1,
+     PS_JOB D,
+     PS_PERSONAL_DATA E
+WHERE B.BENEFIT_PROGRAM = $BP_name
+  AND B.EMPLID   = D.EMPLID
+  AND B.EMPL_RCD = D.EMPL_RCD
+  AND D.EMPL_STATUS IN ('A','L','P','Q','U','R','T','D')
+  AND B.EMPLID   = E.EMPLID
+  AND C1.BENEFIT_PROGRAM = B.BENEFIT_PROGRAM
+  AND C1.GEX_SPCL_ACCUM_CD = C.ERNCD_SPCL
+  AND B.EFFDT = (SELECT MAX(EFFDT)
+		 FROM PS_BEN_PROG_PARTIC
+		 WHERE EMPLID   = B.EMPLID
+		   AND EMPL_RCD = B.EMPL_RCD
+		   AND EFFDT   <= $effdt_dbf)
+  AND C1.EFFDT = (SELECT MAX(EFFDT)
+		   FROM PS_BEN_DEFN_PGM
+		  WHERE BENEFIT_PROGRAM   = $BP_name
+!		    AND GEX_SPCL_ACCUM_CD = C.ERNCD_SPCL
+		    AND EFFDT  <= $effdt_dbf)
+  AND C.EFFDT = (SELECT MAX(C3.EFFDT)
+                   FROM PS_SPCL_EARNS_TBL C3
+                  WHERE C3.ERNCD_SPCL = C.ERNCD_SPCL
+                    AND C3.EFF_STATUS = 'A'
+                    AND C3.EFFDT <= $effdt_dbf)
+  AND D.EFFDT = (SELECT MAX(EFFDT)
+		   FROM PS_JOB
+		  WHERE EMPLID   = D.EMPLID
+		    AND EMPL_RCD = D.EMPL_RCD
+		    AND EFFDT   <= $effdt_dbf)
+  AND D.EFFSEQ = (SELECT MAX(EFFSEQ)
+		   FROM PS_JOB
+		  WHERE EMPLID   = D.EMPLID
+		    AND EMPL_RCD = D.EMPL_RCD
+		    AND EFFDT    = D.EFFDT)
+ORDER BY D.DEPTID, E.NAME
+end-SELECT
+
+ 
+if $beninfo_found = 'N'
+   Let $beninfo_found = ' '
+   show 'No Benefit Participation information found'
+   show 'Dates used for select: '
+   show '$status_asofdate_dbf = ' $status_asofdate_dbf
+   show '$effdt_dbf           = ' $effdt_dbf
+   show '-------------------------------------------'
+   do error-found
+   print 'No Benefit Participation information found' (,34)
+end-if
+
+end-procedure
+!*********************************************************************
+
+begin-procedure get-status-last-month 
+begin-select
+
+dd.empl_status
+
+from ps_job dd
+
+where dd.emplid = $emplid
+  and dd.empl_rcd = &d.empl_rcd
+  and dd.empl_status in ('A','L','P','Q','U','R','T','D')
+  AND dd.EFFDT = (SELECT MAX(dd1.EFFDT)
+	 FROM PS_JOB dd1
+	  WHERE dd1.EMPLID   = dd.EMPLID
+	    AND dd1.EMPL_RCD = dd.EMPL_RCD
+	    AND dd1.EFFDT   <= $prev_effdt_dbf)
+  AND dd.EFFSEQ = (SELECT MAX(dd2.EFFSEQ)
+        FROM PS_JOB dd2
+	  WHERE dd2.EMPLID   = dd.EMPLID
+	    AND dd2.EMPL_RCD = dd.EMPL_RCD
+	    AND dd2.EFFDT    = dd.EFFDT)
+end-select
+
+end-procedure   !get-status-last-month 
+
+!*********************************************************************
+!Retrieve employee's service date
+!*********************************************************************
+
+begin-procedure Obtain-service-date
+begin-select on-error=sql-error-found('Obtain-Service-date')
+EMP.SERVICE_DT 	
+
+ Do format-datetime (&EMP.SERVICE_DT,$svc_dt_cmp,{DEFCMP},'','')   
+
+EMP.EMPL_RCD
+
+    move &emp.service_dt to $emp_service_dt
+    do convert-to-dtu-date($emp_service_dt,$emp_service_dt_dtu)
+
+    Let $service_month = substr($emp_service_dt_dtu,6,2)
+    Let #service_month = to_number($service_month)
+    Let $service_year  = substr($emp_service_dt_dtu,1,4)
+    Let #service_year  = to_number($service_year)
+    Let $service_year_mm = $service_year || $service_month
+    Let #service_year_mm = to_number($service_year_mm)
+!        display '$service_yyyy_mm ' noline
+!        display $service_yyyy_mm
+!        display '#service_yyyy_mm ' noline
+!        display #service_yyyy_mm  
+!       display 'service date ' noline
+!       display $emp_service_dt
+!       display 'service month ' noline
+!       display $service_month
+!        display 'service year ' noline
+!        display $service_year
+
+FROM PS_EMPLOYMENT EMP
+
+WHERE EMP.EMPLID   = $emplid
+  and EMP.EMPL_RCD = &d.empl_rcd
+
+ 
+end-SELECT
+
+end-procedure
+
+
+!*********************************************************************
+begin-procedure Ratification-Dt-Status
+!*********************************************************************
+
+    Let $A_LVL_EE = 'N'
+
+begin-select on-error=sql-error-found('Ratification-Dt-Status')
+RD.EFFDT
+RD.ELIG_CONFIG2
+
+    if substr(&RD.ELIG_CONFIG2,4,1) = 'A'
+       Let $A_LVL_EE = 'Y'
+    end-if
+
+FROM PS_JOB RD
+
+WHERE RD.EMPLID    = $emplid
+  and RD.EMPL_RCD  = &d.empl_rcd
+  AND RD.EFFDT  = (SELECT MAX(EFFDT) FROM PS_JOB
+	          WHERE RD.EMPLID    = EMPLID
+	            AND RD.EMPL_RCD  = EMPL_RCD
+	            AND EFFDT <= $ratification_dt)
+  AND RD.EFFSEQ = (SELECT MAX(EFFSEQ) FROM PS_JOB 
+	          WHERE RD.EMPLID    = EMPLID
+	            AND RD.EMPL_RCD  = EMPL_RCD
+	            AND RD.EFFDT     = EFFDT)
+end-SELECT
+
+end-procedure
+  
+!*********************************************************************
+begin-procedure Find-B-Occurs
+!*********************************************************************
+
+  Let $B_Occurs_Found = 'N'
+
+begin-select on-error=sql-error-found('Find-B-Occurs')
+'BB'
+
+  Let $B_Occurs_Found = 'Y'
+
+FROM PS_JOB BB
+
+WHERE BB.EMPLID    = $emplid
+  and BB.EMPL_RCD  = &d.empl_rcd
+  AND BB.EFFDT  = (SELECT MAX(EFFDT) FROM PS_JOB
+	          WHERE BB.EMPLID    = EMPLID
+	            AND BB.EMPL_RCD  = EMPL_RCD
+                    AND SUBSTR(ELIG_CONFIG2,4,1) IN ('B','C')      !SCM  10/15/2002
+	            AND EFFDT > $ratification_dt)
+  AND BB.EFFSEQ = (SELECT MAX(EFFSEQ) FROM PS_JOB 
+	          WHERE BB.EMPLID    = EMPLID
+	            AND BB.EMPL_RCD  = EMPL_RCD
+	            AND BB.EFFDT     = EFFDT)
+end-SELECT
+
+end-procedure
+
+!*********************************************************************
+!Compares the existing job table config2 field and the calculated field
+!and processes further
+!*********************************************************************
+
+begin-procedure Evaluate-config-value
+
+move 'Y' to $delete_clicker
+
+move &D.ELIG_CONFIG2 to $elig_config2_job
+move $ee_config2_val to $elig_config2
+
+let $ee_config2_val_nospaces = rtrim($ee_config2_Val,' ')
+let $ee_config2_job_nospaces = rtrim($elig_config2_job,' ')
+
+ 
+!display 'Volun Value:'
+!display &d.gex_volun_low_hrs
+!display $ee_config2_val_nospaces
+!display $ee_config2_job_nospaces
+
+
+!if $ee_config2_val_nospaces = $ee_Config2_job_nospaces
+ 
+
+   let $ee_config2_val_4to7 = substr($ee_config2_val_nospaces,4,7)
+   let $ee_config2_job_4to7 = substr($ee_config2_job_nospaces,4,7)
+
+show '-----------e v a l u a t e    c o n f i g   v a l u e--------------'
+show 'Pgm Config2 Value:' $ee_config2_val_4to7
+show 'Job Config2 Value:' $ee_config2_job_4to7
+show '-------------------------------------------------------------------'
+
+   Evaluate $ee_config2_val_4to7
+     when = 'A000000'
+	 evaluate $ee_config2_job_4to7 
+	     when = 'A000000'
+		 do delete-clicker-table
+             when = 'B000000'
+                 if &D.GEX_INFLATED_HRS = 'N'
+                    !EE goes to A 1st of mth after 3 consec mths of A hrs
+                    move 2 to #clicker_count_max
+                    let $active_all_month = 'Y'
+    		    do select-clicker-table
+	 	    do process-clicker-count
+                    move 1 to #clicker_count_max
+                    let $active_all_month = 'N'
+		 end-if     !else if 'Y', stop and leave benefit level at 'B'  
+	     when = 'C000000'
+		 if &D.GEX_INFLATED_HRS = 'N'    !move up to 'B' immediately, delete all clicks
+                    let $elig_config2 = '000B000000' 
+                    show '$$$$$$$$$$   A to C    I N S E R T  B   $$$$$$$$$$'       
+          	    do insert-procedure
+!                    do update-personal-data
+                    do delete-clicker-table       
+		 end-if                          !if 'Y', stop and leave at current level 'C' 
+	     when-other
+                 show '$$$$$$$$$$   A -when other  I N S E R T    $$$$$$$$$$' 
+		 do insert-procedure            
+
+!                 do update-personal-data          
+ 
+                 do delete-clicker-table       
+	   end-evaluate
+     when = 'B000000'
+	 evaluate $ee_config2_job_4to7
+	     when = 'A000000'
+		 if &D.GEX_INFLATED_HRS = 'Y'
+		    do write-audit-report
+		    print 'Decrease in hours worked with inflated hrs on' (,121)
+		 end-if
+
+		 do find-empl-active-all-month
+
+                 If $active_all_month = 'N'
+                    do select-clicker-table
+                    do process-clicker-count
+                 else
+
+               	    if &D.GEX_VOLUN_LOW_HRS = 'Y'
+    		       do select-clicker-table
+	 	       do process-clicker-count
+		    else
+                       !AXL 10/1/2002 - Begin
+                       if $A_LVL_EE = 'Y'    !ee was an 'A' lvl at ratif dt
+                          if $allow_extra_one_time = 'Y'       !A lvl ee does NOT have    
+							       !B or C row after ratif dt   
+                             move 5 to #clicker_count_max
+    		             do select-clicker-table
+	 	             do process-clicker-count
+                             move 1 to #clicker_count_max
+                          else         !A lvl ee has a B or C row after r-date or a newhire
+                             move 2 to #clicker_count_max
+    		             do select-clicker-table
+	 	             do process-clicker-count
+                             move 1 to #clicker_count_max
+                          end-if
+                       end-if
+                      
+		    end-if                 
+
+                 end-if
+
+
+	     when = 'B000000'
+		 do delete-clicker-table
+	     when = 'C000000'
+		 if &D.GEX_INFLATED_HRS = 'N'     !no 3 month wait, move immediately
+                    show '$$$$$$$$$$   B to C    I N S E R T      $$$$$$$$$$'
+		    do insert-procedure             
+!                    do update-personal-data
+                    do delete-clicker-table       
+ 		 end-if                           !if inflated_hrs=Y, stop, leave at level B
+	         
+	     when-other
+                 show '$$$$$$$$$$   B -when other  I N S E R T    $$$$$$$$$$' 
+		 do insert-procedure
+ 
+!                 do update-personal-data            
+
+                 do delete-clicker-table       
+     	     end-evaluate
+     when = 'C000000'
+	 evaluate $ee_config2_job_4to7
+	     when = 'A000000'
+                 do find-empl-active-all-month
+ 
+                 if $active_all_month = 'N'
+                    do select-clicker-table
+                    do process-clicker-count
+                 else
+                    if #end_yyyymm               != #service_year_mm  
+     		       do write-audit-report
+		       print 'Employee working low hours not coded as Vol Low' (,121)
+                    end-if
+                    if &D.GEX_VOLUN_LOW_HRS = 'N'
+                    
+                       if $A_LVL_EE = 'Y'
+                          if $allow_extra_one_time = 'Y'
+                             move 5 to #clicker_count_max
+    		             do select-clicker-table
+	 	             do process-clicker-count
+                             move 1 to #clicker_count_max
+                          else          !A lvl ee has a B or C row after r-date or a newhire
+                             move 2 to #clicker_count_max
+    		             do select-clicker-table
+	 	             do process-clicker-count
+                             move 1 to #clicker_count_max
+                          end-if
+                       end-if
+                    
+                    else       !VOLUN_LOW_HRS = 'Y
+                       move 1 to #clicker_count_max
+    		       do select-clicker-table
+	 	       do process-clicker-count
+                       !#clicker_count_max should stay at 1 (reset)
+                    end-if
+                 end-if
+             when = 'B000000'
+		 do find-empl-active-all-month
+                 if $active_all_month = 'N'
+                    do select-clicker-table
+                    do process-clicker-count
+                 else                    !active_all_month = 'Y'
+                    if #end_yyyymm       != #service_year_mm  
+     		       do write-audit-report
+		       print 'Employee working low hours not coded as Vol Low' (,121)
+                    end-if 
+                    !AXL 10/1/2002 - Begin
+	            !do select-clicker-table
+	            !do process-clicker-count
+                    move 1 to #clicker_count_max
+    	            do select-clicker-table
+	            do process-clicker-count
+                    !#clicker_count_max should stay at 1 (reset)                                           
+		 end-if                 
+ 
+     
+	      when = 'C000000'
+ 
+		 if ( &D.GEX_VOLUN_LOW_HRS = 'N' ) and ( #end_yyyymm != #service_year_mm )
+		    do write-audit-report
+		    print 'Employee working low hours not coded as Vol Low' (,121)
+		 end-if
+	     when-other
+ 
+		 if ( &D.GEX_VOLUN_LOW_HRS = 'N' ) and ( #end_yyyymm != #service_year_mm )
+		    do write-audit-report
+		    print 'Employee working low hours not coded as Vol Low' (,121)
+		 end-if
+                 show '$$$$$$$$$$   C -when other  I N S E R T    $$$$$$$$$$' 
+		 do insert-procedure
+!                 do update-personal-data         
+                 do delete-clicker-table       
+
+             end-evaluate
+     when-other
+	 do write-audit-report
+	 print 'Employee does not evaluate to an actual hours range for benefits program: ' (,121)
+	 print $bp_name ()
+   end-evaluate    
+
+end-procedure
+
+!*********************************************************************
+!Selects the clicker table row for the employee
+!*********************************************************************
+begin-procedure select-clicker-table
+
+move 'N' to $clicker_found
+move 0 to #clicker_count
+
+begin-select on-error=sql-error-found('Select-Clicker-table')
+CLK.EMPLID
+CLK.EMPL_RCD
+CLK.COUNTER
+
+   move &clk.counter to #clicker_count
+   move 'Y' to $clicker_found
+
+FROM PS_GEX_CLICKER CLK
+
+WHERE CLK.EMPLID   = $emplid
+  AND CLK.EMPL_RCD = &D.EMPL_RCD
+
+end-select
+
+end-procedure
+
+!*********************************************************************
+!If the clicker count is greater than or equal to 4, reports the employee
+!with corresponding message. Otherwise, if the clicker count is equal 
+!to the maximum value, inserts job row and delete the clicker table 
+!entry for the employee.  If the clicker count is less than the maximum,
+!update the clicker table with the new value.
+!*********************************************************************
+begin-procedure process-clicker-count
+
+if $clicker_found = 'N'
+   move 0 to #clicker_count
+end-if
+
+  
+if #clicker_count >= #clicker_count_max and $active_all_month = 'Y'
+   do insert-procedure
+ 
+!   do update-personal-data
+ 
+   do delete-clicker-table       
+else
+ 
+      add 1 to #clicker_count
+      if $clicker_found = 'Y'
+	 do update-clicker-table
+      else
+	 do insert-clicker-table
+      end-if
+ 
+
+  if #clicker_count >= #clicker_count_max
+
+    do write-audit-report
+    print 'Employee is at ' (,121)
+    move #clicker_count to $clicker_cnt 99
+    print $clicker_cnt ()
+
+!   print ' month prior to benefit reduction' ()
+    if #clicker_count = 1
+      print ' month prior to benefit reduction' ()
+    else
+      print ' months prior to benefit reduction' ()
+    end-if
+
+  end-if
+end-if
+
+end-procedure
+
+!*********************************************************************
+!Deletes the clicker table entry for the employee
+! This procedure now found in GEXBNAHP.SQC
+!*********************************************************************
+
+!begin-procedure delete-clicker-table
+
+!begin-sql on-error=sql-error-found('delete-clicker-table')
+!DELETE FROM PS_GEX_CLICKER
+!WHERE EMPLID   = $emplid
+!  AND EMPL_RCD = &D.EMPL_RCD
+!end-sql
+!DISPLAY 'IN CLICKER TABLE ' 
+!DISPLAY 'EMPLID ' NOLINE
+!DISPLAY $EMPLID
+!DISPLAY 'EMPL RCD ' NOLINE
+!DISPLAY &D.EMPL_RCD 
+!end-procedure
+
+!*********************************************************************
+!Updates the GEX_CLICKER COUNTER field 
+!*********************************************************************
+
+begin-procedure update-clicker-table
+show '*******************  U P D A T E   CLICKER TABLE  *******************'
+
+begin-sql on-error=sql-error-found('update-clicker-table')
+UPDATE PS_GEX_CLICKER
+   SET COUNTER  = #clicker_count
+WHERE EMPLID    = &CLK.EMPLID
+   AND EMPL_RCD = &CLK.EMPL_RCD
+end-sql
+
+end-procedure
+
+!*********************************************************************
+!Inserts into Clicker table
+!*********************************************************************
+
+begin-procedure insert-clicker-table
+show '**************   INSERT CLICKER TABLE   ********************'
+
+begin-sql on-error=sql-error-found('insert-clicker-table')
+INSERT INTO PS_GEX_CLICKER
+(EMPLID,
+EMPL_RCD,
+COUNTER)
+VALUES(
+$emplid,
+&D.EMPL_RCD,
+#clicker_count)
+end-sql
+
+end-procedure
+
+!*********************************************************************
+!Writes the corresponding messages to report log
+!*********************************************************************
+
+begin-procedure write-audit-report
+#debug9 show 'gexbnr1l.write-audit-report'
+
+move 'Y' to $audit_printed
+
+  use-report audit-report
+!  do Format-Number(#InputTran, $out, '99999')
+!  print $out (+1,1)
+
+  move &D.JOBCODE to $jobcode
+  do get-job-title
+  
+  !VENDTKK Begin   ITG#56786   5-Feb-2009
+
+  Let $Position_Nbr = &D.Position_nbr
+  Do Get-Position-Title			 !getposnm.sqc
+  	 IF $PosNameAbbrv = '' 
+  		Let $JobTitleabbrv = $JobTitleabbrv
+	 Else
+ 		Let $JobTitleabbrv = $PosNameAbbrv
+	 End-if
+ !VENDTKK End   ITG#56786   5-Feb-2009
+  
+  move 'EMPL_STATUS' to $FieldName
+  move ' ' to $xlatshortname
+  move &DD.EMPL_STATUS to $FieldValue
+  do Read-Translate-Table
+  move ' ' to $status
+!  display 'Xlat Short:' noline
+!  display $xlatshortname
+  move $xlatShortName to $status
+!  display 'Status:' noline
+!  display $status
+
+  let $EmplId_1st3 = substr($EmplId,1,3)
+  let $EmplId_mid2 = substr($EmplId,4,2)
+  let $EmplId_last4 = substr($EmplId,6,4)
+ 
+  String $EmplId_1st3 $EmplID_mid2 $EmplId_last4 by '-' into $EmplId11
+
+! JNB 01/18/1999 Made several changes to print format 
+  print $emplid11  (+1,1)
+  print &E.Name    (,16)
+  print &D.DEPTID  (,45)
+  print $status (,53)
+  print &D.JOBCODE (,64)
+  print $JobTitleabbrv (,75)
+  print &D.reg_temp (,88)
+  print &emp.service_dt (,96)
+
+  do Format-Number(#sum_mtd_hrs,$out, '9999.99')
+  print $out (,112)
+  
+
+end-procedure
+
+
+!------------------------------------------------------------------
+#Include 'tranctrl.sqc'  !Common Transaction Control Procedures
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'payrnctl.sqc'  !Select-Parameters
+#Include 'stdapi.sqc'    !Get_Run_Control Procedure
+#Include 'datemath.sqc'  !Does the date-math functions
+#Include 'readxlat.sqc'  !Read xlattable
+#Include 'getjobtl.sqc'  !Get Job Title
+#Include 'gexbnahp.sqc'  !Procedures for actual hours 
+#include 'gexbnmdt.sqc'  !Edit-pay-calendar parameters
+#Include 'getposnm.sqc'  !Get-Position-Title    VENDTKK ITG#56786   5-Feb-2009  	

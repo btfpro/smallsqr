@@ -1,0 +1,998 @@
+!***********************************************************************
+! GEXPY616:  SERVICE AWARD TERM REPORT                                 *
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module is the confidential and proprietary information of       *
+! Giant Eagle, Inc.; it is not to be copied, reproduced,or transmitted *
+! in any form, by any means, in whole or in part, nor is it to be used *
+! for any purpose other than that for which it is expressly provided   *
+! without the written permission of Giant Eagle.                       *
+!                                                                      *
+! Copyright (c) 1997-1998 Giant Eagle,Inc. All Rights Reserved         *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+! GEXPY616 :		Service Award Term Report                      *
+!                                                                      *
+! Narrative:		After Service Award Tape is sent to            *
+!                       O C Tanner, this report is run every month to  *
+!                       list the term employees (employees originally  *
+!                       reported on the tape).  Report is used to      *                                                    
+!                       inform O C Tanner to stop sending the award to *
+!                       these terminated employees.                    *
+!                                                                      *
+! #Debugx Used:		#debug9 paragraph trace                        *
+!				#debug8 key variable values                    *
+!				#debug7 data returned from sql calls           *
+!                                                                      *
+! SQL Tables:		location_tbl                                   *
+!                       personal_data                                  *
+!                       employment                                     *
+!                       job                                            *
+!                                                                      *
+! Written by:		Gene Davis                                     *
+!                                                                      *
+! Normally Run:		On Demand                                      *
+!                                                                      *
+! Control Parms:		FOR WHERE CLAUSE:                              *
+!				  Company  			   	                 *
+!				  From Date                                    *
+!				  Thru Date                                    *
+!				  As Of Date                                   *
+!                                                                      *
+!***********************************************************************
+!                         MODIFICATION HISTORY                         *
+!***********************************************************************
+! INITIALS	DATE		DESCRIPTION OF THE CHANGE                      *
+!***********************************************************************
+! GXD		03/11/98	Initial Creation                               *
+! SXK       01/27/99    Added stdhdg01 sqc  and adjusted logic 
+!				to check employee's anniversary fall in
+!				between from date and thru date
+! SXK       01/29/99    Added term date and status                     *
+!                                                                      *
+! JNB       02/03/1999  Service date was used to calculate the years of*
+!                       service. It was decided to use  company        *
+!                       seniority date. All reference to service date  *
+!                       is changed to company seniority date.          *        
+!                                                                      *
+! SXK       11/29/1999  Changed from zip to postal                     *
+!                                                                      * 
+! JNB       04/11/2000  When FromDate and ThruDate left blank system   *
+!                       will obtain the dates. SaveEdit PeopleCode was *
+!                       changed enabling run cntl panel to be saved    *
+!                       with above two fields blank.                   *
+! SCM      03/09/2001   Added code for Cleveland (company='RFI')       *
+!                                                                      * 
+! GBD      12/19/2002   Remove 5 year report from processing.          *
+!                                                                      * 
+! GBD      04/09/2003   Added code to include all termination, retired,*
+!                       and deceased status codes from report file.    *
+!                                                                      * 
+! GBD      08/07/2003   Changed personnel manager to hr manager.       *
+!                       Modified program to read temp table created by *
+!                       gexpy615 to reference to create the term rpt.  *
+!                       Remove call to gexxx900.sqc run control sqc.   *
+!                                                                      * 
+!  NPK         10/03/2006       The vendor Changed  from OC tanner to  *
+!                               CA short & changed the file layout as  *  
+!                               per the new vendor.                    *
+!                               Changed the SQR to send the Employees  *  
+!                               data to contact names from GEX_DEPT_TBL*
+!                               Stand alones are sent to General Manager  
+!                               Pharmacies within Independent stores   *
+!                               are sent to Pharmacy Manager           *
+!                               Modified to pick up the company address*  
+!                               from ESTAB_TBL instead of LOCATION TBL.*
+!                               Modified to send EMPLID instead of SSN.*
+!                               Changed GET STORE Info & Get Contact Person
+!                               procedures to be in sync with GEXPY615.*
+!                               Added new Company MCC & Paygroup RE5.  *  
+!                               Cleaned up the SQR by removing all the *  
+!                               unwanted code                          *
+!                                                                      *
+! GEX-AXG    08/17/2007	Upgrade 9.0			      	       *
+! GEX-TLL    03/26/2008 HCM 9.0 Upgrade(Was not showing year on reort  *
+! GEX-MXT    04/02/2008 ADDED THE join condition for PER_ORG_INST      *
+!***********************************************************************
+
+
+#include 'setenv.sqc' !Set environment
+#include 'setup02.sqc'
+
+!*********************************************************************
+!Initial processing, retrieving current dates and calls the main 
+!procedure to do the processing.                                     
+!*********************************************************************
+begin-report
+
+  do Init-DateTime
+  do Init-Number
+  do stdapi-init
+  do Get-Calendar-Year-Id
+  move 'GEXPY616' to $ReportID
+  move 'Service Award Term Report' to $ReportTitle
+  display $ReportTitle noline
+
+  do Get-Current-DateTime
+   
+  let $sev-error = 'N'
+  let $firstcomp = 'Y'
+  let $firstrec = 'Y'
+  let $firstacctcd = 'Y'
+  let $firstemplid = 'Y'
+  let #pass1a = 0
+  let #pass1 = 0
+  let $company-changed = 'N'
+  let $deptid-changed = 'N'
+  let $OK_Process = 'N'
+
+  let #empl-count = 0
+
+  do Report
+  do Commit-Transaction
+  date-time () hh:mi:ss &timeEnded
+  display 'Report Ended: ' noline
+  display &timeEnded
+  do stdapi-term
+  !*do Reset
+end-report
+
+!*********************************************************************
+!If this Program is being executed through process scheduler, 
+!the run control parameters and calls the main processing procedure.
+!Otherwise, interrogates the user for the run control parameters and 
+!validates them. If the run control parameters are invalid, stops the
+!execution.
+!*********************************************************************
+begin-procedure Report
+
+date-time () hh:mi:ss &timeBegan
+display 'Report Began: ' noline
+display &timeBegan
+
+ move 'N' to $Errorfound
+
+if $prcs_process_instance = ''
+
+!GBD 08/07/2003 - Begin - Remove
+!  let $GEXXX900_INCLUDE_COMPANY_CRITERIA = 'B.COMPANY IN (''AET'',''GEI'',''TMK'',''BRM'',''RTP'',''RFI'')'    !SCM 3/09/2001
+!  let $GEXXX900_INCLUDE_COMPANY_DISPLAY_CRITERIA = $GEXXX900_INCLUDE_COMPANY_CRITERIA
+!GBD 08/07/2003 - End
+
+  Let $X000_Where_Select_AsOfDate = $AsOfToday
+
+!****************** Accept Input from user for information ************************
+ display ' '
+ input $begindate maxlen=10 type=char 'Enter the Quarter Begin Date (mm/dd/yyyy) '
+ if rtrim($begindate, '') = ''
+    let $begindate = ' '
+    display ' '
+    display 'Quarter Begin Date Required - Execution Halted.'
+    goto Report-exit
+ else
+    let $begindate = rtrim($begindate,' ')
+ end-if
+
+ display ' '                                                                                    
+ input $enddate maxlen=10  type=char 'Enter the Quarter End Date (mm/dd/yyyy) '
+ if rtrim($enddate, ' ') = ''
+    display ' '
+    display 'Quarter End Date Required - Execution Halted.'
+    goto Report-exit
+ else
+    let $enddate = rtrim($enddate, ' ')
+ end-if
+
+else
+  Do GEXXX922-Select-Parameters
+
+  Let $X000_Where_Select_AsOfDate = $GEX_RC_PAY.AsOfDate
+  If Rtrim ($GEX_RC_PAY.AsOfDate, ' ') = ''
+    Let $X000_Where_Select_AsOfDate = $AsOfToday
+  End-If
+
+! JNB 04/11/2000
+  
+  Let $FromDate = $GEX_RC_PAY.FromDate
+  Let $ThruDate = $GEX_RC_PAY.ThruDate
+  Show '$FromDate ' $FromDate
+  Show '$ThruDate ' $ThruDate
+
+  If Rtrim($FromDate,' ') = '' and 
+     Rtrim($ThruDate,' ') <> ''
+     display ' '
+     display 'Provide both FromDate and Thrudate or leave both blank'
+     goto Report-exit
+  end-if
+
+  If Rtrim($FromDate,' ') <> '' and 
+     Rtrim($ThruDate,' ') =  ''
+     display ' '
+     display 'Provide both FromDate and Thrudate or leave both blank'
+     goto Report-exit
+  end-if
+
+  If Rtrim($FromDate,' ') = '' and
+     Rtrim($ThruDate,' ') = ''
+	
+      LET $REPORTDATE_MM = SUBSTR($Reportdate,1,2)                               
+	LET $REPORTDATE_DD = SUBSTR($REPORTDATE,4,2)                                                      
+	
+	LET $REPORTDATE_YY = SUBSTR($REPORTDATE,7,2)                                                      
+	
+  												    
+	DO MAKEYEAR4DIGITS ($REPORTDATE_YY)        
+       
+      If $Reportdate_mm <= '03'
+         Let $FromDate = '01-JAN-' || $Reportdate_yy
+         Let $ThruDate = '31-MAR-' || $Reportdate_yy
+      End-If
+   
+      If $Reportdate_mm >= '04' and $Reportdate_mm <= '06'
+         Let $FromDate = '01-APR-' || $Reportdate_yy
+         Let $ThruDate = '30-JUN-' || $Reportdate_yy
+      End-If
+
+      If $Reportdate_mm >= '07' and $Reportdate_mm <= '09'
+         Let $FromDate = '01-JUL-' || $Reportdate_yy
+         Let $ThruDate = '30-SEP-' || $Reportdate_yy
+      End-If
+
+      If $Reportdate_mm >= '10' 
+         Let $FromDate = '01-OCT-' || $Reportdate_yy
+         Let $ThruDate = '31-DEC-' || $Reportdate_yy
+      End-If
+
+  End-If
+
+  Let $Year4 = '1'
+  Do Format-DateTime ($FromDate, $begindate, {DEFMDY}, '', '')
+  Let $Year4 = '1'
+  Do Format-DateTime ($ThruDate, $enddate, {DEFMDY}, '', '')
+  
+
+!  Let $GEXXX900_Company_Alias = 'B.COMPANY'          !GBD 08/07/2003
+!  Do GEXXX900-Select-Company-Parameters              !GBD 08/07/2003
+end-if
+
+!**********************************
+! Setup Date Check
+!**********************************  
+date-time () MM/DD/YYYY &curr_date
+
+
+  move &curr_date to $curr_date
+
+  let $from_mm = substr($begindate,1,2)
+  let $from_dd = substr($begindate,4,2)
+  let $from_yy = substr($begindate,9,2)
+
+  do Format-DateTime($begindate,$out1,{DEFMDY},'','native')
+  display $out1
+
+  let $thru_mm = substr($enddate,1,2)
+  let $thru_dd = substr($enddate,4,2)
+  let $thru_yy = substr($enddate,9,2)
+
+  do Format-DateTime($enddate,$out2,{DEFMDY},'','native')
+  display $out2
+
+!  display $begindate
+!  display $from_yy noline
+!  display $from_mm noline
+!  display $from_dd
+!  display $enddate
+!  display $thru_yy noline
+!  display $thru_mm noline
+!  display $thru_dd
+
+  do Format-DateTime($begindate,$begin_dt,{DEFMDY},'','native')
+  do Format-DateTime($enddate,$end_dt,{DEFMDY},'','native')
+
+  do Format-DateTime($begin_dt,$date1,{DEFCMP},'','')
+  do Format-DateTime($end_dt,$date2,{DEFCMP},'','')
+
+!  display $date1
+!  display $date2
+
+  if $date1 > $date2
+     display ' '
+     display 'The From Date can not be greater than the Thru Date'
+     goto Report-exit
+  else
+     do Diff-Date($begin_dt,$end_dt,#years,#months,#days)
+
+!     display #years
+!     display #months
+!     display #days
+
+     if #years > 0
+	display ' '
+	display 'The Hire Date Range cannot exceed one year.'
+	goto Report-exit
+     end-if
+  end-if
+
+  Do P130-Print-Cover-Page
+
+  do process-data
+
+
+Report-Exit:
+
+
+  date-time () hh:mi:ss &timeProcess
+  display #InputTran 99999 noline
+  display ' Transactions Processed: ' noline
+  display &timeProcess
+
+end-procedure
+
+begin-procedure Get-Values
+   let $language_cd = $PRCS_LANGUAGE_CD
+end-procedure
+
+!*********************************************************************
+!Prints the header information in the report.
+!*********************************************************************
+
+begin-heading 7
+!Sxk 01/27/99  Added stdhdg01 to get into mobius
+
+#include 'stdhdg01.sqc'
+
+!  print 'Report ID:  '    (1,1)
+!  print $ReportID         ()
+
+!  uppercase $ReportTitle
+!  print $ReportTitle      (0,49)
+
+!  print 'Run Date:'       (0,110)
+!  date-time () DD-MON-YYYY &curr_Date 
+!  print &curr_Date ()
+
+  let $Subheading = 'From Date - Thru Date: '||$begindate||' - '||$enddate
+  print $Subheading             (-1,1)
+
+  position (+2)
+  
+end-heading
+
+!*******************************************************
+! Prints the footer in the report
+!*******************************************************
+begin-footing 2
+page-number (+1,110) 'Page '  
+last-page () ' of ' '.'
+end-footing
+
+begin-procedure P130-Print-Cover-Page
+#debug9 Show 'P130-Print-Cover-Page'
+  Print 'RUN CONTROL INFORMATION FOR THIS REPORT RUN:'            (+5,1)
+  Print '$Prcs_OprID          ='                                  (+2,5)
+  Print $Prcs_OprID                                               (0,+2)
+  Print '$Prcs_Run_Cntl_ID    ='                                  (+1,5)
+  Print $Prcs_Run_Cntl_ID                                         (0,+2)
+
+!GBD 08/07/2003 Begin
+!  Print 'SELECTION CRITERIA FOR THIS REPORT RUN:'                 (+5,2)
+!  Print '$GEXXX900_Include_Company_Display_Criteria          ='   (+1,5)
+!  Print $GEXXX900_Include_Company_Display_Criteria                (0,+2)
+!GBD 08/07/2003 End
+
+  Print 'From Date  :'                      (+2,5)
+  Print $begindate                          (0,+2)
+  Print 'Thru Date  :'                      (+2,5)
+  Print $enddate                            (0,+2)
+
+  let $Year4 = '1'
+  do Format-DateTime ($X000_Where_Select_AsOfDate, $X000_Report_Heading_AsOfDate, {DEFMDY}, '', '')
+  Print 'As Of Date :'                      (+2,5)
+  Print $X000_Report_Heading_AsOfDate       (0,+2)
+
+  Let $X000_Order_By = 'Company, Paygroup, Deptid, Emplid'
+
+  Print 'SORT ORDER FOR THIS REPORT RUN:'   (+5,2)
+  Print $X000_Order_By                      (+2,5)
+
+  Let #PAGE-COUNT = 0
+  NEW-PAGE
+  Let #PAGE-COUNT = 1
+End-Procedure
+
+!*********************************************************************
+! Main Process
+!*********************************************************************
+
+begin-procedure process-data
+
+move 'N' to $rowfound
+
+let #inputtran = 0
+
+!display 'In Process-Data'
+
+begin-select ON-ERROR=SQL-Error-Found('Process-data')
+B.COMPANY             &company  
+  move &company    to $company
+
+B.PAYGROUP            &paygroup  
+  move &paygroup   to $paygroup
+
+B.DEPTID              &deptid  
+  move &deptid     to $deptid
+
+B.EMPLID              &emplid
+  move &emplid     to $emplid
+
+!  if $firstemplid <> 'N'
+!     move 'N' to $firstemplid
+!     move &emplid to $hold-emplid
+     move &emplid to $emplid
+!  end-if
+
+A.NAME                &name
+  move &name       to $name
+
+B.LOCATION            &location
+  move &location   to $location
+
+B.ACCT_CD             &acct_cd
+  move &acct_cd    to $acct_cd
+
+A.SEX                 &sex
+  move &sex        to $sex
+
+A.ADDRESS1            &address1
+  move &address1   to $address1
+
+A.ADDRESS2            &address2
+  move &address2   to $address2
+
+A.CITY                &per_city
+  move &per_city   to $per_city
+
+A.STATE               &per_state
+  move &per_state  to $per_state
+
+!SXK 11/29/99 Changed from zip to postal
+A.POSTAL              &per_zip
+  move &per_zip    to $per_zip
+!Modified for Upgrade 9.0 GEX-AXG - Begin
+!A.ORIG_HIRE_DT        &orig_hire_dt
+E.ORIG_HIRE_DT        &orig_hire_dt
+!Modified for Upgrade 9.0 Abhishe - End
+  move &orig_hire_dt to $orig_hire_dt
+
+C.SERVICE_DT          &service_dt
+  move &service_dt    to $service_dt
+
+C.TERMINATION_DT          &term_dt
+  move &term_dt    to $term_dt
+B.EMPL_STATUS      &status
+  move &Status to $status
+
+!  display $cmpny_seniority_dt
+
+C.CMPNY_SENIORITY_DT  &cmpny_seniority_dt
+   move &cmpny_seniority_dt to $cmpny_seniority_dt
+
+! JNB 02/03/1999 $service_dt changed to $cmpny_seniority_dt 
+
+   do Diff-Date($out2,$cmpny_seniority_dt,#service_years,#service_months, #service_days)  
+   do Diff-Date($out1,$cmpny_seniority_dt,#service_years_1,#service_months_1, #service_days_1)
+
+   display $emplid
+  display #service_years
+
+
+! JNB 02/03/1999 $service_dt changed to $cmpny_seniority_dt
+ 
+   do Format-DateTime($cmpny_seniority_dt, $serv_dt,{DEFYMD}, '', '')
+
+!     display $serv_dt
+
+   let $service_yy = substr($serv_dt,1,2)
+   let $service_mm = substr($serv_dt,4,2)
+   let $service_dd = substr($serv_dt,7,2)
+
+ if RTRIM($company_seniority_dt, ' ') = ''
+   let $wk_hire_dt = $orig_hire_dt
+  else
+   let $wk_hire_dt = $company_seniority_dt
+  end-if
+   
+   do Get-Store-Info
+ 
+   do Get-Contact-Person
+
+   if #current-line > 48
+      new-page
+   end-if
+
+   move 'Y' to $rowfound
+   add 1 to #inputtran
+
+   do Get-Mapp-Emplid             ! ISDVNPK 10/03/2006 Added this
+   do Emplid-Change
+
+! JNB 02/03/1999 $service_dt changed to $cmpny_seniority_dt
+
+!    display $emplid
+!    display $cmpny_seniority_dt
+!    display #service_years
+
+   move 'N' to $OK_Process
+
+FROM PS_PERSONAL_DATA A, PS_JOB B, 
+!Modified for upgrade 9.0 GEX-AXG -  Begin
+     !PS_EMPLOYMENT C, PS_GEX_R_GEXPY615 D         !GBD 08/07/2003 - add temp table
+     PS_EMPLOYMENT C, PS_GEX_R_GEXPY615 D, PS_PER_ORG_INST E        !GBD 08/07/2003 - add temp table
+!Modified for upgrade 9.0 GEX-AXG -  End
+WHERE A.EMPLID = B.EMPLID
+AND   B.EMPLID = C.EMPLID
+AND   A.EMPLID = E.EMPLID 		!Added for Upgrade 9.0 GEX-AXG
+AND   C.EMPLID = D.EMPLID                         !GBD 08/07/2003
+AND   B.EMPL_RCD = C.EMPL_RCD
+AND   E.ORG_INSTANCE_ERN  = B.EMPL_RCD	!GEX-MXT added for PER_ORG_INST join
+
+! GBD 04/09/2003 Begin
+!AND   B.EMPL_STATUS = 'T'
+
+AND   B.EMPL_STATUS IN ('D','Q','R','T','U','V','X')
+! GBD 04/09/2003 End
+
+!AND  [$GEXXX900_INCLUDE_COMPANY_CRITERIA]         GBD 08/07/2003
+AND   B.COMPANY = D.COMPANY                       !GBD 08/07/2003
+AND   B.PAYGROUP = D.PAYGROUP                     !GBD 08/07/2003
+AND   B.DEPTID = D.DEPTID                         !GBD 08/07/2003
+AND   B.LOCATION = D.LOCATION                     !GBD 08/07/2003
+
+AND   B.EFFDT = (SELECT MAX(EFFDT)
+		 FROM PS_JOB
+		 WHERE EMPLID = B.EMPLID
+		 AND   EMPL_RCD = B.EMPL_RCD
+	 AND   EFFDT <= $asoftoday)
+AND   B.EFFSEQ = (SELECT MAX(B2.EFFSEQ)
+		  FROM PS_JOB B2
+		  WHERE B2.EMPLID = B.EMPLID
+		  AND   B2.EMPL_RCD = B.EMPL_RCD
+		  AND   B2.EFFDT = B.EFFDT)
+
+ORDER BY B.COMPANY, B.PAYGROUP, B.DEPTID, B.EMPLID
+
+end-select
+
+if $rowfound = 'N'
+   display 'No Employees found for the Service Award Term Report.' 
+!else
+
+end-if
+
+end-procedure
+
+
+
+! ISDVNPK 10/03/2006 Modified this to be in sync with GEXPY615.SQR
+!*********************************************************************
+! Store Info
+!*********************************************************************
+begin-procedure Get-Store-Info
+
+  let $location2=$location
+
+evaluate $company
+   when = 'RTP'
+      let $location2 = 'RIDC'
+      break
+   when = 'KAP'
+      let $location2 = 'RIDC'
+      break
+   when = 'GEI'
+      if (($paygroup='RET' or $paygroup='PHM') and
+          ($deptid > '0400' and $deptid < '3000'))
+	   let $location2 = 'RIDC'
+           break
+      end-if
+      if ($location > 'A0001' and $location < 'A0035') or
+	  $location = 'RIDC' or
+!          $location = 'ALPHA' or
+          $location = 'RTPRM' or
+	  $location = 'OKGRCKAPP'
+	  let $location2 = 'RIDC'
+          break
+      end-if
+      if ($paygroup='RET' or $paygroup = 'PHM') and
+          $deptid < '0400' and $deptid > '3000'
+!        location remains the same
+         break
+      end-if
+      if ($paygroup='W02' or $paygroup='W07') or 
+          $location='OKGRCTHRN' or
+          $location='OK35TH'
+	 let $location2 = 'OKGRCTHRN'
+         break
+      end-if
+      break
+   when = 'TMK'
+      if $paygroup='RE2' or $paygroup='PH2'
+	 if $deptid='0049'
+          !AXL - 8/7/2000 These stores need to default to normal locn - Begin 
+          or $deptid ='1605' or $deptid ='1611' or $deptid ='1616' 
+          or $deptid ='1618' or $deptid ='1620'
+          !AXL - 8/7/2000 These stores need to default to normal locn - End
+	  or $deptid>'3999'
+	    !Location remains from the Main Select
+	 else
+	    let $location2 = 'RIDC'
+	 end-if
+      end-if
+      if $paygroup='W05'
+	 let $location2 = 'SHWHS'
+      end-if
+      if $paygroup='W04'
+	 let $location2 = 'TAMARKIN'
+      end-if
+      if $paygroup='W06'
+	 let $location2 = 'PETAL'
+      end-if
+      break
+   when = 'BRM'
+      if $paygroup = 'W01'
+	 let $location2='BUTLR'
+      end-if
+      break
+  when = 'MCC'
+      if $paygroup = 'RE5'
+	 let $location2='M3841'
+      end-if
+      break
+! CWB 12/05/2001 BEGIN
+   when = 'RFI'
+      break
+! CWB 12/05/2001 END
+   when-other
+      display $emplid noline
+      display ' has an invalid location code of ' noline
+      display $location
+      break
+
+end-evaluate
+
+   If $acct_cd = '008'
+      let $location2 = 'RIDC'      ! JNB 07/19/1999
+   End-If
+ 
+   do Get-Location
+
+end-procedure
+
+
+! ISDVNPK 10/03/2006 Modified this to be in sync with GEXPY615.SQR
+!*********************************************************************
+! Contact Person
+!*********************************************************************
+begin-procedure Get-Contact-Person
+
+let $contact_person = ' '
+begin-select
+DPT.DEPTID
+GEX_DEPT.CONTACT_NAME
+DPT.DESCR
+GEX_DEPT.GEX_COMPANY_DIV_CD
+
+  move &GEX_DEPT.CONTACT_NAME to  $contact_person
+ 
+ If Ltrim(rtrim($contact_person,' '),' ') = ''
+  If Ltrim(rtrim(&GEX_DEPT.GEX_COMPANY_DIV_CD,' '),' ') = 'GGO'
+    let $contact_person = 'General Manager'
+   Else
+    If substr(Ltrim(rtrim(&DPT.DESCR,' '),' '),1,2) = 'Rx' 
+     let $contact_person = 'Pharmacy Manager'
+     let $location2 = $location
+     do Get-Location
+    End-If
+  End-If
+ End-If
+
+FROM PS_DEPT_TBL DPT,
+     PS_GEX_DEPT_TBL GEX_DEPT
+WHERE DPT.DEPTID = $deptid
+AND GEX_DEPT.DEPTID = DPT.DEPTID 
+AND GEX_DEPT.EFFDT = (SELECT MAX(GEX_DEPT1.EFFDT) FROM PS_GEX_DEPT_TBL GEX_DEPT1
+			WHERE GEX_DEPT1.DEPTID = GEX_DEPT.DEPTID AND
+				GEX_DEPT1.EFFDT <= $X000_WHERE_SELECT_ASOFDATE) 
+	AND GEX_DEPT.SEQUENCE_NUMBER = (SELECT MAX(GEX_DEPT2.SEQUENCE_NUMBER) FROM PS_GEX_DEPT_TBL GEX_DEPT2
+			WHERE GEX_DEPT2.DEPTID = GEX_DEPT.DEPTID AND
+				GEX_DEPT2.EFFDT = GEX_DEPT.EFFDT)
+AND DPT.EFFDT = GEX_DEPT.EFFDT
+
+end-select
+
+ IF Ltrim(rtrim($contact_person,' '),' ') = ''
+
+!  let $contact_person = 'Personnel Manager'        GBD 08/07/2003
+  let $contact_person = 'HR Manager'
+
+  evaluate $location
+!    when = 'OKGRCKAPPA' 
+!    when = 'ALPHA'
+!    when = 'KAPPA'
+     when = 'RIDC'  
+!     let $contact_person = 'Joanne Brownlee'  ! CWB 12/05/2001
+!     let $contact_person = 'Melissa Anthony'       GBD 08/07/2003
+!     let $contact_person = 'Communications Administrator, POD'  ! CWB 06/10/2004
+     let $contact_person = 'Employee Communications - Marketing Dept'  ! CWB 06/10/2004
+      break
+    when = 'HBCSWASH'
+!      let $contact_person = 'Michele Carlisle'     GBD 08/07/2003
+      let $contact_person = 'HR Manager'
+      break
+    when = 'OKGRCTHRN'
+!      let $contact_person = 'Jill Tilford'         GBD 08/07/2003
+      let $contact_person = 'HR Manager'
+      break
+    when = 'OK35TH'
+!      let $contact_person = 'Jill Tilford'         GBD 08/07/2003
+      let $contact_person = 'HR Manager'
+      break
+    when = 'TAMARKIN'
+    when = 'TMWHS'
+!      let $contact_person = 'Jeannie Keiffer'      GBD 08/07/2003
+      let $contact_person = 'HR Manager'
+      break
+!GBD 08/07/2003 - Begin - Remove
+!    when = 'SHWHS'
+!      let $contact_person = 'Ed Sikos'
+!      break
+!    when = 'PETAL'
+!      let $contact_person = 'Phyllis Pascarella'   JNB  07/06/1999
+!       let $contact_person = 'Karen Hudran'
+!      break
+!GBD 08/07/2003 - End
+    when = 'BUTLR' 
+    when = 'BUTLER'
+! CWB 12/05/2001 BEGIN
+!      let $contact_person = 'Terri Clouse'         JNB 10/20/1999
+!       let $contact_person = 'Nathan Book'         GBD 08/07/2003
+       let $contact_person = 'HR Manager'
+! CWB 12/05/2001 END
+      break
+!GBD 08/07/2003 - Begin - Remove
+!    when = 'RTPRM'
+! CWB 12/05/2001 BEGIN
+!      let $contact_person = 'Alberta Ziolkowski'
+!      let $contact_person = 'Sarah Peters'
+!      break
+!GBD 08/07/2003 - End
+    when = 'CODCORP'
+       evaluate $Deptid
+         when = 'C490'
+         when = 'C510'
+         when = 'C550'
+         when = 'C811'
+!           let $contact_person = 'Kelly McCormick' GBD 08/07/2003
+           let $contact_person = 'HR Manager'
+         break
+         when-other
+!           let $contact_person = 'Stormy Sammon'   GBD 08/07/2003
+!           let $contact_person = 'Communications Administrator, COD' ! CWB 06/10/2004
+            let $contact_person = 'Employee Communications - Marketing Dept' ! CWB 06/10/2004
+         break
+       end-evaluate
+    when = 'RRWHS' 
+!      let $contact_person = 'Kelly McCormick'      GBD 08/07/2003
+      let $contact_person = 'HR Manager'
+      break
+! CWB 12/05/2001 END
+    when-other
+!      let $contact_person = 'Personnel Manager'    GBD 08/07/2003
+       let $contact_person = 'HR Manager'
+      break
+  end-evaluate
+
+  if $acct_cd = '008'
+!    let $contact_person = 'Randy Heiser'           GBD 08/07/2003
+    let $contact_person = 'Vice President, Pharmacy'
+  end-if
+
+ End-If 
+
+end-procedure
+
+
+
+! ISDVNPK 10/03/2006 Modifed this to get the Location from ESTAB_TBL
+!*********************************************************************
+! Location Info
+!*********************************************************************
+begin-procedure Get-Location
+
+move 'N' to $loc_found
+
+begin-select
+
+L.DESCR
+L.ADDRESS1
+L.ADDRESS2
+L.CITY
+L.STATE
+L.POSTAL
+
+  move 'Y'           to $loc_found
+  move &L.DESCR      to $store_name
+  move &L.ADDRESS1   to $store_address1
+  move &L.ADDRESS2   to $store_address2
+  move &L.CITY       to $store_city
+  move &L.STATE      to $store_state
+  move &L.POSTAL     to $store_zip
+
+FROM PS_ESTAB_LOC_US E,
+     PS_ESTAB_TBL L
+WHERE E.LOCATION = $location2
+and E.ESTABID = L.ESTABID
+and L.EFFDT = (SELECT MAX(EFFDT)
+		 FROM  PS_ESTAB_TBL
+		 WHERE ESTABID = L.ESTABID
+		 AND   EFFDT <= $asoftoday)
+
+end-select
+
+if $loc_found = 'N'
+   move ' ' to $location2
+   display 'Location not found on PS_LOCATION_TBL.'
+   move ' ' to $store_name
+   move ' ' to $store_address1
+   move ' ' to $store_address2
+   move ' ' to $store_city
+   move ' ' to $store_state
+   move ' ' to $store_zip
+end-if
+
+end-procedure
+! ISDVNPK 10/03/2006 Modifed the above to get the Location from ESTAB_TBL
+
+! ISDVNPK 09/13/2006 Added to get the GEX_MAPP_EMPLID
+!*********************************
+Begin-Procedure Get-Mapp-Emplid
+!*********************************
+
+let $mapp_emplid = ' '
+Begin-SELECT
+MAPP.EMPLID
+ let $mapp_emplid = RTRIM(&MAPP.EMPLID,' ')
+
+FROM PS_GEX_EMPLID_MAPP MAPP
+WHERE MAPP.SSN = $emplid
+
+End-SELECT
+
+End-Procedure
+! ISDVNPK 09/13/2006 Added to get the GEX_MAPP_EMPLID
+
+
+
+!*********************************************************************
+! Emplid Change
+!*********************************************************************
+begin-procedure Emplid-Change
+
+if #current-line > 48
+   new-page
+end-if
+
+  do Format-Number(#service_years, $serv_years, 'B9')
+
+  do Format-DateTime($orig_hire_dt,$orig_dt,{DEFMDY},'','')
+  
+  let $orig_mm = substr($orig_dt,1,2)
+  let $orig_dd = substr($orig_dt,4,2)
+!GEX-TLL 03/26/2008 HCM 9.0 Upgrade Was not showing year on reort - Begin  
+  let $orig_yy = substr($orig_dt,7,2)	! MXT 10/05/2007 commented this
+  !let $orig_yy = substr($orig_dt,9,2)	! MXT 10/05/2007 Added this
+!GEX-TLL 03/26/2008 HCM 9.0 Upgrade Was not showing year on reort - End 
+  let $orig_all = $orig_mm||'/'||$orig_dd||'/'||$orig_yy
+	
+  do Format-DateTime($term_dt,$term_date,{DEFMDY},'','')
+  let $term_mm = substr($term_date,1,2)
+  let $term_dd = substr($term_date,4,2)
+  !GEX-TLL 03/26/2008 HCM 9.0 Upgrade Was not showing year on reort - Begin 
+  let $term_yy = substr($term_date,7,2) ! MXT 10/05/2007 commented this
+  !let $term_yy = substr($term_date,9,2)	 ! MXT 10/05/2007 Added this
+  !GEX-TLL 03/26/2008 HCM 9.0 Upgrade Was not showing year on reort - End 
+  let $term_all = $term_mm||'/'||$term_dd||'/'||$term_yy
+	
+  print 'NAME:'              (+1,1) BOLD
+  print $name                (0,10)
+  print 'EMPLID:'            (0,47) BOLD
+  print $mapp_emplid         (0,55)          ! ISDVNPK 10/03/2006 Modifed this 
+  print 'SEX:'               (0,75) BOLD
+  print $sex                 (0,80)
+  print 'SERVICE YEARS:'     (0,88) BOLD
+  print $serv_years         (0,103)
+  print 'ADDRESS:'           (+1,1) BOLD
+  print $address1            (0,10)
+  print 'HIRE DATE:'         (0,44) BOLD
+  print $orig_all            (0,56)
+  print 'DEPTID:'            (0,72) BOLD
+  print $deptid              (0,80)
+  !print 'L3 UNIQUE CD:'      (0,89) BOLD     ! ISDVNPK 10/03/2006 commented this
+  !print $l3_unique_cd       (0,103)          ! ISDVNPK 10/03/2006 commented this
+  if rtrim($address2,' ') <> ''
+     print $address2           (+1,10)
+  else
+     print $per_city           (+1,10)
+     print $per_state           (0,33)
+     print $per_zip             (0,36)
+     move 'Y' to $city_printed     
+  end-if
+  print 'TERM DATE:'         (0,44) BOLD
+  print $term_all            (0,56)
+  print 'COMPANY:'           (0,71) BOLD
+  print $company             (0,80)
+  print 'LOCATION:'          (0,93) BOLD
+  print $location           (0,103)
+  if $city_printed = 'Y'
+     move 'N' to $city_printed
+  else
+     print $per_city           (+1,10)
+     print $per_state           (0,33)
+     print $per_zip             (0,36)
+  end-if
+  !print 'CUST CD:'           (+1,1) BOLD      ! ISDVNPK 10/03/2006 commented this
+ ! print $wk_customer_code    (0,10)           ! ISDVNPK 10/03/2006 commented this
+  Print 'STATUS:'          (+1,1) BOLD   !  (0,47) BOLD   ! ISDVNPK 10/03/2006 Modifed this 
+  move 'EMPL_STATUS' to $fieldname
+  move $status to $fieldvalue
+  do read-translate-table
+  print $xlatlongname        (0,09)      !   (0,55)       ! ISDVNPK 10/03/2006 Modifed this 
+  print 'CONTACT:'           (+1,1) BOLD
+  print $contact_person      (0,10)
+  print 'STORE:'             (0,48) BOLD
+  print $store_name          (0,55)
+  print 'ADDRESS:'          (+1,46) BOLD
+  print $store_address1      (0,55)
+  if rtrim($store_address2,' ') <> ''
+     print $store_address2     (+1,55)
+  end-if
+  print $store_city         (+1,55)
+  print $store_state         (0,82)
+  print $store_zip           (0,85)
+  print ' '                  (+2,1)
+
+end-procedure
+
+!*********************************************************************
+!Displays the error messages and stops execution
+!*********************************************************************
+ 
+begin-procedure SQL-Error-Found($Proc_Name) 
+!  do error-found
+  display 'SQL Error in ' 
+  display $Proc_Name 
+  display $_sql-error
+  display 'sql-status:' 
+  display #_sql-status 
+
+  STOP
+
+end-procedure
+
+!#Include 'gexxx900.sqc'  !Multiple companies run control   GBD 08/07/2003 - Remove
+#Include 'gexxx922.sqc'  !Payroll run control
+#Include 'tranctrl.sqc'  !Common Transaction Control Procedures
+!*#Include 'reset.sqc'     !Reset printer procedure
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'stdapi.sqc'    !Update Process API
+#Include 'hrrnctl1.sqc'  !Get_Run_Control Procedure
+#Include 'hrgetval.sqc'  !Get values mask routines
+#Include 'datemath.sqc'  !Does the date-math functions
+#Include 'getdatcd.sqc'  !Get-Date-Codes procedure
+#Include 'getbalid.sqc'  !Get-Calendar-Year-Id
+#Include 'sqrtrans.sqc'
+#Include 'readxlat.sqc'

@@ -1,0 +1,824 @@
+!***********************************************************************
+!  GEXPY088 :  Customized Pennsylvania Occupational Tax Report         *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module is the confidential and proprietary information of       *
+! PeopleSoft, Inc.; it is not to be copied, reproduced, or transmitted *
+! in any form, by any means, in whole or in part, nor is it to be used *
+! for any purpose other than that for which it is expressly provided   *
+! without the written permission of PeopleSoft.                        *
+!                                                                      *
+! Copyright (c) 1988-1997 PeopleSoft, Inc. All Rights Reserved         *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+!      $Date:: 04/16/99         $                                      *
+!  $Revision:: 1                $                                      *
+!  $Workfile:: GEXPY088.SQR     $                                      *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+!  SQL Tables:      Pay_Tax                                            *
+!                   Pay_Check                                          *
+!                   Pay_Calendar                                       *
+!                   Rc_Tax010PA                                        *
+!                                                                      *
+!  Normally Run:    Weekly                                             *
+!                                                                      *
+!***********************************************************************
+!  ID#   INITIALS   DATE        DESCRIPTION                            *
+!***********************************************************************
+!        GXD        04/16/1999  Initial Creation - modified TAX010PA   *
+!        GXD        04/22/1999  Removed Locality within Company Logic  *
+!                                from the program                      *
+!                               Added Deptid Sort Order Logic          *
+!                               Added Deptid to Summary/Detail Reports *
+!                                and Deptid totals to Detail Report    *
+!                               Removed Page Breaks from Summary Report*
+!        GXD        04/26/1999  Added Logic for separate Report ID's   *
+!                                PY088SUM for Summary Report           *
+!                                PY088DET for Detail Report            *
+!        CWB        07/23/1999  Added command to alter session to use  *
+!                               RULE optimizer.                        *   
+!                                                                      *
+!        AXL        03/02/2000  Added changes made to 7.5 TAX010PA.SQR *
+!                               version.                               * 
+!                                                                      *
+!        CJH        09/20/2000  Performance change of main SELECT      *
+!                                                                      *
+!        CWB        05/25/2001  Changed total line to print on line_num 7 *
+!                               instead of line_num 6. Line# 6 is used by *
+!                               Mobius for sorting by company.         *   
+!                                                                      *
+!GEX_PY271 SXD      08/23/2007  Commented Optimizer Goal Rule          *
+!GEXPY_GEXPY088     01/26/2017  Took out the rule hint to improve      *
+!                               performance                            *
+!***********************************************************************
+
+#include 'setenv.sqc' !Set environment
+#Include 'setup01.sqc'  !printer and page-size initialization
+#include 'usarpt.sqc'   !Get USA variables !AXL 3/2/2000 7.5 Change
+
+begin-report
+
+!CWB 07/23/99 Begin
+!SXD 08/23/2007  Begin
+  !do Alter-Session   ! Set Session to RULE Optimizer
+!SXD 08/23/2007  End   
+!CWB 07/23/99 End
+
+  do Init-Report
+  do Stdapi-Term
+end-report
+
+begin-procedure Init-Report
+!  move 'GEXPY088' to $ReportID
+  move 'PA Occupational Tax Weekly Report' to $ReportTitle
+
+  do Init-DateTime
+  do Init-Number
+  do Stdapi-Init
+  do Get-Current-DateTime
+
+  do Initialize
+  do Standard-Initialization
+end-procedure
+
+begin-procedure Initialize
+  do Select-Parameters
+  do GEXXX922-Select-Parameters
+
+  let $X000_WHERE_SELECT_ASOFDATE = $GEX_RC_PAY.ASOFDATE
+  if rtrim($GEX_RC_PAY.ASOFDATE,' ') = ''
+     let $X000_WHERE_SELECT_ASOFDATE = $AsOfToday
+  end-if
+
+  if $prcs_process_instance = ''
+     Display 'As of Date MM/DD/CCYY - or leave blank to default to today.'      
+     Input $date_in Maxlen=10
+     let $X000_WHERE_SELECT_ASOFDATE = $date_in
+     if $X000_WHERE_SELECT_ASOFDATE = ''
+       let $X000_WHERE_SELECT_ASOFDATE = $AsOfToday
+     end-if
+     Display 'Display Details: '
+     Input $EE_Detail_Flag Maxlen=1
+     Uppercase $EE_Detail_Flag
+!     Display 'Sort Option: '
+!     Input $Sort_Option Maxlen=1
+!     Uppercase $Sort_Option
+     Let $Sort_Option = 'C'
+     do Process-Run-Control
+     do Get-Pay-End-Dt
+  else
+     do Process-Run-Control
+     do Get-Pay-End-Dt
+  end-if
+
+!**
+  create-array name=TaxArray size=4
+                             field=TAXCUR:number:14
+
+
+  create-array name=SectCols size=4
+                             field=TAXCURCol:number
+
+  put 75  into SectCols(1) TAXCURCol
+
+  create-array name=Totals size=4
+                           field=TotalName:char
+                           field=total_CUR:number:4
+                           field=startCol:number:4
+  put 'Grand Total'    into Totals(1) TotalName
+  put 'Company Total'  into Totals(2) TotalName
+  put 'LocalityTotal'  into Totals(3) TotalName
+  put  24 into Totals(0) startCol(1)
+  put  40 into Totals(0) startCol(2)
+  put  55 into Totals(0) startCol(3)
+
+  let $Tax_Classes = 'HCPDFMNVBUSRE'            !for storing array info
+  let $TaxSection  = '1112222223333'            !section for tax class
+  let $TaxesFound  = 'HCPDFMNVBUSRE'            !track which taxes found
+  let #Num_Tax_Classes = 13                     !for tax entity
+!**
+
+  do Print-Page1
+end-procedure
+
+begin-procedure Process-Run-Control
+
+!GXD 04/26/1999 Begin
+  if $EE_Detail_Flag = 'Y'
+    if $Sort_Option  = 'C'
+      move 'PY088DET' to $ReportID
+      let $Rpt_Type = 'YC'
+      let $Rpt_Type_Desc = 'By Company within Locality'
+      let $Orderby = 'C3.COMPANY, C3.LOCALITY, C3.TAX_CLASS, PC3.EMPLID' 
+    end-if
+  else
+    if $EE_Detail_Flag = 'N'
+      if $Sort_Option  = 'C'
+        move 'PY088SUM' to $ReportID
+        let $Rpt_Type = 'NC'
+        let $Rpt_Type_Desc = 'By Company within Locality'
+        let $Orderby = 'C1.COMPANY, C1.LOCALITY, C1.TAX_CLASS, PC1.EMPLID'
+      end-if
+    end-if
+  end-if
+!GXD 04/26/1999 End
+
+end-procedure
+
+!**************************
+begin-procedure Get-Pay-End-Dt
+begin-select
+ped.pay_end_dt
+
+   move &ped.pay_end_dt to $ped
+   do Convert-to-dtu-date($ped,$dtu_ped)
+   let $ped_yy = substr($dtu_ped,3,2)
+   let $ped_mm = substr($dtu_ped,6,2)
+   let $ped_dd = substr($dtu_ped,9,2)
+
+   let $pay_end_dt = $ped_mm||'/'||$ped_dd||'/'||$ped_yy
+
+from ps_pay_calendar ped
+where ped.pay_end_dt = (select max(pay_end_dt) from
+                        ps_pay_calendar
+                        where company = ped.company
+                        and   paygroup = ped.paygroup
+                        and   pay_end_dt <= $X000_WHERE_SELECT_ASOFDATE)
+end-select
+end-procedure
+
+!**************************
+begin-procedure Print-Page1
+
+  Do Format-Datetime($X000_WHERE_SELECT_ASOFDATE, $X000_REPORT_HEADING_ASOFDATE,{DEFDATE},'','')
+  let $X000_ORDER_BY = $Orderby 
+
+  show '$X000_ORDER_BY                                   = ' $X000_ORDER_BY
+  show '$X000_WHERE_SELECT_ASOFDATE                      = ' $X000_WHERE_SELECT_ASOFDATE
+
+  show 'Report Type Description                          = ' $Rpt_Type_Desc
+
+  show '$EE_Detail_Flag                                  = ' $EE_Detail_Flag
+  show '$Sort_Option                                     = ' $Sort_Option
+
+  print '$X000_ORDER_BY                                   = ' (+2,1)
+  print $X000_ORDER_BY                                        (0,+2)
+  print '$X000_WHERE_SELECT_ASOFDATE                      = ' (+2,1)
+  print $X000_WHERE_SELECT_ASOFDATE                           (0,+2)
+
+  print 'Report Type Description                          = ' (+2,1)
+  print $Rpt_Type_Desc                                        (0,+2)
+
+  print '$EE_Detail_Flag                                  = ' (+2,1)
+  print $EE_Detail_Flag                                       (0,+2)
+  print '$Sort_Option                                     = ' (+2,1)
+  print $Sort_Option                                          (0,+2)
+
+  let #page-count = 0
+  new-page
+  let #page-count = 1
+
+end-procedure
+
+begin-heading 4
+  #Include 'stdhdg01.sqc'  !standard heading 1
+  let $header = 'As of '||$pay_end_dt
+  position (-1)
+  print $header                                                        () Center   
+  print $Rpt_Type_Desc                                             (+1,1)
+  print 'Current Tax'                                              (0,78)
+end-heading
+
+begin-procedure Report
+  move ' ' to $hold_deptid
+  move 'Y' to $first
+
+  evaluate $Rpt_Type
+    when = 'YC'
+       do Process-Company-Detail
+       break
+    when = 'NC'
+       do Process-Company-Summary
+       break
+  end-evaluate
+
+  move 1 to #totalRow
+  move 1 to #changeLevel
+  move 'Y' to $End
+  if $Company = ''
+    display 'No data selected'
+    print 'No data selected'    (+5,1)  center
+  else
+    do Print-Totals
+  end-if
+end-procedure
+
+begin-procedure Process-Company-Summary
+
+begin-SELECT
+
+! CJH - 09/20/2000 - modified FROM, WHERE clauses and added index hints 
+
+C1.COMPANY   () on-break level=1 print=never before=Before-Company
+                                             AFTER=AFTER-COMPANY
+C1.STATE     () on-break level=2 print=never
+C1.LOCALITY  () on-break level=2 print=never before=Before-State-Local
+                                             AFTER=AFTER-STATE-LOCAL2-dept
+PC1.DEPTID   () on-break level=3 print=never after=after-deptid1
+C1.TAX_CLASS () on-break level=4 print=never  after=After-Class
+C1.TAX_CUR  &C1.TAX_CUR
+
+  add &C1.TAX_CUR to #dep_tax_tot
+
+  move &C1.Tax_Class to $priorTaxClass
+  let #i = INSTR($Tax_Classes,&C1.Tax_Class,1)
+
+  if $first = 'Y'
+     move &PC1.DEPTID to $hold_deptid
+     move 'N' to $first
+  end-if
+
+  ARRAY-ADD &C1.Tax_CUR to TAXARRAY(1) TAXCUR(#I)
+
+FROM  PS_PAY_CALENDAR C1A, 
+      PS_PAY_CHECK PC1, 
+      PS_PAY_TAX C1
+WHERE C1.STATE        = 'PA'
+  AND C1.LOCALITY    <> ' '
+  AND C1.TAX_CLASS    = 'P'
+  AND C1.TAX_CUR     <> 0
+  AND PC1.COMPANY     = C1.COMPANY
+  AND PC1.PAYGROUP    = C1.PAYGROUP
+  AND PC1.PAY_END_DT  = C1.PAY_END_DT
+  AND PC1.PAY_END_DT  = (SELECT MAX(PAY_END_DT) FROM
+                         PS_PAY_CALENDAR
+                         WHERE COMPANY     = C1A.COMPANY
+                         AND   PAYGROUP    = C1A.PAYGROUP
+                         AND   PAY_END_DT <= $X000_WHERE_SELECT_ASOFDATE)
+  AND PC1.OFF_CYCLE   = C1.OFF_CYCLE
+  AND PC1.PAGE_NUM       = C1.PAGE_NUM
+  AND PC1.LINE_NUM       = C1.LINE_NUM
+  AND PC1.SEPCHK      = C1.SEPCHK
+  AND  C1.PAYGROUP    = C1A.PAYGROUP
+  AND  C1.COMPANY     = C1A.COMPANY
+  AND  C1.PAY_END_DT  = C1A.PAY_END_DT
+ORDER BY C1.COMPANY, C1.LOCALITY, PC1.DEPTID, C1.TAX_CLASS
+end-SELECT
+end-procedure
+
+begin-procedure Process-Company-Detail
+move 0 to #dept_total
+
+begin-SELECT
+
+! CJH - 09/20/2000 - modified FROM, WHERE clauses and added index hints 
+
+C3.COMPANY   () on-break level=1 print=never before=Before-Company3
+                                             AFTER=AFTER-COMPANY
+C3.STATE    
+C3.LOCALITY  () on-break level=2 print=never before=Before-State-Local3
+                                             AFTER=AFTER-STATE-LOCAL2
+PC3.DEPTID   () on-break level=3 print=never after=after-dept-total
+C3.TAX_CLASS () on-break level=4 print=never after=After-Class
+C3.TAX_CUR
+PC3.EMPLID
+PC3.NAME
+
+  add &C3.TAX_CUR to #dept_total
+
+  move &C3.Tax_Class to $priorTaxClass
+  let #i = INSTR($Tax_Classes,&C3.Tax_Class,1)
+
+  if $first = 'Y'
+     move &PC3.DEPTID to $hold_deptid
+     move 'N' to $first
+  end-if
+
+  print &PC3.EMPLID (+1,1)
+  print &PC3.NAME   (0,12)
+  print &PC3.DEPTID (0,43)
+  do Format-Number(&C3.TAX_CUR, $out, 'b99,999,999.99mi')
+  print $out (0,75)
+  ARRAY-ADD &C3.Tax_CUR to TAXARRAY(1) TAXCUR(#I)
+
+FROM  PS_PAY_CALENDAR C3A,
+      PS_PAY_CHECK PC3, 
+      PS_PAY_TAX C3
+WHERE C3.STATE        = 'PA'
+  AND C3.LOCALITY    <> ' '
+  AND C3.TAX_CLASS    = 'P'
+  AND C3.TAX_CUR     <> 0
+  AND PC3.COMPANY     = C3.COMPANY
+  AND PC3.PAYGROUP    = C3.PAYGROUP
+  AND PC3.PAY_END_DT  = (SELECT /*+ INDEX(PS_PAY_CHECK, PS_PAY_CHECK) */
+                         MAX(PAY_END_DT) FROM
+                         PS_PAY_CHECK
+                         WHERE COMPANY     = PC3.COMPANY
+                         AND   PAYGROUP    = PC3.PAYGROUP
+                         AND   PAY_END_DT <= $X000_WHERE_SELECT_ASOFDATE)
+  AND PC3.PAY_END_DT  = C3.PAY_END_DT
+  AND PC3.OFF_CYCLE   = C3.OFF_CYCLE
+  AND PC3.PAGE_NUM       = C3.PAGE_NUM
+  AND PC3.LINE_NUM       = C3.LINE_NUM
+  AND PC3.SEPCHK      = C3.SEPCHK
+  AND  C3.COMPANY     = C3A.COMPANY
+  AND  C3.PAYGROUP    = C3A.PAYGROUP
+  AND  C3.PAY_END_DT  = C3A.PAY_END_DT
+ORDER BY C3.COMPANY, C3.STATE, C3.LOCALITY, PC3.DEPTID, C3.TAX_CLASS, PC3.EMPLID
+end-SELECT
+end-procedure
+
+begin-procedure Before-Company
+  move &C1.Company to $Company
+  do Get-Company-Data
+  let $Emplid_Literal  = ' '
+  let $Name_Literal    = ' '
+  let $Deptid_Literal  = ' '
+  do Company-Heading1A
+  print ' '                                                       (+1,1)
+end-procedure
+
+begin-procedure Before-Company3
+  move &C3.Company to $Company
+  do Get-Company-Data
+  let $Emplid_Literal  = 'EMPLID'
+  let $Name_Literal    = 'NAME'
+!  let $Deptid_Literal  = 'DEPTID'
+  do Company-Heading1A
+  print ' '                                                       (+1,1)
+end-procedure
+
+begin-procedure After-Company
+  evaluate $Rpt_Type
+    when = 'YC'
+      move 2 to #totalRow
+      move 2 to #changeLevel
+      do Print-Totals
+      new-page
+      break
+    when = 'NC'
+      move 2 to #totalRow
+      move 2 to #changeLevel
+      do Print-Totals
+      new-page
+      break
+  end-evaluate
+end-procedure
+
+begin-procedure Before-State-Local
+  let $State = rtrim(&C1.State, ' ')
+  do Get-State-Tax-Data
+
+  if RTRIM(&C1.Locality, ' ') <> ''
+    move &C1.Locality to $Locality
+    do Get-Local-Tax-Data
+  end-if
+  do Company-Heading2A
+end-procedure
+
+begin-procedure Before-State-Local3
+  let $State = rtrim(&C3.State, ' ')
+  do Get-State-Tax-Data
+
+  if RTRIM(&C3.Locality, ' ') <> ''
+    move &C3.Locality to $Locality
+    do Get-Local-Tax-Data
+  end-if
+  do Company-Heading2A
+  print ' '                                                       (+1,1)
+end-procedure
+
+begin-procedure Company-Heading1A
+  print 'Company ID'                                               (+1,1)
+  print $Company                                                   (0,13)
+  print 'Company Name'                                             (+1,1)
+  print &CT.Descr                                                  (0,16)
+  print $Emplid_Literal                                            (+2,1)
+  print $Name_Literal                                              (0,14)
+  print $Deptid_Literal                                            (0,41)
+  print 'Locality ID/Name'                                         (+2,7)
+  print 'Deptid'                                                   (0,41)
+  print ' '                                                        (+1,1)
+end-procedure
+
+begin-procedure Company-Heading2A
+  let $Locality = rtrim($Locality, ' ')
+!AXL 3/2/2000 7.5 Change - Begin
+  let $Locality_Heading = $Locality || '/' || &A.Locality_Name
+!AXL 3/2/2000 7.5 Change - End
+  print $Locality_Heading                                         (0,7)
+end-procedure
+
+begin-procedure Company-Heading1B
+  print 'Locality ID'                                               (+1,1)
+  print $Locality                                                   (0,15)
+  print 'Locality Name'                                             (+1,1)
+!AXL 3/2/2000 7.5 Change - Begin
+  print &A.Locality_Name                                            (0,17)
+!AXL 3/2/2000 7.5 Change - End
+  print $Emplid_Literal                                             (+2,1)
+  print $Name_Literal                                               (0,14)
+  print $Deptid_Literal                                             (0,41)
+  print 'Company ID/Name'                                           (+2,7)
+  print 'Deptid'                                                    (0,41)
+  print ' '                                                         (+1,1)
+end-procedure
+
+begin-procedure Company-Heading2B
+  let $Company = rtrim($Company, ' ')
+  let $Company_Heading = $Company || '/' || &CT.Descr
+  print $Company_Heading                                         (+1,7)
+end-procedure
+
+begin-procedure After-State-Local
+  evaluate $Rpt_Type
+    when = 'YC'
+    when = 'NC'
+      move 2 to #totalRow
+      move 2 to #changeLevel
+      do Print-State-Local
+      break
+  end-evaluate
+end-procedure
+
+!**************************************************
+begin-procedure After-State-Local2
+  evaluate $Rpt_Type
+    when = 'YC'
+      move 2 to #totalRow
+      move 2 to #changeLevel
+      do Print-State-Local
+      new-page
+      break
+    when = 'NC'
+      move 2 to #totalRow
+      move 2 to #changeLevel
+      do Print-State-Local
+!      new-page
+      break
+  end-evaluate
+end-procedure
+
+!**************************************************
+begin-procedure After-State-Local-dept
+  evaluate $Rpt_Type
+    when = 'YC'
+    when = 'NC'
+      move 2 to #totalRow
+      move 2 to #changeLevel
+      do Print-State-Local2
+      break
+  end-evaluate
+end-procedure
+
+!**************************************************
+begin-procedure After-State-Local2-dept
+  evaluate $Rpt_Type
+    when = 'YC'
+      move 2 to #totalRow
+      move 2 to #changeLevel
+      do Print-State-Local2
+      new-page
+      break
+    when = 'NC'
+      move 2 to #totalRow
+      move 2 to #changeLevel
+      do Print-State-Local2
+!      new-page
+      break
+  end-evaluate
+end-procedure
+
+!**************************************************
+begin-procedure after-deptid1
+
+     if rtrim($hold_deptid,' ') <> ''
+        print $hold_deptid (0,43)
+        do Format-Number(#dep_tax_tot, $out, 'b99,999,999.99mi')
+        if #dep_tax_tot = 0
+           let $out = '          0.00'
+        end-if
+        print $out (0,75)
+        position (+1)
+     end-if
+     move &PC1.DEPTID to $hold_deptid
+     move 0            to #dep_tax_tot
+!     move #dep_tax_cur to #dep_tax_tot
+
+end-procedure
+
+!**************************************************
+begin-procedure after-dept-total
+
+   if rtrim($hold_deptid,' ') <> ''
+      print 'Deptid '                 (+2,7) 
+      print $hold_deptid                  ()
+      print ' Total'                      ()
+      do Format-Number(#dept_total, $out, 'b99,999,999.99mi')
+      if #dept_total = 0
+         let $out = '          0.00'
+      end-if
+      print $out                      (0,75)
+      position (+1)
+   end-if
+   move &PC3.DEPTID to $hold_deptid
+   move 0           to #dept_total
+!   move #dept_cur   to #dept_total
+
+end-procedure
+
+!**************************************************
+begin-procedure After-Class
+  let $TaxesFound = TRANSLATE($TaxesFound,$priorTaxClass,'x')
+end-procedure
+
+begin-procedure Print-State-Local
+  move 1 to #i
+  let #ToDate = COND($RptPeriod = 'M',1,2)
+  while #ToDate <= 3
+    move 0 to #priorSection
+    move 1 to #i
+    while #i <= #Num_Tax_Classes
+      if SUBSTR($TaxesFound,#i,1) = 'x'
+        let #Section = TO_NUMBER(SUBSTR($TaxSection,#i,1))
+        if #Section <> #priorSection
+          move #startline to #line
+        end-if
+        move #Section to #priorSection
+        get #TAXCURCol
+          from SectCols(#Section) TAXCURCol
+        get #TAXCUR
+          from TaxArray(1) TAXCUR(#i)
+        evaluate $Rpt_Type
+          when = 'YL'
+            if #ToDate = 2
+              let $TotalCoName = 'Company ' || $Company || ' Total'
+              print $TotalCoName (+2,7)
+              do Format-Number(#TAXCUR, $out, 'b99,999,999.99mi')
+              print $out         (0,#TAXCURCol)
+            end-if
+            break
+          when = 'YC'
+            if #ToDate = 2
+              let $Local_Tot_Desc = 'Locality ' || $Locality || ' Total'
+              print $Local_Tot_Desc (+2,7)
+              do Format-Number(#TAXCUR, $out, 'b99,999,999.99mi')
+              print $out         (0,#TAXCURCol)
+              print ' '             (+1,1)
+            end-if
+            break
+          when = 'NC'
+           if #ToDate = 2
+             do Format-Number(#TAXCUR, $out, 'b99,999,999.99mi')
+             print $out         (0,#TAXCURCol)
+           end-if
+           break
+        end-evaluate
+        evaluate #ToDate
+            when = 1
+              array-add #TAXCUR to Totals(2) total_CUR(#Section)
+            when = 2
+              array-add #TAXCUR to Totals(2) total_CUR(#Section)
+            when = 3
+              array-add #TAXCUR to Totals(3) total_CUR(#Section)
+        end-evaluate
+
+        put 0               
+              into TaxArray(1) TAXCUR(#i)
+        add 1 to #line
+      end-if
+      add 1 to #i
+    end-while
+    add 1 to #ToDate
+  end-while
+
+  move 0 to #MaxCount
+  let $TaxesFound = $Tax_Classes
+
+  next-listing skiplines=1 need=6
+end-procedure
+
+begin-procedure Print-Totals
+  while #totalRow >= #changeLevel
+    let #rollRow = #totalRow - 1
+    get $TotalName from Totals(#totalRow) TotalName
+
+    evaluate $Rpt_Type
+      when = 'YC'
+        if $TotalName = 'Company Total'
+          let $TotalName = 'Company ' || $Company || ' Total'
+        end-if
+        break
+      when = 'NC'
+        if $TotalName = 'Company Total'
+          let $TotalName = 'Company ' || $Company || ' Total'
+        end-if
+        break
+    end-evaluate
+
+    print $TotalName (+2,7)     ! CWB - 05/25/2001 Change +1 to +2
+
+    move 1 to #i
+    while #i <= 3
+      move 0 to #subLine
+      get #total_CUR from Totals(#totalRow) total_CUR(#i)
+      do Format-Number(#total_CUR, $out, 'b99,999,999.99mi')
+      print $out (0,75)
+      array-add #total_CUR
+          to Totals(#rollRow) total_CUR(#i)
+      put 0
+          into Totals(#totalRow) total_CUR(#i)
+      add 1 to #i
+      if #i <= 3
+          position (-1)
+      end-if
+    end-while
+    subtract 1 from #totalRow
+  end-while
+  if $End = 'Y'
+    do Reset
+  end-if
+end-procedure
+
+!********************************************************
+begin-procedure Print-State-Local2
+  move 1 to #i
+  let #ToDate = COND($RptPeriod = 'M',1,2)
+  while #ToDate <= 3
+    move 0 to #priorSection
+    move 1 to #i
+    while #i <= #Num_Tax_Classes
+      if SUBSTR($TaxesFound,#i,1) = 'x'
+        let #Section = TO_NUMBER(SUBSTR($TaxSection,#i,1))
+        if #Section <> #priorSection
+          move #startline to #line
+        end-if
+        move #Section to #priorSection
+        get #TAXCURCol
+          from SectCols(#Section) TAXCURCol
+        get #TAXCUR
+          from TaxArray(1) TAXCUR(#i)
+        evaluate $Rpt_Type
+          when = 'YC'
+            if #ToDate = 2
+              let $Local_Tot_Desc = 'Locality ' || $Locality || ' Total'
+              print $Local_Tot_Desc (+2,7)
+              do Format-Number(#TAXCUR, $out, 'b99,999,999.99mi')
+              print $out         (0,#TAXCURCol)
+              print ' '             (+1,1)
+            end-if
+            break
+          when = 'NC'
+           if #ToDate = 2
+!             do Format-Number(#TAXCUR, $out, 'b99,999,999.99mi')
+!             print $out         (0,#TAXCURCol)
+           end-if
+           break
+        end-evaluate
+        evaluate #ToDate
+            when = 1
+              array-add #TAXCUR to Totals(2) total_CUR(#Section)
+            when = 2
+              array-add #TAXCUR to Totals(2) total_CUR(#Section)
+            when = 3
+              array-add #TAXCUR to Totals(3) total_CUR(#Section)
+        end-evaluate
+
+        put 0               
+              into TaxArray(1) TAXCUR(#i)
+        add 1 to #line
+      end-if
+      add 1 to #i
+    end-while
+    add 1 to #ToDate
+  end-while
+
+  move 0 to #MaxCount
+  let $TaxesFound = $Tax_Classes
+
+  next-listing skiplines=1 need=6
+end-procedure
+
+!****************************
+begin-procedure Print-Totals2
+  while #totalRow >= #changeLevel
+    let #rollRow = #totalRow - 1
+    get $TotalName from Totals(#totalRow) TotalName
+
+    evaluate $Rpt_Type
+      when = 'YC'
+      when = 'NC'
+        if $TotalName = 'Company Total'
+          let $TotalName = 'Company ' || $Company || ' Total'
+        end-if
+        break
+    end-evaluate
+
+    print $TotalName (+1,7)      ! CWB - 05/25/2001 Change +1 to +2
+    move 1 to #i
+    while #i <= 3
+      move 0 to #subLine
+      get #total_CUR from Totals(#totalRow) total_CUR(#i)
+      do Format-Number(#total_CUR, $out, 'b99,999,999.99mi')
+      print $out (0,75)
+      array-add #total_CUR
+          to Totals(#rollRow) total_CUR(#i)
+      put 0
+          into Totals(#totalRow) total_CUR(#i)
+      add 1 to #i
+      if #i <= 3
+          position (-1)
+      end-if
+    end-while
+    subtract 1 from #totalRow
+  end-while
+  if $End = 'Y'
+    do Reset
+  end-if
+end-procedure
+
+!******************************************************
+
+begin-procedure Select-Parameters
+
+begin-select
+RC_TAX010PA.EE_DETAIL_FLAG
+!RC_TAX010PA.SORT_OPTION
+
+FROM  PS_RC_TAX010PA RC_TAX010PA
+WHERE RC_TAX010PA.OPRID          = $Prcs_OprID
+AND   RC_TAX010PA.RUN_CNTL_ID    = $Prcs_Run_Cntl_ID
+
+end-select
+
+  let  $EE_Detail_Flag               = &RC_TAX010PA.EE_Detail_Flag
+!  let  $Sort_Option                  = &RC_TAX010PA.Sort_Option
+  let  $Sort_Option                  = 'C'
+
+end-procedure
+
+#Include 'askaod.sqc'    !Ask-As-Of-Date Routine
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'stdinit.sqc'   !Standard-Initialization procedure
+#Include 'getqtrcd.sqc'  !Get-Quarter-Month-Codes procedure
+#Include 'getrptpd.sqc'  !Get-Report-Period procedure
+#Include 'getcodta.sqc'  !Get-Company-Data procedure
+#Include 'getstdta.sqc'  !Get-State-Tax-Data procedure
+#Include 'getlcdta.sqc'  !Get-Local-Tax-Data procedure
+#Include 'getmonnm.sqc'  !Get-Month-Name procedure
+#Include 'reset.sqc'     !Reset printer procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'datemath.sqc'  !Date-Math Functions
+#Include 'number.sqc'    !Routines to format numbers
+
+#Include 'getbalid.sqc'  !Get-Calendar-Year-Id
+#Include 'stdapi.sqc'    !Update Process API
+#Include 'sqrtrans.sqc'  !Translate SQR strings to given language
+#Include 'gexxx922.sqc'  !Get AsOfDate
+#include 'gexaltse.sqc'  !Alter session SQC

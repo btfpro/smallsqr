@@ -1,0 +1,2371 @@
+! ***************************************************************!
+!  This software and related documentation are provided under a!
+!  license agreement containing restrictions on use and!
+!  disclosure and are protected by intellectual property!
+!  laws. Except as expressly permitted in your license agreement!
+!  or allowed by law, you may not use, copy, reproduce,!
+!  translate, broadcast, modify, license, transmit, distribute,!
+!  exhibit, perform, publish or display any part, in any form or!
+!  by any means. Reverse engineering, disassembly, or!
+!  decompilation of this software, unless required by law for!
+!  interoperability, is prohibited.!
+!  The information contained herein is subject to change without!
+!  notice and is not warranted to be error-free. If you find any!
+!  errors, please report them to us in writing.!
+!  !
+!  Copyright (C) 1988, 2011, Oracle and/or its affiliates.!
+!  All Rights Reserved.!
+! ***************************************************************!
+ 
+ 
+!                                                                    !
+!***********************************************************************
+!  ECIN0001.SQR   Inbound EC Agent                                     *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!                                                                      *
+!***********************************************************************
+! This application is used to map data from PeopleSoft Business        *
+! Document flat files into EC Staging Area relational tables.          *
+!                                                                      *
+! It can be executed in three modes:                                   *
+!    o  Driven by an input file that has a list of PSFT Bus Doc files  *
+!       to process.                                                    *
+!    o  Driven by a single PSFT Bus Doc file                           *
+!    o  Driven by single ECQUEUE instance that has errored, been       *
+!       corrected by an end user, and is being processed again.        *
+!                                                                      *
+! Overall Algorithm:                                                   *
+!                                                                      *
+!    o  Read row from PSFT Bus Doc file                                *
+!    o  Enter a ECBUSDOCHDR entry for each PSFT Bus Doc                *
+!    o  The first three bytes of each row tells us what type of row    *
+!       it is.  999 rows are identifier rows, 000 - 025 are data rows  *
+!       o  if 999 row parse it, validate                               *
+!             o  ECTRANSID                                             *
+!             o  External TPID                                         *
+!             o  Internal TPID                                         *
+!             o  Convert TPID's                                        *
+!             o  Retrieve ECMAPID                                      *
+!       o  if not 999 row                                              *
+!             o  Retrieve all rows for the Logical Unit of Work        *
+!                 (LUW is set at the 000 row level)                    *
+!             o  Once LUW retrieved into memory                        *
+!                o  Build and Execute each statement                   *
+!             o  If any errors are found (i.e. SQL errors), rollback   *
+!                the entire LUW and enter a Worklist entry             *
+!             o  Log an ECQUEUE entry regardless of errors             *
+!      o  We user the DBMS to do all field level data validations      *
+!         for use (i.e. that a date is in a date format)               *
+!                                                                      *
+! Flow:
+!
+! Init-Report
+!    - Init-Variables
+!    - Just-Do-It
+!          - Process-Inbound-List-File
+!               - Replace-List-File
+!               - Get-Busdocid
+!               - Process-ECBUSDOCHDR
+!           - Process-PSFT-Business-Documents
+!               - Get-BusDoc
+!               - Process-File-Data
+!                   - Process-999-Row
+!                        - Parse-999-Row
+!                        - Validate-999-Row
+!                        - Get-ECMAPID
+!                    - Load-PS_ECINMAPFILE
+!                         - Load-PS_ECINMAPFLD
+!                         - Load-PS_ECINMAPREC
+!                    - Process-LUW
+!                              - Get-PSMAPFILEROWID
+!                              - Format-Row
+!                                   - Format-File-Value
+!                                        - Formant-Value
+!                              - Loop-PS_ECINMAPREC
+!                                   - Build-Run-Statements
+!                                        - Build-Statement
+!                                             - Format-Statement
+!                                                  - Get-Fieldvalue
+!                                                  - Format-Value
+!                                                  - Process-Driver-Calc
+!                                        - Execute-Statement
+!                              - Process-ECQUEUE
+!                    - Put-Row-In-Filedata0
+!    - Process-Single-File
+!    - Procss-Single-Instance
+!
+!***********************************************************************
+!                                                                      *
+! CHANGE HISTORY
+! 06/14/96 - Redesigned entire inbound map definition panels so that all
+! Agent Calculations are done on the target data. Removed the old child/parent
+! processing routines. Added support for new INAGENTCALCCD options.
+! 06/20/96 - Added new logic to support user defined row IDs. Instead of
+! ASSuming the first three bytes are the record ID, it will detect the
+! row ID value from the PS_INMAPFLD array. It saves this info for each
+! row ID defined at the record level (for performance). Then as each
+! data row is read from file it calls new function Detect-Rowid_Value.
+! 06/28/96 - Added "Order By ecfilerowid" clause to selection from
+! PS_ECINMAPFILE when loading the map. Needed to make sure data loaded OK.
+! 07/03/96 - Converted Work List processing to support V6 Business Process
+! definitions. This required a changed to call 'Log-WL-Entry' and call
+! to 'Worklist-gen'.
+! 07/12/96 - Updated the Format-Value routine to receive the "decimal
+! position" input parameter. This is used to handle implied decimals.
+! 07/12/96 - Added support for three new Agent Calculation types
+! (PID, RID, OID).
+! 07/13/96 - Removed "stop" condition if input file is not found. Logged
+! new busdoc header level error status when this condition occurs. Then
+! new code proceeds to next file in the file list (if any).
+! 08/20/96 - Added call to "Update-Prcs-Run-Status" to update the run
+! control status in process scheduler.
+! 08/23/96 - Added logic to insure that if an inbound date value is NULL
+! it is not included in the INSERT statement. Proc 'Format-Statement'.
+! Added new include file for 'timemath'
+! 09/13/96 - Fixed invalid date/time formats when the EDI Agent calc code
+! = 'DTM' or 'DAT'. Converted native time to standard SQR time.
+! 09/23/96 - Changed correlation table names so that they don't match
+! actual table names. This fix is for DB2 support. In most cases dropped
+! correlation usage.
+! 09/30/96 - Reworked logic on processing LUWs. This was due to bad commit
+! logic. The program now processes LUWs prior to loading new maps and
+! commits them. Was also able to eliminate the 'Process-Data-Row' function.
+! 10/17/96 - Due to DB2 returning trailing blanks, needed to use 'rtrim'
+! function for all selected character columns.
+! 10/24/96 - Added support for MVS and OS/400 file naming conventions. This
+! will be done with conditional compiles to build the file names properly.
+! 11/04/96 - Dropped usage of local $Current_datetime variable and
+! referenced the standard $SysDateTime variable.
+! 03/03/97 - Updated #Max_PS_ECINMAPFLD and #Max_PS_ECINMAPRECFLD to be 300
+! per incident T-MARMSTR3-0003.  This increases field map arrays to handle large
+! table definitions.
+! 03/18/97 - Implemented Changes for Forced Agent Mapping as well as
+! Flexible Date Formatting.
+! 03/22/99 - Updated #Max_PS_ECINMAPFLD and #Max_PS_ECINMAPRECFLD to be 600
+! per incident T-DYLAGA-1T9U6.  This increases field map arrays to handle large
+! table definitions.
+! 07/12/99 - Updated array size to accomodate new limit of 100 per incident
+! T-FHE-HP9NB
+!
+!***********************************************************************
+
+#include 'setenv.sqc'
+
+!----------------------------------------------------------------------!
+!  Begin Setup
+!----------------------------------------------------------------------!
+begin-setup
+#include "setupdb.sqc"
+end-setup
+
+!----------------------------------------------------------------------!
+!  Begin Report
+!----------------------------------------------------------------------!
+begin-Report
+
+   do Init-Report
+
+end-Report
+
+
+!----------------------------------------------------------------------!
+! Initialize Report
+!----------------------------------------------------------------------!
+begin-Procedure Init-Report
+   #debugh do debug-msg('Init-Report')
+
+   do Init-Variables
+
+   do Init-DateTime
+
+   do Define-Prcs-Vars
+
+   do Get-Current-DateTime
+
+   do Get-Run-Control-Parms
+
+   do Just-Do-It
+
+   do Update-Prcs-Run-Status
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+! Initialize Variables                                                 !
+!                                                                      !
+! Set globals and create arrays                                        !
+!                                                                      !
+!----------------------------------------------------------------------!
+begin-Procedure Init-Variables
+   #debugh do debug-msg('Init-Variables')
+
+   let $sql_char  = ''''
+   let $comma = ','
+
+
+   let #File_Rowid_Size      = 3
+   let #Rowid_999_Size       = 3
+   let #ectransid_size       = 15
+   let #ec_tp_id_size        = 16
+   let #Ec_Mapid_Size        = 10
+   let #Profile_Size         = 10
+   let #ec_entitycd_size     = 4
+   let #Max_PS_ECINMAPFILE   = 100
+   let #Max_PS_ECINMAPREC    = 100
+   let #Max_PS_ECINMAPFLD    = 600
+   let #Max_PS_ECINMAPRECFLD = 600
+
+   let $Logged_Status     = '0'
+   let $PreLoad_Status    = '1'
+   let $Load_Error_Status = '2'
+   let $Loaded_Status     = '3'
+   let $Not_Found_Status  = '4'
+   let $ECQUEUESTATUS_LOADED = 'L'
+   let $ECQUEUESTATUS_ERROR = 'E'
+   let $Bus_Doc_In_Out_Sw = 'I'
+   let $Rowid_998 = '998'
+   let $Rowid_999 = '999'
+   let $Rowid_000 = '000'
+   let $ECACTIONCD = ' '
+   let $Bus_Doc_In_Out_Sw = 'I'
+   let #message_set_nbr = 109
+   let $force_flag = 'N'
+   let $csv_flag = 'N'           ! N means fixed format as per map definitions
+   let $csv_delimiter = ''''
+   let $csv_separator = ','
+   let $suppress_rowid = 'N'     ! Y means assume a 000 record id
+
+
+   Create-Array name= PS_ECINMAPFILE size = 1
+         field=ecmapid:char:100
+         field=ecfilerowid:char:100
+         field=recname:char:100
+         field=rowidvalue:char:100
+         field=rowidstartpos:number:100
+         field=rowidlength:number:100
+         field=totalfilefields:number:100
+
+   Create-Array name= PS_ECINMAPFLD size = 600
+         field=ecmapid:char:100
+         field=ecfilerowid:char:100
+         field=seqno:number:100
+         field=fieldname:char:100
+         field=fieldtype:number:100
+         field=ecstartpos:number:100
+         field=length:number:100
+         field=decimalpos:number:100
+         field=ecconvertcd:char:100
+         field=ecrowidvalue:char:100
+         field=ectpcvtid:char:100
+         field=ecfldspecialcd:char:100
+         field=errornumber:number:100
+         field=error_misc:char:100
+         field=filefldval:char:100
+         field=delimit_date:char:100
+         field=year_start:number:100
+         field=year_len:number:100
+         field=month_start:number:100
+         field=month_len:number:100
+         field=day_start:number:100
+         field=day_len:number:100
+
+   Create-Array name= PS_ECINMAPREC size = 1
+         field=ecmapid:char:100
+         field=ecfilerowid:char:100
+         field=recname:char:100
+
+   Create-Array name= PS_ECINMAPRECFLD size = 600
+         field=ecmapid:char:100
+         field=ecfilerowid:char:100
+         field=recname:char:100
+         field=seqno:number:100
+         field=fieldname:char:100
+         field=fieldtype:number:100
+         field=ecrecfldvaluecd:char:100
+         field=ecfilefieldname:char:100
+         field=ecdefaultvalue:char:100
+         field=ecinagentcalccd:char:100
+         field=ecrelatedrowid:char:100
+         field=ecrelatedrecname:char:100
+         field=ecrelatedfieldname:char:100
+         field=fldxref:number:100
+         field=fldrowxref:number:100
+         field=curseqnovalue:number:100=1
+         field=summaryinfoindex:number:100=-1
+         field=recordfieldvalue:char:100
+
+
+   Create-Array name= Summary_Info size = 1000
+         field=ecfilerowid:char
+         field=recname:char
+         field=fieldname:char
+         field=resetflag:char='N'
+         field=total:number
+         field=maximum:number
+         field=minimum:number
+         field=occurancecount:number
+
+   Create-Array name= FILEDATA0 size = 1
+         field=ecfilerowid:char:2500
+         field=ecqueueinstance:number:2500
+         field=filedata:char:2500
+         field=luwlinenum:number:2500
+         field=ectransid:char:2500
+         field=message_set_nbr:number:2500
+         field=message_nbr:number:2500
+         field=error_misc:char:2500
+         field=siblingcount:number:2500=-1    ! number of siblings detected for this parent row
+
+   Create-Array name= FLEX_DATE size = 21
+         field=dtchar:char:1
+
+   Create-Array name= CSV_DATA size = 100  ! used for CSV only
+         field=sequencenum:number
+         field=filedata:char
+
+end-procedure
+
+!----------------------------------------------------------------------!
+!  Just-Do-It
+!                                                                      !
+! Like Nike says ... note that processing must be called outside the   !
+! the select on ECRUNCNTL or else commit processing breaks.            !
+!                                                                      !
+!----------------------------------------------------------------------!
+begin-procedure Just-Do-It
+      #debugh do debug-msg('Just-Do-It')
+
+   let $more_request = 'Y'
+   #debugh display 'proc oprid=' noline
+   #debugh display $prcs_oprid
+   #debugh display 'proc cntrl=' noline
+   #debugh display $prcs_run_cntl_id
+   let $prcs_oprid = rtrim($prcs_oprid, ' ')
+   let $prcs_run_cntl_id = rtrim($prcs_run_cntl_id, ' ')
+
+begin-select on-error=SQLError
+
+ECRUNCNTL.OPRID,
+ECRUNCNTL.RUN_CNTL_ID,
+ECRUNCNTL.ECFILELISTPATH,
+ECRUNCNTL.ECFILELISTNAME,
+ECRUNCNTL.ECONEFILEPATH,
+ECRUNCNTL.ECONEFILENAME,
+ECRUNCNTL.ECBUSDOCID,
+ECRUNCNTL.ECTRANSID,
+ECRUNCNTL.ECQUEUEINSTANCE,
+ECRUNCNTL.ECINDRIVEROPT,
+ECRUNCNTL.ECFORCEFLG,
+ECRUNCNTL.ECMAPID,
+ECRUNCNTL.TP_PROFILE_ID,
+ECRUNCNTL.CVT_PROFILE_ID,
+ECRUNCNTL.ECFORCETRANS,
+ECRUNCNTL.ECENTITYCD,
+ECRUNCNTL.EC_EXT_TP_ID,
+ECRUNCNTL.ECENTITYIAEC,
+ECRUNCNTL.EC_ALIAS_TP_ID,
+ECRUNCNTL.ECCSVFLG,
+ECRUNCNTL.ECCSVDEL,
+ECRUNCNTL.ECCSVSEP,
+ECRUNCNTL.ECSUPROW
+
+
+
+FROM  PS_ECRUNCNTL ECRUNCNTL
+WHERE ECRUNCNTL.OPRID       = $prcs_oprid
+AND   ECRUNCNTL.RUN_CNTL_ID = $prcs_run_cntl_id
+
+end-select
+
+! these fields are used for CSV (Comma Separated) data
+   let $csv_flag = &ECRUNCNTL.ECCSVFLG
+   let $csv_delimiter = &ECRUNCNTL.ECCSVDEL
+   let $csv_separator = &ECRUNCNTL.ECCSVSEP
+
+   let $suppress_rowid = &ECRUNCNTL.ECSUPROW
+
+! if they are forcing this file to be mapped based on information in the
+! run control, then get the map information.
+   let $force_flag = &ECRUNCNTL.ECFORCEFLG
+   if $force_flag <> 'N'
+      let $force_map = &ECRUNCNTL.ECMAPID           ! these are for a psuedo 998
+      let $force_tpi = &ECRUNCNTL.TP_PROFILE_ID
+      let $force_cpi = &ECRUNCNTL.CVT_PROFILE_ID
+      let $Force_trans = &ECRUNCNTL.ECFORCETRANS    ! these are for a psuedo 999
+      let $Force_eec = &ECRUNCNTL.ECENTITYCD
+      let $Force_etpi = &ECRUNCNTL.EC_EXT_TP_ID
+      let $Force_iaec = &ECRUNCNTL.ECENTITYIAEC
+      let $Force_itpi = &ECRUNCNTL.EC_ALIAS_TP_ID
+   end-if
+
+   evaluate &ECRUNCNTL.ECINDRIVEROPT
+
+      when = 'L'
+
+         let $Input_List_ID   = rtrim(&ECRUNCNTL.ECFILELISTNAME, ' ')
+         let $Input_Path      = rtrim(&ECRUNCNTL.ECFILELISTPATH, ' ')
+         #ifdef MVS
+            let $Input_List_File = $Input_List_ID
+         #else
+         #ifdef OS400
+            let $Input_List_File = $Input_List_ID
+         #else
+            let $Input_List_File = $Input_Path || $Input_List_ID
+         #endif
+         #endif
+         do Process-Inbound-File-List
+
+         do Process-PSFT-Business-Documents
+
+      when = 'F'
+
+         let $ecbusdoc_filename_ID = rtrim(&ECRUNCNTL.ECONEFILENAME, ' ')
+         let $Input_Path           = rtrim(&ECRUNCNTL.ECONEFILEPATH, ' ')
+         #ifdef MVS
+            let $ecbusdoc_filename = $ecbusdoc_filename_ID
+         #else
+         #ifdef OS400
+            let $ecbusdoc_filename = $ecbusdoc_filename_ID
+         #else
+            let $ecbusdoc_filename = $Input_Path || $ecbusdoc_filename_ID
+         #endif
+         #endif
+        do Process-Single-File
+
+         do Process-PSFT-Business-Documents
+
+      when = 'I'
+
+         do Init-Variables
+
+         let $ECTRANSID        = rtrim(&ECRUNCNTL.ECTRANSID, ' ')
+         let #ECQUEUEINSTANCE  = &ECRUNCNTL.ECQUEUEINSTANCE
+         let #ECBUSDOCID       = &ECRUNCNTL.ECBUSDOCID
+
+         do Process-Single-Instance
+
+   end-evaluate
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+!  Process-Single-Instance
+!                                                                      !
+! End user may submit a single entry to be processed for LUW's that    !
+! are in error and have been corrected.                                !
+!                                                                      !
+!----------------------------------------------------------------------!
+begin-procedure Process-Single-Instance
+      #debugh do debug-msg('Process-Single-Instance')
+
+
+   let $ECDATAVALUE = ''
+   let $Input_Record = ''
+   let #luw_load_total = 0
+   let #Total_Rows_In_FILEDATA0 = 0
+   let #total_detail_rows = 0
+   let #Message_Nbr = 0
+   let $EC_Queue_Cntl_Nbr = ' '
+
+begin-select on-error=SQLError
+
+INFILEDTL.ECBUSDOCID,
+INFILEDTL.ECTRANSID,
+INFILEDTL.ECBUSDOCDATAROWS,
+INFILEDTL.ECQUEUEINSTANCE,
+INFILEDTL.ECLUW_SEQNO,
+INFILEDATA.SEQNO,
+INFILEDATA.ECDATALENGTH,
+INFILEDATA.ECDATAVALUE
+
+   let $temp = rpad(&INFILEDATA.ECDATAVALUE,&INFILEDATA.ECDATALENGTH,' ')
+   let $Input_Record = $Input_Record || $temp
+
+   add 1 to #total_detail_rows
+
+   if #total_detail_rows = &INFILEDTL.ECBUSDOCDATAROWS
+
+      do Detect-Rowid_Value($Input_Record, $ecfilerowid_file)
+      evaluate $ecfilerowid_file
+         when = $Rowid_999
+            let $Active_Rowid_99X = $Rowid_999
+            do Process-999-Row
+            do Load-PS_ECINMAPFILE
+            if #Message_Nbr <> 0
+               let #ecqueueinstance_err = #ECQUEUEINSTANCE
+               let #LUWlinenum = 0
+               do Process-ECBUSDOCERR
+               do Log-WL-Entry('Manage EDI',
+                         'Manage Inbound EDI Agent',
+                         'Run Inbound Agent',
+                         'Work Inbound Agent Errors',
+                         'ECBUSDOCLN_WL',
+                         'ECIN0001',
+                         #ECBUSDOCID, $ECTRANSID,
+                         #ECQUEUEINSTANCE, $Bus_Doc_In_Out_Sw)
+               do Commit-Transaction
+               let #prcs_run_status = #prcs_run_status_error
+               do Update-Prcs-Run-Status
+               STOP
+
+            end-if
+         when = $Rowid_998
+            let $Active_Rowid_99X = $Rowid_998
+            do Process-998-Row($Input_Record, $ECMAPID, $ECTRANSID, $Tp_Profile_ID, $Cvt_Profile_ID,$Force_flag,$force_map,$force_tpi,$force_cpi)
+            do Load-PS_ECINMAPFILE
+            if #Message_Nbr <> 0        ! Error in loading Map info, abort program
+               let #ecqueueinstance_err = #ECQUEUEINSTANCE
+               let #LUWlinenum = 0
+               do Process-ECBUSDOCERR
+               do Log-WL-Entry('Manage EDI',
+                         'Manage Inbound EDI Agent',
+                         'Run Inbound Agent',
+                         'Work Inbound Agent Errors',
+                         'ECBUSDOCLN_WL',
+                         'ECIN0001',
+                         #ECBUSDOCID, $ECTRANSID,
+                         #ECQUEUEINSTANCE, $Bus_Doc_In_Out_Sw)
+               do Commit-Transaction
+               let #prcs_run_status = #prcs_run_status_error
+               do Update-Prcs-Run-Status
+               STOP
+            end-if
+         when = $Row_000
+            let #ECLUW_SEQNO = 0
+         when-other
+            add 1 to #ECLUW_SEQNO
+      end-evaluate
+
+      do Put-Row-In-FILEDATA0($ecfilerowid_file, #ECQUEUEINSTANCE, $Input_Record,
+                              $ECTRANSID, #Total_Rows_In_FILEDATA0)
+      let $Input_Record = ''
+      let #total_detail_rows = 0
+
+   end-if
+
+FROM  PS_ECBUSDOCDTL  INFILEDTL,
+      PS_ECBUSDOCDATA INFILEDATA
+WHERE INFILEDTL.ECBUSDOCID      = #ECBUSDOCID
+AND   INFILEDTL.ECBUSDOCID      = INFILEDATA.ECBUSDOCID
+AND   INFILEDTL.ECTRANSID       = INFILEDATA.ECTRANSID
+AND   INFILEDTL.ECTRANSID       = $ECTRANSID
+AND   INFILEDTL.ECQUEUEINSTANCE = INFILEDATA.ECQUEUEINSTANCE
+AND   INFILEDTL.ECQUEUEINSTANCE = #ECQUEUEINSTANCE
+AND   INFILEDTL.ECTRANSINOUTSW  = INFILEDATA.ECTRANSINOUTSW
+AND   INFILEDTL.ECTRANSINOUTSW  = $Bus_Doc_In_Out_Sw
+AND   INFILEDTL.ECLUW_SEQNO     = INFILEDATA.ECLUW_SEQNO
+ORDER BY
+INFILEDTL.ECBUSDOCID,
+INFILEDTL.ECTRANSID,
+INFILEDTL.ECQUEUEINSTANCE,
+INFILEDTL.ECLUW_SEQNO,
+INFILEDATA.SEQNO
+
+end-select
+
+   if #Total_Rows_In_FILEDATA0 > 0
+      do Process-LUW
+      if $LUW_Error_Sw = 'N'
+         let $Temp_Status = $Loaded_Status
+         do Update-ECBUSDOCDTL   ! Update all data rows in bus doc buffer to OK
+      end-if
+   end-if
+
+   do Update-ECBUSDOCHDR(#ECBUSDOCID, 'Y', #luw_load_total, #luw_error_total)
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+!  Process-Inbound-File-List                                           !
+!                                                                      !
+! Process each PSFT Bus Doc file that is listed in the inbound file    !
+! list.                                                                !
+!                                                                      !
+!----------------------------------------------------------------------!
+begin-procedure Process-Inbound-File-List
+      #debugh do debug-msg('Process-Inbound-File-List')
+
+   open $Input_List_File as 1 for-reading record=500:vary status = #filestat
+
+   if #filestat = 0
+      Display 'Opening PeopleSoft Inbound Business Document List File'
+      Display $Input_List_File
+   else
+      Display 'Cannot Open PeopleSoft Inbound Business Document List File'
+      Display $Input_List_File
+      let #prcs_run_status = #prcs_run_status_error
+      do Update-Prcs-Run-Status
+      stop
+   end-if
+
+   let #ECBUSDOCID       = 0
+   let #ECBUSDOCID_START = 0
+   let #ECBUSDOCID_END   = 0
+
+   while 1
+
+      read 1 into $Input_Record:500
+      if #end-file = 1
+         close 1
+         do Replace-List-File
+         break
+      else
+         let $ecbusdoc_filename = rtrim($Input_Record,' ')
+
+         #debugv display '$ecbusdoc_filename=' noline
+         #debugv display $ecbusdoc_filename
+
+         if not(isnull($ecbusdoc_filename))
+            do Get-ECBUSDOCID
+            do Process-ECBUSDOCHDR( #ECBUSDOCID, $ecbusdoc_filename, $Bus_Doc_In_Out_Sw, $Logged_Status)
+         end-if
+      end-if
+
+   end-while
+   do Commit-Transaction        ! Make sure we burn these busdocid counters
+
+end-procedure
+
+!----------------------------------------------------------------------!
+!  Replace-List-File
+!  This proc will truncate the input list file so that the data files
+!  are not re-processed or added to during this Agent run.
+!----------------------------------------------------------------------!
+begin-procedure Replace-List-File
+   #debugh do debug-msg('Replace-List-File')
+
+   open $Input_List_File as 1 for-writing record=500:vary
+
+   close 1
+
+end-procedure
+
+!----------------------------------------------------------------------!
+!  Process-Single-File
+!                                                                      !
+! A single PSFT Bus Doc file may be processed by itself.               !
+!                                                                      !
+!----------------------------------------------------------------------!
+begin-procedure Process-Single-File
+      #debugh do debug-msg('Process-Single-File')
+
+
+   let #ECBUSDOCID       = 0
+   let #ECBUSDOCID_START = 0
+   let #ECBUSDOCID_END   = 0
+
+   #debugv display '$ecbusdoc_filename'
+   #debugv display $ecbusdoc_filename
+
+   if not(isnull($ecbusdoc_filename))
+      do Get-ECBUSDOCID
+      do Process-ECBUSDOCHDR( #ECBUSDOCID, $ecbusdoc_filename, $Bus_Doc_In_Out_Sw, $Logged_Status)
+      do Commit-Transaction        ! Make sure we burn this busdocid counter
+   end-if
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+!  Process-PSFT-Business-Documents
+!  This proc will loop through all business document files. The start and
+!  stop doc ID values have been calculated and the file names saved in
+!  ECBUSDOCHDR. It will retrieve the file name and call the routine to
+!  open the input data file and process it.
+!                                                                      !
+!----------------------------------------------------------------------!
+begin-procedure Process-PSFT-Business-Documents
+      #debugh do debug-msg('Process-PSFT-Business-Documents')
+
+      #debugv display '#ECBUSDOCID_START=' noline
+      #debugv display #ECBUSDOCID_START
+      #debugv display '#ECBUSDOCID_END=' noline
+      #debugv display #ECBUSDOCID_END
+
+
+   let #ECBUSDOCID = #ECBUSDOCID_START
+
+   while #ECBUSDOCID <= #ECBUSDOCID_END
+
+      do Get-BUSDOC(#ECBUSDOCID, $Input_Data_File)
+
+      #debugv display 'PSBD Loop #ECBUSDOCID=' noline
+      #debugv display #ECBUSDOCID
+      #debugv display '$Input_Data_File:'
+      #debugv display $Input_Data_File
+
+      let #ECQUEUEINSTANCE = -1
+      do Process-File-Data
+
+      add 1 to #ECBUSDOCID
+
+   end-while
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+!  Process-File-Data                                                   !
+!                                                                      !
+! Read in each row of data and process it.                             !
+!                                                                      !
+!----------------------------------------------------------------------!
+begin-procedure Process-File-Data
+   #debugh do debug-msg('Process-File-Data')
+
+   open $Input_Data_File as 2  for-reading record=10000:vary
+   status = #filestat
+   if #filestat != 0
+      Display 'Cannot open input file: '
+      Display $Input_Data_File
+      Display 'Logging Error At the Business Document Level'
+      Display 'Proceeding to the Next Business Document'
+      do Update-ECBUSDOCHDR(#ECBUSDOCID, 'N', 0, -1)  ! Log header info as in error
+      do Commit-Transaction
+   else
+      Display 'Opening Input file '
+      Display $Input_Data_File
+
+      let #luw_error_total = 0
+      let #luw_load_total = 0
+      let #Total_Rows_In_FILEDATA0 = 0
+      let $EC_Queue_Cntl_Nbr = ' '
+
+
+! if force flag is on, then we will build the 998 from the run control parms
+      evaluate $force_flag
+      when = '8'   ! act as though we have a 998 record
+        let $Active_Rowid_99X = $Rowid_998
+        do Process-998-Row($Input_Record, $ECMAPID, $ECTRANSID, $Tp_Profile_ID, $Cvt_Profile_ID,$force_flag,$force_map,$force_tpi,$force_cpi)
+        do Load-PS_ECINMAPFILE
+        if #Message_Nbr <> 0        ! Error in loading Map info, abort program
+          do Process-999-Error
+        end-if
+! force flag check.
+      when = '9'   ! act as though we have a 999 record
+        let $Active_Rowid_99X = $Rowid_999
+
+        #debugv display $Force_Trans
+        do Process-force-999
+        do Load-PS_ECINMAPFILE
+        if #Message_Nbr <> 0        ! Error in loading Map info, abort program
+          do Process-999-Error
+        end-if
+
+      end-evaluate
+
+
+      while 1              ! Keep reading until end-of-file
+
+         read 2 into $Input_Record:10000           ! Read next record of data from current input file
+         if #end-file = 1
+         ! End of file has been reached, close out any data in buffer for this LUW
+            if #Total_Rows_In_FILEDATA0 > 0
+               do Process-LUW
+            end-if
+            do Update-ECQUEUEINSTANCE($ECTRANSID, 'I' , #ECQUEUEINSTANCE)
+            do Update-ECBUSDOCHDR(#ECBUSDOCID, 'N', #luw_load_total, #luw_error_total)
+            do Commit-Transaction
+            close 2
+            break
+         else
+            do Detect-Rowid_Value($Input_Record, $ecfilerowid_file)
+            evaluate $ecfilerowid_file
+            when = $Rowid_999
+               let $Active_Rowid_99X = $Rowid_999
+               if #Total_Rows_In_FILEDATA0 > 1  ! Commit preious LUW
+                  do Process-LUW
+                  !  Get the next Q instance
+                  do Update-ECQUEUEINSTANCE($ECTRANSID, 'I' , #ECQUEUEINSTANCE)
+                  do Commit-Transaction   ! Burn this Q instance
+               end-if
+               do Process-999-Row
+               do Load-PS_ECINMAPFILE
+               if #Message_Nbr <> 0        ! Error in loading Map info, abort program
+                  do Process-999-Error
+               end-if
+            when = $Rowid_998
+               let $Active_Rowid_99X = $Rowid_998
+               if #Total_Rows_In_FILEDATA0 > 1  ! Commit preious LUW
+                  do Process-LUW
+                  !  Get the next Q instance
+                  do Update-ECQUEUEINSTANCE($ECTRANSID, 'I' , #ECQUEUEINSTANCE)
+                  do Commit-Transaction   ! Burn this Q instance
+               end-if
+
+               do Process-998-Row($Input_Record, $ECMAPID, $ECTRANSID, $Tp_Profile_ID, $Cvt_Profile_ID,$Force_flag,$force_map,$force_tpi,$force_cpi)
+
+               do Load-PS_ECINMAPFILE
+               if #Message_Nbr <> 0        ! Error in loading Map info, abort program
+                  do Process-999-Error
+               end-if
+            ! FUTURE CHECK HERE FOR CASE WHERE INPUT FILE DOES NOT HAVE '000' RECORD ???
+            when = $Rowid_000
+               if #ECQUEUEINSTANCE = -1   ! Special case for first doc in file
+                  do Get-ECQUEUEINSTANCE($ECTRANSID, 'I' , #ECQUEUEINSTANCE)
+               end-if
+               if #Total_Rows_In_FILEDATA0 > 1  ! Commit preious LUW
+                  do Process-LUW
+                  !  Get the next Q instance
+                  do Update-ECQUEUEINSTANCE($ECTRANSID, 'I' , #ECQUEUEINSTANCE)
+                  do Commit-Transaction   ! Burn this Q instance
+               end-if
+               ! Save the current 999/998 record in the array
+               do Put-Row-In-FILEDATA0($Active_Rowid_99X, #ECQUEUEINSTANCE, $Active_999_Row_Data,
+                                       $ECTRANSID, #Total_Rows_In_FILEDATA0)
+               do Put-Row-In-FILEDATA0($ecfilerowid_file, #ECQUEUEINSTANCE, $Input_Record,
+                                       $ECTRANSID, #Total_Rows_In_FILEDATA0)
+            when-other
+               do Put-Row-In-FILEDATA0($ecfilerowid_file, #ECQUEUEINSTANCE, $Input_Record,
+                                       $ECTRANSID, #Total_Rows_In_FILEDATA0)
+            end-evaluate
+         end-if
+
+      end-while
+   end-if
+
+end-procedure
+
+!----------------------------------------------------------------------!
+!  Process-ECQUEUE                                                     !
+!                                                                      !
+! Create an ECQUEUE entry for each LUW.  The ECQUEUE is the to do list !
+! for the application load programs.                                   !
+!                                                                      !
+!----------------------------------------------------------------------!
+begin-procedure Process-ECQUEUE
+   #debugh do debug-msg('Process-ECQUEUE')
+
+   #debugv display 'Process-ECQUEUE #ecqueueinstance_luw=' noline
+   #debugv display #ecqueueinstance_luw
+   #debugv display '$SysDatetime=' noline
+   #debugv display $SysDateTime
+   if $LUW_Error_Sw = 'N'
+     let $temp =  $ECQUEUESTATUS_LOADED
+   else
+      let $temp =  $ECQUEUESTATUS_ERROR
+   end-if
+   if isnull($Q_Cust_Vndr)
+      let $Q_Cust_Vndr = ' '
+      let $EC_Entitycd_Ext = ' '
+   end-if
+   if isnull($Q_Business_Unit)
+      let $Q_Business_Unit = ' '
+      let $EC_Entitycd_Bu = ' '
+   end-if
+
+   if &ECRUNCNTL.ECINDRIVEROPT <> 'I'        ! Single instance ==> reload of previous error, don't generate new error docs
+
+      begin-sql on-error=SQLError
+
+      INSERT INTO PS_ECQUEUE
+      (
+      ECTRANSID,
+      ECQUEUEINSTANCE,
+      ECTRANSINOUTSW,
+      ECBUSDOCID,
+      ECQUEUESTATUS,
+      EC_QUEUE_CNTL_NBR,
+      ECENTITYCD_EXT,
+      ECACTIONCD,
+      ECDRIVERDTTM,
+      ECCUSTVNDRVAL,
+      BUSINESS_UNIT,
+      ECENTITYCD_BU
+      )
+      VALUES
+      (
+      $ECTRANSID,
+      #ecqueueinstance_luw,
+      $Bus_Doc_In_Out_Sw,
+      #ECBUSDOCID,
+      $temp,
+      $EC_Queue_Cntl_Nbr,
+      $EC_Entitycd_Ext,
+      $ECACTIONCD,
+      {DateTimeIn-Prefix}$SysDateTime{DateTimeIn-Suffix},
+      $Q_Cust_Vndr,
+      $Q_Business_Unit,
+      $EC_Entitycd_BU
+      )
+
+      end-sql
+
+   else
+
+      begin-sql on-error=SQLError
+
+         UPDATE PS_ECQUEUE
+         SET
+            ECQUEUESTATUS = $temp,
+            ECDRIVERDTTM = {DateTimeIn-Prefix}$SysDateTime{DateTimeIn-Suffix}
+         WHERE ECTRANSID = $ECTRANSID
+         AND   ECQUEUEINSTANCE = #ecqueueinstance_luw
+         AND   ECTRANSINOUTSW = $Bus_Doc_In_Out_Sw
+         AND   ECBUSDOCID = #ECBUSDOCID
+
+      end-sql
+   end-if
+
+end-procedure
+
+
+!---------------------------------------------------------------------!
+!  Put-Row-In-FILEDATA0
+!  This proc stores the current row of data from the flat file into an
+!  array. The program reads in all data rows into memory for the current
+!  LUW. Then upon seeing the next 000 record, it processes what is in the
+!  buffer.
+!----------------------------------------------------------------------!
+begin-procedure Put-Row-In-FILEDATA0($rowid, #qinstance, $input_rec,
+                                     $ectransid, :#file_count)
+   #debugh do debug-msg('Put-Row-In-FILEDATA0')
+   #debugv display 'Input row id=' noline
+   #debugv display $rowid
+   #debugv display 'Input qinstance=' noline
+   #debugv display #qinstance
+   #debugv display 'Input ectransid=' noline
+   #debugv display $ectransid
+
+   let #i = 0
+   let $temp = ' '
+
+    put
+       $rowid
+       #qinstance
+       $input_rec
+       #file_count
+       $ectransid
+       #_Message_Set_Nbr
+       #i
+       $temp
+    into FILEDATA0(0)
+       ecfilerowid(#file_count)
+       ecqueueinstance(#file_count)
+       filedata(#file_count)
+       luwlinenum(#file_count)
+       ectransid(#file_count)
+       message_set_nbr(#file_count)
+       message_nbr(#file_count)
+       error_misc(#file_count)
+
+    add 1 to #file_count
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+!  Process-LUW                                                         !
+!                                                                      !
+!  LUW data is in memory.  Grab it, and process it.  If there are any  !
+!  errors, rollback the entire LUW and enter a Worklist entry.         !
+!  Enter the LUW data into the BUSDOC tables if an error exists.       !
+!  If no errors, commit the LUW.  Log an ECQUEUE entry regardless.     !
+!                                                                      !
+!----------------------------------------------------------------------!
+begin-procedure Process-LUW
+      #debugh do debug-msg('Process-LUW')
+
+   let $Get_Current_Datetime = 'N'
+
+   let #filedata_seqno = 1              ! Skip over the 999 row
+   let $LUW_Error_Sw = 'N'
+
+   while #filedata_seqno < #Total_Rows_In_FILEDATA0
+
+      let $Pri_Evt_Cd = ' '             ! Reset these special code variables for each file record
+      let $Sec_Evt_Cd = ' '             ! They are only valid for current row.
+      let $Ec_Entity_Code = ' '
+      get
+         $ecfilerowid_filedata0
+         #ecqueueinstance_luw
+         $ECDATAVALUE
+         #LUWLinenum
+         $ectransid
+      from FILEDATA0(0)
+         ecfilerowid(#filedata_seqno)
+         ecqueueinstance(#filedata_seqno)
+         filedata(#filedata_seqno)
+         luwlinenum(#filedata_seqno)
+         ectransid(#filedata_seqno)
+
+      #debugv display 'Process-LUW #f=' noline
+      #debugv display #f
+      #debugv display 'Process-LUW $ecfilerowid_filedata0=' noline
+      #debugv display $ecfilerowid_filedata0
+      #debugv display 'Process-LUW $ECDATAVALUE=' noline
+      #debugv display $ECDATAVALUE
+
+      do Get-PSMAPFILE-Rowid($ecfilerowid_filedata0, #Current_ecfilerow, #Current_Field_Total)
+      let $Current_ecfilerowid = $ecfilerowid_filedata0
+      let $ecfilerowid = $ecfilerowid_filedata0
+
+      do Format-Row            ! Perform any pre-target computations on source data
+
+      do Loop-PS_ECINMAPPREC
+
+      add 1 to #filedata_seqno
+
+   end-while
+
+   if $LUW_Error_Sw = 'N'
+      add 1 to #luw_load_total
+      do Process-ECQUEUE
+      do Commit-Transaction
+   else
+      add 1 to #luw_error_total
+      do Rollback-Transaction
+      do Process-ECQUEUE            ! Make sure the queue is updated with correct status
+      do Log-LUW-Error
+      do Commit-Transaction         ! Save all BUSDOC updates
+      if &ECRUNCNTL.ECINDRIVEROPT <> 'I'
+         let $LUW_Error_Sw = 'N'
+      end-if
+   end-if
+
+   let #Total_Rows_In_FILEDATA0 = 0
+   clear-array name = FILEDATA0
+   let $EC_Queue_Cntl_Nbr = ' '
+   let #i = 0
+   let #j = 0
+   ! reset target data values in the array. Each data value is the last value inserted.
+   while #i < #Maprec_Count
+      while #j < #Max_PS_ECINMAPRECFLD
+         if isblank(PS_ECINMAPRECFLD.fieldname(#j,#i))
+            break
+         end-if
+         let PS_ECINMAPRECFLD.recordfieldvalue(#j,#i) = ''
+         add 1 to #j
+      end-while
+      add 1 to #i
+   end-while
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+!  Log-LUW-Error
+!  This proc loops through each row of data in the buffers and writes
+!  the data to the BUSDOC tables and logs the worklist entry.
+!----------------------------------------------------------------------!
+begin-procedure Log-LUW-Error
+      #debugh do debug-msg('Log-LUW-Error')
+
+   let #filedata_seqno = 0
+   while #filedata_seqno < #Total_Rows_In_FILEDATA0
+
+      get
+         $ecfilerowid_filedata0
+         #ecqueueinstance_err
+         $ECDATAVALUE
+         #luwlinenum
+         $ectransid
+         #message_set_nbr
+         #Message_Nbr
+         $Error_Misc
+      from FILEDATA0(0)
+         ecfilerowid(#filedata_seqno)
+         ecqueueinstance(#filedata_seqno)
+         filedata(#filedata_seqno)
+         luwlinenum(#filedata_seqno)
+         ectransid(#filedata_seqno)
+         message_set_nbr(#filedata_seqno)
+         message_nbr(#filedata_seqno)
+         error_misc(#filedata_seqno)
+
+      if #filedata_seqno = 0
+         do Log-WL-Entry('Manage EDI',
+                         'Manage Inbound EDI Agent',
+                         'Run Inbound Agent',
+                         'Work Inbound Agent Errors',
+                         'ECBUSDOCLN_WL',
+                         'ECIN0001',
+                         #ECBUSDOCID, $ECTRANSID,
+                         #ECQUEUEINSTANCE, $Bus_Doc_In_Out_Sw)
+         if &ECRUNCNTL.ECINDRIVEROPT <> 'I'        ! Single instance ==> reload of previous error, don't generate new error docs
+            do Process-ECBUSDOCLN(#ECBUSDOCID, $ECTRANSID, #ecqueueinstance_err, $Bus_Doc_In_Out_Sw)
+         end-if
+      end-if
+      if #Message_Nbr > 0
+         let $ECBUSDOCDTL_Status = $Load_Error_Status
+      else
+         let $ECBUSDOCDTL_Status = $Logged_Status
+      end-if
+      if &ECRUNCNTL.ECINDRIVEROPT <> 'I'        ! Single instance ==> reload of previous error, don't generate new error docs
+         do Process-ECBUSDOCDTL
+      end-if
+
+      if #Message_Nbr > 0
+         do Process-ECBUSDOCERR
+      end-if
+
+      add 1 to #filedata_seqno
+
+   end-while
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+! Get-PSMAPFILE-Rowid
+! This proc will try to find the corresponding flat file row ID based on
+! input DB file row ID. The ECINMAPFILE array holds the source row id to be
+! used as the source row. If this can't be found, a mapping error has occured.
+!----------------------------------------------------------------------!
+begin-procedure Get-PSMAPFILE-Rowid($maprec_rowid, :#i, :#total_file_fields)
+   #debugh do debug-msg('Get-PSMAPFILE-Rowid')
+
+   let #i = 0
+   while #i <= #_ecmapid_count
+      get
+         $rowid
+         #total_file_fields
+      from PS_ECINMAPFILE(0)
+         ecfilerowid(#i)
+         totalfilefields(#i)
+
+      let $rowid = rtrim($rowid, ' ')
+
+      if $rowid = $maprec_rowid
+         Break
+      else
+         add 1 to #i
+      end-if
+   end-while
+
+   if #i > #_ecmapid_count
+
+      let $_LUW_Error_Sw = 'Y'
+      let #msg_nbr = 201
+      let $error_temp = 'ROWID: ' || $ecfilerowid_filedata0
+
+      put
+         #_message_set_nbr
+         #msg_nbr
+         $error_misc
+      into FILEDATA0(0)
+         message_set_nbr(#filedata_seqno)
+         message_nbr(#filedata_seqno)
+         error_misc(#filedata_seqno)
+
+   end-if
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+!  Loop-PS_ECINMAPPREC
+!  Based on current input data row's file row id, find the target record(s) name
+!----------------------------------------------------------------------!
+begin-procedure Loop-PS_ECINMAPPREC
+      #debugh do debug-msg('Loop-PS_ECINMAPPREC')
+
+      let #j = 0
+
+      while #j < #Max_PS_ECINMAPREC
+
+         get
+            $Cur_ecfilerowid
+            $Cur_Recname
+
+         from PS_ECINMAPREC(0)
+            ecfilerowid(#j)
+            recname(#j)
+
+         if $Cur_ecfilerowid = $Current_ecfilerowid
+
+            let #PS_ECINMAPREC_Row = #j
+            do Build-Run-Statements
+
+            ! Reset all lower level sequence counters that point to this level
+            ! Also reset all summary stats that have been used at this level
+            if $LUW_Error_Sw = 'N'
+               let #i = #j + 1
+               while #i < #Max_PS_ECINMAPREC
+                  if isblank(PS_ECINMAPREC.recname(0,#i))
+                     break
+                  end-if
+                  let #k = 0
+                  ! loop thru all fields for current record to see if they point to j
+                  while #k < #Max_PS_ECINMAPRECFLD
+
+                     if  isblank(PS_ECINMAPRECFLD.fieldname(#k, #i))
+                        break
+                     end-if
+                     if  PS_ECINMAPRECFLD.ecinagentcalccd(#k, #i) = 'SEQ' and
+                         to_number(PS_ECINMAPRECFLD.ecrelatedrowid(#k, #i)) = #j
+                        let PS_ECINMAPRECFLD.curseqnovalue(#k, #i) = 1
+                     end-if
+                     add 1 to #k
+                  end-while
+                  add 1 to #i
+               end-while
+               let #i = 0
+               while #i < #Summary_Field_Count
+                  if Summary_Info.resetflag(#i) = 'Y'
+                     #debugv display 'Resetting summary info for count=' noline
+                     #debug display #i
+
+                     let Summary_Info.total(#i) = 0
+                     let Summary_Info.occurancecount(#i) = 0
+                     let Summary_Info.maximum(#i) = 0
+                     let Summary_Info.minimum(#i) = 0
+                     let Summary_Info.resetflag(#i) = 'N'
+                  end-if
+                  add 1 to #i
+               end-while
+
+            end-if
+
+         end-if
+
+         add 1 to #j
+
+      end-while
+
+      let #j = 0
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+!  Build-Run-Statements
+!----------------------------------------------------------------------!
+begin-procedure Build-Run-Statements
+   #debugh do debug-msg('Build-Run-Statements')
+
+   #debugv display '#PS_ECINMAPREC_Row=' noline
+   #debugv display #PS_ECINMAPREC_Row
+
+   let $Insert_Columns = ''
+   let $Insert_Values  = ''
+
+   let #s = 0
+
+   do Build-Statement
+
+   let $Insert_Columns = rtrim($Insert_Columns, ',')
+   let $Insert_Values  = rtrim($Insert_Values, ',')
+
+   let $Insert_Statement = 'INSERT INTO PS_' || $Cur_Recname || ' ( '
+       || $Insert_Columns || ' ) VALUES ( ' || $Insert_Values || ' ) '
+
+   if $LUW_Error_Sw = 'N'
+      do Execute-Statement
+   end-if
+
+end-procedure
+
+!----------------------------------------------------------------------!
+!  Execute-Statement
+!----------------------------------------------------------------------!
+begin-procedure Execute-Statement
+   #debugh do debug-msg('Execute-Statement')
+
+   #debugv display '$Insert_Statement'
+   #debugv display $Insert_Statement
+
+   begin-sql on-error=Execute-Statement-SQL-Error
+      [$Insert_Statement]
+   end-sql
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+!  Execute-Statement-SQL-Error
+!----------------------------------------------------------------------!
+begin-procedure Execute-Statement-SQL-Error
+   #debugh do debug-msg('Execute-Statement-SQL-Error')
+
+   let $LUW_Error_Sw = 'Y'
+
+   #debugv display 'Invalid $Insert_Statement'
+   #debugv display $Insert_Statement
+   #debugv  display '#Sql-Status=' noline
+   #debugv  display #Sql-Status
+   #debugv  display '$SQL-Error=' noline
+   #debugv  display $SQL-Error
+   #debugv  display '$SQL-Msg=' noline
+   #debugv  display $SQL-Msg
+   let $Error_Misc = $Insert_Statement || '     ' || $SQL-Error
+
+   let #Message_Nbr = 200
+
+   put
+      #message_set_nbr
+      #Message_Nbr
+      $Error_Misc
+   into FILEDATA0(0)
+      message_set_nbr(#filedata_seqno)
+      message_nbr(#filedata_seqno)
+      error_misc(#filedata_seqno)
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+!  Build-Statement                                                     !
+!                                                                      !
+!  Loop thru target records, build the insert statement for each.      !
+!                                                                      !
+!----------------------------------------------------------------------!
+begin-procedure Build-Statement
+      #debugh do debug-msg('Build-Statement')
+
+   while #s <= #Max_PS_ECINMAPRECFLD
+      get
+         #seqno
+         $FieldName
+         #FieldType
+         $ecrecfldvaluecd
+         $ecdefaultvalue
+         $ecinagentcalccd
+         #fldxref
+         #fldrowxref
+         #curseqnovalue
+       from PS_ECINMAPRECFLD(#s)
+         seqno(#PS_ECINMAPREC_Row)
+         fieldname(#PS_ECINMAPREC_Row)
+         fieldtype(#PS_ECINMAPREC_Row)
+         ecrecfldvaluecd(#PS_ECINMAPREC_Row)
+         ecdefaultvalue(#PS_ECINMAPREC_Row)
+         ecinagentcalccd(#PS_ECINMAPREC_Row)
+         fldxref(#PS_ECINMAPREC_Row)
+         fldrowxref(#PS_ECINMAPREC_Row)
+         curseqnovalue(#PS_ECINMAPREC_Row)
+
+
+      let $FieldType = to_char(#fieldtype)
+      if isnull(rtrim($fieldname, ' '))
+         break
+      else
+         do Format-Statement
+      end-if
+      add 1 to #s
+
+   end-while
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+!  Format-Statement
+!----------------------------------------------------------------------!
+begin-procedure Format-Statement
+
+   let $FieldValue = ' '
+   let $source_field_name = ' '
+   let #decimal_pos = 0
+   if #fldrowxref <= #Max_PS_ECINMAPFLD
+      get
+         #Message_Nbr
+         $Error_Misc
+         $source_field_name
+         #decimal_pos
+         $FieldValue
+      from PS_ECINMAPFLD(#fldrowxref)
+         errornumber(#fldxref)
+         error_misc(#fldxref)
+         fieldname(#fldxref)
+         decimalpos(#fldxref)
+         filefldval(#fldxref)
+   else
+      if $ecrecfldvaluecd = 'F' ! Perform this check here since we are in middle of LUW
+         let #Message_Nbr = 208
+         let $Error_Misc = 'Map ID(' || $ECMAPID ||
+                    ') Field Name(' || $FieldName ||
+                    ') Source Field Number(' || to_char(#fldxref) ||
+                    ') Source Field Row(' || to_char(#fldrowxref) || ').'
+      end-if
+   end-if
+
+   if #Message_Nbr = 0
+      evaluate $ecrecfldvaluecd
+         when = 'D'   ! Use Default only when source field does not exist or is null
+            #debugv display 'Default processing data values:'
+            #debugv display $source_field_name
+            #debugv display $FieldValue
+            #debugv display $ecdefaultvalue
+            if isblank($source_field_name) or isblank($FieldValue)
+               let $FieldValue = $ecdefaultvalue
+               let PS_ECINMAPRECFLD.recordfieldvalue(#s, #PS_ECINMAPREC_Row) = $ecdefaultvalue
+            else
+               let PS_ECINMAPRECFLD.recordfieldvalue(#s, #PS_ECINMAPREC_Row) = $FieldValue
+            end-if
+         when = 'C'   ! Driver Calculated
+            do Process-Driver-Calc($ecinagentcalccd, $FieldValue)
+            let PS_ECINMAPRECFLD.recordfieldvalue(#s, #PS_ECINMAPREC_Row) = $FieldValue
+         when = 'F'   ! Use File Value
+            let PS_ECINMAPRECFLD.recordfieldvalue(#s, #PS_ECINMAPREC_Row) = $FieldValue
+         when-other
+            break
+      end-evaluate
+
+   end-if
+   if #Message_Nbr > 0
+
+      let $LUW_Error_Sw = 'Y'
+      #debugv display 'Format-Statement #Message_Nbr=' noline
+      #debugv display #Message_Nbr
+
+      put
+         #message_set_nbr
+         #Message_Nbr
+         $Error_Misc
+      into FILEDATA0(0)
+         message_set_nbr(#filedata_seqno)
+         message_nbr(#filedata_seqno)
+         error_misc(#filedata_seqno)
+
+   end-if
+
+   if range(to_number($FieldType), 4, 6) and isnull($FieldValue)
+      #debugv display 'Ignoring blank date/time data value'
+   else
+      #debugv display '   before format value=' noline
+      #debugv display #year_start
+      do Format-Value($FieldType,$FieldValue, #decimal_pos)
+
+      #debugv display 'Insert values fieldname=' noline
+      #debugv display $FieldName noline
+      #debugv display '   Fieldvalue=' noline
+      #debugv display $FieldValue
+      let $Insert_Values = $Insert_Values || $FieldValue || $Comma
+      let $Insert_Columns = $Insert_Columns || $FieldName || $Comma
+   end-if
+
+   ! Gather statistics for any summary related fields save in the array
+   if PS_ECINMAPRECFLD.summaryinfoindex(#s, #PS_ECINMAPREC_Row) != -1
+      ! indicates that this field needs stats
+      let #i = PS_ECINMAPRECFLD.summaryinfoindex(#s, #PS_ECINMAPREC_Row)
+      let #FieldValue = to_number($FieldValue)
+      #debugv display 'Stats index=' noline
+      #debugv display #i
+      #debugv display 'Field Name=' noline
+      #debugv display $FieldName
+      #debugv display 'Field Value=' noline
+      #debugv display #FieldValue
+
+      let Summary_Info.occurancecount(#i) =  Summary_Info.occurancecount(#i) + 1
+      #debugv let #temp = Summary_Info.occurancecount(#i)
+      #debugv display 'Occurance Count=' noline
+      #debugv display #temp
+      let Summary_Info.total(#i) = Summary_Info.total(#i) + #FieldValue
+      if Summary_Info.occurancecount(#i) = 1    ! First time stats saved on this field
+         let Summary_Info.maximum(#i) = #FieldValue
+         let Summary_Info.minimum(#i) = #FieldValue
+      end-if
+      if Summary_Info.maximum(#i) < #FieldValue
+         let Summary_Info.maximum(#i) = #FieldValue
+         #debugv display 'New Max=' noline
+         #debugv display #FieldValue
+      end-if
+      if Summary_Info.minimum(#i) > #FieldValue
+         let Summary_Info.minimum(#i) = #FieldValue
+         #debugv display 'New Min=' noline
+         #debugv display #FieldValue
+      end-if
+   end-if
+
+end-procedure
+
+!----------------------------------------------------------------------!
+!  Process-Driver-Calc                                                 !
+!                                                                      !
+!  The EC Agent can calculate values to put into a target record.  Not !
+!  all data to be mapped has to come from the PSFT Bus Doc file.       !
+!                                                                      !
+!----------------------------------------------------------------------!
+begin-procedure Process-Driver-Calc($driver_calc_cd, :$value)
+     #debugh do debug-msg('Process-Driver-Calc')
+     #debugv display 'Input driver calc code=' noline
+     #debugv display $driver_calc_cd
+     #debugv display 'Input Field Value=' noline
+     #debugv display $value
+
+
+     evaluate $driver_calc_cd
+        when = 'ACT'
+           do Get-Action-Code($_Tp_Profile_ID, $_ECTRANSID, $_Pri_Evt_Cd, $_Sec_Evt_Cd, $_ECACTIONCD)
+           let $value = $_ECACTIONCD
+           if isblank($value)
+              let #_message_nbr = 202
+              let $_Error_Misc = 'Profile(' || $_Tp_Profile_ID ||
+                 ') Transaction(' || $_ECTRANSID ||
+                 ') Primary Event Code(' || $_Pri_Evt_Cd ||
+                 ') Secondary Event Code(' || $_Sec_Evt_Cd ||
+                 ') EC Action Code(' || $_ECACTIONCD || ').'
+           end-if
+
+        when = 'APV'     ! Apportion / average the Parent Value
+           let #par_rowid_idx = to_number(PS_ECINMAPRECFLD.ecrelatedrowid(#_s, #_PS_ECINMAPREC_Row))
+           let $par_recname = rtrim(PS_ECINMAPRECFLD.ecrelatedrecname(#_s, #_PS_ECINMAPREC_Row),' ')
+           let $par_fieldname = rtrim(PS_ECINMAPRECFLD.ecrelatedfieldname(#_s, #_PS_ECINMAPREC_Row),' ')
+           #debugv display 'APV rowid idx=' noline
+           #debugv display #par_rowid_idx
+           #debugv display 'APV parent rec=' noline
+           #debugv display $par_recname
+           #debugv display 'APV parent field=' noline
+           #debugv display $par_fieldname
+           do Count-Siblings(#_PS_ECINMAPREC_Row, #_LUWLinenum, #sibling_count)
+           let #i = 0
+           let $value = '0'
+           while #i < #_Max_PS_ECINMAPRECFLD
+              if rtrim(PS_ECINMAPRECFLD.recname(#i, #par_rowid_idx),' ') = $par_recname and
+                 rtrim(PS_ECINMAPRECFLD.fieldname(#i, #par_rowid_idx),' ') = $par_fieldname
+                 if #sibling_count > 0
+                    let #value = PS_ECINMAPRECFLD.recordfieldvalue(#i, #rowid_idx)
+                    let $value = to_char(round((#value/#sibling_count),
+                                 PS_ECINMAPFLD.decimalpos(#_fldrowxref, #_fldxref)))
+                 else
+                    let $value = '0'
+                 end-if
+                 #debugv display 'APV value=' noline
+                 #debugv display $value
+               break
+              end-if
+              add 1 to #i
+           end-while
+
+        when = 'TSV'            ! Accumulate Summary Value
+        when = 'ASV'            ! Average Summary Value
+        when = 'NSV'            ! Maximum Summary Value
+        when = 'XSV'            ! Minimum Summary Value
+           ! look for the related recname and fieldname in the summary array
+           ! reset the total array value for this field.
+           let #i = 0
+           let $value = '0'
+           while #i < #_Summary_Field_Count
+              if Summary_Info.ecfilerowid(#i) = PS_ECINMAPRECFLD.ecrelatedrowid(#_s, #_PS_ECINMAPREC_Row) and
+                 Summary_Info.recname(#i) = PS_ECINMAPRECFLD.ecrelatedrecname(#_s, #_PS_ECINMAPREC_Row) and
+                 Summary_Info.fieldname(#i) = PS_ECINMAPRECFLD.ecrelatedfieldname(#_s, #_PS_ECINMAPREC_Row)
+                 if $driver_calc_cd = 'TSV'
+                    let $value = to_char(Summary_Info.total(#i))
+                 end-if
+                 if $driver_calc_cd = 'ASV'
+                    let $value = to_char(Summary_Info.total(#i) /
+                                         Summary_Info.occurancecount(#i))
+                 end-if
+                 if $driver_calc_cd = 'NSV'
+                    let $value = to_char(Summary_Info.minimum(#i))
+                 end-if
+                 if $driver_calc_cd = 'XSV'
+                    let $value = to_char(Summary_Info.maximum(#i))
+                 end-if
+                 let Summary_Info.resetflag(#i) = 'Y'
+                 break
+              end-if
+              add 1 to #i
+           end-while
+
+        when = 'BIN'            ! Business Doc Level Internal TPID Assignment
+           let $value = $_Q_Business_Unit
+        when = 'BEX'            ! Business Doc Level External TPID Assignment
+           let $value = $_Q_Cust_Vndr
+        when = 'DTM'
+        when = 'TIM'
+           if $_Get_Current_Datetime = 'N'    ! Only do timestamp once per LUW
+              do Get-Current-Datetime
+              let $_Get_Current_Datetime = 'Y'
+           end-if
+           do Format-DateTime($_SysDateTime, $value, {DEFYMD}, 'time', '')
+           if $driver_calc_cd = 'TIM'         ! strip off the date portion 97/11/24 11:26:27
+               let #time_loc = instr($value,':',1) - 2
+               if #time_loc < 1
+                  let #time_loc = 10
+               end-if
+               let $value = {PS-substr}($value,#time_loc,({PS-length}($value) - #time_loc) + 1)
+           end-if
+
+        when = 'DAT'
+           if $_Get_Current_Datetime = 'N'
+              do Get-Current-Datetime
+              let $_Get_Current_Datetime = 'Y'
+           end-if
+           do Format-DateTime($_AsofToday, $value, {DEFYMD}, '', '')
+
+
+        when = 'ECT'
+           let $value = $_ECTRANSID
+        when = 'ECQ'
+           let $value = to_char(#_ecqueueinstance_luw)
+        when = 'FID'
+           let $value = $_Input_Data_File
+
+        when = 'IPV'     ! Inherit the Parent Value
+           let #rowid_idx = to_number(PS_ECINMAPRECFLD.ecrelatedrowid(#_s, #_PS_ECINMAPREC_Row))
+           let $par_recname = rtrim(PS_ECINMAPRECFLD.ecrelatedrecname(#_s, #_PS_ECINMAPREC_Row),' ')
+           let $par_fieldname = rtrim(PS_ECINMAPRECFLD.ecrelatedfieldname(#_s, #_PS_ECINMAPREC_Row),' ')
+           #debugv display 'IPV rowid idx=' noline
+           #debugv display #rowid_idx
+           #debugv display 'IPV parent rec=' noline
+           #debugv display $par_recname
+           #debugv display 'IPV parent field=' noline
+           #debugv display $par_fieldname
+           let #i = 0
+           let $value = ' '
+           while #i < #_Max_PS_ECINMAPRECFLD
+              if rtrim(PS_ECINMAPRECFLD.recname(#i, #rowid_idx),' ') = $par_recname and
+                 rtrim(PS_ECINMAPRECFLD.fieldname(#i, #rowid_idx),' ') = $par_fieldname
+                 let $value = PS_ECINMAPRECFLD.recordfieldvalue(#i, #rowid_idx)
+                 #debugv display 'IPV value=' noline
+                 #debugv display $value
+                 break
+              end-if
+              add 1 to #i
+           end-while
+
+        when = 'OID'
+           let $value = $_Prcs_Oprid
+
+        when = 'PID'
+           let $value = to_char(#_prcs_process_instance)
+
+        when = 'RID'
+           let $value = $_Prcs_Run_Cntl_ID
+
+        when = 'SEQ'
+            let $value = to_char(#_curseqnovalue)
+            #debugv display 'SEQ Driver=' noline
+            #debugv display $value
+            add 1 to  #_curseqnovalue      ! Increment counter and save for next data row
+            put #_curseqnovalue
+            into PS_ECINMAPRECFLD(#_s)
+                curseqnovalue(#_PS_ECINMAPREC_Row)
+
+        when = 'TPC'
+
+           do Get-ECENTITYCD_Type($_Ec_Entity_Code, $ec_ext_id_sw, $entitycd_recname)
+           if $ec_ext_id_sw = 'Y'
+              do Convert-External_TP_ID($_Active_Business_Unit,
+                  $value, $_Ec_Entity_Code, $entitycd_recname, $value)
+              if isblank($value)
+                 let #_Message_Nbr = 207
+                 let $_Error_Misc = 'Active Business Unit=('
+                    || $_Active_Business_Unit || '), External TPID=('
+                    || $_Ec_Ext_Tp_Id || '), Entity Code=(' || $_Ec_Entity_Code || ')'
+              end-if
+           else
+              do Validate-EC_ALIAS_TP_ID($_Ec_Ext_Tp_Id, $value, $int_tp_id)
+              if isblank($int_tp_id)
+                 let #_Message_Nbr = 206
+                 let $_Error_Misc = 'External TPID(' || $_Ec_Ext_Tp_Id ||
+                     ') Alias TPID(' || $_Ec_Alias_Tp_Id ||
+                     ') Internal TPID(' || $int_tp_id || ').'
+              else
+                 do Convert-EC_ALIAS_TP_ID($int_tp_id, $_EC_Entity_Code, $value)
+                 if isblank($value)
+                    let #_Message_Nbr = 204
+                    let $_Error_Misc = 'Internal TPID(' || $int_tp_id ||
+                     ') Entity Code(' || $_Ec_Entity_Code ||
+                     ') Business Unit(' || $value || ').'
+                 else
+                    let $_Active_Business_Unit = $value         ! This lower level BU is now active
+                 end-if
+              end-if
+           end-if
+
+        when-other
+           break
+     end-evaluate
+     #debugv display 'Output driver calc value=' noline
+     #debugv display $value
+
+end-procedure
+
+!----------------------------------------------------------------------!
+!  Format-Row
+!  This proc loops through each field in the current row and performs
+!  any pre-target copy assignments. If there are any map specific or TP
+!  specific conversions, these can be done prior to assigning the target field
+!  data.         REDO
+!----------------------------------------------------------------------!
+begin-procedure Format-Row
+   #debugh do debug-msg('Format-Row')
+
+
+! if this is a csv file, then we must load the CSV_DATA array with
+! each element from the input row
+
+  if $csv_flag <> 'N'
+    do Load-CSV-Data
+  end-if
+
+  let #j = 0
+
+  while #j <= #Current_Field_Total
+
+     get
+        #seqno
+        $fieldname
+        #fieldtype
+        #ecstartpos
+        #length
+        #decimalpos
+        $ecconvertcd
+        $ectpcvtid
+        $ecfldspecialcd
+        #Message_Nbr
+        $delimit_date
+        #year_start
+        #year_len
+        #month_start
+        #month_len
+        #day_start
+        #day_len
+
+     from PS_ECINMAPFLD(#j)
+        seqno(#Current_ecfilerow)
+        fieldname(#Current_ecfilerow)
+        fieldtype(#Current_ecfilerow)
+        ecstartpos(#Current_ecfilerow)
+        length(#Current_ecfilerow)
+        decimalpos(#Current_ecfilerow)
+        ecconvertcd(#Current_ecfilerow)
+        ectpcvtid(#Current_ecfilerow)
+        ecfldspecialcd(#Current_ecfilerow)
+        errornumber(#Current_ecfilerow)
+        delimit_date(#Current_ecfilerow)
+        year_start(#Current_ecfilerow)
+        year_len(#Current_ecfilerow)
+        month_start(#Current_ecfilerow)
+        month_len(#Current_ecfilerow)
+        day_start(#Current_ecfilerow)
+        day_len(#Current_ecfilerow)
+
+
+     if isnull(rtrim($fieldname, ' '))
+
+        break
+
+     else
+
+        let $Inmap_Fld_Value = ''
+        let #Message_Nbr = 0
+        let $Error_Misc = ''
+        do Get-File-Field-Value
+
+        put
+           #Message_Nbr
+           $Error_Misc
+           $Inmap_Fld_Value
+        into PS_ECINMAPFLD(#j)
+           errornumber(#Current_ecfilerow)
+           error_misc(#Current_ecfilerow)
+           filefldval(#Current_ecfilerow)
+
+     end-if
+     add 1 to #j
+
+   end-while
+
+end-procedure
+
+!----------------------------------------------------------------------!
+! Get-File-Field-Value
+!----------------------------------------------------------------------!
+begin-procedure Get-File-Field-Value
+      #debugh do debug-msg('Get-File-Field-Value')
+
+   let $ectpcvtid      = rtrim($ectpcvtid, ' ')
+   let $ecfldspecialcd = rtrim($ecfldspecialcd, ' ')
+
+   #debugv display '#ecstartpos=' noline
+   #debugv display #ecstartpos
+   #debugv display '#length=' noline
+   #debugv display #length
+   #debugv display 'CSV Flag =' noline
+   #debugv display $csv_flag
+
+
+   !----------------------------------------------------
+   ! get the field from the input record based
+   ! on field position if it is NOT a CSV file
+   ! if it IS a CSV file, then get it from CSV_DATA
+   !----------------------------------------------------
+
+   if $csv_flag = 'N'
+    let $Inmap_Fld_Value = rtrim({PS-substr}($ECDATAVALUE, #ecstartpos, #length), ' ')
+   else
+    get
+     $Inmap_Fld_Value
+    from CSV_DATA(#seqno) filedata
+
+    #debugv display 'value extracted form csv data :' noline
+    #debugv display $Inmap_Fld_Value
+   end-if
+
+
+   evaluate $ecfldspecialcd
+      when = 'E'        ! Input record field is marked as a entity code
+         let $Ec_Entity_Code = $Inmap_Fld_Value
+      when = 'P'        ! Input record field is marked as a primary event code
+         let $Pri_Evt_Cd = $Inmap_Fld_Value
+      when = 'S'        ! Input record field is marked as a secondary event code
+         let $Sec_Evt_Cd = $Inmap_Fld_Value
+      when = 'Q'        ! Input record field is marked as the EC Q Control Number
+         let $EC_Queue_Cntl_Nbr = $Inmap_Fld_Value
+     when-other
+   end-evaluate
+
+   if $ecconvertcd = 'C'   ! This field needs map specific cross reference
+      do Convert-Value($ECMAPID, $ecfilerowid, #seqno, $Inmap_Fld_Value)
+      if isblank($Inmap_Fld_Value)
+         let #message_nbr = 103
+         let $error_misc = 'EC Map ID('  || $ECMAPID
+                        || ')   EC File Row ID(' || $ecfilerowid
+                        || ')   External Data Value('
+                        || {PS-substr}($ECDATAVALUE, #ecstartpos #length) || ')'
+      end-if
+   end-if
+
+   if $ecconvertcd = 'T'   ! This field needs TPID specific cross reference
+      do Process-TP_Conversion_Type($Cvt_Profile_ID, $ectpcvtid,
+           $Bus_Doc_In_Out_Sw, $Inmap_Fld_Value, $Inmap_Fld_Value)
+      if isblank($Inmap_Fld_Value)
+         let #message_nbr = 207
+         let $error_misc = 'External TPID('  || $ec_ext_tp_id
+                        || ')   Consersion Type(' || $ectpcvtid
+                        || ')   External Data Value('
+                        || {PS-substr}($ECDATAVALUE, #ecstartpos #length) || ')'
+      end-if
+   end-if
+
+!  flexible date formatting will take place here.  Convert the date to the specified
+!  format
+   if #fieldtype = 4
+      #debugv display 'FieldType/value for new conversion' noline
+      #debugv display #fieldtype
+      #debugv display $inmap_fld_value
+
+      ! skip this if we're already at YYYY/MM/DD or we probably don't have a date format
+      ! loaded in the db, OR if there is NO date in the field.
+      if (#year_start <> 1 or #year_len <> 4 or #month_start <> 6 or #month_len <> 2 or
+          #day_start <> 9 or #day_len <> 2) AND
+         (#year_start + #month_start + #day_start) >= 7 AND
+          not(isblank($inmap_fld_value))
+
+        do Process-Flex-Date($inmap_fld_value,$inmap_fld_value,#year_start,#year_len,#month_start,
+                             #month_len,#day_start,#day_len,$delimit_date,'I')
+      end-if
+  end-if
+
+end-procedure
+
+!----------------------------------------------------------------------!
+! this procedure is used to load data from the input row into a csv array
+! based on SEQUENCE number.  The field positions in the file are NOT
+! used, but the SEQUENCE number in the map definition is.  This proc
+! should take into account the delimiter and separator and just bring back
+! the sequence number, data combination
+!----------------------------------------------------------------------!
+begin-procedure Load-CSV-Data
+
+ let $tempdata = $ECDATAVALUE
+ let #remainlen = 0
+ let #sep_start = 1
+ let $csv_element = ' '
+
+
+! if there is no rowid, have to bump up the seq number since the rowid is still
+! in the map definition
+
+ if $suppress_rowid = 'N'
+  let #element_count = 1
+ else
+  let #element_count = 2
+ end-if
+
+
+ while #sep_start > 0
+
+   let #sep_start = instr($tempdata,$csv_separator,1)
+
+   if #sep_start > 0
+     let $csv_element = {PS-substr}($tempdata,1,#sep_start)
+     let #remainlen = {PS-length}($tempdata) - #sep_start + 1
+     let $tempdata = {PS-substr}($tempdata,#sep_start+1,#remainlen)
+
+
+! we have the element, now lets take off blanks,separator and delimiter
+     let $csv_element = rtrim(ltrim($csv_element,' '),' ')
+     let $csv_element = rtrim($csv_element,$csv_separator)
+     let $csv_element = rtrim($csv_element,$csv_delimiter)
+     let $csv_element = ltrim($csv_element,$csv_delimiter)
+
+     put
+        $csv_element
+     into CSV_DATA(#element_count) filedata
+
+
+     let #element_count = #element_count + 1
+
+
+   end-if
+
+ end-while
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+! Count-Siblings
+! Based on the current child row ID, find all other data rows in the file
+! that have the same row id. This count becomes the denominator in the averaging
+! calculation. This proc assumes that it is called with the first sibling
+! in the sequence for the particular parent. It counts forward in the flat
+! file array until the next less row id is encountered (next parent row).
+!----------------------------------------------------------------------!
+begin-procedure Count-Siblings(#rowid_idx, #luwlinenum, :#sibling_count)
+   #debugh do debug-msg('Count-Siblings')
+   #debugv display 'Input row=' noline
+   #debugv display #rowid_idx
+   #debugv display 'Input LUW #=' noline
+   #debugv display  #luwlinenum
+
+   let #sib = #luwlinenum
+   let $to_current_row = 'N'
+   let #sibling_count = FILEDATA0.siblingcount(0, #rowid_idx)
+
+   if #sibling_count = -1  ! First time child level processed
+      let #sibling_count = 0       ! reset for correct beginning value
+      while #sib < #_Total_Rows_In_Filedata0
+
+         let #rowid_temp = to_number(FILEDATA0.ecfilerowid(0, #sib))
+         #debugv display 'Sibling Count $rowid_temp=' noline
+         #debugv display #rowid_temp
+         if #rowid_temp < #rowid_idx and $to_current_row = 'Y' ! have found all the siblings
+            break
+         end-if
+         if #rowid_temp = #rowid_idx
+            if $to_current_row = 'N'
+               let $to_current_row = 'Y'
+            end-if
+            add 1 to #sibling_count
+         end-if
+         add 1 to #sib
+
+      end-while
+   end-if
+
+   let FILEDATA0.siblingcount(0, #rowid_idx) = #sibling_count
+   #debugv display 'Output Sibling Count=' noline
+   #debugv display #sibling_count
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+! Convert-Value
+!----------------------------------------------------------------------!
+begin-procedure Convert-Value($mapid, $rowid, #seqno, :$value)
+   #debugh do debug-msg('Convert-Value')
+   #debugv display 'Input mapid=' noline
+   #debugv display $mapid
+   #debugv display 'Input rowid=' noline
+   #debugv display $rowid
+   #debugv display 'Input seqno=' noline
+   #debugv display #seqno
+
+   let $out_value = ''
+
+begin-select on-error=SQLError
+
+ECCVTTOVALUE
+
+  let $out_value = rtrim(&ECCVTTOVALUE, ' ')
+
+FROM PS_ECINMAPFLDCVT
+WHERE ECMAPID        = $mapid
+AND   ECFILEROWID    = $rowid
+AND   SEQNO          = #seqno
+AND   ECCVTFROMVALUE = $value
+
+end-select
+
+   let $value = $out_value
+   #debugv display 'Output value=' noline
+   #debugv display $value
+
+end-procedure
+
+!---------------------------------------------------------------------!
+!  Load-PS_ECINMAPFILE
+!----------------------------------------------------------------------!
+begin-procedure Load-PS_ECINMAPFILE
+   #debugh do debug-msg('Load-PS_ECINMAPFILE ')
+
+   let #Maprec_Count = 0
+   let $temp = ''
+   clear-array name=PS_ECINMAPFILE
+   clear-array name=PS_ECINMAPFLD
+   clear-array name=PS_ECINMAPREC
+   clear-array name=PS_ECINMAPRECFLD
+   clear-array name=Summary_Info
+   let #Summary_Field_Count = 0
+
+begin-select on-error=SQLError
+
+PS_ECINMAPFILE1.ECMAPID,
+PS_ECINMAPFILE1.ECFILEROWID,
+PS_ECINMAPFILE1.RECNAME
+
+            let $temp = 'Y'
+            let $ECMAPID   = rtrim(&PS_ECINMAPFILE1.ECMAPID, ' ')
+            let $ecfilerowid = rtrim(&PS_ECINMAPFILE1.ECFILEROWID, ' ')
+            let $recname = rtrim(&PS_ECINMAPFILE1.RECNAME, ' ')
+            let #ECmapid_Count = to_number($ecfilerowid)
+
+            #debugv display 'Load In Map File #ECmapid_Count=' noline
+            #debugv display #ECmapid_Count
+
+            do Load-PS_ECINMAPFLD
+
+            put
+               $ECMAPID
+               $ecfilerowid
+               $recname
+               $Rowid_Value
+               #Rowid_Start_Pos
+               #Rowid_Length
+               #totalfilefields
+            into PS_ECINMAPFILE(0)
+               ecmapid(#ECmapid_Count)
+               ecfilerowid(#ECmapid_Count)
+               recname(#ECmapid_Count)
+               rowidvalue(#ECmapid_Count)
+               rowidstartpos(#ECmapid_Count)
+               rowidlength(#ECmapid_Count)
+               totalfilefields(#ECmapid_Count)
+
+            do Load-PS_ECINMAPREC
+
+FROM PS_ECINMAPFILE PS_ECINMAPFILE1
+WHERE ECMAPID = $ECMAPID
+ORDER BY ECFILEROWID
+
+end-select
+   if isblank($temp)
+      let $LUW_Error_Sw = 'Y'
+      let #Message_Nbr = 209
+      let $Error_Misc = 'EC Inbound Process Map ID (' || $ECMAPID
+      || ') External TPID (' || $Ec_Ext_TP_ID || ').'
+   end-if
+
+end-procedure
+
+!----------------------------------------------------------------------!
+!  Load-PS_ECINMAPFLD
+!----------------------------------------------------------------------!
+begin-procedure Load-PS_ECINMAPFLD
+
+      #debugh do debug-msg('Load-PS_ECINMAPFLD')
+
+      let #i = 0
+
+begin-select on-error=SQLError
+
+PS_ECINMAPFLD1.ECMAPID,
+PS_ECINMAPFLD1.ECFILEROWID,
+PS_ECINMAPFLD1.SEQNO,
+PS_ECINMAPFLD1.FIELDNAME,
+PS_ECINMAPFLD1.FIELDTYPE,
+PS_ECINMAPFLD1.ECSTARTPOS,
+PS_ECINMAPFLD1.LENGTH,
+PS_ECINMAPFLD1.DECIMALPOS,
+PS_ECINMAPFLD1.ECCONVERTCD,
+PS_ECINMAPFLD1.ECROWIDVALUE,
+PS_ECINMAPFLD1.ECTPCVTID,
+PS_ECINMAPFLD1.ECFLDSPECIALCD,
+PS_ECINMAPFLD1.DELIMIT_DATE,
+PS_ECINMAPFLD1.YEAR_START,
+PS_ECINMAPFLD1.YEAR_LEN,
+PS_ECINMAPFLD1.MONTH_START,
+PS_ECINMAPFLD1.MONTH_LEN,
+PS_ECINMAPFLD1.DAY_START,
+PS_ECINMAPFLD1.DAY_LEN
+
+   do Put-PS_ECINMAPFLD
+   let #i = #i + 1
+
+FROM  PS_ECINMAPFLD PS_ECINMAPFLD1
+WHERE ECMAPID   = $ecmapid
+AND   ECFILEROWID = $ecfilerowid
+ORDER BY SEQNO
+
+end-select
+
+let #totalfilefields = #i - 1
+
+end-procedure
+
+!----------------------------------------------------------------------!
+! Put-PS_ECINMAPFLD
+!----------------------------------------------------------------------!
+begin-procedure Put-PS_ECINMAPFLD
+
+   let PS_ECINMAPFLD.ECMAPID(#i, #ECMAPID_count) = rtrim(&PS_ECINMAPFLD1.ECMAPID, ' ')
+   let PS_ECINMAPFLD.ECFILEROWID(#i, #ECMAPID_count) = rtrim(&PS_ECINMAPFLD1.ECFILEROWID, ' ')
+   let PS_ECINMAPFLD.SEQNO(#i, #ECMAPID_count) =  &PS_ECINMAPFLD1.SEQNO
+   let PS_ECINMAPFLD.FIELDNAME(#i, #ECMAPID_count) =  rtrim(&PS_ECINMAPFLD1.FIELDNAME, ' ')
+   let PS_ECINMAPFLD.FIELDTYPE(#i, #ECMAPID_count) = &PS_ECINMAPFLD1.FIELDTYPE
+   let PS_ECINMAPFLD.ECSTARTPOS(#i, #ECMAPID_count) =  &PS_ECINMAPFLD1.ECSTARTPOS
+   let PS_ECINMAPFLD.LENGTH(#i, #ECMAPID_count) =  &PS_ECINMAPFLD1.LENGTH
+   let PS_ECINMAPFLD.DECIMALPOS(#i, #ECMAPID_count) =  &PS_ECINMAPFLD1.DECIMALPOS
+   let PS_ECINMAPFLD.ECCONVERTCD(#i, #ECMAPID_count) = rtrim(&PS_ECINMAPFLD1.ECCONVERTCD, ' ')
+   let PS_ECINMAPFLD.ECROWIDVALUE(#i, #ECMAPID_count) = rtrim(&PS_ECINMAPFLD1.ECROWIDVALUE , ' ')
+   let PS_ECINMAPFLD.ECTPCVTID(#i, #ECMAPID_count) =  rtrim(&PS_ECINMAPFLD1.ECTPCVTID , ' ')
+   let PS_ECINMAPFLD.ECFLDSPECIALCD(#i, #ECMAPID_count) =  rtrim(&PS_ECINMAPFLD1.ECFLDSPECIALCD, ' ')
+   let PS_ECINMAPFLD.delimit_date(#i, #ECMAPID_Count) =  rtrim(&PS_ECINMAPFLD1.delimit_date, ' ')
+   let PS_ECINMAPFLD.year_start(#i, #ECMAPID_Count) =  &PS_ECINMAPFLD1.year_start
+   let PS_ECINMAPFLD.year_len(#i, #ECMAPID_Count) =  &PS_ECINMAPFLD1.year_len
+   let PS_ECINMAPFLD.month_start(#i, #ECMAPID_Count) =  &PS_ECINMAPFLD1.month_start
+   let PS_ECINMAPFLD.month_len(#i, #ECMAPID_Count) =  &PS_ECINMAPFLD1.month_len
+   let PS_ECINMAPFLD.day_start(#i, #ECMAPID_Count) =  &PS_ECINMAPFLD1.day_start
+   let PS_ECINMAPFLD.day_len(#i,#ECMAPID_Count) =  &PS_ECINMAPFLD1.day_len
+
+
+   if PS_ECINMAPFLD.ECCONVERTCD(#i, #ECMAPID_count) = 'R'        ! Save this field row ID info for record level
+      let $Rowid_Value = PS_ECINMAPFLD.ECROWIDVALUE(#i, #ECMAPID_count)
+      let #Rowid_Start_Pos = PS_ECINMAPFLD.ECSTARTPOS(#i, #ECMAPID_count)
+      let #Rowid_Length =  PS_ECINMAPFLD.LENGTH(#i, #ECMAPID_count)
+   end-if
+
+end-procedure
+
+!----------------------------------------------------------------------!
+!  Load-PS_ECINMAPREC
+!----------------------------------------------------------------------!
+begin-procedure Load-PS_ECINMAPREC
+   #debugh do debug-msg('Load-PS_ECINMAPREC ')
+
+begin-select on-error=SQLError
+
+PS_ECINMAPREC1.ECMAPID,
+PS_ECINMAPREC1.ECFILEROWID,
+PS_ECINMAPREC1.RECNAME
+
+
+            let $MAPREC_recname = rtrim(&PS_ECINMAPREC1.RECNAME, ' ')
+
+            let PS_ECINMAPREC.ECMAPID(0,#Maprec_Count) =  rtrim(&PS_ECINMAPREC1.ECMAPID, ' ')
+            let PS_ECINMAPREC.ECFILEROWID(0,#Maprec_Count) =  rtrim(&PS_ECINMAPREC1.ECFILEROWID, ' ')
+            let PS_ECINMAPREC.RECNAME(0,#Maprec_Count) =  rtrim(&PS_ECINMAPREC1.RECNAME, ' ')
+
+            do Load-PS_ECINMAPRECFLD
+
+            add 1 to #Maprec_Count
+
+FROM  PS_ECINMAPREC PS_ECINMAPREC1
+WHERE ECMAPID   = $ecmapid
+AND   ECFILEROWID = $ecfilerowid
+ORDER BY RECNAME
+
+end-select
+
+! Go back through entire map defn and mark target records that need to be
+! used for summary calculations
+   let #i = 0
+   while #i < #Maprec_count
+     let #j = 0
+     while #j < #Max_PS_ECINMAPRECFLD
+        if isblank(PS_ECINMAPRECFLD.fieldname(#j,#i))
+           break
+        end-if
+        let #k = 0
+        while #k < #Summary_Field_Count
+            if PS_ECINMAPRECFLD.ecfilerowid(#j,#i) =  Summary_Info.ecfilerowid(#k) and
+               PS_ECINMAPRECFLD.recname(#j,#i) = Summary_Info.recname(#k) and
+               PS_ECINMAPRECFLD.fieldname(#j,#i) = Summary_Info.fieldname(#k)
+               let PS_ECINMAPRECFLD.summaryinfoindex(#j,#i) = #k
+            end-if
+            add 1 to #k
+         end-while
+         add 1 to #j
+      end-while
+      add 1 to #i
+   end-while
+
+end-procedure
+
+!----------------------------------------------------------------------!
+!  Load-PS_ECINMAPRECFLD
+!----------------------------------------------------------------------!
+begin-procedure Load-PS_ECINMAPRECFLD
+
+      #debugh do debug-msg('Load-PS_ECINMAPRECFLD')
+
+      let #inmaprec_idx = 0
+
+begin-select on-error=SQLError
+
+PS_ECINMAPRECFLD1.ECMAPID,
+PS_ECINMAPRECFLD1.ECFILEROWID,
+PS_ECINMAPRECFLD1.RECNAME,
+PS_ECINMAPRECFLD1.SEQNO,
+PS_ECINMAPRECFLD1.FIELDNAME,
+PS_ECINMAPRECFLD1.FIELDTYPE,
+PS_ECINMAPRECFLD1.ECRECFLDVALUECD,
+PS_ECINMAPRECFLD1.ECFILEFIELDNAME,
+PS_ECINMAPRECFLD1.ECDEFAULTVALUE,
+PS_ECINMAPRECFLD1.ECINAGENTCALCCD,
+PS_ECINMAPRECFLD1.ECRELATEDROWID,
+PS_ECINMAPRECFLD1.ECRELATEDRECNAME,
+PS_ECINMAPRECFLD1.ECRELATEDFIELDNAME
+
+
+       do Get-Xrefs
+
+       do Put-PS_ECINMAPRECFLD
+
+       let #inmaprec_idx = #inmaprec_idx + 1
+
+FROM  PS_ECINMAPRECFLD PS_ECINMAPRECFLD1
+WHERE ECMAPID   = $ecmapid
+AND   ECFILEROWID = $ecfilerowid
+AND   RECNAME     = $MAPREC_recname
+ORDER BY SEQNO
+
+end-select
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+!  Get-Xrefs
+!  This routine finds the corresponding field in the source flat file record
+!  for the current target table column. It sets the Xref array index number
+!  for the field and its row id.
+!----------------------------------------------------------------------!
+begin-procedure Get-Xrefs
+
+
+       let $File_Row_Id    = $ecfilerowid
+       let $File_Fieldname = rtrim(&PS_ECINMAPRECFLD1.ECFILEFIELDNAME, ' ')
+
+       let #k = 0
+       let #Xref_row = #Max_PS_ECINMAPRECFLD + 1
+
+       let #Xref_File = #ECmapid_Count
+       get
+          #totalfields
+       from PS_ECINMAPFILE(0)
+          totalfilefields(#ECmapid_Count)
+
+       while #k <= #totalfields
+          get
+             $srch_fieldname
+          from PS_ECINMAPFLD(#k)
+             fieldname(#ECmapid_Count)
+          if $srch_fieldname = $File_Fieldname
+             let #Xref_row = #k
+             break
+          end-if
+          let #k = #k + 1
+       end-while
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+! Put-PS_ECINMAPRECFLD
+!----------------------------------------------------------------------!
+begin-procedure Put-PS_ECINMAPRECFLD
+
+   #debugv display 'In Map Rec Idx=' noline
+   #debugv display #inmaprec_idx
+   #debugv display 'Seq No=' noline
+   #debugv display     &PS_ECINMAPRECFLD1.SEQNO
+   #debugv display 'field name=' noline
+   #debugv display     &PS_ECINMAPRECFLD1.FIELDNAME
+   #debugv display 'Record Field Value Code=' noline
+   #debugv display     &PS_ECINMAPRECFLD1.ECRECFLDVALUECD
+   #debugv display 'Default Value=' noline
+   #debugv display &PS_ECINMAPRECFLD1.ECDEFAULTVALUE
+   #debugv display 'Driver Calc Code=' noline
+   #debugv display &PS_ECINMAPRECFLD1.ECINAGENTCALCCD
+   #debugv display 'Xref file=' noline
+   #debugv display #Xref_File
+   #debugv display 'Xref row=' noline
+   #debugv display #Xref_Row
+
+   let PS_ECINMAPRECFLD.ECMAPID(#inmaprec_idx, #Maprec_Count) = rtrim(&PS_ECINMAPRECFLD1.ECMAPID, ' ')
+   let PS_ECINMAPRECFLD.ECFILEROWID(#inmaprec_idx, #Maprec_Count) =   rtrim(&PS_ECINMAPRECFLD1.ECFILEROWID, ' ')
+   let PS_ECINMAPRECFLD.RECNAME(#inmaprec_idx, #Maprec_Count) =   rtrim(&PS_ECINMAPRECFLD1.RECNAME, ' ')
+   let PS_ECINMAPRECFLD.SEQNO(#inmaprec_idx, #Maprec_Count) =   &PS_ECINMAPRECFLD1.SEQNO
+   let PS_ECINMAPRECFLD.FIELDNAME(#inmaprec_idx, #Maprec_Count) =  rtrim(&PS_ECINMAPRECFLD1.FIELDNAME, ' ')
+   let PS_ECINMAPRECFLD.FIELDTYPE(#inmaprec_idx, #Maprec_Count) =   &PS_ECINMAPRECFLD1.FIELDTYPE
+   let PS_ECINMAPRECFLD.ECRECFLDVALUECD(#inmaprec_idx, #Maprec_Count) =   rtrim(&PS_ECINMAPRECFLD1.ECRECFLDVALUECD , ' ')
+   let PS_ECINMAPRECFLD.ECFILEFIELDNAME(#inmaprec_idx, #Maprec_Count) =   rtrim(&PS_ECINMAPRECFLD1.ECFILEFIELDNAME, ' ')
+   let PS_ECINMAPRECFLD.ECDEFAULTVALUE(#inmaprec_idx, #Maprec_Count) =   rtrim(&PS_ECINMAPRECFLD1.ECDEFAULTVALUE, ' ')
+   let PS_ECINMAPRECFLD.ECINAGENTCALCCD(#inmaprec_idx, #Maprec_Count) =   rtrim(&PS_ECINMAPRECFLD1.ECINAGENTCALCCD , ' ')
+   let PS_ECINMAPRECFLD.ECRELATEDROWID(#inmaprec_idx, #Maprec_Count) =   rtrim(&PS_ECINMAPRECFLD1.ECRELATEDROWID, ' ')
+   let PS_ECINMAPRECFLD.ECRELATEDRECNAME(#inmaprec_idx, #Maprec_Count) =   rtrim(&PS_ECINMAPRECFLD1.ECRELATEDRECNAME, ' ')
+   let PS_ECINMAPRECFLD.ECRELATEDFIELDNAME(#inmaprec_idx, #Maprec_Count) =   rtrim(&PS_ECINMAPRECFLD1.ECRELATEDFIELDNAME, ' ')
+   let PS_ECINMAPRECFLD.FLDXREF(#inmaprec_idx, #Maprec_Count) =   #Xref_File
+   let PS_ECINMAPRECFLD.FLDROWXREF(#inmaprec_idx, #Maprec_Count) =   #Xref_Row
+
+
+   evaluate &PS_ECINMAPRECFLD1.ECINAGENTCALCCD
+   when = 'TSV'            ! Accumulate Summary Value
+   when = 'ASV'            ! Average Summary Value
+   when = 'NSV'            ! Maximum Summary Value
+   when = 'XSV'            ! Minimum Summary Value
+      #debugv display 'New summary info count=' noline
+      #debugv display #Summary_Field_Count
+      #debugv display 'related field info:'
+      #debugv display &PS_ECINMAPRECFLD1.ECRELATEDROWID
+      #debugv display &PS_ECINMAPRECFLD1.ECRELATEDRECNAME
+      #debugv display &PS_ECINMAPRECFLD1.ECRELATEDFIELDNAME
+      let Summary_Info.ecfileROWID(#Summary_Field_Count) = PS_ECINMAPRECFLD.ECRELATEDROWID(#inmaprec_idx, #Maprec_Count)
+      let Summary_Info.RECNAME(#Summary_Field_Count) = PS_ECINMAPRECFLD.ECRELATEDRECNAME(#inmaprec_idx, #Maprec_Count)
+      let Summary_Info.FIELDNAME(#Summary_Field_Count) = PS_ECINMAPRECFLD.ECRELATEDFIELDNAME(#inmaprec_idx, #Maprec_Count)
+      add 1 to  #Summary_Field_Count
+   end-evaluate
+end-procedure
+
+
+!----------------------------------------------------------------------!
+! Called SQC Procedures                                                !
+!----------------------------------------------------------------------!
+   #include 'setenv.sqc'
+   #include 'ecbusdoc.sqc'
+   #include 'ecin999.sqc'
+   #include 'wlgen.sqc'
+   #include 'fsgetshr.sqc'
+   #include 'number.sqc'
+   #include 'tranctrl.sqc'
+   #include 'reset.sqc'     !Reset Printer Procedure
+   #include 'curdttim.sqc'  !Get Current Date Time
+   #include 'datetime.sqc'  !Routines for date and time formatting
+   #include 'datemath.sqc'  !SQR date arithmetic procedures
+   #include 'timemath.sqc'  !SQR time arithmetic procedures
+   #include 'prcsapi.sqc'   !Update Process Request API
+   #include 'prcsdef.sqc'   !Update Process Request variable declare
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

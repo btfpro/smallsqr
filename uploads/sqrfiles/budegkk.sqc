@@ -1,0 +1,3768 @@
+!***********************************************************************
+!  BUDEGKK.SQC:  Budget Export - Send Current FY to G/L                *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+!                                                                      *
+! This module contains confidential and proprietary information        *
+! of Oracle; it is not to be copied, reproduced, or transmitted        *
+! in any form, by any means, in whole or in part, nor is it to         *
+! be used for any purpose other than that for which it is              *
+! expressly provided under the applicable license agreement.           *
+!                                                                      *
+! Copyright (C) 2006 Oracle. All Rights Reserved.                      *
+!                                                                      *
+!***********************************************************************
+! to load the budget ledgers in the General Ledger module of the       *
+! Financials-PS application.                                           *
+!                                                                      *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+!          $Date:  2006/07/19:11:26:38                                 *
+!       $Release:  HR9                                                 *
+!      $Revision:  101                                                 *
+!    $Last Modified: March 5 2000 Retro Distribution Sequence Chg      *
+!                                                                      *
+!***********************************************************************
+! This program is specific to HRMS for Public Sector.                  *
+!***********************************************************************
+
+!***********************************************************************
+! Procedure: MAINLINE                                                  *
+! Descr:     Drive paragraph for this program.  Uses the run type flag *
+!            read from the run control record.  If this is an incre-   *
+!            mental run, call the Incr_Mainline driver.  If not, then  *
+!            call the FYear-Mainline driver to run the program.        *
+!                                                                      *
+! Called by: BEGIN-REPORT                                              *
+!***********************************************************************
+Begin-Procedure MAINLINE
+
+
+!  Obtain the run type flag read from the run control record.  If this
+!  is an incremental run, call the Incr_Mainline driver.  If not, then
+!  call the FYear-Mainline driver to run the program.
+
+   if $Budget_Run_Type = 'F'
+      do Fyear-Mainline
+   else
+      do Incr-Mainline
+   end-if
+
+
+End-Procedure MAINLINE
+
+!***********************************************************************
+! Procedure: FYEAR-MAINLINE                                            *
+! Descr:     Drive paragraph for this program when initiated as a      *
+!            fiscal year batch run.  Uses department data obtained on  *
+!            a Business Unit basis to process all department budgets   *
+
+!            business unit.  Primary table is Dept_Budget              *
+!                                                                      *
+! Called by: MAINLINE                                                  *
+!***********************************************************************
+Begin-Procedure FYEAR-MAINLINE
+
+!  Read the department table for all departments within the Business Unit
+!  parameter.  This read relies on Business_Unit being the Set control field
+!  for the Department table.
+
+   let $err-statement1 = 'BUD007, SELECT, PS_SET_CNTRL_REC, FYEAR-MAINLINE'
+   let $err-statement2 = 'Params: BUSINESS_UNIT=<' || $Business_Unit || '>'
+
+Begin-SELECT On-error=Error-Display
+DP.SETID
+DP.DEPTID
+
+   move &DP.SetID to $Gbl_SetID
+   move &DP.DeptID to $Gbl_DeptID
+
+   !**** Initialize this Flag to N for mainline because it is never used *****
+   !**** will prevent zero amounts when not processing incremental ******
+   let  $Proc_Dept_Trigger = 'N'
+
+   if $Add_to_File = 'Y'
+      do DELETE-WORK-FILE
+   end-if
+
+   do PROCESS-DEPT-HEADER
+
+FROM PS_SET_CNTRL_REC SC
+   , PS_DEPT_TBL DP
+WHERE SC.SETCNTRLVALUE = $Business_Unit
+  AND SC.REC_GROUP_ID = 'HR_01'
+  AND SC.RECNAME = 'DEPT_TBL'
+  AND SC.SETID = DP.SETID
+  AND DP.USE_BUDGETS = 'Y'
+  AND DP.EFFDT = (SELECT MAX(DP1.EFFDT)
+                    FROM PS_DEPT_TBL DP1
+                   WHERE DP1.SETID = DP.SETID
+                     AND DP1.DEPTID = DP.DEPTID
+                     AND DP1.EFFDT <= $ThruDate)
+  AND DP.EFF_STATUS = 'A'
+
+End-SELECT
+
+End-Procedure FYEAR-MAINLINE
+
+!***********************************************************************
+! Procedure: INCR-MAINLINE                                             *
+! Descr:     Drive paragraph for this program when initiated as a      *
+!            incremental batch run in mid-year.  Uses department data  *
+!            obtained from the BUDGET_TRIGGER file to process all      *
+!            department budgets which may have changed since the last  *
+!            run of the program.                                       *
+!                                                                      *
+! Called by: MAINLINE                                                  *
+!***********************************************************************
+Begin-Procedure INCR-MAINLINE
+
+!  Read the BUDGET_TRIGGER table.  Process the department referenced by
+!  each record found there.
+
+   let $err-statement1 = $ProgramID || ', SELECT, PS_BUDGET_TRIGGER, INCR-MAINLINE'
+   let $err-statement2 = 'Params: EMPLID --- None'
+
+Begin-SELECT On-error=Error-Display
+BT.SETID
+BT.DEPTID
+
+   move &BT.SetID to $Gbl_SetID
+   move &BT.DeptID to $Gbl_DeptID
+
+   do FIND-USE-BUDGETS-INDC
+
+   if $Use_Budgets = 'Y'
+
+       do FIND-TRIGGER-RECORD
+
+       IF $Proc_Dept_Trigger = 'Y'
+           do RESET-BUDGET-AMOUNT
+       else
+           do DELETE-WORK-FILE
+       end-if
+
+       do PROCESS-DEPT-HEADER
+   end-if
+
+   do UPDATE-TRIGGER-RECORD
+
+FROM PS_BUDGET_TRIGGER BT
+   , PS_SET_CNTRL_REC SCB
+WHERE SCB.SETCNTRLVALUE = $Business_Unit
+  AND SCB.REC_GROUP_ID = 'HR_01'
+  AND SCB.RECNAME = 'DEPT_TBL'
+  AND SCB.SETID = BT.SETID
+  AND BT.PROCESSED = 'N'
+GROUP BY BT.SETID, BT.DEPTID
+End-SELECT
+
+End-Procedure INCR-MAINLINE
+
+!***********************************************************************
+! Procedure: DELETE-WORK-FILE                                          *
+! Descr:     If the add-to-file parameter is no or the Budget_Run_Type *
+!            parameter = "I" (Incremental), deletes work data only for *
+!            the SETID/DEPTID combination currently being processed.   *
+!                                                                      *
+! Called by: INITIALIZE                                                *
+!***********************************************************************
+Begin-Procedure DELETE-WORK-FILE
+
+Begin-SQL
+DELETE FROM PS_BDGT_EXPORT_WRK
+ WHERE SETID = $Gbl_SetID
+   AND DEPTID = $Gbl_DeptID
+End-SQL
+
+End-Procedure DELETE-WORK-FILE
+
+!***********************************************************************
+! Procedure: PROCESS-DEPT-HEADER                                       *
+! Descr:     For an individual department, processed primary depart-   *
+!            ment budget and all subordinate budgets.                  *
+!                                                                      *
+! Called by: FYEAR-MAINLINE                                            *
+!            INCR-MAINLINE                                             *
+!***********************************************************************
+Begin-Procedure PROCESS-DEPT-HEADER
+
+!  Load the arrays.  For each department, arrays will be loaded for budgets
+!  at the overall department level, the Position Pool level, and the Jobcode
+!  level.  This allows budgets at the lower levels of Position and Appointment
+!  to deplete the higher level budgets as they are processed.
+
+   do Initialize-Dept-Arrays
+
+!  Select the "header" record for this department.  The record is the most
+!  current row from the DEPT_BUDGET_DT table, and its values will be in effect
+!  for the processing of the entire department.
+
+   do Load-Dept-Header
+
+!  If a DEPT_BUDGET_DT record for the department, then a department budget
+!  probably exists.  Process the department budget.
+
+   if $Dept_Hdr_Found = 'Y'
+      do PROCESS-DEPARTMENT
+   end-if
+
+End-Procedure PROCESS-DEPT-HEADER
+
+!***********************************************************************
+! Procedure: FIND-USE-BUDGETS-INDC                                     *
+! Descr:     This routine find if the Department has the USE BUDGETS   *
+!            indicator turn on                                         *
+!                                                                      *
+! Called by: INCR-MAINLINE                                             *
+!***********************************************************************
+Begin-Procedure FIND-USE-BUDGETS-INDC
+
+   let $err-statement1 = $ProgramID || ', SELECT, PS_DEPT_TBL, FIND-USE-BUDGETS-INDC'
+   let $err-statement2 = 'Params: EMPLID --- None'
+
+   let $Use_Budgets = 'N'
+
+Begin-SELECT On-error=Error-Display
+DTB.USE_BUDGETS
+
+   let $Use_Budgets = 'Y'
+
+FROM PS_DEPT_TBL DTB
+WHERE DTB.SETID = $Gbl_SetID
+  AND DTB.DEPTID = $Gbl_DeptID
+  AND DTB.USE_BUDGETS = 'Y'
+  AND DTB.EFF_STATUS = 'A'
+  AND DTB.EFFDT = (SELECT MAX(DTB1.EFFDT)
+                     FROM PS_DEPT_TBL DTB1
+                    WHERE DTB1.SETID = DTB.SETID
+                      AND DTB1.DEPTID = DTB.DEPTID
+                      AND DTB1.EFFDT <= $ThruDate)
+End-SELECT
+
+End-Procedure FIND-USE-BUDGETS-INDC
+
+!***********************************************************************
+! Procedure: FIND-TRIGGER-RECORD                                       *
+! Descr:     This routine find if it is a Department Trigger record    *
+!                                                                      *
+! Called by: INCR-MAINLINE                                             *
+!***********************************************************************
+Begin-Procedure FIND-TRIGGER-RECORD
+
+   let $err-statement1 = $ProgramID || ', SELECT, PS_BUDGET_TRIGGER, FIND-TRIGGER-RECORD'
+   let $err-statement2 = 'Params: EMPLID --- None'
+
+   let $Proc_Dept_Trigger = 'N'
+
+Begin-SELECT On-error=Error-Display
+BT1.TRIGGER_RECORD
+
+   let $Proc_Dept_Trigger = 'Y'
+
+FROM PS_BUDGET_TRIGGER BT1
+WHERE BT1.SETID = $Gbl_SetID
+  AND BT1.DEPTID = $Gbl_DeptID
+  AND BT1.TRIGGER_RECORD = 'T'
+  AND BT1.PROCESSED = 'N'
+End-SELECT
+
+End-Procedure FIND-TRIGGER-RECORD
+
+!***********************************************************************
+! Procedure: RESET-BUDGET-AMOUNT                                       *
+! Descr:     This routine reset work data for the SETID/DEPTID         *
+!            combination currently being processed.                    *
+!                                                                      *
+! Called by: INCR-MAINLINE                                             *
+!***********************************************************************
+Begin-Procedure RESET-BUDGET-AMOUNT
+
+Begin-SQL
+UPDATE PS_BDGT_EXPORT_WRK
+SET BUDGET_AMT = 0
+ WHERE SETID = $Gbl_SetID
+   AND DEPTID = $Gbl_DeptID
+End-SQL
+
+End-Procedure RESET-BUDGET-AMOUNT
+
+!***********************************************************************
+! Procedure: UPDATE-TRIGGER-RECORD                                     *
+! Descr:     Sets the processed flag on the trigger record.            *
+!                                                                      *
+! Called by: INCR-MAINLINE                                             *
+!***********************************************************************
+begin-procedure UPDATE-TRIGGER-RECORD
+
+begin-SQL on-error=SQL-Error
+UPDATE PS_BUDGET_TRIGGER
+SET PROCESSED = 'Y'
+WHERE SETID = $Gbl_SetID
+  AND DEPTID = $Gbl_DeptID
+  AND PROCESSED = 'N'
+end-SQL
+
+end-procedure UPDATE-TRIGGER-RECORD
+
+!***********************************************************************
+! Procedure: INITIALIZE-DEPT-ARRAYS                                    *
+! Descr:     Removes all data from the three department budget arrays  *
+!                                                                      *
+! Called by: PROCESS-DEPARTMENT                                        *
+!***********************************************************************
+Begin-Procedure INITIALIZE-DEPT-ARRAYS
+
+   move 1 to #dept_idx
+   while #dept_idx < {deptarraymax}
+      put ' '   into Dept_array (#dept_idx) DASetID
+      put ' '   into Dept_array (#dept_idx) DADeptID
+      put ''    into Dept_Array (#dept_idx) DAEffdt
+      put ' '   into Dept_Array (#dept_idx) DACurrency_Cd
+      put 'NNN' into Dept_Array (#dept_idx) DADerive_Caps
+      put 0.0   into Dept_Array (#dept_idx) DAOverall_Bdgt_Cap
+      put 0.0   into Dept_Array (#dept_idx) DAOverall_Bdgt_Beg
+      put 0.0   into Dept_Array (#dept_idx) DAErn_Bdgt_Cap
+      put 0.0   into Dept_Array (#dept_idx) DAErn_Bdgt_Beg
+      put 0.0   into Dept_Array (#dept_idx) DADed_Bdgt_Cap
+      put 0.0   into Dept_Array (#dept_idx) DADed_Bdgt_Beg
+      put 0.0   into Dept_Array (#dept_idx) DATax_Bdgt_Cap
+      put 0.0   into Dept_Array (#dept_idx) DATax_Bdgt_Beg
+      add 1 to #dept_idx
+   end-while
+
+   move 1 to #pool_idx
+   while #pool_idx < {poolarraymax}
+      put ' '   into Pool_Array (#pool_idx) PAPosition_Pool_ID
+      put ''    into Pool_Array (#pool_idx) PAEffdt
+      put ' '   into Pool_Array (#pool_idx) PACurrency_Cd
+      put 'NNN' into Pool_Array (#pool_idx) PADerive_Caps
+      put 0.0   into Pool_Array (#pool_idx) PAOverall_Bdgt_Cap
+      put 0.0   into Pool_Array (#pool_idx) PAOverall_Bdgt_Beg
+      put 0.0   into Pool_Array (#pool_idx) PAErn_Bdgt_Cap
+      put 0.0   into Pool_Array (#pool_idx) PAErn_Bdgt_Beg
+      put 0.0   into Pool_Array (#pool_idx) PADed_Bdgt_Cap
+      put 0.0   into Pool_Array (#pool_idx) PADed_Bdgt_Beg
+      put 0.0   into Pool_Array (#pool_idx) PATax_Bdgt_Cap
+      put 0.0   into Pool_Array (#pool_idx) PATax_Bdgt_Beg
+      add 1 to #pool_idx
+   end-while
+
+   move 1 to #job_idx
+   while #job_idx < {jobcodearraymax}
+      put ' '   into JobCode_Array (#job_idx) JASetID_Jobcode
+      put ' '   into JobCode_Array (#job_idx) JAJobCode
+      put ''    into JobCode_Array (#job_idx) JAEffdt
+      put ' '   into JobCode_Array (#job_idx) JACurrency_Cd
+      put 'NNN' into Jobcode_Array (#job_idx) JADerive_Caps
+      put 0.0   into JobCode_Array (#job_idx) JAOverall_Bdgt_Cap
+      put 0.0   into JobCode_Array (#job_idx) JAOverall_Bdgt_Beg
+      put 0.0   into JobCode_Array (#job_idx) JAErn_Bdgt_Cap
+      put 0.0   into JobCode_Array (#job_idx) JAErn_Bdgt_Beg
+      put 0.0   into JobCode_Array (#job_idx) JADed_Bdgt_Cap
+      put 0.0   into JobCode_Array (#job_idx) JADed_Bdgt_Beg
+      put 0.0   into JobCode_Array (#job_idx) JATax_Bdgt_Cap
+      put 0.0   into JobCode_Array (#job_idx) JATax_Bdgt_Beg
+      add 1 to #job_idx
+   end-while
+
+   move 1 to #posn_idx
+   while #posn_idx < {posnarraymax}
+      put ' '   into Posn_Array (#posn_idx) NAPosition_Nbr
+      put ''    into Posn_Array (#posn_idx) NAEffdt
+      put ' '   into Posn_Array (#posn_idx) NACurrency_Cd
+      put 'NNN' into Posn_Array (#posn_idx) NADerive_Caps
+      put 0.0   into Posn_Array (#posn_idx) NAOverall_Bdgt_Cap
+      put 0.0   into Posn_Array (#posn_idx) NAOverall_Bdgt_Beg
+      put 0.0   into Posn_Array (#posn_idx) NAErn_Bdgt_Cap
+      put 0.0   into Posn_Array (#posn_idx) NAErn_Bdgt_Beg
+      put 0.0   into Posn_Array (#posn_idx) NADed_Bdgt_Cap
+      put 0.0   into Posn_Array (#posn_idx) NADed_Bdgt_Beg
+      put 0.0   into Posn_Array (#posn_idx) NATax_Bdgt_Cap
+      put 0.0   into Posn_Array (#posn_idx) NATax_Bdgt_Beg
+      add 1 to #posn_idx
+   end-while
+
+End-Procedure INITIALIZE-DEPT-ARRAYS
+
+!***********************************************************************
+! Procedure: LOAD-DEPT-HEADER                                          *
+! Descr:     Loads header data from the DEPT_BUDGET_DT record.         *
+!                                                                      *
+! Called by: PROCESS-DEPARTMENT                                        *
+!***********************************************************************
+Begin-Procedure LOAD-DEPT-HEADER
+
+   move 'Y' to $First_Row
+   move 'N' to $Dept_Hdr_Found
+
+   let $Dis_FiscalYear =  edit(#FiscalYear,'9999')
+   let $err-statement1 = 'BUD007, SELECT, PS_DEPT_BUDGET_DT, LOAD-DEPT-HEADER'
+   let $err-statement2 = 'Params: SETID=<' || $Gbl_SetID ||
+                         '>, DEPTID=<' || $Gbl_DeptID ||
+                         '>, FISCAL_YEAR=<' || $Dis_FiscalYear ||
+                         '>, BUDGET_END_DT=<' || $ThruDate || '>'
+
+
+Begin-SELECT on-error=Error-Display
+DBGD.SETID
+DBGD.DEPTID
+DBGD.BUDGET_BEGIN_DT
+DBGD.BUDGET_END_DT
+DBGD.FISCAL_YEAR
+DBGD.BUDGET_CAP_INDC
+DBGD.DEPT_OFFSET_GRP
+
+   move 'Y' to $Dept_Hdr_Found
+
+   move &DBGD.Budget_Begin_Dt to $Gbl_Budget_Begin_Dt
+   move &DBGD.Budget_End_Dt   to $Gbl_Budget_End_Dt
+   move &DBGD.Budget_Cap_Indc to $Gbl_Budget_Cap_Indc
+   move &DBGD.Dept_Offset_Grp to $Gbl_Dept_Offset_Grp
+
+
+FROM PS_DEPT_BUDGET_DT DBGD
+   , PS_DEPT_TBL       DPTA
+WHERE DBGD.SETID              = $Gbl_SetID
+  AND DBGD.DEPTID             = $Gbl_DeptID
+  AND DBGD.FISCAL_YEAR        = #FiscalYear
+  AND DBGD.BUDGET_END_DT      = $ThruDate
+  AND DPTA.SETID              = DBGD.SETID
+  AND DPTA.DEPTID             = DBGD.DEPTID
+  AND DPTA.BUDGET_DEPTID      = DPTA.DEPTID
+  AND DPTA.EFFDT              = (SELECT MAX(DPTA1.EFFDT)
+                                   FROM PS_DEPT_TBL DPTA1
+                                  WHERE DPTA1.SETID = DPTA.SETID
+                                    AND DPTA1.DEPTID = DPTA.DEPTID
+                                    AND DPTA1.EFFDT <= DBGD.BUDGET_BEGIN_DT)
+  AND DPTA.EFF_STATUS         = 'A'
+
+End-SELECT
+
+End-Procedure LOAD-DEPT-HEADER
+
+!***********************************************************************
+! Procedure: PROCESS-DEPARTMENT                                        *
+! Descr:     For an individual department, processed primary depart-   *
+!            ment budget and all subordinate budgets.                  *
+!                                                                      *
+! Called by: FYEAR-MAINLINE                                            *
+!            INCR-MAINLINE                                             *
+!***********************************************************************
+Begin-Procedure PROCESS-DEPARTMENT
+
+!  Select all rows from the DEPT_BUDGET table which relate to "high-level"
+!  budgets.  "High-Level refers to Department, Position Pool and JobCode level
+!  budgets.  Arrays are loaded with the data from this select.
+
+   do Load-Dept-Arrays
+
+!  For the current department, read and process the appointment budgets
+!  (Earnings, Deductions, And Taxes (US or CAN).  All budgets are deducted
+!  from the dept budget and Jobcode budget if the jobcode of the appointee
+!  is contained within the jobcode_array. (avoids double counting)
+
+ move 'A' to $Process_Level_Indc
+ do Select-Dept-Budget
+
+!**** Appointments are processed as a result of the last Select Dept Budget ******
+!****  Appointments designated by Process level Indc = A  ******
+
+
+!  Using the Pre-loaded array, process all the position records.
+
+ move 'P' to $Process_Level_Indc
+ move 1 to #posn_idx
+ while #posn_idx <= #posn_cnt
+    get $Dtl_Position_Nbr from Posn_Array (#posn_idx) NAPosition_Nbr
+    get $Dtl_Effdt from Posn_Array (#posn_idx) NAEffdt
+    get $Dtl_Currency_Cd from Posn_Array (#posn_idx) NACurrency_Cd
+    get #Dtl_Overall_Bdgt_Cap from Posn_Array (#posn_idx) NAOverall_Bdgt_Cap
+    get #Dtl_Overall_Bdgt_Beg from Posn_Array (#posn_idx) NAOverall_Bdgt_Beg
+    get #Dtl_Ern_Bdgt_Cap from Posn_Array (#posn_idx) NAErn_Bdgt_Cap
+    get #Dtl_Ern_Bdgt_Beg from Posn_Array (#posn_idx) NAErn_Bdgt_Beg
+    get #Dtl_Ded_Bdgt_Cap from Posn_Array (#posn_idx) NADed_Bdgt_Cap
+    get #Dtl_Ded_Bdgt_Beg from Posn_Array (#posn_idx) NADed_Bdgt_Beg
+    get #Dtl_Tax_Bdgt_Cap from Posn_Array (#posn_idx) NATax_Bdgt_Cap
+    get #Dtl_Tax_Bdgt_Beg from Posn_Array (#posn_idx) NATax_Bdgt_Beg
+    get $NA_Derive_Caps from Posn_Array(#posn_idx) NADerive_Caps
+    let $Ern_Budget_Was_Derived = substr($NA_Derive_Caps,1,1)
+    let $Ded_Budget_Was_Derived = substr($NA_Derive_Caps,2,1)
+    let $Tax_Budget_Was_Derived = substr($NA_Derive_Caps,3,1)
+    move ' ' to $Dtl_SetID_Jobcode
+    move ' ' to $Dtl_Jobcode
+    move ' ' to $Dtl_Position_Pool_ID
+    move ' ' to $Dtl_EmplID
+    move  0  to #Dtl_Empl_Rcd
+    do Process-Posn-Budget
+    add 1 to #posn_idx
+  end-while
+
+
+!  Using the Pre-loaded array, process all the position pool records.
+
+  move 'O' to $Process_Level_Indc
+  move 1 to #pool_idx
+  while #pool_idx <= #pool_cnt
+    get $Dtl_Position_Pool_ID from Pool_Array (#pool_idx) PAPosition_Pool_ID
+    get $Dtl_Effdt from Pool_Array (#pool_idx) PAEffdt
+    get $Dtl_Currency_Cd from Pool_Array (#pool_idx) PACurrency_Cd
+    get #Dtl_Overall_Bdgt_Cap from Pool_Array (#pool_idx) PAOverall_Bdgt_Cap
+    get #Dtl_Overall_Bdgt_Beg from Pool_Array (#pool_idx) PAOverall_Bdgt_Beg
+    get #Dtl_Ern_Bdgt_Cap from Pool_Array (#pool_idx) PAErn_Bdgt_Cap
+    get #Dtl_Ern_Bdgt_Beg from Pool_Array (#pool_idx) PAErn_Bdgt_Beg
+    get #Dtl_Ded_Bdgt_Cap from Pool_Array (#pool_idx) PADed_Bdgt_Cap
+    get #Dtl_Ded_Bdgt_Beg from Pool_Array (#pool_idx) PADed_Bdgt_Beg
+    get #Dtl_Tax_Bdgt_Cap from Pool_Array (#pool_idx) PATax_Bdgt_Cap
+    get #Dtl_Tax_Bdgt_Beg from Pool_Array (#pool_idx) PATax_Bdgt_Beg
+    get $PA_Derive_Caps from Pool_Array(#pool_idx) PADerive_Caps
+    let $Ern_Budget_Was_Derived = substr($PA_Derive_Caps,1,1)
+    let $Ded_Budget_Was_Derived = substr($PA_Derive_Caps,2,1)
+    let $Tax_Budget_Was_Derived = substr($PA_Derive_Caps,3,1)
+    move ' ' to $Dtl_SetID_Jobcode
+    move ' ' to $Dtl_Jobcode
+    move ' ' to $Dtl_Position_Nbr
+    move ' ' to $Dtl_EmplID
+    move  0  to #Dtl_Empl_Rcd
+    do Process-Pool-Budget
+    add 1 to #pool_idx
+ end-while
+
+
+!  Using the Pre-loaded array, process all the jobcode records.
+
+ move 'J' to $Process_Level_Indc
+ move 1 to #job_idx
+ while #job_idx <= #job_cnt
+   get $Dtl_SetID_Jobcode from Jobcode_Array (#job_idx) JASetID_Jobcode
+   get $Dtl_Jobcode from Jobcode_Array (#job_idx) JAJobcode
+   get $Dtl_Effdt from Jobcode_Array (#job_idx) JAEffdt
+   get $Dtl_Currency_Cd from Jobcode_Array (#job_idx) JACurrency_Cd
+   get #Dtl_Overall_Bdgt_Cap from Jobcode_Array (#job_idx) JAOverall_Bdgt_Cap
+   get #Dtl_Overall_Bdgt_Beg from Jobcode_Array (#job_idx) JAOverall_Bdgt_Beg
+   get #Dtl_Ern_Bdgt_Cap from Jobcode_Array (#job_idx) JAErn_Bdgt_Cap
+   get #Dtl_Ern_Bdgt_Beg from Jobcode_Array (#job_idx) JAErn_Bdgt_Beg
+   get #Dtl_Ded_Bdgt_Cap from Jobcode_Array (#job_idx) JADed_Bdgt_Cap
+   get #Dtl_Ded_Bdgt_Beg from Jobcode_Array (#job_idx) JADed_Bdgt_Beg
+   get #Dtl_Tax_Bdgt_Cap from Jobcode_Array (#job_idx) JATax_Bdgt_Cap
+   get #Dtl_Tax_Bdgt_Beg from Jobcode_Array (#job_idx) JATax_Bdgt_Beg
+   get $JA_Derive_Caps from Jobcode_Array(#job_idx) JADerive_Caps
+   let $Ern_Budget_Was_Derived = substr($JA_Derive_Caps,1,1)
+   let $Ded_Budget_Was_Derived = substr($JA_Derive_Caps,2,1)
+   let $Tax_Budget_Was_Derived = substr($JA_Derive_Caps,3,1)
+   move ' ' to $Dtl_Position_Pool_ID
+   move ' ' to $Dtl_Position_Nbr
+   move ' ' to $Dtl_EmplID
+   move  0  to #Dtl_Empl_Rcd
+   do Process-jobcode-budget
+   add 1 to #job_idx
+ end-while
+
+
+!  If an overall department budget exists, generate the output records for
+!  that department and produce a report line (depending on report detail
+!  parameter.
+
+ move 'D' to $Process_Level_Indc
+ move 1 to #dept_idx
+ while #dept_idx <= #dept_cnt
+   get $Dtl_Effdt from Dept_Array (#dept_idx) DAEffdt
+   get $Dtl_Currency_Cd from Dept_Array (#dept_idx) DACurrency_Cd
+   get #Dtl_Overall_Bdgt_Cap from Dept_Array (#dept_idx) DAOverall_Bdgt_Cap
+   get #Dtl_Overall_Bdgt_Beg from Dept_Array (#dept_idx) DAOverall_Bdgt_Beg
+   get #Dtl_Ern_Bdgt_Cap from Dept_Array (#dept_idx) DAErn_Bdgt_Cap
+   get #Dtl_Ern_Bdgt_Beg from Dept_Array (#dept_idx) DAErn_Bdgt_Beg
+   get #Dtl_Ded_Bdgt_Cap from Dept_Array (#dept_idx) DADed_Bdgt_Cap
+   get #Dtl_Ded_Bdgt_Beg from Dept_Array (#dept_idx) DADed_Bdgt_Beg
+   get #Dtl_Tax_Bdgt_Cap from Dept_Array (#dept_idx) DATax_Bdgt_Cap
+   get #Dtl_Tax_Bdgt_Beg from Dept_Array (#dept_idx) DATax_Bdgt_Beg
+   get $DA_Derive_Caps from Dept_Array(#dept_idx) DADerive_Caps
+   let $Ern_Budget_Was_Derived = substr($DA_Derive_Caps,1,1)
+   let $Ded_Budget_Was_Derived = substr($DA_Derive_Caps,2,1)
+   let $Tax_Budget_Was_Derived = substr($DA_Derive_Caps,3,1)
+   move $Gbl_DeptID to $Dtl_DeptID
+   move ' ' to $Dtl_SetID_Jobcode
+   move ' ' to $Dtl_Jobcode
+   move ' ' to $Dtl_Position_Pool_ID
+   move ' ' to $Dtl_Position_Nbr
+   move ' ' to $Dtl_EmplID
+   move  0  to #Dtl_Empl_Rcd
+   do Process-Dept-Budget
+   add 1 to #dept_idx
+ end-while
+
+End-Procedure PROCESS-DEPARTMENT
+
+!***********************************************************************
+! Procedure: LOAD-DEPT-ARRAYS                                          *
+! Descr:     Loads data for all three department level arrays.  Note   *
+!            that either an "Overall" cap or three "Detail" caps will  *
+!            be loaded depending on the flag on DEPT_BUDGET_DT         *
+!                                                                      *
+! Called by: PROCESS-DEPARTMENT                                        *
+!***********************************************************************
+Begin-Procedure LOAD-DEPT-ARRAYS
+
+   move 0 to #dept_idx
+   move 0 to #dept_cnt
+   move 'N' to $Dept_Bdgt_Fnd
+   move 'D' to $Process_Level_Indc
+   do Select-Dept-Budget
+   move #dept_idx to #dept_cnt
+
+   move 0 to #pool_idx
+   move 0 to #pool_cnt
+   move 'O' to $Process_Level_Indc
+   do Select-Dept-Budget
+   move #pool_idx to #pool_cnt
+
+   move 0 to #job_idx
+   move 0 to #job_cnt
+   move 'J' to $Process_Level_Indc
+   do Select-Dept-Budget
+   move #job_idx  to #job_cnt
+
+   move 0 to #posn_idx
+   move 0 to #posn_cnt
+   move 'P' to $Process_Level_Indc
+   do Select-Dept-Budget
+   move #posn_idx  to #posn_cnt
+
+
+End-Procedure LOAD-DEPT-ARRAYS
+
+!***********************************************************************
+! Procedure: SELECT-DEPT-BUDGET                                        *
+! Descr:     Common module.  This module selects data from the DEPT_   *
+!            BUDGET table, based on the budget level indicator given.  *
+!                                                                      *
+! Called by: LOAD-DEPT-ARRAYS                                          *
+!***********************************************************************
+Begin-Procedure SELECT-DEPT-BUDGET
+
+   move 0 to #dept_level_cnt
+
+   let $Dis_FiscalYear =  edit(#FiscalYear,'9999')
+   let $err-statement1 = 'BUD007, SELECT, PS_DEPT_BUDGET, SELECT-DEPT-SHORTCUT'
+   let $err-statement2 = 'Params: SETID=<' || $Gbl_SetID ||
+                         '>, DEPTID=<' || $Gbl_DeptID ||
+                         '>, FISCAL_YEAR=<' || $Dis_FiscalYear ||
+                         '>, PROCESS_LEVEL_INDC=<' || $Process_Level_Indc || '>'
+
+
+begin-SELECT on-error=Error-Display
+DBGT.POSITION_POOL_ID
+DBGT.SETID_JOBCODE
+DBGT.JOBCODE
+DBGT.POSITION_NBR
+DBGT.EMPLID
+DBGT.EMPL_RCD
+DBGT.EFFDT
+DBGT.BUDGET_LEVEL_INDC
+DBGT.CURRENCY_CD
+DBGT.OVERALL_BDGT_CAP
+DBGT.ERN_BDGT_CAP
+DBGT.DED_BDGT_CAP
+DBGT.TAX_BDGT_CAP
+
+   if $Process_Level_Indc = 'D'
+      add 1 to #dept_idx
+      move 'Y' to $Dept_Bdgt_Fnd
+      move &DBGT.Currency_Cd to $Dept_Currency_Cd
+
+      !***  Load the Dept. array with Dept. budget (should be only one)
+      put $Gbl_SetID into Dept_Array(#dept_idx) DASetID
+      put $Gbl_DeptID into Dept_Array(#dept_idx) DADeptID
+      put &DBGT.Effdt into Dept_Array(#dept_idx) DAEffdt
+      put &DBGT.Currency_Cd into Dept_Array(#dept_idx) DACurrency_Cd
+      put &DBGT.Overall_Bdgt_cap into Dept_Array(#dept_idx) DAOverall_Bdgt_Cap
+      put &DBGT.Overall_Bdgt_cap into Dept_Array(#dept_idx) DAOverall_Bdgt_Beg
+      put &DBGT.Ern_Bdgt_cap into Dept_Array(#dept_idx) DAErn_Bdgt_Cap
+      put &DBGT.Ern_Bdgt_cap into Dept_Array(#dept_idx) DAErn_Bdgt_Beg
+      put &DBGT.Ded_Bdgt_cap into Dept_Array(#dept_idx) DADed_Bdgt_Cap
+      put &DBGT.Ded_Bdgt_cap into Dept_Array(#dept_idx) DADed_Bdgt_Beg
+      put &DBGT.Tax_Bdgt_cap into Dept_Array(#dept_idx) DATax_Bdgt_Cap
+      put &DBGT.Tax_Bdgt_cap into Dept_Array(#dept_idx) DATax_Bdgt_Beg
+      move $Gbl_SetID             to $Dtl_SetID
+      move $Gbl_DeptID            to $Dtl_DeptID
+      move $Dept_Currency_Cd      to $Dtl_Currency_Cd
+      move &DBGT.Effdt            to $Dtl_Effdt
+      move &DBGT.Position_Pool_Id to $Dtl_Position_Pool_ID
+      move &DBGT.SetID_Jobcode    to $Dtl_SetID_Jobcode
+      move &DBGT.Jobcode          to $Dtl_Jobcode
+      move &DBGT.Position_Nbr     to $Dtl_Position_Nbr
+      move &DBGT.EmplID           to $Dtl_EmplID
+      move &DBGT.Empl_Rcd         to #Dtl_Empl_Rcd
+      if $Gbl_Budget_Cap_Indc = 'O'
+         if &DBGT.Overall_Bdgt_cap = 0
+            do DERIVE-BUDGET-CAP
+            put #Total_Annual_Cap into Dept_Array(#dept_idx) DAOverall_Bdgt_Cap
+            put #Total_Annual_Cap into Dept_Array(#dept_idx) DAOverall_Bdgt_Beg
+         else
+            move 'N' to $Ern_Budget_Was_Derived
+         end-if
+      else
+         if &DBGT.Ern_Bdgt_cap = 0
+            do DERIVE-BUDGET-CAP
+            put #Total_Annual_Cap into Dept_Array(#dept_idx) DAErn_Bdgt_Cap
+            put #Total_Annual_Cap into Dept_Array(#dept_idx) DAErn_Bdgt_Beg
+         else
+            move 'N' to $Ern_Budget_Was_Derived
+         end-if
+         if &DBGT.Ded_Bdgt_cap = 0
+            put #Total_Ann_Ded_Cap into Dept_Array(#dept_idx) DADed_Bdgt_Cap
+            put #Total_Ann_Ded_Cap into Dept_Array(#dept_idx) DADed_Bdgt_Beg
+         else
+            move 'N' to $Ded_Budget_Was_Derived
+         end-if
+         if &DBGT.Tax_Bdgt_cap = 0
+            put #Total_Ann_Tax_Cap into Dept_Array(#dept_idx) DATax_Bdgt_Cap
+            put #Total_Ann_Tax_Cap into Dept_Array(#dept_idx) DATax_Bdgt_Beg
+         else
+            move 'N' to $Tax_Budget_Was_Derived
+         end-if
+      end-if
+      let $DA_Derive_Caps = $Ern_Budget_Was_Derived ||
+                            $Ded_Budget_Was_Derived ||
+                            $Tax_Budget_Was_Derived
+      put $DA_Derive_Caps into Dept_Array(#dept_idx) DADerive_Caps
+   end-if
+
+   if $Process_Level_Indc = 'O'
+      add 1 to #pool_idx
+
+      !***  Load the Posn Pool array with Posn Pool budgets in this department.
+      put &DBGT.Position_Pool_ID into Pool_Array(#pool_idx) PAPosition_Pool_ID
+      put &DBGT.Effdt into Pool_Array(#pool_idx) PAEffdt
+      put &DBGT.Currency_Cd into Pool_Array(#pool_idx) PACurrency_Cd
+      put &DBGT.Overall_Bdgt_cap into Pool_Array(#pool_idx) PAOverall_Bdgt_Cap
+      put &DBGT.Overall_Bdgt_cap into Pool_Array(#pool_idx) PAOverall_Bdgt_Beg
+      put &DBGT.Ern_Bdgt_cap into Pool_Array(#pool_idx) PAErn_Bdgt_Cap
+      put &DBGT.Ern_Bdgt_cap into Pool_Array(#pool_idx) PAErn_Bdgt_Beg
+      put &DBGT.Ded_Bdgt_cap into Pool_Array(#pool_idx) PADed_Bdgt_Cap
+      put &DBGT.Ded_Bdgt_cap into Pool_Array(#pool_idx) PADed_Bdgt_Beg
+      put &DBGT.Tax_Bdgt_cap into Pool_Array(#pool_idx) PATax_Bdgt_Cap
+      put &DBGT.Ded_Bdgt_cap into Pool_Array(#pool_idx) PADed_Bdgt_Beg
+      move $Gbl_SetID             to $Dtl_SetID
+      move $Gbl_DeptID            to $Dtl_DeptID
+      move $Dept_Currency_Cd      to $Dtl_Currency_Cd
+      move &DBGT.Effdt            to $Dtl_Effdt
+      move &DBGT.Position_Pool_Id to $Dtl_Position_Pool_ID
+      move &DBGT.SetID_Jobcode    to $Dtl_SetID_Jobcode
+      move &DBGT.Jobcode          to $Dtl_Jobcode
+      move &DBGT.Position_Nbr     to $Dtl_Position_Nbr
+      move &DBGT.EmplID           to $Dtl_EmplID
+      move &DBGT.Empl_Rcd         to #Dtl_Empl_Rcd
+      if $Gbl_Budget_Cap_Indc = 'O'
+         if &DBGT.Overall_Bdgt_cap = 0
+            do DERIVE-BUDGET-CAP
+            put #Total_Annual_Cap into Pool_Array(#pool_idx) PAOverall_Bdgt_Cap
+            put #Total_Annual_Cap into Pool_Array(#pool_idx) PAOverall_Bdgt_Beg
+         else
+            move 'N' to $Ern_Budget_Was_Derived
+         end-if
+      else
+         if &DBGT.Ern_Bdgt_cap = 0
+            do DERIVE-BUDGET-CAP
+            put #Total_Annual_Cap into Pool_Array(#pool_idx) PAErn_Bdgt_Cap
+            put #Total_Annual_Cap into Pool_Array(#pool_idx) PAErn_Bdgt_Beg
+         else
+            move 'N' to $Ern_Budget_Was_Derived
+         end-if
+         if &DBGT.Ded_Bdgt_cap = 0
+            put #Total_Ann_Ded_Cap into Pool_Array(#pool_idx) PADed_Bdgt_Cap
+            put #Total_Ann_Ded_Cap into Pool_Array(#pool_idx) PADed_Bdgt_Beg
+         else
+            move 'N' to $Ded_Budget_Was_Derived
+         end-if
+         if &DBGT.Tax_Bdgt_cap = 0
+            put #Total_Ann_Tax_Cap into Pool_Array(#pool_idx) PATax_Bdgt_Cap
+            put #Total_Ann_Tax_Cap into Pool_Array(#pool_idx) PATax_Bdgt_Beg
+         else
+            move 'N' to $Tax_Budget_Was_Derived
+         end-if
+      end-if
+      let $PA_Derive_Caps = $Ern_Budget_Was_Derived ||
+                            $Ded_Budget_Was_Derived ||
+                            $Tax_Budget_Was_Derived
+      put $PA_Derive_Caps into Pool_Array(#pool_idx) PADerive_Caps
+   end-if
+
+   if $Process_Level_Indc = 'J'
+      add 1 to #job_idx
+
+      !***  Load the Jobcode array with jobcode budgets in this department.
+      put &DBGT.SetID_Jobcode into Jobcode_Array(#job_idx) JASetID_Jobcode
+      put &DBGT.Jobcode into Jobcode_Array(#job_idx) JAJobcode
+      put &DBGT.Effdt into Jobcode_Array(#job_idx) JAEffdt
+      put &DBGT.Currency_Cd into Jobcode_Array(#job_idx) JACurrency_Cd
+      put &DBGT.Overall_Bdgt_cap into Jobcode_Array(#job_idx) JAOverall_Bdgt_Cap
+      put &DBGT.Overall_Bdgt_cap into Jobcode_Array(#job_idx) JAOverall_Bdgt_Beg
+      put &DBGT.Ern_Bdgt_cap into Jobcode_Array(#job_idx) JAErn_Bdgt_Cap
+      put &DBGT.Ern_Bdgt_cap into Jobcode_Array(#job_idx) JAErn_Bdgt_Beg
+      put &DBGT.Ded_Bdgt_cap into Jobcode_Array(#job_idx) JADed_Bdgt_Cap
+      put &DBGT.Ded_Bdgt_cap into Jobcode_Array(#job_idx) JADed_Bdgt_Beg
+      put &DBGT.Tax_Bdgt_cap into Jobcode_Array(#job_idx) JATax_Bdgt_Cap
+      put &DBGT.Tax_Bdgt_cap into Jobcode_Array(#job_idx) JATax_Bdgt_Beg
+      move $Gbl_SetID             to $Dtl_SetID
+      move $Gbl_DeptID            to $Dtl_DeptID
+      move $Dept_Currency_Cd      to $Dtl_Currency_Cd
+      move &DBGT.Effdt            to $Dtl_Effdt
+      move &DBGT.Position_Pool_Id to $Dtl_Position_Pool_ID
+      move &DBGT.SetID_Jobcode    to $Dtl_SetID_Jobcode
+      move &DBGT.Jobcode          to $Dtl_Jobcode
+      move &DBGT.Position_Nbr     to $Dtl_Position_Nbr
+      move &DBGT.EmplID           to $Dtl_EmplID
+      move &DBGT.Empl_Rcd         to #Dtl_Empl_Rcd
+      if $Gbl_Budget_Cap_Indc = 'O'
+         if &DBGT.Overall_Bdgt_cap = 0
+            do DERIVE-BUDGET-CAP
+            put #Total_Annual_Cap into Jobcode_Array(#job_idx) JAOverall_Bdgt_Cap
+            put #Total_Annual_Cap into Jobcode_Array(#job_idx) JAOverall_Bdgt_Beg
+         else
+            move 'N' to $Ern_Budget_Was_Derived
+         end-if
+      else
+         if &DBGT.Ern_Bdgt_cap = 0
+            do DERIVE-BUDGET-CAP
+            put #Total_Annual_Cap into Jobcode_Array(#job_idx) JAErn_Bdgt_Cap
+            put #Total_Annual_Cap into Jobcode_Array(#job_idx) JAErn_Bdgt_Beg
+         else
+            move 'N' to $Ern_Budget_Was_Derived
+         end-if
+         if &DBGT.Ded_Bdgt_cap = 0
+            put #Total_Ann_Ded_Cap into Jobcode_Array(#job_idx) JADed_Bdgt_Cap
+            put #Total_Ann_Ded_Cap into Jobcode_Array(#job_idx) JADed_Bdgt_Beg
+         else
+            move 'N' to $Ded_Budget_Was_Derived
+         end-if
+         if &DBGT.Tax_Bdgt_cap = 0
+            put #Total_Ann_Tax_Cap into Jobcode_Array(#job_idx) JATax_Bdgt_Cap
+            put #Total_Ann_Tax_Cap into Jobcode_Array(#job_idx) JATax_Bdgt_Beg
+         else
+            move 'N' to $Tax_Budget_Was_Derived
+         end-if
+      end-if
+      let $JA_Derive_Caps = $Ern_Budget_Was_Derived ||
+                            $Ded_Budget_Was_Derived ||
+                            $Tax_Budget_Was_Derived
+      put $JA_Derive_Caps into Jobcode_Array(#job_idx) JADerive_Caps
+   end-if
+
+   if $Process_Level_Indc = 'P'
+      add 1 to #posn_idx
+
+      !***  Load the Position array with Position budgets in this department.
+      put &DBGT.Position_Nbr into Posn_Array(#posn_idx) NAPosition_Nbr
+      put &DBGT.Effdt into Posn_Array(#posn_idx) NAEffdt
+      put &DBGT.Currency_Cd into Posn_Array(#posn_idx) NACurrency_Cd
+      put &DBGT.Overall_Bdgt_cap into Posn_Array(#posn_idx) NAOverall_Bdgt_Cap
+      put &DBGT.Overall_Bdgt_cap into Posn_Array(#posn_idx) NAOverall_Bdgt_Beg
+      put &DBGT.Ern_Bdgt_cap into Posn_Array(#posn_idx) NAErn_Bdgt_Cap
+      put &DBGT.Ern_Bdgt_cap into Posn_Array(#posn_idx) NAErn_Bdgt_Beg
+      put &DBGT.Ded_Bdgt_cap into Posn_Array(#posn_idx) NADed_Bdgt_Cap
+      put &DBGT.Ded_Bdgt_cap into Posn_Array(#posn_idx) NADed_Bdgt_Beg
+      put &DBGT.Tax_Bdgt_cap into Posn_Array(#posn_idx) NATax_Bdgt_Cap
+      put &DBGT.Tax_Bdgt_cap into Posn_Array(#posn_idx) NATax_Bdgt_Beg
+      move $Gbl_SetID             to $Dtl_SetID
+      move $Gbl_DeptID            to $Dtl_DeptID
+      move $Dept_Currency_Cd      to $Dtl_Currency_Cd
+      move &DBGT.Effdt            to $Dtl_Effdt
+      move &DBGT.Position_Pool_Id to $Dtl_Position_Pool_ID
+      move &DBGT.SetID_Jobcode    to $Dtl_SetID_Jobcode
+      move &DBGT.Jobcode          to $Dtl_Jobcode
+      move &DBGT.Position_Nbr     to $Dtl_Position_Nbr
+      move &DBGT.EmplID           to $Dtl_EmplID
+      move &DBGT.Empl_Rcd         to #Dtl_Empl_Rcd
+      if $Gbl_Budget_Cap_Indc = 'O'
+         if &DBGT.Overall_Bdgt_cap = 0
+            do DERIVE-BUDGET-CAP
+            put #Total_Annual_Cap into Posn_Array(#posn_idx) NAOverall_Bdgt_Cap
+            put #Total_Annual_Cap into Posn_Array(#posn_idx) NAOverall_Bdgt_Beg
+         else
+            move 'N' to $Ern_Budget_Was_Derived
+         end-if
+      else
+         if &DBGT.Ern_Bdgt_cap = 0
+            do DERIVE-BUDGET-CAP
+            put #Total_Annual_Cap into Posn_Array(#posn_idx) NAErn_Bdgt_Cap
+            put #Total_Annual_Cap into Posn_Array(#posn_idx) NAErn_Bdgt_Beg
+         else
+            move 'N' to $Ern_Budget_Was_Derived
+         end-if
+         if &DBGT.Ded_Bdgt_cap = 0
+            put #Total_Ann_Ded_Cap into Posn_Array(#posn_idx) NADed_Bdgt_Cap
+            put #Total_Ann_Ded_Cap into Posn_Array(#posn_idx) NADed_Bdgt_Beg
+         else
+            move 'N' to $Ded_Budget_Was_Derived
+         end-if
+         if &DBGT.Tax_Bdgt_cap = 0
+            put #Total_Ann_Tax_Cap into Posn_Array(#posn_idx) NATax_Bdgt_Cap
+            put #Total_Ann_Tax_Cap into Posn_Array(#posn_idx) NATax_Bdgt_Beg
+         else
+            move 'N' to $Tax_Budget_Was_Derived
+         end-if
+      end-if
+      let $NA_Derive_Caps = $Ern_Budget_Was_Derived ||
+                            $Ded_Budget_Was_Derived ||
+                            $Tax_Budget_Was_Derived
+      put $NA_Derive_Caps into Posn_Array(#posn_idx) NADerive_Caps
+   end-if
+
+   if $Process_Level_Indc = 'A'
+      move &DBGT.Effdt            to $Dtl_Effdt
+      move &DBGT.Position_Pool_Id to $Dtl_Position_Pool_ID
+      move &DBGT.SetID_Jobcode    to $Dtl_SetID_Jobcode
+      move &DBGT.Jobcode          to $Dtl_Jobcode
+      move &DBGT.Position_Nbr     to $Dtl_Position_Nbr
+      move &DBGT.EmplID           to $Dtl_EmplID
+      move &DBGT.Empl_Rcd         to #Dtl_Empl_Rcd
+      move &DBGT.Currency_Cd      to $Dtl_Currency_Cd
+      move &DBGT.Overall_Bdgt_Cap to #Dtl_Overall_Bdgt_Cap
+      move &DBGT.Overall_Bdgt_Cap to #Dtl_Overall_Bdgt_Beg
+      move &DBGT.Ern_Bdgt_Cap     to #Dtl_Ern_Bdgt_Cap
+      move &DBGT.Ern_Bdgt_Cap     to #Dtl_Ern_Bdgt_Beg
+      move &DBGT.Ded_Bdgt_Cap     to #Dtl_Ded_Bdgt_Cap
+      move &DBGT.Ded_Bdgt_Cap     to #Dtl_Ded_Bdgt_Beg
+      move &DBGT.Tax_Bdgt_Cap     to #Dtl_Tax_Bdgt_Cap
+      move &DBGT.Tax_Bdgt_Cap     to #Dtl_Tax_Bdgt_Beg
+
+      if $Gbl_Budget_Cap_Indc = 'O'
+         if not #Dtl_Overall_Bdgt_Cap
+            do DERIVE-BUDGET-CAP
+            move #Total_Annual_Cap to #Dtl_Overall_Bdgt_Cap
+            move #Total_Annual_Cap to #Dtl_Overall_Bdgt_Beg
+         else
+            move 'N' to $Ern_Budget_Was_Derived
+         end-if
+      else
+         if not #Dtl_Ern_Bdgt_Cap
+            do DERIVE-BUDGET-CAP
+            move #Total_Annual_Cap to #Dtl_Ern_Bdgt_Cap
+            move #Total_Annual_Cap to #Dtl_Ern_Bdgt_Beg
+         else
+            move 'N' to $Ern_Budget_Was_Derived
+         end-if
+         if not #Dtl_Ded_Bdgt_Cap
+            move #Total_Ann_Ded_Cap to #Dtl_Ded_Bdgt_Cap
+            move #Total_Ann_Ded_Cap to #Dtl_Ded_Bdgt_Beg
+         else
+            move 'N' to $Ded_Budget_Was_Derived
+         end-if
+         if not #Dtl_Tax_Bdgt_Cap
+            move #Total_Ann_Tax_Cap to #Dtl_Tax_Bdgt_Cap
+            move #Total_Ann_Tax_Cap to #Dtl_Tax_Bdgt_Beg
+         else
+            move 'N' to $Tax_Budget_Was_Derived
+         end-if
+      end-if
+
+
+      !**** The first level to be processed is Appointments ******
+      do Process-Appt-Budget
+   end-if
+
+FROM PS_DEPT_BUDGET DBGT
+WHERE DBGT.SETID              = $Gbl_SetID
+  AND DBGT.DEPTID             = $Gbl_DeptID
+  AND DBGT.FISCAL_YEAR        = #FiscalYear
+  AND DBGT.BUDGET_LEVEL_INDC  = $Process_Level_Indc
+  AND DBGT.EFFDT              =
+        (SELECT Max(DBGT1.EFFDT)
+          FROM PS_DEPT_BUDGET DBGT1
+         WHERE DBGT1.SETID            = DBGT.SETID
+           AND DBGT1.DEPTID           = DBGT.DEPTID
+           AND DBGT1.FISCAL_YEAR      = DBGT.FISCAL_YEAR
+           AND DBGT1.POSITION_POOL_ID = DBGT.POSITION_POOL_ID
+           AND DBGT1.SETID_JOBCODE    = DBGT.SETID_JOBCODE
+           AND DBGT1.JOBCODE          = DBGT.JOBCODE
+           AND DBGT1.POSITION_NBR     = DBGT.POSITION_NBR
+           AND DBGT1.EMPLID           = DBGT.EMPLID
+           AND DBGT1.EMPL_RCD         = DBGT.EMPL_RCD)
+  AND DBGT.EFFSEQ             =                               !HPRET
+         (SELECT MAX(DBGT2.EFFSEQ)                            !HPRET
+           FROM PS_DEPT_BUDGET DBGT2                          !HPRET
+           WHERE DBGT2.SETID            = DBGT.SETID          !HPRET
+           AND DBGT2.DEPTID           = DBGT.DEPTID             !HPRET
+           AND DBGT2.FISCAL_YEAR      = DBGT.FISCAL_YEAR        !HPRET
+           AND DBGT2.POSITION_POOL_ID = DBGT.POSITION_POOL_ID   !HPRET
+           AND DBGT2.SETID_JOBCODE    = DBGT.SETID_JOBCODE      !HPRET
+           AND DBGT2.JOBCODE          = DBGT.JOBCODE            !HPRET
+           AND DBGT2.POSITION_NBR     = DBGT.POSITION_NBR       !HPRET
+           AND DBGT2.EMPLID           = DBGT.EMPLID             !HPRET
+           AND DBGT2.EMPL_RCD         = DBGT.EMPL_RCD           !HPRET
+           AND DBGT2.EFFDT            = DBGT.EFFDT)             !HPRET
+  AND DBGT.EFF_STATUS         = 'A'
+
+End-SELECT
+
+End-Procedure SELECT-DEPT-BUDGET
+
+!***********************************************************************
+! Procedure: PROCESS-POSN-BUDGET                                       *
+! Descr:     Loads and processes all position level budgets for the    *
+!            current department.  Earning, Ded'ns, and Taxes for each  *
+!            appointment are deducted from the appointment record and  *
+!            the department budget, and from the jobcode budget as     *
+!            necessary.                                                *
+!                                                                      *
+! Called by: SELECT-DEPT-BUDGET                                        *
+!***********************************************************************
+Begin-Procedure PROCESS-POSN-BUDGET
+
+!***  First find out if the position is one for which a budget is defined,
+!***  and if the position is in a position pool with a budget defined.
+
+   move 'N' to $Posn_Bdgt_Fnd
+   move 'N' to $Pool_Bdgt_Fnd
+   move $Dtl_Position_Nbr to $Chk_Position_Nbr
+   move ' ' to $Chk_SetID_Jobcode
+   move ' ' to $Chk_Jobcode
+   move ' ' to $Cur_Position_Pool_ID
+   move ' ' to $Cur_Jobcode
+   move $Dtl_Position_Nbr to $Cur_Position_Nbr
+   move ' ' to $Cur_EmplID
+   move  0  to #Cur_Empl_Rcd
+   move  0  to #Job_Loc_Idx
+   move  0  to #Posn_Loc_Idx
+   move  0  to #Pool_Loc_Idx
+   move  1  to #Dept_Loc_Idx
+
+   move $Dtl_Position_Nbr to $Chk_Position_Nbr
+   do Check-Posn-Record
+
+   move 1 to #Dept_Loc_Idx
+
+   move 'A' to $Account_Level_Indc
+
+   !***** Collect all earnings accounts and distributions under this appointment ******
+   do SELECT-ERN-DETAIL
+
+   !***** Collect all deductions account and distributions under this level ******
+   do SELECT-DED-DETAIL
+
+   !***** Collect all tax account and distributions under this level ******
+   do SELECT-TAX-DETAIL
+
+   if #taxarraycnt = 0
+      do SELECT-CTX-DETAIL
+   end-if
+
+   !***   If we are doing Budget Level apply all fixed amounts to overall budget
+   if $Gbl_budget_Cap_indc = 'O'
+      do Process-budget-level
+   else
+      do Process-Specific-levels
+   end-if
+
+   !****** Process the Position Level left over amounts *********
+    if $Gbl_Budget_Cap_indc = 'O'
+       if #Dtl_overall_bdgt_cap <> 0
+           do Process-Level-for-Budget-Level
+       end-if
+   else
+       if #Dtl_ern_bdgt_cap <> 0  or #Dtl_tax_bdgt_cap <> 0 or #Dtl_ded_bdgt_cap <> 0
+           do Process-Level-for-Specific-Level
+       end-if
+   end-if
+
+End-Procedure PROCESS-POSN-BUDGET
+
+!***********************************************************************
+! Procedure: PROCESS-POOL-BUDGET                                       *
+! Descr:     Loads and processes all position pool budgets for the     *
+!            current department.  Earning, Ded'ns, and Taxes for each  *
+!            position pool are deducted from the array record and      *
+!            the results written to a temporary table.                 *
+!                                                                      *
+! Called by: SELECT-DEPT-BUDGET                                        *
+!***********************************************************************
+Begin-Procedure PROCESS-POOL-BUDGET
+
+!***  First find out if the position is one for which a budget is defined,
+!***  and if the position is in a position pool with a budget defined.
+
+   move 'N' to $Posn_Bdgt_Fnd
+   move 'N' to $Pool_Bdgt_Fnd
+   move ' ' to $Chk_Position_Nbr
+   move ' ' to $Chk_SetID_Jobcode
+   move ' ' to $Chk_Jobcode
+   move $Dtl_Position_Pool_ID to $Cur_Position_Pool_ID
+   move ' ' to $Cur_Jobcode
+   move ' ' to $Cur_Position_Nbr
+   move ' ' to $Cur_EmplID
+   move  0  to #Cur_Empl_Rcd
+   move  0  to #Job_Loc_Idx
+   move  0  to #Posn_Loc_Idx
+   move  0  to #Pool_Loc_Idx
+   move  1  to #Dept_Loc_Idx
+
+   move 'A' to $Account_Level_Indc
+
+   !***** Collect all earnings accounts and distributions under this appointment ******
+   do SELECT-ERN-DETAIL
+
+   !***** Collect all deductions account and distributions under this level ******
+   do SELECT-DED-DETAIL
+
+   !***** Collect all tax account and distributions under this level ******
+   do SELECT-TAX-DETAIL
+
+   if #taxarraycnt = 0
+      do SELECT-CTX-DETAIL
+   end-if
+
+   !***   If we are doing Budget Level apply all fixed amounts to overall budget
+   if $Gbl_budget_Cap_indc = 'O'
+      do Process-budget-level
+   else
+      do Process-Specific-levels
+   end-if
+
+   !****** Process the Pool Level left over amounts *********
+   if $Gbl_Budget_Cap_indc = 'O'
+       if #Dtl_overall_bdgt_cap <> 0
+           do Process-Level-for-Budget-Level
+       end-if
+   else
+       if #Dtl_ern_bdgt_cap <> 0  or #Dtl_tax_bdgt_cap <> 0 or #Dtl_ded_bdgt_cap <> 0
+           do Process-Level-for-Specific-Level
+       end-if
+   end-if
+
+End-Procedure PROCESS-POOL-BUDGET
+
+!***********************************************************************
+! Procedure: PROCESS-JOBCODE-BUDGET                                    *
+! Descr:     Loads and processes all jobcode budgets for the current   *
+!            department.  Earning, Ded'ns, and Taxes for each jobcode  *
+!            are deducted from the array record and the results        *
+!            written to a temporary table.                             *
+!                                                                      *
+! Called by: SELECT-DEPT-BUDGET                                        *
+!***********************************************************************
+Begin-Procedure PROCESS-JOBCODE-BUDGET
+
+!***  First find out if the position is one for which a budget is defined,
+!***  and if the position is in a position pool with a budget defined.
+
+   move 'N' to $Posn_Bdgt_Fnd
+   move 'N' to $Pool_Bdgt_Fnd
+   move ' ' to $Chk_Position_Nbr
+   move ' ' to $Chk_SetID_Jobcode
+   move ' ' to $Chk_Jobcode
+   move ' ' to $Cur_Position_Pool_ID
+   move $Dtl_Jobcode to $Cur_Jobcode
+   move ' ' to $Cur_Position_Nbr
+   move ' ' to $Cur_EmplID
+   move  0  to #Cur_Empl_Rcd
+   move  0  to #Job_Loc_Idx
+   move  0  to #Posn_Loc_Idx
+   move  0  to #Pool_Loc_Idx
+   move  1  to #Dept_Loc_Idx
+
+
+   move 'A' to $Account_Level_Indc
+
+   !***** Collect all earnings accounts and distributions under this appointment ******
+   do SELECT-ERN-DETAIL
+
+   !***** Collect all deductions account and distributions under this level ******
+   do SELECT-DED-DETAIL
+
+   !***** Collect all tax account and distributions under this level ******
+   do SELECT-TAX-DETAIL
+
+   if #taxarraycnt = 0
+      do SELECT-CTX-DETAIL
+   end-if
+
+   !***   If we are doing Budget Level apply all fixed amounts to overall budget
+   if $Gbl_budget_Cap_indc = 'O'
+      do Process-budget-level
+   else
+      do Process-Specific-levels
+   end-if
+
+   !****** Process the JobCode Level left over amounts *********
+   if $Gbl_Budget_Cap_indc = 'O'
+       if #Dtl_overall_bdgt_cap <> 0
+           do Process-Level-for-Budget-Level
+       end-if
+   else
+       if #Dtl_ern_bdgt_cap <> 0  or #Dtl_tax_bdgt_cap <> 0 or #Dtl_ded_bdgt_cap <> 0
+           do Process-Level-for-Specific-Level
+       end-if
+   end-if
+
+End-Procedure PROCESS-JOBCODE-BUDGET
+
+!***********************************************************************
+! Procedure: PROCESS-DEPT-BUDGET                                       *
+! Descr:     Loads and processes overall department budget.  Earning,  *
+!            Ded'ns, and Taxes are deducted from the array record and  *
+!            the results written to a temporary table.                 *
+!                                                                      *
+! Called by: SELECT-DEPT-BUDGET                                        *
+!***********************************************************************
+Begin-Procedure PROCESS-DEPT-BUDGET
+
+   move 'N' to $Posn_Bdgt_Fnd
+   move 'N' to $Pool_Bdgt_Fnd
+   move ' ' to $Chk_Position_Nbr
+   move ' ' to $Chk_SetID_Jobcode
+   move ' ' to $Chk_Jobcode
+   move ' ' to $Cur_Position_Pool_ID
+   move ' ' to $Cur_Jobcode
+   move ' ' to $Cur_Position_Nbr
+   move ' ' to $Cur_EmplID
+   move  0  to #Cur_Empl_Rcd
+   move  0  to #Job_Loc_Idx
+   move  0  to #Posn_Loc_Idx
+   move  0  to #Pool_Loc_Idx
+   move  0  to #Dept_Loc_Idx
+
+   move 'A' to $Account_Level_Indc
+
+   !***** Collect all earnings accounts and distributions under this appointment ******
+   do SELECT-ERN-DETAIL
+
+   !***** Collect all deductions account and distributions under this level ******
+   do SELECT-DED-DETAIL
+
+   !***** Collect all tax account and distributions under this level ******
+   do SELECT-TAX-DETAIL
+
+   if #taxarraycnt = 0
+      do SELECT-CTX-DETAIL
+   end-if
+
+   !***   If we are doing Budget Level apply all fixed amounts to overall budget
+   if $Gbl_budget_Cap_indc = 'O'
+      do Process-budget-level
+   else
+      do Process-Specific-levels
+   end-if
+
+   !****** Process the Position Level left over amounts *********
+   if $Gbl_Budget_Cap_indc = 'O'
+       if #Dtl_overall_bdgt_cap <> 0
+           do Process-Level-for-Budget-Level
+       end-if
+   else
+       if #Dtl_ern_bdgt_cap <> 0  or #Dtl_tax_bdgt_cap <> 0 or #Dtl_ded_bdgt_cap <> 0
+           do Process-Level-for-Specific-Level
+       end-if
+   end-if
+
+End-Procedure PROCESS-DEPT-BUDGET
+
+!***********************************************************************
+! Procedure: DERIVE-BUDGET-CAP                                         *
+! Descr:     Common module.  This module derives the total estimated   *
+!            annual salary for all employees and/or positions in a     *
+!            budget level, based on the budget level indicator given.  *
+!                                                                      *
+! Called by: LOAD-DEPT-ARRAYS                                          *
+!***********************************************************************
+Begin-Procedure DERIVE-BUDGET-CAP
+
+   move 0 to #Total_Annual_Cap
+   move 0 to #Total_Ann_Ded_Cap
+   move 0 to #Total_Ann_Tax_Cap
+   move '' to $Default_Ern_Acct_Cd
+   move '' to $Default_Ded_Acct_Cd
+   move '' to $Default_Tax_Acct_Cd
+   move 0 to #Excluded_Incumbents
+
+   !  Check the value of $Process_Level_Indc.  This will establish which
+   !  of the subordinate procedures will be called to accumulate salary
+   !  amounts.
+
+   move 'C' to $Account_Level_Indc
+
+   do SELECT-ERN-CAP
+   move 'Y' to $Ern_Budget_Was_Derived
+
+   if not #Total_Annual_Cap
+      evaluate $Process_Level_Indc
+         when = 'A'
+            do DERIVE-APPT-SALARY
+         when = 'P'
+            do DERIVE-POSN-SALARY
+         when = 'O'
+            do DERIVE-POOL-SALARY
+         when = 'J'
+            do DERIVE-JOBCODE-SALARY
+         when = 'D'
+            do DERIVE-DEPT-SALARY
+         when-other
+            move 0.0 to #Total_Annual_Cap
+      end-evaluate
+      move 'N' to $Ern_Budget_Was_Derived
+   end-if
+
+   if $Gbl_Budget_Cap_Indc <> 'O'
+      do SELECT-DED-CAP
+      do SELECT-TAX-CAP
+      do SELECT-CTX-CAP
+      move 'Y' to $Ded_Budget_Was_Derived
+      move 'Y' to $Tax_Budget_Was_Derived
+   end-if
+
+
+End-Procedure DERIVE-BUDGET-CAP
+
+!***********************************************************************
+! Procedure: PROCESS-APPT-BUDGET                                       *
+! Descr:     Loads and processes all appointment level budgets for the *
+!            current department.  Earning, Ded'ns, and Taxes for each  *
+!            appointment are deducted from the appointment record and  *
+!            the department budget, and from the jobcode budget as     *
+!            necessary.                                                *
+!                                                                      *
+! Called by: SELECT-DEPT-BUDGET                                        *
+!***********************************************************************
+Begin-Procedure PROCESS-APPT-BUDGET
+
+!***  First find out if the appointment is to a position for which a
+!***  budget is defined, and if the position is in a position pool which
+!***  may also have a budget defined.
+
+   move 'N' to $JobCode_Bdgt_Fnd
+   move 'N' to $Posn_Bdgt_Fnd
+   move 'N' to $Pool_Bdgt_Fnd
+   move 'N' to $Job_Rec_Fnd
+   move ' ' to $Chk_Position_Nbr
+   move ' ' to $Chk_SetID_Jobcode
+   move ' ' to $Chk_Jobcode
+   move ' ' to $Cur_Position_Pool_ID
+   move ' ' to $Cur_Jobcode
+   move ' ' to $Cur_Position_Nbr
+   move $Dtl_EmplID to $Cur_EmplID
+   move #Dtl_Empl_Rcd to #Cur_Empl_Rcd
+   move  0  to #Job_Loc_Idx
+   move  0  to #Posn_Loc_Idx
+   move  0  to #Pool_Loc_Idx
+   move  1  to #Dept_Loc_Idx
+
+   let $Dis_Empl_Rcd   =  edit(#Dtl_Empl_Rcd,'99')
+   let $err-statement1 = 'BUD007, SELECT, PS_JOB, PROCESS-APPT-BUDGET'
+   let $err-statement2 = 'Params:EMPLID=<' || $Dtl_EmplID ||
+                         '>, EMPL_RCD=<' || $Dis_Empl_Rcd ||
+                         '>, EFFDT=<' || $Dtl_Effdt || '>'
+
+
+begin-SELECT on-error=Error-Display
+JOB.POSITION_NBR
+JOB.SETID_JOBCODE
+JOB.JOBCODE
+
+   move 'Y' to $Job_Rec_Fnd
+   move &JOB.SetID_Jobcode to $Chk_SetID_Jobcode
+   move &JOB.Jobcode to $Chk_Jobcode
+   move &JOB.Position_Nbr to $Chk_Position_Nbr
+   do Check-Posn-Record
+
+FROM PS_JOB JOB
+WHERE JOB.EMPLID    = $Dtl_EmplID
+  AND JOB.EMPL_RCD  = #Dtl_Empl_Rcd
+  AND JOB.EFFDT     = (SELECT MAX(JOB1.EFFDT)
+                         FROM PS_JOB JOB1
+                        WHERE JOB1.EMPLID    = JOB.EMPLID
+                          AND JOB1.EMPL_RCD  = JOB.EMPL_RCD
+                          AND JOB1.EFFDT    <= $Dtl_Effdt)
+  AND JOB.EFFSEQ    = (SELECT MAX(JOB2.EFFSEQ)
+                         FROM PS_JOB JOB2
+                        WHERE JOB2.EMPLID    = JOB.EMPLID
+                          AND JOB2.EMPL_RCD  = JOB.EMPL_RCD
+                          AND JOB2.EFFDT     = JOB.EFFDT)
+End-Select
+
+
+   !**** Find the jobcode for this employee and see if it matches the job in the budget  ****
+   !**** It will not process against its parent budget if JOB code does not match Budget Job Code ****
+
+   move 1 to #job_srchidx
+   while #job_srchidx <= #job_cnt
+      get $JASetID_Jobcode from Jobcode_Array (#job_srchidx) JASetID_Jobcode
+      get $JAJobcode from Jobcode_Array (#job_srchidx) JAJobcode
+      if $JAJobcode = $Chk_Jobcode and $JASetID_Jobcode = $Chk_SetID_Jobcode
+         move $JAJobcode to $Cur_Jobcode
+         move #Job_srchIdx to #Job_Loc_Idx
+         move 'Y' to $Jobcode_Bdgt_Fnd
+         move #job_cnt to #job_srchidx
+      end-if
+      add 1 to #job_srchidx
+   end-while
+
+   move 'A' to $Account_Level_Indc
+
+   !***** Collect all earnings accounts and distributions under this appointment ******
+   do SELECT-ERN-DETAIL
+
+   !***** Collect all deductions account and distributions under this level ******
+   do SELECT-DED-DETAIL
+
+   !***** Collect all tax account and distributions under this level ******
+   do SELECT-TAX-DETAIL
+
+   if #taxarraycnt = 0
+      do SELECT-CTX-DETAIL
+   end-if
+
+   !***   If we are doing Budget Level apply all fixed amounts to overall budget
+   if $Gbl_budget_Cap_indc = 'O'
+      do Process-budget-level
+   else
+      do Process-Specific-levels
+   end-if
+
+   !****** Process the Appointment Level left over amounts *********
+   if $Gbl_Budget_Cap_indc = 'O'
+       if #Dtl_overall_bdgt_cap <> 0
+           do Process-Level-for-Budget-Level
+       end-if
+   else
+       if #Dtl_ern_bdgt_cap <> 0  or #Dtl_tax_bdgt_cap <> 0 or #Dtl_ded_bdgt_cap <> 0
+           do Process-Level-for-Specific-Level
+       end-if
+   end-if
+
+End-Procedure PROCESS-APPT-BUDGET
+
+!***********************************************************************
+! Procedure: CHECK-POSN-RECORD                                         *
+! Descr:     Selects a current position record based on the position   *
+!            number in "Dtl_Position_Nbr".  If found, checks for the   *
+!            presence of a position budget, and for a Position Pool    *
+!            based on the array loaded earlier.                        *
+!                                                                      *
+! Called by: PROCESS-APPT-BUDGET,                                      *
+!            PROCESS-POSN-BUDGET                                       *
+!***********************************************************************
+Begin-Procedure CHECK-POSN-RECORD
+
+   move 'N' to $Posn_Rec_Fnd
+   move 'N' to $Pool_Rec_Fnd
+
+   let $Dis_FiscalYear =  edit(#FiscalYear,'9999')
+   let $err-statement1 = 'BUD007, SELECT, PS_POSITION_DATA, CHECK-POSN-RECORD'
+   let $err-statement2 = 'Params: EFFDT=<' || $Dtl_Effdt ||
+                         '>, POSITION_NBR=<' || $Chk_Position_Nbr || '>'
+
+
+begin-SELECT on-error=Error-Display
+PSN.POSITION_POOL_ID
+
+   move 'Y' to $Posn_Rec_Fnd
+
+   if &PSN.POSITION_POOL_ID <> ' '
+      move 'Y' to $Pool_Rec_Fnd
+   end-if
+
+FROM PS_POSITION_DATA PSN
+WHERE PSN.POSITION_NBR = $Chk_Position_Nbr
+  AND PSN.EFF_STATUS = 'A'
+  AND PSN.EFFDT = (SELECT MAX(PSN1.EFFDT)
+                     FROM PS_POSITION_DATA PSN1
+                    WHERE PSN1.POSITION_NBR = PSN.POSITION_NBR
+                      AND PSN1.EFFDT <= $Dtl_Effdt)
+End-SELECT
+
+   move 'N' to $Posn_Bdgt_Fnd
+   move 'N' to $Pool_Bdgt_Fnd
+
+   if $Posn_Rec_Fnd = 'Y'
+      move 1 to #posn_srchidx
+      while #posn_srchidx <= #posn_cnt
+         get $NAPosition_Nbr from Posn_Array (#posn_srchidx) NAPosition_Nbr
+         if $NAPosition_Nbr = $Chk_Position_Nbr
+            move $NAPosition_Nbr to $Cur_Position_Nbr
+            move #posn_srchidx to #posn_loc_idx
+            move 'Y' to $Posn_Bdgt_Fnd
+            move #posn_cnt to #posn_srchidx
+         end-if
+         add 1 to #posn_srchidx
+      end-while
+   end-if
+
+   if $Pool_Rec_Fnd = 'Y'
+      move 1 to #pool_srchidx
+      while #pool_srchidx <= #pool_cnt
+         get $PAPosition_Pool_ID from Pool_Array (#pool_srchidx) PAPosition_Pool_ID
+         if $PAPosition_Pool_ID = &PSN.Position_Pool_ID
+            move $PAPosition_Pool_ID to $Cur_Position_Pool_ID
+            move #Pool_srchIdx to #Pool_Loc_Idx
+            move 'Y' to $Pool_Bdgt_Fnd
+            move #pool_cnt to #pool_srchidx
+         end-if
+         add 1 to #pool_srchidx
+      end-while
+   end-if
+
+End-Procedure CHECK-POSN-RECORD
+
+
+!***********************************************************************
+! Procedure: SELECT-ERN-DETAIL                                         *
+! Descr:     Selects all earnings budget for the Appointment or Posn   *
+!            If a unique account code exists, the budget is deducted   *
+!            from budget caps above it.                                *
+!                                                                      *
+! Called by: SELECT-DEPT-BUDGET,                                       *
+!            PROCESS-APPT-BUDGET,                                      *
+!            PROCESS-POSN-BUDGET,                                      *
+!            PROCESS-POOL-BUDGET,                                      *
+!            PROCESS-JOBCODE-BUDGET,                                   *
+!            PROCESS-DEPT-BUDGET,                                      *
+!***********************************************************************
+Begin-Procedure SELECT-ERN-DETAIL
+
+   move #Dtl_Overall_Bdgt_Cap to #Cur_Overall_Bdgt_Cap
+   move #Dtl_Ern_Bdgt_Cap to #Cur_Ern_Bdgt_Cap
+
+   let $Dis_FiscalYear =  edit(#FiscalYear,'9999')
+   let $Dis_Empl_Rcd   =  edit(#Dtl_Empl_Rcd,'99')
+   let $err-statement1 = 'BUD007, SELECT, PS_DEPT_BUDGET_ERN, SELECT-ERN-DETAIL'
+   let $err-statement2 = 'Params: SETID=<' || $Gbl_SetID ||
+                         '>, DEPTID=<' || $Gbl_DeptID ||
+                         '>, FISCAL_YEAR=<' || $Dis_FiscalYear ||
+                         '>, EFFDT=<' || $Dtl_Effdt ||
+                         '>, POSITION_POOL_ID=<' || $Dtl_Position_Pool_ID ||
+                         '>, JOBCODE=<' || $Dtl_Jobcode ||
+                         '>, POSITION_NBR=<' || $Dtl_Position_Nbr ||
+                         '>, EMPLID=<' || $Dtl_EmplID ||
+                         '>, EMPL_RCD =<' || $Dis_Empl_Rcd || '>'
+
+   !****** Initialize array  to no entries *****
+   let #earnsarraycnt = 0
+   let #earnsarrayidx = 0
+
+
+begin-SELECT on-error=Error-Display
+DBGE3.ERNCD
+DBGE3.ACCT_CD
+DBGE3.BUDGET_AMT
+DBGE3.DIST_PCT
+
+
+   !****** Add retrieved earnings into array for later processing
+   let #earnsarrayidx = #earnsarrayidx + 1
+
+   let $Cur_Erncd = rtrim(&DBGE3.ERNCD,' ')
+   let $Cur_Erncd = nvl($Cur_Erncd,' ')
+
+   put $Cur_Erncd into Earns_array (#earnsarrayidx) EREarnCode
+   put &DBGE3.ACCT_CD into Earns_array (#earnsarrayidx) ERAcct_code
+   put &DBGE3.BUDGET_AMT into Earns_array (#earnsarrayidx) ERBudget_amt
+   put &DBGE3.DIST_PCT into Earns_array (#earnsarrayidx) ERDist_percent
+   put 0.00 into Earns_array (#earnsarrayidx) ERBudLevel_percent
+
+
+FROM PS_DEPT_BUDGET_ERN DBGE3
+WHERE DBGE3.SETID             = $Gbl_SetID
+  AND DBGE3.DEPTID            = $Gbl_DeptID
+  AND DBGE3.FISCAL_YEAR       = #FiscalYear
+  AND DBGE3.EFFDT             = $Dtl_Effdt
+  AND DBGE3.POSITION_POOL_ID  = $Dtl_Position_Pool_ID
+  AND DBGE3.SETID_JOBCODE     = $Dtl_SetID_Jobcode
+  AND DBGE3.JOBCODE           = $Dtl_Jobcode
+  AND DBGE3.POSITION_NBR      = $Dtl_Position_Nbr
+  AND DBGE3.EMPLID            = $Dtl_EmplID
+  AND DBGE3.EMPL_RCD          = #Dtl_Empl_Rcd
+  AND DBGE3.EFFSEQ            =                                  !HPRET
+        (SELECT MAX(ERNSEQ.EFFSEQ)                               !HPRET
+         FROM PS_DEPT_BUDGET_ERN ERNSEQ                          !HPRET
+         WHERE ERNSEQ.SETID  = DBGE3.SETID                        !HPRET
+           AND ERNSEQ.DEPTID = DBGE3.DEPTID                       !HPRET
+           AND ERNSEQ.FISCAL_YEAR = DBGE3.FISCAL_YEAR             !HPRET
+           AND ERNSEQ.EFFDT   = DBGE3.EFFDT                       !HPRET
+           AND ERNSEQ.POSITION_POOL_ID = DBGE3.POSITION_POOL_ID   !HPRET
+           AND ERNSEQ.SETID_JOBCODE = DBGE3.SETID_JOBCODE         !HPRET
+           AND ERNSEQ.JOBCODE = DBGE3.JOBCODE                     !HPRET
+           AND ERNSEQ.POSITION_NBR = DBGE3.POSITION_NBR           !HPRET
+           AND ERNSEQ.EMPLID = DBGE3.EMPLID                       !HPRET
+           AND ERNSEQ.EMPL_RCD = DBGE3.EMPL_RCD)                  !HPRET
+ORDER BY DBGE3.ERNCD, DBGE3.DIST_PCT, DBGE3.BUDGET_AMT
+End-SELECT
+
+
+!******* What are the number of entries in Earn Array *****
+let #earnsarraycnt = #earnsarrayidx
+let #earnsarrayidx = 1
+
+!****** If there are left over amounts in the parent the accounts ahould be
+!****** distributed based on perentage of the original balance
+!****** This process is the same at earnings level for both budget level types
+if $Gbl_Budget_Cap_indc = 'O'
+   let #total_earn_amount = #Dtl_overall_Bdgt_Beg
+else
+   let #total_earn_amount = #Dtl_ern_Bdgt_Beg
+end-if
+let #total_fixed_budget = 0
+let $percent_found = 'N'
+
+
+!***** Start with 100% allocated *******
+let #total_percent = 100.00
+let #total_percent_alloc = 0.00
+let #to_process = 0
+let #process_count = 0
+
+!*****  Count number entries not specific to Earning Code *****
+!*****  Do not want to adjust specific earnings *****
+while #earnsarrayidx <= #earnsarraycnt
+
+  get $thisentryearncd from Earns_array (#earnsarrayidx) EREarnCode
+  get #thisentryamt from Earns_array (#earnsarrayidx) ERBudget_amt
+  get #thisentrydist from Earns_array (#earnsarrayidx) ERDist_percent
+
+  if #thisentrydist <> 0
+      let $percent_found = 'Y'
+  end-if
+
+  if $thisentryearncd = ' '
+        let #to_process = #to_process + 1
+        let #total_fixed_budget = #total_fixed_budget + #thisentryamt
+  end-if
+
+  let #earnsarrayidx = #earnsarrayidx + 1
+end-while
+
+!**** Are there only fixed amounts for distrinution analysis
+if $percent_found = 'N'
+   let #total_earn_amount = #total_fixed_budget
+end-if
+
+let #earnsarrayidx = 1
+!****** Always process fixed amounts first ******
+while #earnsarrayidx <= #earnsarraycnt
+
+     get #thisentryamt from Earns_array (#earnsarrayidx) ERBudget_amt
+     get #thisentrydist from Earns_array (#earnsarrayidx) ERDist_percent
+     get $thisentryearncd from Earns_array (#earnsarrayidx) EREarnCode
+
+     !***** Fixed amount
+     if #thisentrydist = 0 and $thisentryearncd = ' '
+
+        let #process_count = #process_count + 1
+
+        !**** The last entry always gets the remainder ****
+        if #process_count = #to_process
+           let #thisentrypct = round(100 - #total_percent_alloc, 2)
+           let #total_percent_alloc = #total_percent_alloc + #thisentrypct
+        else
+           let #thisentrypct = round(#thisentryamt /#total_earn_amount * 100, 2)
+           let #total_percent_alloc = #total_percent_alloc + #thisentrypct
+        end-if
+
+        put #thisentrypct into Earns_array (#earnsarrayidx) ERBudLevel_percent
+
+     end-if
+
+     let #earnsarrayidx = #earnsarrayidx + 1
+
+
+ end-while
+
+let #total_percent = #total_percent - #total_percent_alloc
+let #earnsarrayidx = 1
+let #process_count = 0
+!****** Now process percentages ******
+while #earnsarrayidx <= #earnsarraycnt
+
+     get #thisentrydist from Earns_array (#earnsarrayidx) ERDist_percent
+     get $thisentryearncd from Earns_array (#earnsarrayidx) EREarnCode
+
+     !***** Percentage Distribution
+     if #thisentrydist <>  0 and $thisentryearncd = ' '
+
+        !**** Track for when processing array as to know when processing last one *****
+        let #process_count = #process_count + 1
+
+        !**** The last entry always gets the remainder ****
+        if #process_count = #to_process
+           let #thisentrypct = round(100 - #total_percent_alloc, 2)
+           let #total_percent_alloc = #total_percent_alloc + #thisentrypct
+        else
+           let #thisentrypct = round((#thisentrydist/100) * #total_percent, 2)
+           let #total_percent_alloc = #total_percent_alloc + #thisentrypct
+        end-if
+
+        put #thisentrypct into Earns_array (#earnsarrayidx) ERBudLevel_percent
+
+     end-if
+
+     let #earnsarrayidx = #earnsarrayidx + 1
+
+ end-while
+
+End-Procedure SELECT-ERN-DETAIL
+
+!***********************************************************************
+! Procedure: SELECT-DED-DETAIL                                         *
+! Descr:     Selects all Ded'ns budgets for the Appointment or Posn    *
+!            If a unique account code exists, the budget is deducted   *
+!            from budget caps above it.                                *
+!                                                                      *
+! Called by: SELECT-DEPT-BUDGET,                                       *
+!            PROCESS-APPT-BUDGET,                                      *
+!            PROCESS-POSN-BUDGET,                                      *
+!            PROCESS-POOL-BUDGET,                                      *
+!            PROCESS-JOBCODE-BUDGET,                                   *
+!            PROCESS-DEPT-BUDGET,                                      *
+!***********************************************************************
+Begin-Procedure SELECT-DED-DETAIL
+
+   move #Dtl_Ded_Bdgt_Cap to #Cur_Ded_Bdgt_Cap
+
+   let $Dis_FiscalYear =  edit(#FiscalYear,'9999')
+   let $Dis_Empl_Rcd   =  edit(#Dtl_Empl_Rcd,'99')
+   let $err-statement1 = 'BUD007, SELECT, PS_DEPT_BUDGET_DED, SELECT-DED-DETAIL'
+   let $err-statement2 = 'Params: SETID=<' || $Gbl_SetID ||
+                         '>, DEPTID=<' || $Gbl_DeptID ||
+                         '>, FISCAL_YEAR=<' || $Dis_FiscalYear ||
+                         '>, EFFDT=<' || $Dtl_Effdt ||
+                         '>, POSITION_POOL_ID=<' || $Dtl_Position_Pool_ID ||
+                         '>, JOBCODE=<' || $Dtl_Jobcode ||
+                         '>, POSITION_NBR=<' || $Dtl_Position_Nbr ||
+                         '>, EMPLID=<' || $Dtl_EmplID ||
+                         '>, EMPL_RCD =<' || $Dis_Empl_Rcd || '>'
+
+  !****** Initialize array  to no entries *****
+   let #dedsarraycnt = 0
+   let #dedsarrayidx = 0
+
+begin-SELECT on-error=Error-Display
+DBGF3.PLAN_TYPE
+DBGF3.BENEFIT_PLAN
+DBGF3.DEDCD
+DBGF3.DED_CLASS
+DBGF3.ACCT_CD
+DBGF3.BUDGET_AMT
+DBGF3.DIST_PCT
+
+   let $Cur_Plan_Type    = rtrim(&DBGF3.PLAN_TYPE,' ')
+   let $Cur_Benefit_Plan = rtrim(&DBGF3.BENEFIT_PLAN,' ')
+   let $Cur_Dedcd        = rtrim(&DBGF3.DEDCD,' ')
+   let $Cur_Ded_Class    = rtrim(&DBGF3.DED_CLASS,' ')
+
+   let $Cur_Plan_Type    = nvl($Cur_Plan_Type,' ')
+   let $Cur_Benefit_Plan = nvl($Cur_Benefit_Plan,' ')
+   let $Cur_Dedcd        = nvl($Cur_Dedcd,' ')
+   let $Cur_Ded_Class    = nvl($Cur_Ded_Class,' ')
+
+
+   !****** Add retrieved earnings into array for later processing
+   let #dedsarrayidx = #dedsarrayidx + 1
+
+   put $Cur_Dedcd into Deds_array (#dedsarrayidx) DEDEarnCode
+   put &DBGF3.ACCT_CD into Deds_array (#dedsarrayidx) DEDAcct_code
+   put &DBGF3.BUDGET_AMT into Deds_array (#dedsarrayidx) DEDBudget_amt
+   put &DBGF3.DIST_PCT into Deds_array (#dedsarrayidx) DEDDist_percent
+   put 0.00 into Deds_array (#dedsarrayidx) DEDBudLevel_percent   !** For percentage budget amounts, calculate as a percentage of the cap.
+
+
+FROM PS_DEPT_BUDGET_DED DBGF3
+WHERE DBGF3.SETID             = $Gbl_SetID
+  AND DBGF3.DEPTID            = $Gbl_DeptID
+  AND DBGF3.FISCAL_YEAR       = #FiscalYear
+  AND DBGF3.EFFDT             = $Dtl_Effdt
+  AND DBGF3.POSITION_POOL_ID  = $Dtl_Position_Pool_ID
+  AND DBGF3.SETID_JOBCODE     = $Dtl_SetID_Jobcode
+  AND DBGF3.JOBCODE           = $Dtl_Jobcode
+  AND DBGF3.POSITION_NBR      = $Dtl_Position_Nbr
+  AND DBGF3.EMPLID            = $Dtl_EmplID
+  AND DBGF3.EMPL_RCD          = #Dtl_Empl_Rcd
+  AND DBGF3.EFFSEQ            =                                 !HPRET
+        (SELECT MAX(DEDSEQ.EFFSEQ)                              !HPRET
+         FROM PS_DEPT_BUDGET_DED DEDSEQ                         !HPRET
+         WHERE DEDSEQ.SETID = DBGF3.SETID                       !HPRET
+          AND DEDSEQ.DEPTID = DBGF3.DEPTID                      !HPRET
+          AND DEDSEQ.FISCAL_YEAR = DBGF3.FISCAL_YEAR            !HPRET
+          AND DEDSEQ.EFFDT       = DBGF3.EFFDT                  !HPRET
+          AND DEDSEQ.POSITION_POOL_ID = DBGF3.POSITION_POOL_ID  !HPRET
+          AND DEDSEQ.SETID_JOBCODE = DBGF3.SETID_JOBCODE        !HPRET
+          AND DEDSEQ.JOBCODE = DBGF3.JOBCODE                    !HPRET
+          AND DEDSEQ.POSITION_NBR = DBGF3.POSITION_NBR          !HPRET
+          AND DEDSEQ.EMPLID   = DBGF3.EMPLID                    !HPRET
+          AND DEDSEQ.EMPL_RCD = DBGF3.EMPL_RCD)                 !HPRET
+
+ORDER BY DBGF3.PLAN_TYPE, DBGF3.BENEFIT_PLAN, DBGF3.DEDCD,
+         DBGF3.DED_CLASS, DBGF3.DIST_PCT, DBGF3.BUDGET_AMT
+End-SELECT
+
+
+!******* What are the number of entries in Dedn Array *****
+let #dedsarraycnt = #dedsarrayidx
+let #dedsarrayidx = 1
+
+!****** If there are left over amounts in the parent the accounts ahould be
+!****** distributed based on perentage of the original balance
+!****** This process is only used if mode is in Per Budget/Deduction/Level
+if $Gbl_Budget_Cap_indc <> 'O'
+   let #total_ded_amount = #Dtl_ded_Bdgt_Beg
+   let #total_fixed_budget = 0
+   let $percent_found = 'N'
+
+
+  !***** Start with 100% allocated *******
+  let #total_percent = 100.00
+  let #total_percent_alloc = 0.00
+  let #to_process = 0
+  let #process_count = 0
+
+  !*****  Count number entries not specific to Earning Code *****
+  !*****  Do not want to adjust specific earnings *****
+  while #dedsarrayidx <= #dedsarraycnt
+
+    get $thisentrydedcd from Deds_array (#dedsarrayidx) DEDEarnCode
+    get #thisentryamt from Deds_array (#dedsarrayidx) DEDBudget_amt
+    get #thisentrydist from Deds_array (#dedsarrayidx) DEDDist_percent
+
+    if #thisentrydist <> 0
+        let $percent_found = 'Y'
+    end-if
+
+    if $thisentrydedcd = ' '
+          let #to_process = #to_process + 1
+          let #total_fixed_budget = #total_fixed_budget + #thisentryamt
+    end-if
+
+    let #dedsarrayidx = #dedsarrayidx + 1
+  end-while
+
+  !**** Are there only fixed amounts for distrinution analysis
+  if $percent_found = 'N'
+     let #total_ded_amount = #total_fixed_budget
+  end-if
+
+
+  let #dedsarrayidx = 1
+  !****** Always process fixed amounts first ******
+  while #dedsarrayidx <= #dedsarraycnt
+
+       get #thisentryamt from Deds_array (#dedsarrayidx) DEDBudget_amt
+       get #thisentrydist from Deds_array (#dedsarrayidx) DEDDist_percent
+       get $thisentrydedcd from Deds_array (#dedsarrayidx) DEDEarnCode
+
+       !***** Fixed amount
+       if #thisentrydist = 0 and $thisentrydedcd = ' '
+
+          let #process_count = #process_count + 1
+
+          !**** The last entry always gets the remainder ****
+          if #process_count = #to_process
+             let #thisentrypct = round(100 - #total_percent_alloc, 2)
+             let #total_percent_alloc = #total_percent_alloc + #thisentrypct
+          else
+             let #thisentrypct = round(#thisentryamt /#total_ded_amount * 100, 2)
+             let #total_percent_alloc = #total_percent_alloc + #thisentrypct
+          end-if
+
+          put #thisentrypct into Deds_array (#dedsarrayidx) DEDBudLevel_percent
+
+       end-if
+
+       let #dedsarrayidx = #dedsarrayidx + 1
+
+   end-while
+
+  let #total_percent = #total_percent - #total_percent_alloc
+  let #dedsarrayidx = 1
+  !****** Now process percentages ******
+  while #dedsarrayidx <= #dedsarraycnt
+
+       get #thisentrydist from Deds_array (#dedsarrayidx) DEDDist_percent
+       get $thisentrydedcd from Deds_array (#dedsarrayidx) DEDEarnCode
+
+
+       !***** Percentage Distribution
+       if #thisentrydist <>  0 and $thisentrydedcd = ' '
+
+          let #process_count = #process_count + 1
+
+          !**** The last entry always gets the remainder ****
+          if #process_count = #to_process
+             let #thisentrypct = round(100 - #total_percent_alloc, 2)
+             let #total_percent_alloc = #total_percent_alloc + #thisentrypct
+          else
+             let #thisentrypct = round((#thisentrydist/100) * #total_percent, 2)
+             let #total_percent_alloc = #total_percent_alloc + #thisentrypct
+          end-if
+
+          put #thisentrypct into Deds_array (#dedsarrayidx) DEDBudLevel_percent
+
+       end-if
+
+       let #dedsarrayidx = #dedsarrayidx + 1
+
+   end-while
+end-if
+
+End-Procedure SELECT-DED-DETAIL
+
+!***********************************************************************
+! Procedure: SELECT-TAX-DETAIL                                         *
+! Descr:     Selects all US Tax budgets for the Appointment or Posn    *
+!            If a unique account code exists, the budget is deducted   *
+!            from budget caps above it.                                *
+!                                                                      *
+! Called by: SELECT-DEPT-BUDGET,                                       *
+!            PROCESS-APPT-BUDGET,                                      *
+!            PROCESS-POSN-BUDGET,                                      *
+!            PROCESS-POOL-BUDGET,                                      *
+!            PROCESS-JOBCODE-BUDGET,                                   *
+!            PROCESS-DEPT-BUDGET,                                      *
+!***********************************************************************
+Begin-Procedure SELECT-TAX-DETAIL
+
+   move #Dtl_Tax_Bdgt_Cap to #Cur_Tax_Bdgt_Cap
+
+   let $Dis_FiscalYear =  edit(#FiscalYear,'9999')
+   let $Dis_Empl_Rcd   =  edit(#Dtl_Empl_Rcd,'99')
+   let $err-statement1 = 'BUD007, SELECT, PS_DEPT_BUDGET_TAX, SELECT-TAX-DETAIL'
+   let $err-statement2 = 'Params: SETID=<' || $Gbl_SetID ||
+                         '>, DEPTID=<' || $Gbl_DeptID ||
+                         '>, FISCAL_YEAR=<' || $Dis_FiscalYear ||
+                         '>, EFFDT=<' || $Dtl_Effdt ||
+                         '>, POSITION_POOL_ID=<' || $Dtl_Position_Pool_ID ||
+                         '>, JOBCODE=<' || $Dtl_Jobcode ||
+                         '>, POSITION_NBR=<' || $Dtl_Position_Nbr ||
+                         '>, EMPLID=<' || $Dtl_EmplID ||
+                         '>, EMPL_RCD =<' || $Dis_Empl_Rcd || '>'
+
+  !****** Initialize array  to no entries *****
+   let #taxarraycnt = 0
+   let #taxarrayidx = 0
+
+begin-SELECT on-error=Error-Display
+DBTX3.STATE
+DBTX3.LOCALITY
+DBTX3.TAX_CLASS
+DBTX3.ACCT_CD
+DBTX3.BUDGET_AMT
+DBTX3.DIST_PCT
+
+   let $Cur_State      = rtrim(&DBTX3.STATE,' ')
+   let $Cur_Locality   = rtrim(&DBTX3.LOCALITY,' ')
+   let $Cur_Tax_Class  = rtrim(&DBTX3.TAX_CLASS,' ')
+
+   let $Cur_State      = nvl($Cur_State,' ')
+   let $Cur_Locality   = nvl($Cur_Locality,' ')
+   let $Cur_Tax_Class  = nvl($Cur_Tax_Class,' ')
+
+   !****** Add retrieved earnings into array for later processing
+   let #taxarrayidx = #taxarrayidx + 1
+
+   put &DBTX3.ACCT_CD into Tax_array (#taxarrayidx) TAXAcct_code
+   put &DBTX3.BUDGET_AMT into Tax_array (#taxarrayidx) TAXBudget_amt
+   put &DBTX3.DIST_PCT into Tax_array (#taxarrayidx) TAXDist_percent
+   put 0.00 into Tax_array (#taxarrayidx) TAXBudLevel_percent   !** For percentage budget amounts, calculate as a percentage of the cap.
+
+
+
+FROM PS_DEPT_BUDGET_TAX DBTX3
+WHERE DBTX3.SETID             = $Gbl_SetID
+  AND DBTX3.DEPTID            = $Gbl_DeptID
+  AND DBTX3.FISCAL_YEAR       = #FiscalYear
+  AND DBTX3.EFFDT             = $Dtl_Effdt
+  AND DBTX3.POSITION_POOL_ID  = $Dtl_Position_Pool_ID
+  AND DBTX3.SETID_JOBCODE     = $Dtl_SetID_Jobcode
+  AND DBTX3.JOBCODE           = $Dtl_Jobcode
+  AND DBTX3.POSITION_NBR      = $Dtl_Position_Nbr
+  AND DBTX3.EMPLID            = $Dtl_EmplID
+  AND DBTX3.EMPL_RCD          = #Dtl_Empl_Rcd
+  and DBTX3.EFFSEQ            =                                    !HPRET
+        (SELECT MAX(TAXSEQ.EFFSEQ)                                 !HPRET
+         FROM PS_DEPT_BUDGET_TAX TAXSEQ                            !HPRET
+         WHERE TAXSEQ.SETID   = DBTX3.SETID                        !HPRET
+          AND TAXSEQ.DEPTID   = DBTX3.DEPTID                       !HPRET
+          AND TAXSEQ.FISCAL_YEAR = DBTX3.FISCAL_YEAR               !HPRET
+          AND TAXSEQ.EFFDT    = DBTX3.EFFDT                        !HPRET
+          AND TAXSEQ.POSITION_POOL_ID = DBTX3.POSITION_POOL_ID     !HPRET
+          AND TAXSEQ.SETID_JOBCODE = DBTX3.SETID_JOBCODE           !HPRET
+          AND TAXSEQ.JOBCODE  = DBTX3.JOBCODE                      !HPRET
+          AND TAXSEQ.POSITION_NBR  = DBTX3.POSITION_NBR            !HPRET
+          AND TAXSEQ.EMPLID   = DBTX3.EMPLID                       !HPRET
+          AND TAXSEQ.EMPL_RCD = DBTX3.EMPL_RCD)                    !HPRET
+ORDER BY DBTX3.STATE, DBTX3.LOCALITY, DBTX3.TAX_CLASS,
+         DBTX3.DIST_PCT, DBTX3.BUDGET_AMT
+End-SELECT
+
+!******* What are the number of entries in TAX Array *****
+let #taxarraycnt = #taxarrayidx
+let #taxarrayidx = 1
+
+!* Establish level allocation that is used for CTX and TAX
+ do Establish-Tax-Proration
+
+End-Procedure SELECT-TAX-DETAIL
+
+!***********************************************************************
+! Procedure: SELECT-CTX-DETAIL                                         *
+! Descr:     Selects all Canadian Tax budgets for the Appt or Posn     *
+!            If a unique account code exists, the budget is deducted   *
+!            from budget caps above it.                                *
+!                                                                      *
+! Called by: SELECT-DEPT-BUDGET,                                       *
+!            PROCESS-APPT-BUDGET,                                      *
+!            PROCESS-POSN-BUDGET,                                      *
+!            PROCESS-POOL-BUDGET,                                      *
+!            PROCESS-JOBCODE-BUDGET,                                   *
+!            PROCESS-DEPT-BUDGET,                                      *
+!***********************************************************************
+Begin-Procedure SELECT-CTX-DETAIL
+
+   move #Dtl_Tax_Bdgt_Cap to #Cur_Tax_Bdgt_Cap
+
+   let $Dis_FiscalYear =  edit(#FiscalYear,'9999')
+   let $Dis_Empl_Rcd   =  edit(#Dtl_Empl_Rcd,'99')
+   let $err-statement1 = 'BUD007, SELECT, PS_DEPT_BUDGET_CTX, SELECT-CTX-DETAIL'
+   let $err-statement2 = 'Params: SETID=<' || $Gbl_SetID ||
+                         '>, DEPTID=<' || $Gbl_DeptID ||
+                         '>, FISCAL_YEAR=<' || $Dis_FiscalYear ||
+                         '>, EFFDT=<' || $Dtl_Effdt ||
+                         '>, POSITION_POOL_ID=<' || $Dtl_Position_Pool_ID ||
+                         '>, JOBCODE=<' || $Dtl_Jobcode ||
+                         '>, POSITION_NBR=<' || $Dtl_Position_Nbr ||
+                         '>, EMPLID=<' || $Dtl_EmplID ||
+                         '>, EMPL_RCD =<' || $Dis_Empl_Rcd || '>'
+
+  !****** Initialize array  to no entries *****
+   let #taxarraycnt = 0
+   let #taxarrayidx = 0
+
+begin-SELECT on-error=Error-Display
+DBCX3.PROVINCE
+DBCX3.TAX_CLASS_CAN
+DBCX3.ACCT_CD
+DBCX3.BUDGET_AMT
+DBCX3.DIST_PCT
+
+   let $Cur_Province       = rtrim(&DBCX3.PROVINCE,' ')
+   let $Cur_Tax_Class_Can  = rtrim(&DBCX3.TAX_CLASS_CAN,' ')
+
+   let $Cur_Province       = nvl($Cur_Province,' ')
+   let $Cur_Tax_Class_Can  = nvl($Cur_Tax_Class_Can,' ')
+
+   !****** Add retrieved earnings into array for later processing
+   let #taxarrayidx = #taxarrayidx + 1
+
+   put &DBCX3.ACCT_CD into Tax_array (#taxarrayidx) TAXAcct_code
+   put &DBCX3.BUDGET_AMT into Tax_array (#taxarrayidx) TAXBudget_amt
+   put &DBCX3.DIST_PCT into Tax_array (#taxarrayidx) TAXDist_percent
+   put 0.00 into Tax_array (#taxarrayidx) TAXBudLevel_percent
+
+
+FROM PS_DEPT_BUDGET_CTX DBCX3
+WHERE DBCX3.SETID             = $Gbl_SetID
+  AND DBCX3.DEPTID            = $Gbl_DeptID
+  AND DBCX3.FISCAL_YEAR       = #FiscalYear
+  AND DBCX3.EFFDT             = $Dtl_Effdt
+  AND DBCX3.POSITION_POOL_ID  = $Dtl_Position_Pool_ID
+  AND DBCX3.SETID_JOBCODE     = $Dtl_SetID_Jobcode
+  AND DBCX3.JOBCODE           = $Dtl_Jobcode
+  AND DBCX3.POSITION_NBR      = $Dtl_Position_Nbr
+  AND DBCX3.EMPLID            = $Dtl_EmplID
+  AND DBCX3.EMPL_RCD          = #Dtl_Empl_Rcd
+  AND DBCX3.EFFSEQ            =                                !HPRET
+       (SELECT MAX(CTXSEQ.EFFSEQ)                              !HPRET
+        FROM PS_DEPT_BUDGET_CTX CTXSEQ                         !HPRET
+        WHERE CTXSEQ.SETID           = DBCX3.SETID             !HPRET
+         AND CTXSEQ.DEPTID           = DBCX3.DEPTID            !HPRET
+         AND CTXSEQ.FISCAL_YEAR      = DBCX3.FISCAL_YEAR       !HPRET
+         AND CTXSEQ.EFFDT            = DBCX3.EFFDT             !HPRET
+         AND CTXSEQ.POSITION_POOL_ID = DBCX3.POSITION_POOL_ID  !HPRET
+         AND CTXSEQ.SETID_JOBCODE    = DBCX3.SETID_JOBCODE     !HPRET
+         AND CTXSEQ.JOBCODE          = DBCX3.JOBCODE           !HPRET
+         AND CTXSEQ.POSITION_NBR     = DBCX3.POSITION_NBR      !HPRET
+         AND CTXSEQ.EMPLID           = DBCX3.EMPLID            !HPRET
+         AND CTXSEQ.EMPL_RCD         = DBCX3.EMPL_RCD)         !HPRET
+ORDER BY DBCX3.PROVINCE, DBCX3.TAX_CLASS_CAN, DBCX3.DIST_PCT, DBCX3.BUDGET_AMT
+End-SELECT
+
+!******* What are the number of entries in TAX Array *****
+let #taxarraycnt = #taxarrayidx
+let #taxarrayidx = 1
+
+!* Establish level allocation that is used for CTX and TAX
+ do Establish-Tax-Proration
+
+
+End-Procedure SELECT-CTX-DETAIL
+
+!***********************************************************************
+! Procedure: PROCESS-BUDGET-LEVEL                                      *
+! Descr:     Processes Earnings, Taxes, and Deductions against the     *
+!            overall budget cap. This process will always process the  *
+!            fixed amounts first.  At a budget level % of tax and      *
+!            deductions will not be processed  If there is a % of tax  *
+!            or deductions there must be a % of earnings.  When the    *
+!            percent of earnings are processed the entire budget cap   *
+!            is disapated by 100% of the earnings.                     *
+!                                                                      *
+! Called by: PROCESS-DEPT-SHORTCUT,                                    *
+!            PROCESS-APPT-BUDGET,                                      *
+!            PROCESS-POSN-BUDGET,                                      *
+!            PROCESS-POOL-BUDGET,                                      *
+!            PROCESS-JOBCODE-BUDGET,                                   *
+!            PROCESS-DEPT-BUDGET,                                      *
+!***********************************************************************
+Begin-Procedure PROCESS-BUDGET-LEVEL
+
+! ****  Process Fixed Earnings against Overall Budget  ****
+ do Process-Fixed-Earnings
+
+! ****  Process Fixed Tax against Overall Budget second ****
+ do Process-Fixed-Tax
+
+! ****  Process Fixed Deductions against Overall Budget third ****
+ do Process-Fixed-Deductions
+
+!*****  Process Percentage Distribution Amounts last ******
+ do Process-Distributed-Earnings
+
+End-Procedure PROCESS-BUDGET-LEVEL
+
+!***********************************************************************
+! Procedure: PROCESS-SPECIFIC-LEVELS                                   *
+! Descr:     Performs the "drilling up" of budgets.  If the acct_cd    *
+!            differs from default, reduces the Appt. or Posn. level    *
+!            budget and writes an output record.  This same budget amt *
+!            is then removed from higher level budgets which may       *
+!            contain the Appt or Posn budget.                          *
+!                                                                      *
+! Called by: PROCESS-DEPT-SHORTCUT,                                    *
+!            PROCESS-APPT-BUDGET,                                      *
+!            PROCESS-POSN-BUDGET,                                      *
+!            PROCESS-POOL-BUDGET,                                      *
+!            PROCESS-JOBCODE-BUDGET,                                   *
+!            PROCESS-DEPT-BUDGET,                                      *
+!***********************************************************************
+Begin-Procedure PROCESS-SPECIFIC-LEVELS
+
+ ! ****  Process Fixed Earnings against Overall Earnings Budget  ****
+ do Process-Fixed-Earnings
+
+!*****  Process Percentage Distribution Amounts second ******
+ do Process-Distributed-Earnings
+
+! ****  Process Fixed Tax against Overall Tax Budget ****
+ do Process-Fixed-Tax
+
+!*****  Process Percentage Distribution Tax Amounts fourth ******
+ do Process-Distributed-Tax
+
+! ****  Process Fixed Deductions against Overall Deductions Budget  ****
+ do Process-Fixed-Deductions
+
+!*****  Process Percentage Distribution Tax Amounts fourth ******
+ do Process-Distributed-Deductions
+
+
+End-Procedure PROCESS-SPECIFIC-LEVELS
+
+!***********************************************************************
+! Procedure: PROCESS-LEVEL-FOR-BUDGET-LEVEL                            *
+! Descr:     Performs the final write of data for this level when      *
+!            running in a per budget level mode.  The amounts are      *
+!            according to the accounts based on a proaration of the    *
+!            original balances  IE if Acct 1 was 75% and Acct 2 was 25 *
+!            the leftover amount is placed into those accounts based   *
+!            on those percentages.
+!                                                                      *
+! Called by: PROCESS-DEPT-SHORTCUT,                                    *
+!            PROCESS-APPT-BUDGET,                                      *
+!            PROCESS-POSN-BUDGET,                                      *
+!            PROCESS-POOL-BUDGET,                                      *
+!            PROCESS-JOBCODE-BUDGET,                                   *
+!            PROCESS-DEPT-BUDGET,                                      *
+!***********************************************************************
+Begin-Procedure PROCESS-LEVEL-FOR-BUDGET-LEVEL
+
+let #earnsarrayidx = 1
+
+!***** prohibit amount from eating at its account parent this is
+!****  the immediate parent
+move 'B' to $Account_level_indc
+
+move 'SM' to $Budget_type_flag
+let #outstanding_bal =  #Dtl_overall_bdgt_cap
+
+!****** Now process all entries ******
+while #earnsarrayidx <= #earnsarraycnt
+
+     get #thisentrypct from Earns_array (#earnsarrayidx) ERBudLevel_percent
+     get $Out_Acct_Cd from Earns_array (#earnsarrayidx) ERAcct_Code
+
+     !**** The last entry always gets the remainder ****
+     if #earnsarrayidx = #earnsarraycnt
+          let #Output_Budget = #outstanding_bal
+     else
+          let #Output_budget = round(#Dtl_overall_bdgt_cap * #thisentrypct/100, 2)
+          let #outstanding_bal = #outstanding_bal - #Output_Budget
+     end-if
+
+     do Write-Temp-Table
+     do Process-Included-Budget
+
+     let #earnsarrayidx = #earnsarrayidx + 1
+
+ end-while
+
+End-Procedure PROCESS-LEVEL-FOR-BUDGET-LEVEL
+
+!***********************************************************************
+! Procedure: PROCESS-LEVEL-FOR-SPECIFIC-LEVEL                          *
+! Descr:     Performs the final write of data for this level when      *
+!            running in a per EARNS/DED/TAXl mode.  The amounts are    *
+!            according to the accounts based on a proaration of the    *
+!            original balances  IE if Acct 1 was 75% and Acct 2 was 25 *
+!            the leftover amount is placed into those accounts based   *
+!            on those percentages.
+!                                                                      *
+! Called by: PROCESS-DEPT-SHORTCUT,                                    *
+!            PROCESS-APPT-BUDGET,                                      *
+!            PROCESS-POSN-BUDGET,                                      *
+!            PROCESS-POOL-BUDGET,                                      *
+!            PROCESS-JOBCODE-BUDGET,                                   *
+!            PROCESS-DEPT-BUDGET,                                      *
+!***********************************************************************
+Begin-Procedure PROCESS-LEVEL-FOR-SPECIFIC-LEVEL
+
+let #earnsarrayidx = 1
+
+!***** prohibit amount from eating at its account parent this is
+!****  the immediate parent
+move 'B' to $Account_level_indc
+
+move 'SE' to $Budget_Level_Flag3
+move 'ERN' to $Budget_type_flag
+let #outstanding_ern =  #Dtl_ern_bdgt_cap
+
+!****** Now process all entries ******
+while #earnsarrayidx <= #earnsarraycnt
+
+     get #thisentrypct from Earns_array (#earnsarrayidx) ERBudLevel_percent
+     get $Out_Acct_Cd from Earns_array (#earnsarrayidx) ERAcct_Code
+
+     !**** The last entry always gets the remainder ****
+     if #earnsarrayidx = #earnsarraycnt
+          let #Output_Budget = #outstanding_ern
+     else
+          let #Output_budget = round(#Dtl_ern_bdgt_cap * #thisentrypct/100, 2)
+          let #outstanding_ern = #outstanding_ern - #Output_Budget
+     end-if
+
+     do Write-Temp-Table
+     do Process-Included-Budget
+
+     let #earnsarrayidx = #earnsarrayidx + 1
+
+ end-while
+
+let #taxarrayidx = 1
+
+move 'ST' to $Budget_Level_Flag3
+move 'TAX' to $Budget_type_flag
+let #outstanding_tax =  #Dtl_tax_bdgt_cap
+
+!****** Now process all entries ******
+while #taxarrayidx <= #taxarraycnt
+
+     get #thisentrypct from Tax_array (#taxarrayidx) TAXBudLevel_percent
+     get $Out_Acct_Cd from Tax_array (#taxarrayidx) TAXAcct_Code
+
+     !**** The last entry always gets the remainder ****
+     if #taxarrayidx = #taxarraycnt
+          let #Output_Budget = #outstanding_tax
+     else
+          let #Output_budget = round(#Dtl_tax_bdgt_cap * #thisentrypct/100, 2)
+          let #outstanding_tax = #outstanding_tax - #Output_Budget
+     end-if
+
+     do Write-Temp-Table
+     do Process-Included-Budget
+
+     let #taxarrayidx = #taxarrayidx + 1
+
+ end-while
+
+
+let #dedsarrayidx = 1
+
+move 'SD' to $Budget_Level_Flag3
+move 'DED' to $Budget_type_flag
+let #outstanding_ded =  #Dtl_ded_bdgt_cap
+
+!****** Now process all entries ******
+while #dedsarrayidx <= #dedsarraycnt
+
+     get #thisentrypct from Deds_array (#dedsarrayidx) DEDBudLevel_percent
+     get $Out_Acct_Cd from Deds_array (#dedsarrayidx) DEDAcct_Code
+
+     !**** The last entry always gets the remainder ****
+     if #dedsarrayidx = #dedsarraycnt
+          let #Output_Budget = #outstanding_ded
+     else
+          let #Output_budget = round(#Dtl_ded_bdgt_cap * #thisentrypct/100, 2)
+          let #outstanding_ded = #outstanding_ded - #Output_Budget
+     end-if
+
+     do Write-Temp-Table
+     do Process-Included-Budget
+
+     let #dedsarrayidx = #dedsarrayidx + 1
+
+ end-while
+
+ !**** Reset out of level process ****
+ move '  ' to $Budget_Level_Flag3
+
+end-procedure Process-Level-For-Specific-Level
+
+!***********************************************************************
+! Procedure: SELECT-ERN-CAP                                            *
+! Descr:     Selects account code, budget amount and percentage for    *
+!            the DEPT_BUDGET_ERN row where ERNCD is blank.  Is used to *
+!            find default funding source for a budget level and to     *
+!            establish cap amount if none is otherwise specified.      *
+!                                                                      *
+! Called by: SELECT-DEPT-BUDGET,                                       *
+!            PROCESS-APPT-BUDGET,                                      *
+!            PROCESS-POSN-BUDGET,                                      *
+!            PROCESS-POOL-BUDGET,                                      *
+!            PROCESS-JOBCODE-BUDGET,                                   *
+!            PROCESS-DEPT-BUDGET,                                      *
+!            DERIVE-BUDGET-CAP                                         *
+!***********************************************************************
+Begin-Procedure SELECT-ERN-CAP
+
+   if $Account_Level_Indc = 'B'
+      move ' ' to $Default_Ern_Acct_Cd
+   end-if
+
+   let $Dis_FiscalYear =  edit(#FiscalYear,'9999')
+   let $Dis_Empl_Rcd   =  edit(#Dtl_Empl_Rcd,'99')
+   let $err-statement1 = 'BUD007, SELECT, PS_DEPT_BUDGET_ERN, SELECT-ERN-CAP'
+   let $err-statement2 = 'Params: SETID=<' || $Gbl_SetID ||
+                         '>, DEPTID=<' || $Gbl_DeptID ||
+                         '>, FISCAL_YEAR=<' || $Dis_FiscalYear ||
+                         '>, EFFDT=<' || $Dtl_Effdt ||
+                         '>, POSITION_POOL_ID=<' || $Dtl_Position_Pool_ID ||
+                         '>, JOBCODE=<' || $Dtl_Jobcode ||
+                         '>, POSITION_NBR=<' || $Dtl_Position_Nbr ||
+                         '>, EMPLID=<' || $Dtl_EmplID ||
+                         '>, EMPL_RCD =<' || $Dis_Empl_Rcd || '>'
+
+begin-SELECT on-error=Error-Display
+DBGE2.BUDGET_SEQ
+DBGE2.ACCT_CD
+DBGE2.BUDGET_AMT
+DBGE2.DIST_PCT
+
+   if $Account_Level_Indc = 'B'
+      if $Ern_Budget_Was_Derived = 'Y'
+         if &DBGE2.BUDGET_AMT > 0.00
+            move &DBGE2.Acct_Cd to $Default_Ern_Acct_Cd
+         end-if
+      else
+         if &DBGE2.DIST_PCT > 0.00
+            move &DBGE2.Acct_Cd to $Default_Ern_Acct_Cd
+         end-if
+      end-if
+      if $Gbl_Budget_Cap_Indc = 'O'
+         move #Dtl_Overall_Bdgt_Cap to #Output_Budget
+      else
+         move #Dtl_Ern_Bdgt_Cap to #Output_Budget
+      end-if
+   else
+      if &DBGE2.BUDGET_AMT > 0.00
+         add &DBGE2.BUDGET_AMT to #Total_Annual_Cap
+      end-if
+   end-if
+
+FROM PS_DEPT_BUDGET_ERN DBGE2
+WHERE DBGE2.SETID             = $Gbl_SetID
+  AND DBGE2.DEPTID            = $Gbl_DeptID
+  AND DBGE2.FISCAL_YEAR       = #FiscalYear
+  AND DBGE2.EFFDT             = $Dtl_Effdt
+  AND DBGE2.POSITION_POOL_ID  = $Dtl_Position_Pool_ID
+  AND DBGE2.SETID_JOBCODE     = $Dtl_SetID_Jobcode
+  AND DBGE2.JOBCODE           = $Dtl_Jobcode
+  AND DBGE2.POSITION_NBR      = $Dtl_Position_Nbr
+  AND DBGE2.EMPLID            = $Dtl_EmplID
+  AND DBGE2.EMPL_RCD          = #Dtl_Empl_Rcd
+  AND DBGE2.ERNCD             = ' '
+  AND DBGE2.EFFSEQ            =                           !HPRET
+        (SELECT MAX(ERNSQ.EFFSEQ)                         !HPRET
+         FROM PS_DEPT_BUDGET_ERN ERNSQ                    !HPRET
+         WHERE ERNSQ.SETID = DBGE2.SETID                  !HPRET
+          AND ERNSQ.DEPTID = DBGE2.DEPTID                 !HPRET
+          AND ERNSQ.FISCAL_YEAR = DBGE2.FISCAL_YEAR          !HPRET
+          AND ERNSQ.EFFDT       = DBGE2.EFFDT
+          AND ERNSQ.POSITION_POOL_ID = DBGE2.POSITION_POOL_ID   !HPRET
+          AND ERNSQ.SETID_JOBCODE    = DBGE2.SETID_JOBCODE   !HPRET
+          AND ERNSQ.JOBCODE      = DBGE2.JOBCODE          !HPRET
+          AND ERNSQ.POSITION_NBR = DBGE2.POSITION_NBR     !HPRET
+          AND ERNSQ.EMPLID       = DBGE2.EMPLID           !HPRET
+          AND ERNSQ.EMPL_RCD     = DBGE2.EMPL_RCD         !HPRET
+          AND ERNSQ.ERNCD        = DBGE2.ERNCD)           !HPRET
+ORDER BY DBGE2.DIST_PCT, DBGE2.BUDGET_AMT
+End-SELECT
+
+   if $Account_Level_Indc = 'B'
+      move 'N' to $Ern_Budget_Was_Derived
+   end-if
+
+End-Procedure SELECT-ERN-CAP
+
+!***********************************************************************
+! Procedure: DERIVE-APPT-SALARY                                        *
+! Descr:     Common module.  This procedure may be called individually *
+!            for a single appointment, or within a loop for jobcode    *
+!            or department total salaries.  The appointment salary is  *
+!            obtained from the employee's most current job record.     *
+!                                                                      *
+! Called by: DERIVE-BUDGET-CAP                                         *
+!***********************************************************************
+Begin-Procedure DERIVE-APPT-SALARY
+
+   let $Dis_Empl_Rcd   =  edit(#Dtl_Empl_Rcd,'99')
+   let $err-statement1 = 'BUD007, SELECT, PS_JOB, DERIVE-APPT-SALARY'
+   let $err-statement2 = 'Params:EMPLID=<' || $Dtl_EmplID ||
+                         '>, EMPL_RCD =<' || $Dis_Empl_Rcd ||
+                         '>, EFFDT=<' || $ThruDate || '>'
+
+begin-SELECT on-error=Error-Display
+JOBA.ANNUAL_RT
+
+   add &JOBA.ANNUAL_RT to #Total_Annual_Cap
+
+FROM PS_JOB JOBA
+WHERE JOBA.EMPLID    = $Dtl_EmplID
+  AND JOBA.EMPL_RCD  = #Dtl_Empl_Rcd
+  AND JOBA.EMPL_STATUS IN ('A','P','L','S')
+  AND JOBA.EFFDT     = (SELECT MAX(JOB3.EFFDT)
+                         FROM PS_JOB JOB3
+                        WHERE JOB3.EMPLID    = JOBA.EMPLID
+                          AND JOB3.EMPL_RCD  = JOBA.EMPL_RCD
+                          AND JOB3.EFFDT    <= $ThruDate)
+  AND JOBA.EFFSEQ    = (SELECT MAX(JOB4.EFFSEQ)
+                         FROM PS_JOB JOB4
+                        WHERE JOB4.EMPLID    = JOBA.EMPLID
+                          AND JOB4.EMPL_RCD  = JOBA.EMPL_RCD
+                          AND JOB4.EFFDT     = JOBA.EFFDT)
+End-SELECT
+
+End-Procedure DERIVE-APPT-SALARY
+
+!***********************************************************************
+! Procedure: DERIVE-POSN-SALARY                                        *
+! Descr:     Common module.  This procedure may be called individually *
+!            for a single position, or within a loop for department    *
+!            or position pool total salaries.  The position salary     *
+!            is set at the midpoint of the salary grade assigned to    *
+!            the jobcode for the position.  This position salary is    *
+!            multiplied by the headcount for the position, less any    *
+!            filled headcount in jobcode or department budget calcs.   *
+!                                                                      *
+! Called by: DERIVE-BUDGET-CAP                                         *
+!            DERIVE-POOL-SALARY                                        *
+!            DERIVE-JOBCODE-SALARY                                     *
+!            DERIVE-DEPT-SALARY                                        *
+!***********************************************************************
+Begin-Procedure DERIVE-POSN-SALARY
+
+   let $err-statement1 = 'BUD007, SELECT, PS_POSITION_DATA, DERIVE-POSN-SALARY'
+   let $err-statement2 = 'Params:POSITION_NBR=<' || $Dtl_Position_Nbr ||
+                         '>, EFFDT=<' || $ThruDate || '>'
+
+begin-SELECT on-error=Error-Display
+PSNA.MAX_HEAD_COUNT
+SGT.MID_RT_ANNUAL
+
+   let #Computed_Head_Count = &PSNA.MAX_HEAD_COUNT - #Excluded_Incumbents
+   let #Position_Salary = &SGT.MID_RT_ANNUAL * (#Computed_Head_Count)
+   add #Position_Salary to #Total_Annual_Cap
+
+FROM PS_POSITION_DATA PSNA
+   , PS_JOBCODE_TBL JCD
+   , PS_SAL_GRADE_TBL SGT
+WHERE PSNA.POSITION_NBR = $Dtl_Position_Nbr
+  AND PSNA.EFFDT = (SELECT MAX(PSN2.EFFDT)
+                     FROM PS_POSITION_DATA PSN2
+                    WHERE PSN2.POSITION_NBR = PSNA.POSITION_NBR
+                      AND PSN2.EFFDT <= $ThruDate)
+  AND PSNA.EFF_STATUS = 'A'
+  AND JCD.SETID = (SELECT CTL.SETID
+                     FROM PS_SET_CNTRL_REC CTL
+                    WHERE CTL.SETCNTRLVALUE = PSNA.BUSINESS_UNIT
+                      AND CTL.REC_GROUP_ID = 'HR_02'
+                      AND CTL.RECNAME='JOBCODE_TBL')
+  AND JCD.JOBCODE = PSNA.JOBCODE
+  AND JCD.EFFDT = (SELECT MAX(JCD1.EFFDT)
+                     FROM PS_JOBCODE_TBL JCD1
+                    WHERE JCD1.SETID = JCD.SETID
+                      AND JCD1.JOBCODE = JCD.JOBCODE
+                      AND JCD1.EFFDT <= $ThruDate)
+  AND JCD.EFF_STATUS = 'A'
+  AND SGT.SETID = JCD.SETID_SALARY
+  AND SGT.SAL_ADMIN_PLAN = JCD.SAL_ADMIN_PLAN
+  AND SGT.GRADE = JCD.GRADE
+  AND SGT.EFFDT = (SELECT MAX(SGT1.EFFDT)
+                     FROM PS_SAL_GRADE_TBL SGT1
+                    WHERE SGT1.SETID = SGT.SETID
+                      AND SGT1.SAL_ADMIN_PLAN = SGT.SAL_ADMIN_PLAN
+                      AND SGT1.EFFDT <= $ThruDate)
+  AND SGT.EFF_STATUS = 'A'
+End-Select
+
+End-Procedure DERIVE-POSN-SALARY
+
+!***********************************************************************
+! Procedure: DERIVE-POOL-SALARY                                        *
+! Descr:     Common module.  This procedure is called individually for *
+!            a single position pool.  It will loop through all the     *
+!            positions in the pool, calling the DERIVE-POSN-SALARY     *
+!            module to fetch each salary grade midpoint in turn.       *
+!                                                                      *
+! Called by: DERIVE-BUDGET-CAP                                         *
+!***********************************************************************
+Begin-Procedure DERIVE-POOL-SALARY
+
+   let $err-statement1 = 'BUD007, SELECT, PS_POSITION_DATA, DERIVE-POOL-SALARY'
+   let $err-statement2 = 'Params:EMPLID=<' || $Dtl_DEPT ||
+                         '>, EFFDT=<' || $ThruDate || '>'
+
+begin-SELECT on-error=Error-Display
+PSNB.POSITION_NBR
+
+   move &PSNB.POSITION_NBR to $Dtl_Position_Nbr
+   move 0 to #Excluded_Incumbents
+
+   do DERIVE-POSN-SALARY
+
+FROM PS_POSITION_DATA PSNB
+WHERE PSNB.POSITION_POOL_ID = $Dtl_Position_Pool_ID
+  AND PSNB.EFFDT = (SELECT MAX(PSN3.EFFDT)
+                     FROM PS_POSITION_DATA PSN3
+                    WHERE PSN3.POSITION_NBR = PSNB.POSITION_NBR
+                      AND PSN3.EFFDT <= $ThruDate)
+  AND PSNB.EFF_STATUS = 'A'
+End-Select
+
+End-Procedure DERIVE-POOL-SALARY
+
+!***********************************************************************
+! Procedure: DERIVE-JOBCODE-SALARY                                     *
+! Descr:     Called module.  This procedure is called individually for *
+!            a single jobcode.  It will loop first through all the     *
+!            positions in the jobcode, calling the DERIVE-POSN-SALARY  *
+!            module to fetch each salary grade midpoint in turn, but   *
+!            including only unfilled headcount. Then, it will loop     *
+!            through all the PS_JOB records which are assigned to the  *
+!            jobcode and compute the salary using DERIVE_APPT_SALARY.  *
+!                                                                      *
+! Called by: DERIVE-BUDGET-CAP                                         *
+!***********************************************************************
+Begin-Procedure DERIVE-JOBCODE-SALARY
+
+   let $err-statement1 = 'BUD007, SELECT, PS_POSITION_DATA, DERIVE-JOBCODE-SALARY'
+   let $err-statement2 = 'Params:EMPLID=<' || $Dtl_Jobcode ||
+                         '>, EFFDT=<' || $ThruDate || '>'
+
+begin-SELECT on-error=Error-Display
+PSNC.POSITION_NBR
+
+   move &PSNC.POSITION_NBR to $Dtl_Position_Nbr
+
+   do DERIVE-FILLED-HEADCOUNT
+
+   do DERIVE-POSN-SALARY
+
+FROM PS_POSITION_DATA PSNC
+WHERE PSNC.JOBCODE = $Dtl_Jobcode
+  AND PSNC.EFFDT = (SELECT MAX(PSN4.EFFDT)
+                     FROM PS_POSITION_DATA PSN4
+                    WHERE PSN4.POSITION_NBR = PSNC.POSITION_NBR
+                      AND PSN4.EFFDT <= $ThruDate)
+  AND PSNC.EFF_STATUS = 'A'
+End-SELECT
+
+   let $err-statement1 = 'BUD007, SELECT, PS_JOB, DERIVE-JOBCODE-SALARY'
+   let $err-statement2 = 'Params:JOBCODE=<' || $Dtl_Jobcode ||
+                         '>, EFFDT=<' || $ThruDate || '>'
+
+begin-SELECT on-error=Error-Display
+JOBB.ANNUAL_RT
+
+   add &JOBB.ANNUAL_RT to #Total_Annual_Cap
+
+FROM PS_JOB JOBB
+WHERE JOBB.SETID_JOBCODE = $Dtl_SetID_Jobcode
+  AND JOBB.JOBCODE   = $Dtl_Jobcode
+  AND JOBB.SETID_DEPT = $Dtl_SetID
+  AND JOBB.DEPTID IN (SELECT BUDDEP.DEPTID FROM PS_BUDGET_DEPT_VW BUDDEP
+                     WHERE BUDDEP.SETID = $Dtl_SetID
+                       AND BUDDEP.BUDGET_DEPTID = $Dtl_DeptID
+                       AND BUDDEP.EFFDT = (SELECT MAX(BUDDEP1.EFFDT) FROM PS_BUDGET_DEPT_VW BUDDEP1
+                                           WHERE BUDDEP1.SETID = BUDDEP.SETID
+                                             AND BUDDEP1.DEPTID = BUDDEP.DEPTID
+                                             AND BUDDEP1.EFFDT <= $Thru_Date)
+                       AND BUDDEP.EFF_STATUS = 'A')
+  AND JOBB.EMPL_STATUS IN ('A','P','L','S')
+  AND JOBB.EFFDT     = (SELECT MAX(JOB5.EFFDT)
+                         FROM PS_JOB JOB5
+                        WHERE JOB5.EMPLID    = JOBB.EMPLID
+                          AND JOB5.EMPL_RCD = JOBB.EMPL_RCD
+                          AND JOB5.EFFDT    <= $ThruDate)
+  AND JOBB.EFFSEQ    = (SELECT MAX(JOB6.EFFSEQ)
+                         FROM PS_JOB JOB6
+                        WHERE JOB6.EMPLID    = JOBB.EMPLID
+                          AND JOB6.EMPL_RCD = JOBB.EMPL_RCD
+                          AND JOB6.EFFDT     = JOBB.EFFDT)
+
+End-SELECT
+
+End-Procedure DERIVE-JOBCODE-SALARY
+
+!***********************************************************************
+! Procedure: DERIVE-DEPT-SALARY                                        *
+! Descr:     Called module.  This procedure is called individually for *
+!            a single department  It will loop through all positions   *
+!            in the department, calling the DERIVE-POSN-SALARY module  *
+!            to fetch each salary grade midpoint in turn, but          *
+!            including only unfilled headcount. Then, it will loop     *
+!            through all the PS_JOB records which are assigned to the  *
+!            department and compute salary using DERIVE_APPT_SALARY.   *
+!                                                                      *
+! Called by: DERIVE-BUDGET-CAP                                         *
+!***********************************************************************
+Begin-Procedure DERIVE-DEPT-SALARY
+
+   let $err-statement1 = 'BUD007, SELECT, PS_POSITION_DATA, DERIVE-DEPT-SALARY'
+   let $err-statement2 = 'Params:EMPLID=<' || $Dtl_Dept ||
+                         '>, EFFDT=<' || $ThruDate || '>'
+
+begin-SELECT on-error=Error-Display
+PSND.POSITION_NBR
+
+   move &PSND.POSITION_NBR to $Dtl_Position_Nbr
+
+   do DERIVE-FILLED-HEADCOUNT
+
+   do DERIVE-POSN-SALARY
+
+FROM PS_POSITION_DATA PSND
+   , PS_SET_CNTRL_REC SCTB
+WHERE SCTB.SETID = $Dtl_SetID
+  AND SCTB.REC_GROUP_ID = 'HR_01'
+  AND SCTB.RECNAME = 'DEPT_TBL'
+  AND PSND.BUSINESS_UNIT = SCTB.SETCNTRLVALUE
+  AND PSND.DEPTID = $Dtl_DeptID
+  AND PSND.EFFDT = (SELECT MAX(PSN5.EFFDT)
+                     FROM PS_POSITION_DATA PSN5
+                    WHERE PSN5.POSITION_NBR = PSND.POSITION_NBR
+                      AND PSN5.EFFDT <= $ThruDate)
+  AND PSND.EFF_STATUS = 'A'
+End-SELECT
+
+   let $err-statement1 = 'BUD007, SELECT, PS_JOB, DERIVE-DEPT-SALARY'
+   let $err-statement2 = 'Params:DEPT=<' || $Dtl_DeptID ||
+                         '>, EFFDT=<' || $ThruDate || '>'
+
+begin-SELECT on-error=Error-Display
+JOBC.ANNUAL_RT
+
+   add &JOBC.ANNUAL_RT to #Total_Annual_Cap
+
+FROM PS_JOB JOBC
+WHERE JOBC.DEPTID    = $Dtl_DeptID
+  AND JOBC.SETID_DEPT     = $Dtl_Setid
+  AND JOBC.EMPL_STATUS IN ('A','P','L','S')
+  AND JOBC.EFFDT     = (SELECT MAX(JOB7.EFFDT)
+                         FROM PS_JOB JOB7
+                        WHERE JOB7.EMPLID    = JOBC.EMPLID
+                          AND JOB7.EMPL_RCD  = JOBC.EMPL_RCD
+                          AND JOB7.EFFDT    <= $ThruDate)
+  AND JOBC.EFFSEQ    = (SELECT MAX(JOB8.EFFSEQ)
+                         FROM PS_JOB JOB8
+                        WHERE JOB8.EMPLID    = JOBC.EMPLID
+                          AND JOB8.EMPL_RCD  = JOBC.EMPL_RCD
+                          AND JOB8.EFFDT     = JOBC.EFFDT)
+End-SELECT
+
+End-Procedure DERIVE-DEPT-SALARY
+
+!***********************************************************************
+! Procedure: SELECT-DED-CAP                                            *
+! Descr:     Selects account code, budget amount and percentage for    *
+!            the DEPT_BUDGET_DED row where Deduction Paramenters are   *
+!            blank.  Is used to find default funding source for a      *
+!            budget level and to establish cap amount if none is       *
+!            otherwise specified.                                      *
+!                                                                      *
+! Called by: SELECT-DEPT-BUDGET,                                       *
+!            PROCESS-APPT-BUDGET,                                      *
+!            PROCESS-POSN-BUDGET,                                      *
+!            PROCESS-POOL-BUDGET,                                      *
+!            PROCESS-JOBCODE-BUDGET,                                   *
+!            PROCESS-DEPT-BUDGET,                                      *
+!            DERIVE-BUDGET-CAP                                         *
+!***********************************************************************
+Begin-Procedure SELECT-DED-CAP
+
+   if $Account_Level_Indc = 'B'
+      move ' ' to $Default_Ded_Acct_Cd
+   end-if
+
+   let $Dis_FiscalYear =  edit(#FiscalYear,'9999')
+   let $Dis_Empl_Rcd   =  edit(#Dtl_Empl_Rcd,'99')
+   let $err-statement1 = 'BUD007, SELECT, PS_DEPT_BUDGET_DED, SELECT-DED-CAP'
+   let $err-statement2 = 'Params: SETID=<' || $Gbl_SetID ||
+                         '>, DEPTID=<' || $Gbl_DeptID ||
+                         '>, FISCAL_YEAR=<' || $Dis_FiscalYear ||
+                         '>, EFFDT=<' || $Dtl_Effdt ||
+                         '>, POSITION_POOL_ID=<' || $Dtl_Position_Pool_ID ||
+                         '>, JOBCODE=<' || $Dtl_Jobcode ||
+                         '>, POSITION_NBR=<' || $Dtl_Position_Nbr ||
+                         '>, EMPLID=<' || $Dtl_EmplID ||
+                         '>, EMPL_RCD =<' || $Dis_Empl_Rcd || '>'
+
+begin-SELECT on-error=Error-Display
+DBGF2.BUDGET_SEQ
+DBGF2.ACCT_CD
+DBGF2.BUDGET_AMT
+DBGF2.DIST_PCT
+
+   if $Account_Level_Indc = 'B'
+      if $Ded_Budget_Was_Derived = 'Y'
+         if &DBGF2.BUDGET_AMT > 0.00
+            move &DBGF2.Acct_Cd to $Default_Ded_Acct_Cd
+         end-if
+      else
+         if &DBGF2.DIST_PCT > 0.00
+            move &DBGF2.Acct_Cd to $Default_Ded_Acct_Cd
+         end-if
+      end-if
+   else
+      if &DBGF2.BUDGET_AMT > 0.00
+         add &DBGF2.BUDGET_AMT to #Total_Ann_Ded_Cap
+      end-if
+   end-if
+
+FROM PS_DEPT_BUDGET_DED DBGF2
+WHERE DBGF2.SETID             = $Gbl_SetID
+  AND DBGF2.DEPTID            = $Gbl_DeptID
+  AND DBGF2.FISCAL_YEAR       = #FiscalYear
+  AND DBGF2.EFFDT             = $Dtl_Effdt
+  AND DBGF2.POSITION_POOL_ID  = $Dtl_Position_Pool_ID
+  AND DBGF2.SETID_JOBCODE     = $Dtl_SetID_Jobcode
+  AND DBGF2.JOBCODE           = $Dtl_Jobcode
+  AND DBGF2.POSITION_NBR      = $Dtl_Position_Nbr
+  AND DBGF2.EMPLID            = $Dtl_EmplID
+  AND DBGF2.EMPL_RCD          = #Dtl_Empl_Rcd
+  AND DBGF2.PLAN_TYPE         = ' '
+  AND DBGF2.BENEFIT_PLAN      = ' '
+  AND DBGF2.DEDCD             = ' '
+  AND DBGF2.DED_CLASS         = ' '
+  AND DBGF2.EFFSEQ            =                                !HPRET
+        (SELECT MAX(DEDSQ.EFFSEQ)                              !HPRET
+          FROM PS_DEPT_BUDGET_DED DEDSQ                        !HPRET
+          WHERE DEDSQ.SETID   = DBGF2.SETID                    !HPRET
+           AND DEDSQ.DEPTID   = DBGF2.DEPTID                   !HPRET
+           AND DEDSQ.FISCAL_YEAR = DBGF2.FISCAL_YEAR           !HPRET
+           AND DEDSQ.EFFDT    = DBGF2.EFFDT                    !HPRET
+           AND DEDSQ.POSITION_POOL_ID = DBGF2.POSITION_POOL_ID  !HPRET
+           AND DEDSQ.SETID_JOBCODE = DBGF2.SETID_JOBCODE       !HPRET
+           AND DEDSQ.JOBCODE  = DBGF2.JOBCODE                  !HPRET
+           AND DEDSQ.POSITION_NBR  = DBGF2.POSITION_NBR        !HPRET
+           AND DEDSQ.EMPLID   = DBGF2.EMPLID                   !HPRET
+           AND DEDSQ.EMPL_RCD = DBGF2.EMPL_RCD                 !HPRET
+           AND DEDSQ.PLAN_TYPE = DBGF2.PLAN_TYPE               !HPRET
+           AND DEDSQ.BENEFIT_PLAN = DBGF2.BENEFIT_PLAN         !HPRET
+           AND DEDSQ.DEDCD = DBGF2.DEDCD                       !HPRET
+           AND DEDSQ.DED_CLASS = DBGF2.DED_CLASS)              !HPRET
+ORDER BY DBGF2.DIST_PCT, DBGF2.BUDGET_AMT
+End-SELECT
+
+   if $Account_Level_Indc = 'B'
+      move 'N' to $Ded_Budget_Was_Derived
+   end-if
+
+End-Procedure SELECT-DED-CAP
+
+!***********************************************************************
+! Procedure: SELECT-TAX-CAP                                            *
+! Descr:     Selects account code, budget amount and percentage for    *
+!            the DEPT_BUDGET_TAX row where U.S. Tax Paramenters are    *
+!            blank.  Is used to find default funding source for a      *
+!            budget level and to establish cap amount if none is       *
+!            otherwise specified.                                      *
+!                                                                      *
+! Called by: SELECT-DEPT-BUDGET,                                       *
+!            PROCESS-APPT-BUDGET,                                      *
+!            PROCESS-POSN-BUDGET,                                      *
+!            PROCESS-POOL-BUDGET,                                      *
+!            PROCESS-JOBCODE-BUDGET,                                   *
+!            PROCESS-DEPT-BUDGET,                                      *
+!***********************************************************************
+Begin-Procedure SELECT-TAX-CAP
+
+   if $Account_Level_Indc = 'B'
+      move ' ' to $Default_Tax_Acct_Cd
+   end-if
+
+   let $Dis_FiscalYear =  edit(#FiscalYear,'9999')
+   let $Dis_Empl_Rcd   =  edit(#Dtl_Empl_Rcd,'99')
+   let $err-statement1 = 'BUD007, SELECT, PS_DEPT_BUDGET_TAX, SELECT-TAX-CAP'
+   let $err-statement2 = 'Params: SETID=<' || $Gbl_SetID ||
+                         '>, DEPTID=<' || $Gbl_DeptID ||
+                         '>, FISCAL_YEAR=<' || $Dis_FiscalYear ||
+                         '>, EFFDT=<' || $Dtl_Effdt ||
+                         '>, POSITION_POOL_ID=<' || $Dtl_Position_Pool_ID ||
+                         '>, JOBCODE=<' || $Dtl_Jobcode ||
+                         '>, POSITION_NBR=<' || $Dtl_Position_Nbr ||
+                         '>, EMPLID=<' || $Dtl_EmplID ||
+                         '>, EMPL_RCD =<' || $Dis_Empl_Rcd || '>'
+
+begin-SELECT on-error=Error-Display
+DBTX2.BUDGET_SEQ
+DBTX2.ACCT_CD
+DBTX2.BUDGET_AMT
+DBTX2.DIST_PCT
+
+   if $Account_Level_Indc = 'B'
+      if $Tax_Budget_Was_Derived = 'Y'
+         if &DBTX2.BUDGET_AMT > 0.00
+            move &DBTX2.Acct_Cd to $Default_Tax_Acct_Cd
+         end-if
+      else
+         if &DBTX2.DIST_PCT > 0.00
+            move &DBTX2.Acct_Cd to $Default_Tax_Acct_Cd
+         end-if
+      end-if
+   else
+      if &DBTX2.BUDGET_AMT > 0.00
+         add &DBTX2.BUDGET_AMT to #Total_Ann_Tax_Cap
+      end-if
+   end-if
+
+
+FROM PS_DEPT_BUDGET_TAX DBTX2
+WHERE DBTX2.SETID             = $Gbl_SetID
+  AND DBTX2.DEPTID            = $Gbl_DeptID
+  AND DBTX2.FISCAL_YEAR       = #FiscalYear
+  AND DBTX2.EFFDT             = $Dtl_Effdt
+  AND DBTX2.POSITION_POOL_ID  = $Dtl_Position_Pool_ID
+  AND DBTX2.SETID_JOBCODE     = $Dtl_SetID_Jobcode
+  AND DBTX2.JOBCODE           = $Dtl_Jobcode
+  AND DBTX2.POSITION_NBR      = $Dtl_Position_Nbr
+  AND DBTX2.EMPLID            = $Dtl_EmplID
+  AND DBTX2.EMPL_RCD          = #Dtl_Empl_Rcd
+  AND DBTX2.STATE             = ' '
+  AND DBTX2.LOCALITY          = ' '
+  AND DBTX2.TAX_CLASS         = ' '
+  AND DBTX2.EFFSEQ            =                               !HPRET
+       (SELECT MAX(TAXSQ.EFFSEQ)                              !HPRET
+        FROM PS_DEPT_BUDGET_TAX TAXSQ                         !HPRET
+        WHERE TAXSQ.SETID           = DBTX2.SETID             !HPRET
+         AND TAXSQ.DEPTID           = DBTX2.DEPTID            !HPRET
+         AND TAXSQ.FISCAL_YEAR      = DBTX2.FISCAL_YEAR       !HPRET
+         AND TAXSQ.EFFDT            = DBTX2.EFFDT             !HPRET
+         AND TAXSQ.POSITION_POOL_ID = DBTX2.POSITION_POOL_ID  !HPRET
+         AND TAXSQ.SETID_JOBCODE    = DBTX2.SETID_JOBCODE     !HPRET
+         AND TAXSQ.JOBCODE          = DBTX2.JOBCODE           !HPRET
+         AND TAXSQ.POSITION_NBR     = DBTX2.POSITION_NBR      !HPRET
+         AND TAXSQ.EMPLID           = DBTX2.EMPLID            !HPRET
+         AND TAXSQ.EMPL_RCD         = DBTX2.EMPL_RCD          !HPRET
+         AND TAXSQ.STATE            = DBTX2.STATE             !HPRET
+         AND TAXSQ.LOCALITY         = DBTX2.LOCALITY          !HPRET
+         AND TAXSQ.TAX_CLASS        = DBTX2.TAX_CLASS)        !HPRET
+ORDER BY DBTX2.DIST_PCT, DBTX2.BUDGET_AMT
+End-SELECT
+
+   if $Account_Level_Indc = 'B'
+      move 'N' to $Tax_Budget_Was_Derived
+   end-if
+
+End-Procedure SELECT-TAX-CAP
+
+!***********************************************************************
+! Procedure: SELECT-CTX-CAP                                            *
+! Descr:     Selects account code, budget amount and percentage for    *
+!            the DEPT_BUDGET_TAX row where Can. Tax Paramenters are    *
+!            blank.  Is used to find default funding source for a      *
+!            budget level and to establish cap amount if none is       *
+!            otherwise specified.                                      *
+!                                                                      *
+! Called by: SELECT-DEPT-BUDGET,                                       *
+!            PROCESS-APPT-BUDGET,                                      *
+!            PROCESS-POSN-BUDGET,                                      *
+!            PROCESS-POOL-BUDGET,                                      *
+!            PROCESS-JOBCODE-BUDGET,                                   *
+!            PROCESS-DEPT-BUDGET,                                      *
+!***********************************************************************
+Begin-Procedure SELECT-CTX-CAP
+
+   if $Account_Level_Indc = 'B'
+      move ' ' to $Default_Tax_Acct_Cd
+   end-if
+
+   let $Dis_FiscalYear =  edit(#FiscalYear,'9999')
+   let $Dis_Empl_Rcd   =  edit(#Dtl_Empl_Rcd,'99')
+   let $err-statement1 = 'BUD007, SELECT, PS_DEPT_BUDGET_CTX, SELECT-CTX-CAP'
+   let $err-statement2 = 'Params: SETID=<' || $Gbl_SetID ||
+                         '>, DEPTID=<' || $Gbl_DeptID ||
+                         '>, FISCAL_YEAR=<' || $Dis_FiscalYear ||
+                         '>, EFFDT=<' || $Dtl_Effdt ||
+                         '>, POSITION_POOL_ID=<' || $Dtl_Position_Pool_ID ||
+                         '>, JOBCODE=<' || $Dtl_Jobcode ||
+                         '>, POSITION_NBR=<' || $Dtl_Position_Nbr ||
+                         '>, EMPLID=<' || $Dtl_EmplID ||
+                         '>, EMPL_RCD =<' || $Dis_Empl_Rcd || '>'
+
+begin-SELECT on-error=Error-Display
+DBCX2.BUDGET_SEQ
+DBCX2.ACCT_CD
+DBCX2.BUDGET_AMT
+DBCX2.DIST_PCT
+
+   if $Account_Level_Indc = 'B'
+      if $Tax_Budget_Was_Derived = 'Y'
+         if &DBCX2.BUDGET_AMT > 0.00
+            move &DBCX2.Acct_Cd to $Default_Tax_Acct_Cd
+         end-if
+      else
+         if &DBCX2.DIST_PCT > 0.00
+            move &DBCX2.Acct_Cd to $Default_Tax_Acct_Cd
+         end-if
+      end-if
+   else
+      if &DBCX2.BUDGET_AMT > 0.00
+         add &DBCX2.BUDGET_AMT to #Total_Ann_Tax_Cap
+      end-if
+   end-if
+
+
+FROM PS_DEPT_BUDGET_CTX DBCX2
+WHERE DBCX2.SETID             = $Gbl_SetID
+  AND DBCX2.DEPTID            = $Gbl_DeptID
+  AND DBCX2.FISCAL_YEAR       = #FiscalYear
+  AND DBCX2.EFFDT             = $Dtl_Effdt
+  AND DBCX2.POSITION_POOL_ID  = $Dtl_Position_Pool_ID
+  AND DBCX2.SETID_JOBCODE     = $Dtl_SetID_Jobcode
+  AND DBCX2.JOBCODE           = $Dtl_Jobcode
+  AND DBCX2.POSITION_NBR      = $Dtl_Position_Nbr
+  AND DBCX2.EMPLID            = $Dtl_EmplID
+  AND DBCX2.EMPL_RCD          = #Dtl_Empl_Rcd
+  AND DBCX2.PROVINCE          = ' '
+  AND DBCX2.TAX_CLASS_CAN     = ' '
+  AND DBCX2.EFFSEQ            =                               !HPRET
+       (SELECT MAX(CTXSQ.EFFSEQ)                              !HPRET
+        FROM PS_DEPT_BUDGET_CTX CTXSQ                         !HPRET
+        WHERE CTXSQ.SETID   = DBCX2.SETID                     !HPRET
+         AND CTXSQ.DEPTID   = DBCX2.DEPTID                    !HPRET
+         AND CTXSQ.FISCAL_YEAR = DBCX2.FISCAL_YEAR            !HPRET
+         AND CTXSQ.EFFDT    = DBCX2.EFFDT                     !HPRET
+         AND CTXSQ.POSITION_POOL_ID = DBCX2.POSITION_POOL_ID  !HPRET
+         AND CTXSQ.SETID_JOBCODE    = DBCX2.SETID_JOBCODE     !HPRET
+         AND CTXSQ.JOBCODE  = DBCX2.JOBCODE                   !HPRET
+         AND CTXSQ.POSITION_NBR     = DBCX2.POSITION_NBR      !HPRET
+         AND CTXSQ.EMPLID   = DBCX2.EMPLID                    !HPRET
+         AND CTXSQ.EMPL_RCD = DBCX2.EMPL_RCD                  !HPRET
+         AND CTXSQ.PROVINCE = DBCX2.PROVINCE                  !HPRET
+         AND CTXSQ.TAX_CLASS_CAN = DBCX2.TAX_CLASS_CAN)       !HPRET
+ORDER BY DBCX2.DIST_PCT, DBCX2.BUDGET_AMT
+End-SELECT
+
+   if $Account_Level_Indc = 'B'
+      move 'N' to $Tax_Budget_Was_Derived
+   end-if
+
+End-Procedure SELECT-CTX-CAP
+
+!***********************************************************************
+! Procedure: ESTABLISH-TAX-PRORATION                                   *
+! Descr:     Performs the "pre level processing prating amounts for    *
+!            tax.  This proration is used in the determination of      *
+!            account allocation of taxes left over after processing a  *
+!            budget                                                    *
+!                                                                      *
+!                                                                      *
+! Called by: SELECT-TAX DETAIL                                         *
+!            SELECT-CTX-DETAIL                                         *
+!***********************************************************************
+Begin-Procedure Establish-Tax-Proration
+
+
+!****** If there are left over amounts in the parent the accounts ahould be
+!****** distributed based on perentage of the original balance
+!****** This process is only used if mode is in Per Budget/Deduction/Level
+if $Gbl_Budget_Cap_indc <> 'O'
+  let #total_tax_amount = #Dtl_tax_Bdgt_Beg
+  let #total_fixed_budget = 0
+  let $percent_found = 'N'
+
+  let #taxarrayidx = 1
+  !****** Always process fixed amounts first ******
+  while #taxarrayidx <= #taxarraycnt
+
+       get #thisentryamt from Tax_array (#taxarrayidx) TAXBudget_amt
+       get #thisentrydist from Tax_array (#taxarrayidx) TAXDist_percent
+
+       if #thisentrydist <> 0
+          let $percent_found = 'Y'
+       end-if
+
+       let #total_fixed_budget = #total_fixed_budget + #thisentryamt
+
+       let #taxarrayidx = #taxarrayidx + 1
+
+  end-while
+
+  if $percent_found = 'N'
+       let #total_tax_amount = #total_fixed_budget
+  end-if
+
+  !***** Start with 100% allocated *******
+  let #total_percent = 100.00
+  let #total_percent_alloc = 0.00
+
+  let #taxarrayidx = 1
+  !****** Always process fixed amounts first ******
+  while #taxarrayidx <= #taxarraycnt
+
+       get #thisentryamt from Tax_array (#taxarrayidx) TAXBudget_amt
+       get #thisentrydist from Tax_array (#taxarrayidx) TAXDist_percent
+
+       !***** Fixed amount
+       if #thisentrydist = 0
+
+          let #process_count = #process_count + 1
+
+          !**** The last entry always gets the remainder ****
+          if #taxarrayidx = #taxarraycnt
+             let #thisentrypct = round(100 - #total_percent_alloc, 2)
+             let #total_percent_alloc = #total_percent_alloc + #thisentrypct
+          else
+             let #thisentrypct = round(#thisentryamt /#total_tax_amount * 100, 2)
+             let #total_percent_alloc = #total_percent_alloc + #thisentrypct
+          end-if
+
+          put #thisentrypct into Tax_array (#taxarrayidx) TAXBudLevel_percent
+
+       end-if
+
+       let #taxarrayidx = #taxarrayidx + 1
+
+
+   end-while
+
+  let #total_percent = #total_percent - #total_percent_alloc
+  let #taxsarrayidx = 1
+  !****** Now process percentages ******
+  while #taxarrayidx <= #taxarraycnt
+
+       get #thisentrydist from Tax_array (#taxarrayidx) TAXDist_percent
+       get $thisentrydedcd from Tax_array (#taxarrayidx) TAXEarnCode
+
+       !***** Percentage Distribution
+       if #thisentrydist <>  0
+
+          let #process_count = #process_count + 1
+
+          !**** The last entry always gets the remainder ****
+          if #process_count = #taxarraycnt
+             let #thisentrypct = round(100 - #total_percent_alloc, 2)
+             let #total_percent_alloc = #total_percent_alloc + #thisentrypct
+          else
+             let #thisentrypct = round((#thisentrydist/100) * #total_percent, 2)
+             let #total_percent_alloc = #total_percent_alloc + #thisentrypct
+          end-if
+
+          put #thisentrypct into Tax_array (#taxarrayidx) TAXBudLevel_percent
+
+       end-if
+
+       let #taxarrayidx = #taxarrayidx + 1
+
+   end-while
+end-if
+
+end-procedure Establish-Tax-Proration
+
+!***********************************************************************
+! Procedure: PROCESS-FIXED-EARNINGS                                    *
+! Descr:     Processes Earnings that are set amounts only, this        *
+!            earnings are processed against their overall budget cap   *
+!            or specific earnings cap.                                 *
+!                                                                      *
+! Called by: PROCESS-BUDGET-LEVEL                                      *
+!            PROCESS-SPECIFIC-LEVELS                                   *
+!***********************************************************************
+Begin-Procedure PROCESS-FIXED-EARNINGS
+
+ !*****  Process Fixed Earnings Amounts first ******
+ let #earnsarrayidx = 1
+
+ move 'ERN' to $Budget_type_flag
+
+ !***** This flag used to indicate we are processing an account ***
+ !***** within a level rather than a level  ******
+ move 'A' to $Account_level_Indc
+
+ !****** Always process fixed amounts first ******
+ while #earnsarrayidx <= #earnsarraycnt
+
+     get #Output_Budget from  Earns_array (#earnsarrayidx) ERBudget_amt
+     get $Out_Acct_Cd from Earns_array (#earnsarrayidx) ERAcct_Code
+     get #thisentrydist from Earns_array (#earnsarrayidx) ERDist_percent
+
+     !***** Fixed amount
+     if #Output_Budget <> 0 and #thisentrydist = 0
+        do Write-Temp-Table
+        do Process-Included-Budget
+     end-if
+
+     let #earnsarrayidx = #earnsarrayidx + 1
+
+ end-while
+
+end-procedure   PROCESS-FIXED-EARNINGS
+
+!***********************************************************************
+! Procedure: PROCESS-FIXED-TAX                                         *
+! Descr:     Processes Taxes that are set amounts only, this           *
+!            earnings are processed against their overall budget cap   *
+!            or specific earnings cap.                                 *
+!                                                                      *
+! Called by: PROCESS-BUDGET-LEVEL                                      *
+!            PROCESS-SPECIFIC-LEVELS                                   *
+!***********************************************************************
+Begin-Procedure PROCESS-FIXED-TAX
+
+!*****  Process Fixed Tax Amounts ******
+ let #taxarrayidx = 1
+
+ move 'TAX' to $Budget_type_flag
+
+ !***** This flag used to indicate we are processing an account ***
+ !***** within a level rather than a level  ******
+ move 'A' to $Account_level_Indc
+
+ !****** Always process fixed amounts first ******
+ while #taxarrayidx <= #taxarraycnt
+
+     get #Output_Budget from Tax_array (#taxarrayidx) TAXBudget_amt
+     get $Out_Acct_Cd from Tax_array (#taxarrayidx) TAXAcct_Code
+     get #thisentrydist from Tax_array (#taxarrayidx) TAXDist_percent
+
+       !***** Fixed amount
+     if #thisentrydist = 0 and #Output_Budget <> 0
+        do Write-Temp-Table
+        do Process-Included-Budget
+     end-if
+
+     let #taxarrayidx = #taxarrayidx + 1
+
+ end-while
+
+End-procedure   PROCESS-FIXED-TAX
+
+!***********************************************************************
+! Procedure: PROCESS-FIXED-DEDUCTIONS                                  *
+! Descr:     Processes Deductions that are set amounts only, this      *
+!            earnings are processed against their overall budget cap   *
+!            or specific earnings cap.                                 *
+!                                                                      *
+! Called by: PROCESS-BUDGET-LEVEL                                      *
+!            PROCESS-SPECIFIC-LEVELS                                   *
+!***********************************************************************
+Begin-Procedure PROCESS-FIXED-DEDUCTIONS
+
+!*****  Process Fixed Deductions Amounts ******
+  let #dedsarrayidx = 1
+
+  move 'DED' to $Budget_type_flag
+
+  !***** This flag used to indicate we are processing an account ***
+  !***** within a level rather than a level  ******
+  move 'A' to $Account_level_Indc
+
+  !****** Always process fixed amounts first ******
+  while #dedsarrayidx <= #dedsarraycnt
+
+     get #Output_Budget from Deds_array (#dedsarrayidx) DEDBudget_amt
+     get $Out_Acct_Cd from Deds_array (#dedsarrayidx) DEDAcct_Code
+     get #thisentrydist from Deds_array (#dedsarrayidx) DEDDist_percent
+
+   !***** Fixed amount
+     if #thisentrydist = 0 and #Output_Budget <> 0
+        do Write-Temp-Table
+        do Process-Included-Budget
+     end-if
+
+     let #dedsarrayidx = #dedsarrayidx + 1
+
+  end-while
+
+End-Procedure PROCESS-FIXED-DEDUCTIONS
+
+!***********************************************************************
+! Procedure: PROCESS-DISTRIBUTED-EARNINGS                              *
+! Descr:     Processes Earnings that are percent amounts only, these   *
+!            earnings are processed against their overall budget cap   *
+!            or specific earnings cap. Distributed amounts are         *
+!            processed last in the overall sequence
+!                                                                      *
+! Called by: PROCESS-BUDGET-LEVEL                                      *
+!            PROCESS-SPECIFIC-LEVELS                                   *
+!***********************************************************************
+Begin-Procedure PROCESS-DISTRIBUTED-EARNINGS
+
+! *** Count number of percent entries *****
+let #earnsarrayidx = 1
+let #ern_distribution_count = 0
+while #earnsarrayidx <= #earnsarraycnt
+    get #thisentrydist from Earns_array (#earnsarrayidx) ERDist_percent
+    if #thisentrydist <> 0
+        let #ern_distribution_count = #ern_distribution_count + 1
+    end-if
+
+    let #earnsarrayidx = #earnsarrayidx + 1
+
+end-while
+
+let #earnsarrayidx = 1
+ let #process_count = 0
+
+!***** Save the level Overall budget it gets decremented each pass
+ if $Gbl_budget_Cap_indc = 'O'
+        let #Remain_budget_cap = #Dtl_overall_bdgt_cap
+ else
+        let #Remain_budget_cap = #Dtl_Ern_Bdgt_Cap
+ end-if
+
+ move 'ERN' to $Budget_type_flag
+
+ !***** This flag used to indicate we are processing an account ***
+ !***** within a level rather than a level  ******
+ move 'A' to $Account_level_Indc
+
+ !****** Always process fixed amounts first ******
+ while #earnsarrayidx <= #earnsarraycnt and #process_count < #ern_distribution_count
+
+     get $Out_Acct_Cd from Earns_array (#earnsarrayidx) ERAcct_Code
+     get #thisentrydist from Earns_array (#earnsarrayidx) ERDist_percent
+
+     !***** Percent Distribution amount
+     if #thisentrydist <> 0
+
+        let #process_count = #process_count + 1
+
+        !*** Calculate Output Budget
+        !*** Make sure the entire budget level is allocated
+        if #process_count = #ern_distribution_count
+
+             if $Gbl_budget_Cap_indc = 'O'
+                 let #Output_Budget = #Dtl_overall_bdgt_cap
+             else
+                 let #Output_Budget = #Dtl_Ern_Bdgt_Cap
+             end-if
+
+        else
+             let #Output_budget = round(#Remain_budget_cap * #thisentrydist/100, 2)
+        end-if
+
+        do Write-Temp-Table
+        do Process-Included-Budget
+     end-if
+
+     let #earnsarrayidx = #earnsarrayidx + 1
+
+ end-while
+
+end-procedure PROCESS-DISTRIBUTED-EARNINGS
+
+!***********************************************************************
+! Procedure: PROCESS-DISTRIBUTED-TAX                                   *
+! Descr:     Processes Tax that are percent amounts only, these   *
+!            earnings are processed against their overall budget cap   *
+!            or specific earnings cap. Distributed amounts are         *
+!            processed last in the overall sequence                    *
+!                                                                      *
+! Called by: PROCESS-SPECIFIC-LEVELS                                   *
+!                                                                      *
+!***********************************************************************
+Begin-Procedure PROCESS-DISTRIBUTED-TAX
+
+! *** Count number of percent entries *****
+let #tax_distribution_count = 0
+let #taxarrayidx = 1
+while #taxarrayidx <= #taxarraycnt
+    get #thisentrydist from Tax_array (#taxarrayidx) TAXDist_percent
+    if #thisentrydist <> 0
+        let #tax_distribution_count = #tax_distribution_count + 1
+    end-if
+
+    let #taxarrayidx = #taxarrayidx + 1
+end-while
+
+
+!*****  Process Fixed Tax Amounts ******
+ let #taxarrayidx = 1
+ let #process_count = 0
+
+!*****  This procedure only used for specific budget levels *****
+ let #Remain_budget_cap = #Dtl_Tax_Bdgt_Cap
+
+ move 'TAX' to $Budget_type_flag
+
+ !***** This flag used to indicate we are processing an account ***
+ !***** within a level rather than a level  ******
+ move 'A' to $Account_level_Indc
+
+ !****** Always process fixed amounts first ******
+ while #taxarrayidx <= #taxarraycnt and #process_count < #tax_distribution_count
+
+     get $Out_Acct_Cd from Tax_array (#taxarrayidx) TAXAcct_Code
+     get #thisentrydist from Tax_array (#taxarrayidx) TAXDist_percent
+
+       !***** Fixed amount
+     if #thisentrydist <> 0
+
+        let #process_count = #process_count + 1
+
+        !*** Calculate Output Budget
+        !*** Make sure the entire budget level is allocated
+        if #process_count = #tax_distribution_count
+             let #Output_Budget = #Dtl_Tax_Bdgt_Cap
+        else
+             let #Output_budget = round(#Remain_budget_cap * #thisentrydist/100, 2)
+        end-if
+
+         do Write-Temp-Table
+        do Process-Included-Budget
+
+     end-if
+
+     let #taxarrayidx = #taxarrayidx + 1
+
+ end-while
+
+end-procedure PROCESS_DISTRIBUTED_TAX
+
+!***********************************************************************
+! Procedure: PROCESS-DISTRIBUTED-DEDUCTIONS                            *
+! Descr:     Processes Deductions t are percent amounts only, these    *
+!            earnings are processed against their specific budget cap  *
+!            Distributed amounts are processed last in the overall     *
+!            sequence                                                  *
+!                                                                      *
+! Called by: PROCESS-SPECIFIC-LEVELS                                   *
+!                                                                      *
+!***********************************************************************
+Begin-Procedure PROCESS-DISTRIBUTED-DEDUCTIONS
+
+! *** Count number of percent entries *****
+ let #dedsarrayidx = 1
+ let #ded_distribution_count = 0
+
+ while #dedsarrayidx <= #dedsarraycnt
+    get #thisentrydist from Deds_array (#dedsarrayidx) DEDDist_percent
+    if #thisentrydist <> 0
+        let #ded_distribution_count = #ded_distribution_count + 1
+    end-if
+
+    let #dedsarrayidx = #dedsarrayidx + 1
+ end-while
+
+!*****  Process Fixed Deductions Amounts ******
+ let #dedsarrayidx = 1
+ let #process_count = 0
+
+!*****  This procedure only used for specific budget levels *****
+ let #Remain_budget_cap = #Dtl_Ded_Bdgt_Cap
+
+  move 'DED' to $Budget_type_flag
+
+  !***** This flag used to indicate we are processing an account ***
+  !***** within a level rather than a level  ******
+  move 'A' to $Account_level_Indc
+
+  !****** Always process fixed amounts first ******
+  while #dedsarrayidx <= #dedsarraycnt and #process_count < #ded_distribution_count
+
+     get $Out_Acct_Cd from Deds_array (#dedsarrayidx) DEDAcct_Code
+     get #thisentrydist from Deds_array (#dedsarrayidx) DEDDist_percent
+
+           !***** Fixed amount
+     if #thisentrydist <> 0
+
+        let #process_count = #process_count + 1
+
+        !*** Calculate Output Budget
+        !*** Make sure the entire budget level is allocated
+        if #process_count = #ded_distribution_count
+             let #Output_Budget = #Dtl_Ded_Bdgt_Cap
+        else
+             let #Output_budget = round(#Remain_budget_cap * #thisentrydist/100, 2)
+        end-if
+
+        do Write-Temp-Table
+        do Process-Included-Budget
+
+     end-if
+
+     let #dedsarrayidx = #dedsarrayidx + 1
+
+  end-while
+
+end-procedure Process_Distributed_Deductions
+
+!***********************************************************************
+! Procedure: WRITE-TEMP-TABLE                                          *
+! Descr:     Controls the writing of records with zero amounts.  As    *
+!            records do not contribute to the output flat file, they   *
+!            are not required in the work table.                       *
+!                                                                      *
+! Called by: PROCESS-BUDGETS PROCEDURE.                                *
+!***********************************************************************
+begin-procedure WRITE-TEMP-TABLE
+
+   If $Proc_Dept_Trigger = 'Y'
+       do Write-Temp-Record
+   else
+       if #Output_Budget <> 0.0
+            do Write-Temp-Record
+       end-if
+   end-if
+
+end-procedure WRITE-TEMP-TABLE
+
+!***********************************************************************
+! Procedure: PROCESS-INCLUDED-BUDGET                                   *
+! Descr:     Performs the "drilling up" of budgets.  If the acct_cd    *
+!            differs from default, reduces the Appt. or Posn. level    *
+!            budget and writes an output record.  This same budget amt *
+!            is then removed from higher level budgets which may       *
+!            contain the Appt or Posn budget.                          *
+!                                                                      *
+! Called by: PROCESS-DEPT-SHORTCUT,                                    *
+!            PROCESS-APPT-BUDGET,                                      *
+!            PROCESS-POSN-BUDGET,                                      *
+!            PROCESS-POOL-BUDGET,                                      *
+!            PROCESS-JOBCODE-BUDGET,                                   *
+!            PROCESS-DEPT-BUDGET,                                      *
+!***********************************************************************
+Begin-Procedure PROCESS-INCLUDED-BUDGET
+
+
+!***  Process an output record to the temporary table using the output
+!***  amount and acct_cd.  Deduct the output amount from all budget cap values
+!***  for which it is an included budget.
+
+   if $Account_Level_Indc = 'A'
+      if $Gbl_Budget_Cap_Indc = 'O'
+         subtract #Output_Budget from #Dtl_Overall_Bdgt_Cap
+      else
+         evaluate $Budget_Type_Flag
+            when = 'ERN'
+               subtract #Output_Budget from #Dtl_Ern_Bdgt_Cap
+            when = 'DED'
+               subtract #Output_Budget from #Dtl_Ded_Bdgt_Cap
+            when = 'TAX'
+            when = 'CTX'
+               subtract #Output_Budget from #Dtl_Tax_Bdgt_Cap
+         end-evaluate
+      end-if
+   end-if
+
+   if $Gbl_Budget_Cap_Indc = 'O'
+      evaluate $Process_Level_Indc
+         when = 'O'
+         when = 'J'
+            if $Dept_Bdgt_Fnd = 'Y'
+               array-subtract #Output_Budget
+                  from Dept_Array(#Dept_Loc_Idx) DAOverall_Bdgt_Cap
+            end-if
+         when = 'P'
+            if $Dept_Bdgt_Fnd = 'Y'
+               array-subtract #Output_Budget
+                  from Dept_Array(#Dept_Loc_Idx) DAOverall_Bdgt_Cap
+            end-if
+            if $Pool_Bdgt_Fnd = 'Y'
+               array-subtract #Output_Budget
+                  from Pool_Array(#Pool_Loc_Idx) PAOverall_Bdgt_Cap
+            end-if
+            if $Jobcode_Bdgt_Fnd = 'Y'
+               array-subtract #Output_Budget
+                  from Jobcode_Array(#Job_Loc_Idx) JAOverall_Bdgt_Cap
+            end-if
+         when = 'A'
+            if $Dept_Bdgt_Fnd = 'Y'
+               array-subtract #Output_Budget
+                  from Dept_Array(#Dept_Loc_Idx) DAOverall_Bdgt_Cap
+            end-if
+            if $Pool_Bdgt_Fnd = 'Y'
+               array-subtract #Output_Budget
+                  from Pool_Array(#Pool_Loc_Idx) PAOverall_Bdgt_Cap
+            end-if
+            if $Jobcode_Bdgt_Fnd = 'Y'
+               array-subtract #Output_Budget
+                  from Jobcode_Array(#Job_Loc_Idx) JAOverall_Bdgt_Cap
+            end-if
+            if $Posn_Bdgt_Fnd = 'Y'
+               array-subtract #Output_Budget
+                  from Posn_Array(#Posn_Loc_Idx) NAOverall_Bdgt_Cap
+            end-if
+      end-evaluate
+   else
+      if $Budget_Type_Flag = 'ERN'
+         evaluate $Process_Level_Indc
+            when = 'O'
+            when = 'J'
+               if $Dept_Bdgt_Fnd = 'Y'
+                  array-subtract #Output_Budget
+                     from Dept_Array(#Dept_Loc_Idx) DAErn_Bdgt_Cap
+               end-if
+            when = 'P'
+               if $Dept_Bdgt_Fnd = 'Y'
+                  array-subtract #Output_Budget
+                     from Dept_Array(#Dept_Loc_Idx) DAErn_Bdgt_Cap
+               end-if
+               if $Pool_Bdgt_Fnd = 'Y'
+                  array-subtract #Output_Budget
+                     from Pool_Array(#Pool_Loc_Idx) PAErn_Bdgt_Cap
+               end-if
+               if $Jobcode_Bdgt_Fnd = 'Y'
+                  array-subtract #Output_Budget
+                     from Jobcode_Array(#Job_Loc_Idx) JAErn_Bdgt_Cap
+               end-if
+            when = 'A'
+               if $Dept_Bdgt_Fnd = 'Y'
+                  array-subtract #Output_Budget
+                     from Dept_Array(#Dept_Loc_Idx) DAErn_Bdgt_Cap
+               end-if
+               if $Pool_Bdgt_Fnd = 'Y'
+                  array-subtract #Output_Budget
+                     from Pool_Array(#Pool_Loc_Idx) PAErn_Bdgt_Cap
+               end-if
+               if $Jobcode_Bdgt_Fnd = 'Y'
+                  array-subtract #Output_Budget
+                     from Jobcode_Array(#Job_Loc_Idx) JAErn_Bdgt_Cap
+               end-if
+               if $Posn_Bdgt_Fnd = 'Y'
+                  array-subtract #Output_Budget
+                     from Posn_Array(#Posn_Loc_Idx) NAErn_Bdgt_Cap
+               end-if
+         end-evaluate
+      end-if
+      if $Budget_Type_Flag = 'DED'
+         evaluate $Process_Level_Indc
+            when = 'O'
+            when = 'J'
+               if $Dept_Bdgt_Fnd = 'Y'
+                  array-subtract #Output_Budget
+                     from Dept_Array(#Dept_Loc_Idx) DADed_Bdgt_Cap
+               end-if
+            when = 'P'
+               if $Dept_Bdgt_Fnd = 'Y'
+                  array-subtract #Output_Budget
+                     from Dept_Array(#Dept_Loc_Idx) DADed_Bdgt_Cap
+               end-if
+               if $Pool_Bdgt_Fnd = 'Y'
+                  array-subtract #Output_Budget
+                     from Pool_Array(#Pool_Loc_Idx) PADed_Bdgt_Cap
+               end-if
+               if $Jobcode_Bdgt_Fnd = 'Y'
+                  array-subtract #Output_Budget
+                     from Jobcode_Array(#Job_Loc_Idx) JADed_Bdgt_Cap
+               end-if
+            when = 'A'
+               if $Dept_Bdgt_Fnd = 'Y'
+                  array-subtract #Output_Budget
+                     from Dept_Array(#Dept_Loc_Idx) DADed_Bdgt_Cap
+               end-if
+               if $Pool_Bdgt_Fnd = 'Y'
+                  array-subtract #Output_Budget
+                     from Pool_Array(#Pool_Loc_Idx) PADed_Bdgt_Cap
+               end-if
+               if $Jobcode_Bdgt_Fnd = 'Y'
+                  array-subtract #Output_Budget
+                     from Jobcode_Array(#Job_Loc_Idx) JADed_Bdgt_Cap
+               end-if
+               if $Posn_Bdgt_Fnd = 'Y'
+                  array-subtract #Output_Budget
+                     from Posn_Array(#Posn_Loc_Idx) NADed_Bdgt_Cap
+               end-if
+         end-evaluate
+      end-if
+      if $Budget_Type_Flag = 'TAX' or $Budget_Type_Flag = 'CTX'
+         evaluate $Process_Level_Indc
+            when = 'O'
+            when = 'J'
+               if $Dept_Bdgt_Fnd = 'Y'
+                  array-subtract #Output_Budget
+                     from Dept_Array(#Dept_Loc_Idx) DATax_Bdgt_Cap
+               end-if
+            when = 'P'
+               if $Dept_Bdgt_Fnd = 'Y'
+                  array-subtract #Output_Budget
+                     from Dept_Array(#Dept_Loc_Idx) DATax_Bdgt_Cap
+               end-if
+               if $Pool_Bdgt_Fnd = 'Y'
+                  array-subtract #Output_Budget
+                     from Pool_Array(#Pool_Loc_Idx) PATax_Bdgt_Cap
+               end-if
+               if $Jobcode_Bdgt_Fnd = 'Y'
+                  array-subtract #Output_Budget
+                     from Jobcode_Array(#Job_Loc_Idx) JATax_Bdgt_Cap
+               end-if
+            when = 'A'
+               if $Dept_Bdgt_Fnd = 'Y'
+                  array-subtract #Output_Budget
+                     from Dept_Array(#Dept_Loc_Idx) DATax_Bdgt_Cap
+               end-if
+               if $Pool_Bdgt_Fnd = 'Y'
+                  array-subtract #Output_Budget
+                     from Pool_Array(#Pool_Loc_Idx) PATax_Bdgt_Cap
+               end-if
+               if $Jobcode_Bdgt_Fnd = 'Y'
+                  array-subtract #Output_Budget
+                     from Jobcode_Array(#Job_Loc_Idx) JATax_Bdgt_Cap
+               end-if
+               if $Posn_Bdgt_Fnd = 'Y'
+                  array-subtract #Output_Budget
+                     from Posn_Array(#Posn_Loc_Idx) NATax_Bdgt_Cap
+               end-if
+         end-evaluate
+      end-if
+   end-if
+
+
+End-Procedure PROCESS-INCLUDED-BUDGET
+
+!***********************************************************************
+! Procedure: DERIVE-FILLED-HEADCOUNT                                   *
+! Descr:     Called module.  This procedure is called individually for *
+!            a single position number.  It selects a count from the    *
+!            PS_JOB table of all active employees assigned to that     *
+!            position.  This is used to exclude filled positions for   *
+!            jobcode and department salary totals to avoid double-     *
+!            counting position salary amounts                          *
+!                                                                      *
+! Called by: DERIVE-JOBCODE-SALARY                                     *
+!            DERIVE-DEPT-SALARY                                        *
+!***********************************************************************
+Begin-Procedure DERIVE-FILLED-HEADCOUNT
+
+   move 0 to #Excluded_Incumbents
+
+   let $err-statement1 = 'BUD007, SELECT, PS_JOB, DERIVE-FILLED-HEADCOUNT'
+   let $err-statement2 = 'Params:POSITION_NBR=<' || $Dtl_Position_Nbr ||
+                         '>, EFFDT=<' || $ThruDate || '>'
+
+begin-SELECT on-error=Error-Display
+JOBD.EMPLID
+
+   add 1 to #Excluded_Incumbents
+
+FROM PS_JOB JOBD
+WHERE JOBD.EMPL_STATUS IN ('A','P','L','S')
+  AND JOBD.POSITION_NBR = $Dtl_Position_Nbr
+  AND JOBD.EFFDT = (SELECT MAX(JOB9.EFFDT)
+                      FROM PS_JOB JOB9
+                     WHERE JOB9.EMPLID = JOBD.EMPLID
+                       AND JOB9.EMPL_RCD  = JOBD.EMPL_RCD
+                       AND JOB9.EFFDT <= $ThruDate)
+  AND JOBD.EFFSEQ = (SELECT MAX(JOB10.EFFSEQ)
+                    FROM PS_JOB JOB10
+                   WHERE JOB10.EMPLID = JOBD.EMPLID
+                     AND JOB10.EMPL_RCD  = JOBD.EMPL_RCD
+                     AND JOB10.EFFDT = JOBD.EFFDT)
+End-SELECT
+
+End-Procedure DERIVE-FILLED-HEADCOUNT
+
+!***********************************************************************
+! Procedure: WRITE-TEMP-RECORD                                         *
+! Descr:     Writes output data to a temporary table for sorting and   *
+!            conversion to ASCII file.                                 *
+!                                                                      *
+! Called by: WRITE-TEMP-TABLE                                          *
+!***********************************************************************
+begin-procedure WRITE-TEMP-RECORD
+
+   if $Out_Acct_Cd = ''
+      move ' ' to $Out_Acct_Cd
+   end-if
+
+   let $err-statement1 = 'BUD007, INSERT, PS_BDGT_EXPORT_WRK, WRITE-TEMP-RECORD'
+   let $err-statement2 = 'Key Fields: BUSINESS_UNIT_GL=<' || $GL_Business_Unit ||
+                         '>, ACCT_CD=<' || $Out_Acct_Cd ||
+                         '>, EFFDT=<' || $Dtl_Effdt ||
+                         '>, PROC_INDC=<' || $Gbl_Budget_Cap_indc ||
+                         '>, SETID=<' || $Gbl_SetID ||
+                         '>, DEPTID=<' || $Gbl_DeptID || '>'
+
+
+if $Budget_Level_Flag3 = 'SE' or $Budget_Level_Flag3 = 'ST' or $Budget_Level_Flag3 = 'SD'
+    let $Budget_type_Flag_2char = $Budget_Level_Flag3
+else
+    let $Budget_type_Flag_2char = substr ($Budget_type_flag, 1 ,2)
+end-if
+
+
+if $Gbl_Budget_Cap_indc = 'O'
+   let #Gbl_Budget_Cap_indc = 0
+else
+   let #Gbl_Budget_Cap_indc = 1
+end-if
+
+
+begin-SQL on-error=Error-Display
+INSERT INTO PS_BDGT_EXPORT_WRK (
+  BUSINESS_UNIT_GL,
+  ACCT_CD,
+  EFFDT,
+  OUT_PROC_INDC,
+  SETID,
+  DEPTID,
+  POSITION_POOL_ID,
+  JOBCODE,
+  POSITION_NBR,
+  EMPLID,
+  EMPL_RCD,
+  CURRENCY_CD,
+  BUDGET_AMT,
+  TYPE_1)
+VALUES (
+  $GL_Business_Unit,
+  $Out_Acct_Cd,
+  $Dtl_Effdt,
+  #Gbl_Budget_Cap_indc,
+  $Gbl_SetID,
+  $Gbl_DeptID,
+  $Cur_Position_Pool_ID,
+  $Cur_Jobcode,
+  $Cur_Position_Nbr,
+  $Cur_EmplID,
+  #Cur_Empl_Rcd,
+  $Dtl_Currency_Cd,
+  #Output_Budget,
+  $Budget_type_Flag_2char)
+end-SQL
+
+end-procedure WRITE-TEMP-RECORD
+
+
+

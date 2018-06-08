@@ -1,0 +1,272 @@
+! ***************************************************************!
+!  This software and related documentation are provided under a!
+!  license agreement containing restrictions on use and!
+!  disclosure and are protected by intellectual property!
+!  laws. Except as expressly permitted in your license agreement!
+!  or allowed by law, you may not use, copy, reproduce,!
+!  translate, broadcast, modify, license, transmit, distribute,!
+!  exhibit, perform, publish or display any part, in any form or!
+!  by any means. Reverse engineering, disassembly, or!
+!  decompilation of this software, unless required by law for!
+!  interoperability, is prohibited.!
+!  The information contained herein is subject to change without!
+!  notice and is not warranted to be error-free. If you find any!
+!  errors, please report them to us in writing.!
+!  !
+!  Copyright (C) 1988, 2011, Oracle and/or its affiliates.!
+!  All Rights Reserved.!
+! ***************************************************************!
+ 
+ 
+!                                                                    !
+!***********************************************************************
+!                                                                      *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+!                                                                      *
+!                                                                      *
+!                                                                      *
+!                                                                      *
+!***********************************************************************
+
+
+!----------------------------------------------------------------------!
+!  Derive-Whereclause
+!
+!  The application specific where clause for selecting the data out of
+!  the EC staging area is derived.  The bind variables are substituted
+!  dynamically.  Note that a substitution variable in a where clause
+!  must have the following syntax:
+!
+!        $record.field$
+!
+! CHANGE HISTORY
+! 07/12/96 - Updated the Format-Value routine to receive the "decimal
+! position" input parameter. This is used to handle implied decimals.
+! 09/05/96 - Used the DB field value (rather than any converted flat file
+! value in deriving parent linkage. This is done in 'Sub-Parent-Field'.
+! 10/09/96 - Since the DB field value is already in native DBMS format
+! (from the select), there is no need to call the Format-Value routine.
+! Added 'evaluate' clause to handle different data types to format the
+! where clause.
+!
+!----------------------------------------------------------------------!
+begin-procedure Derive-Whereclause($mapid, $file_row, :$whereclause, :$return_sw)
+   #debugh do debug-msg('Derive-Whereclause')
+   #debugv display 'Input map id ' noline
+   #debugv display $mapid
+   #debugv display 'Input row id ' noline
+   #debugv display $file_row
+
+   let #i = 0
+   let $whereclause = ''
+
+   while #i < #_Max_Index
+
+      get
+         $ecmapid_temp
+         $ecfilerowid_temp
+         $whereclause
+         #totalfields
+      from PS_ECOUTMAPREC(0)
+         ecmapid(#i)
+         ecfilerowid(#i)
+         whereclause(#i)
+         totalfilefields(#i)
+
+     #debugv display $ecmapid_temp
+     #debugv display $ecfilerowid_temp
+      if $ecmapid_temp  = $mapid and
+         $ecfilerowid_temp = $file_row
+         break
+      else
+         add 1 to #i
+      end-if
+
+   end-while
+
+   let $whereclause = upper($whereclause)
+   #debugv display '$whereclause'
+   #debugv display $whereclause
+
+   if not(isnull($whereclause))
+
+      do Sub-Where-Binds($mapid, $whereclause)
+   else
+      let #_Message_Nbr = 106
+      let $_LUW_Error_Sw = 'Y'
+      let $_Error_Misc = 'Map ID=(' || $mapid || '), File Row ID=(' || $file_row || ')'
+   end-if
+
+   let $return_sw = $_LUW_Error_Sw
+
+end-procedure
+
+!----------------------------------------------------------------------!
+!  Sub-Where-Binds
+!  This proc builds the parent/child foreign key part of the where clause.
+!  It also links in the current ec queue instance and trans foreign keys.
+!  For these special cases, it uses global variables ECQUEUEINSTANCE and ectransid
+!----------------------------------------------------------------------!
+begin-procedure Sub-Where-Binds($mapid, :$whereclause)
+   #debugh do debug-msg('Sub-Where-Binds')
+
+   let #bind_loc1 = instr($whereclause,'$',1)
+   let #length = {PS-length}($whereclause)
+
+   #debugv display '#bind_loc1'
+   #debugv display #bind_loc1
+   #debugv display '#length'
+   #debugv display #length
+
+   while #bind_loc1 > 0 and $_LUW_Error_Sw = 'N'
+
+      let $temp
+          = {PS-substr}($whereclause,#bind_loc1 + 1,#length - #bind_loc1)
+      let #bind_loc2 = instr($temp,'$',1)
+      let $bind_var
+          = {PS-substr}($whereclause,#bind_loc1 + 1,#bind_loc2 - 1)
+
+      #debugv display '$temp'
+      #debugv display $temp
+      #debugv display '#bind_loc2'
+      #debugv display #bind_loc2
+      #debugv display '$bind_var'
+      #debugv display $bind_var
+
+      if $bind_var = 'ECQUEUEINSTANCE' or $bind_var = 'ECTRANSID'
+         if $bind_var = 'ECQUEUEINSTANCE'
+            let $value = to_char(#_ECQUEUEINSTANCE)
+         end-if
+         if $bind_var = 'ECTRANSID'
+            let $value = '''' || $_ectransid || ''''
+         end-if
+      else
+         do Sub-Parent-Field($mapid, $bind_var, $value)
+      end-if
+
+      let $left_where = {PS-substr}($whereclause,1,#bind_loc1 - 1)
+      let $right_where = {PS-substr}($whereclause,#bind_loc1 + #bind_loc2 + 1,#length)
+      let $whereclause = $left_where || $value || $right_where
+
+      #debugv display '$left_where'
+      #debugv display $left_where
+      #debugv display '$value'
+      #debugv display $value
+      #debugv display '$right_where'
+      #debugv display $right_where
+      #debugv display '$whereclause'
+      #debugv display $whereclause
+
+      let #bind_loc1 = instr($whereclause,'$',1)
+      let #length = {PS-length}($whereclause)
+
+   end-while
+
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+!  Sub-Parent-Field
+!  This proc retrieves the fieldname specified in the $record.field$ format
+!  from the field map array (read in previously to memory). It expects
+!  to receive the ID as input and returns to field's value as output.
+!----------------------------------------------------------------------!
+begin-procedure Sub-Parent-Field($mapid, $field_id, :$db_value)
+   #debugh do debug-msg('Sub-Parent-Field')
+
+   let #period_loc = instr($field_id,'.',1)
+   let #length = {PS-length}($field_id)
+   if #period_loc = 0
+      let #_Message_Nbr = 107
+      let $_LUW_Error_Sw = 'Y'
+      let $_Error_Misc = 'Map ID=(' || $mapid || '), Field ID=(' || $field_id || ')'
+   end-if
+   let $record_name = {PS-substr}($field_id,1,#period_loc - 1)
+   let $field_name = {PS-substr}($field_id,#period_loc + 1, #length - #period_loc)
+   #debugv display 'SPF record name=' noline
+   #debugv display $record_name
+   #debugv display 'SPF field name=' noline
+   #debugv display $field_name
+
+   let #i = 0
+   while #i < #_Max_Index and $_LUW_Error_Sw = 'N'
+
+      get
+         $ecmapid_temp
+         $ecfilerowid_temp
+         #totalfields
+         $recname
+      from PS_ECOUTMAPREC(0)
+         ecmapid(#i)
+         ecfilerowid(#i)
+         totalfilefields(#i)
+         recname(#i)
+
+      if $ecmapid_temp = $mapid and $recname = $record_name
+         break
+      end-if
+      add 1 to #i
+
+   end-while
+   if #i = #_Max_Index
+      let #_Message_Nbr = 108
+      let $_LUW_Error_Sw = 'Y'
+      let $_Error_Misc = 'Map ID=(' || $mapid || '), Field ID=(' || $field_id ||
+                         ') Record Name=(' || $record_name || ')'
+   end-if
+
+   let #rowid = to_number($ecfilerowid_temp)
+
+   #debugv display 'SPF rowid=' noline
+   #debugv display #rowid
+
+   let #i = 0
+   while #i < #totalfields and $_LUW_Error_Sw = 'N'
+      get
+         $fieldname_temp
+         $db_value
+         #fieldtype
+      from PS_ECOUTMAPFLD(#i)
+         fieldname(#rowid)
+         dbfldval(#rowid)
+         fieldtype(#rowid)
+
+      if $fieldname_temp = $field_name
+         break
+      end-if
+      add 1 to #i
+   end-while
+   if #i = #totalfields and $_LUW_Error_Sw = 'N'
+      let #_Message_Nbr = 109
+      let $_LUW_Error_Sw = 'Y'
+      let $_Error_Misc = 'Map ID=(' || $mapid || '), Field ID=(' || $field_id ||
+                         ') Record Name=(' || $record_name ||
+                         ') Field Name=(' || $field_name || ')'
+   end-if
+
+   if $_LUW_Error_Sw = 'N'
+      evaluate #fieldtype
+      when = 0
+         do translate-char($db_value, $_sql_char, $db_value)
+         let $db_value = $_sql_char || $db_value || $_sql_char ! bracket data value with quotes
+      when = 4      ! no call to Format-Datetime since date values are already in native format
+         let $db_value = '{DYN-DateIn-Prefix}' || $_sql_char || $db_value
+                      || $_sql_char || '{DYN-DateIn-Suffix}'
+      when = 5
+         let $db_value = '{DYN-TimeIn-Prefix}' || $db_value || '{DYN-TimeIn-Suffix}'
+      when = 6
+         let $db_value = '{DYN-DateTimeIn-Prefix}' || $_sql_char || $db_value ||
+                      $_sql_char || '{DYN-DateTimeIn-Suffix}'
+      when-other
+         break
+      end-evaluate
+   else
+      let $db_value = ''
+   end-if
+   #debugv display 'SPF DB value result=' noline
+   #debugv display $db_value
+
+end-procedure

@@ -1,0 +1,705 @@
+!**********************************************************
+!  PER508:  Convert Department Table into Security Tree   *
+!**********************************************************
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+!                                                                      *
+! This module contains confidential and proprietary information        *
+! of Oracle; it is not to be copied, reproduced, or transmitted        *
+! in any form, by any means, in whole or in part, nor is it to         *
+! be used for any purpose other than that for which it is              *
+! expressly provided under the applicable license agreement.           *
+!                                                                      *
+! Copyright (C) 2006 Oracle. All Rights Reserved.                      *
+!                                                                      *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!          $Date:  2006/07/19:15:07:24                                 
+!       $Release:  HR9                                                 
+!      $Revision:  102                                                 
+!                                                                      *
+!***********************************************************************
+
+
+#include 'setenv.sqc'      !Get environment defines
+#Include 'setup07.sqc'     !Printer and page-size initialization
+#define TRUE               1
+#define FALSE              0
+#define OrgCodeArraySize   20
+#define Dept_Tbl           PS_R_PER507
+#define SetID_ColName      SETID
+#define Security_Tree_Name 'DEPT_SECURITY'
+#define Security_Strct_ID  'DEPARTMENT'
+
+begin-report
+
+   do Initialization
+
+  !do Stdapi-Term
+
+begin-SELECT distinct
+SETID &SetID
+
+    do Determine-Tree-Max-Effdt
+
+    move {FALSE} to #Tree-Defn-Found
+    do Check-Old-Dept-Security
+
+    if #Tree-Defn-Found = {TRUE}
+        display 'A Tree Definition already exists for the Department'
+        display 'Security Tree that is about to be created.'
+        display '         Tree Definition'
+        display ' *Set ID (BU)   : '                noline
+        display &SetID                xxxxxxxxxx
+        display ' *Tree Name     : '                noline
+        display {Security_Tree_Name}
+        display ' *Effective Date: '                noline
+        move '1' to $Year4
+        move '-' to $DDelimiter
+        do Format-DateTime(&Tree_Max_EffDt, $out, {DEFYMD}, '', '')
+        display $out
+        display ' '
+        input $Answer maxlen=1 'Should the existing tree objects for this SetID be overlayed? (Y/N)'
+        uppercase $Answer
+
+        if $Answer <> 'Y'
+            ! do not replace existing tree for this SetID
+            display ' '
+        else
+            do Delete-Old-Dept-Security
+
+            do Generate-Dept-Security-Tree
+            do Terminate
+        end-if
+    else
+        do Generate-Dept-Security-Tree
+        do Terminate
+    end-if
+
+FROM {DEPT_TBL}
+WHERE ORGCODE IS NOT NULL
+  AND ORGCODE <>  ' '
+end-SELECT
+
+    do Commit-Transaction
+    do Stdapi-Term
+end-report
+
+
+!***********************************************************************
+! Procedure: Initialization                                            *
+!                                                                      *
+! Description:                                                         *
+! This procedure checks the values and structure of the department     *
+! security trees in the import table {Dept_Tbl}.                       *
+!***********************************************************************
+begin-procedure Initialization
+
+   do Init-DateTime
+   do Get-Current-DateTime
+
+   do Stdapi-Init
+
+!***********************************************************************
+! check if there is any valid data in the {Dept_Tbl}
+! and if the OrgCode is valid.
+!***********************************************************************
+
+begin-SELECT
+O.ORGCODE           &Org
+O.SETID             &SET
+O.DEPTID            &DPID
+O.SETID_RPDEPT      &SETRP
+O.REPORTS_TO_DEPT   &Rpts2
+FROM {DEPT_TBL} O
+WHERE O.ORGCODE  <>  ' '
+  AND O.DEPTID = O.REPORTS_TO_DEPT
+  AND O.SETID = O.SETID_RPDEPT
+end-SELECT
+
+   if &Org = ''
+      display 'No rows were found to process.  Program cancelled.'
+      stop quiet
+      display ' '
+   end-if
+
+   let #OrgCodeUnitSize = 0
+
+begin-SELECT
+LENGTH                          &OrgCode_Length
+   let #OrgCodeUnitSize = trunc(&OrgCode_Length / {OrgCodeArraySize}, 0)
+FROM PSDBFIELD
+WHERE FIELDNAME = 'ORGCODE'
+end-SELECT
+
+  if #OrgCodeUnitSize = 0
+     display 'The field ORGCODE was not found in {Dept_Tbl}.  Program cancelled.'
+     stop quiet
+  end-if
+
+  if #OrgCodeUnitSize * {OrgCodeArraySize} <> &OrgCode_Length
+      display 'The field {Dept_Tbl}.ORGCODE has a nonstandard size.  Unable to'
+      display 'continue processing.  Program cancelled.'
+      stop quiet
+  end-if
+
+let #count_toplevel = 0
+
+
+!***********************************************************************
+! check if there is any undefined SetID in the {Dept_Tbl}
+!***********************************************************************
+
+begin-SELECT distinct
+A.SETID
+
+        display 'In order to convert {Dept_Tbl} into a valid security tree,'
+        display 'all SetIDs must be defined in for your organization. This {Dept_Tbl}'
+        display 'contains the following SetIDs that are not defined yet.'
+        display ' '
+        SHOW '         SetID'
+
+        do List-SetIDs
+
+        display ''
+        display 'Define these SetIDs in your PeopleSoft Application'
+        display '(see your PeopleSoft documentation for further details).'
+        display 'Then rerun PER508.SQR.'
+        STOP QUIET
+
+FROM {DEPT_TBL} A
+WHERE A.ORGCODE  <>  ' '
+  AND A.ORGCODE <>  ' '
+  AND NOT EXISTS (SELECT 'X'
+                       FROM PS_SETID_TBL S
+                      WHERE S.SETID = A.SETID)
+end-SELECT
+
+
+!***********************************************************************
+! check if there are any multiple top-level departments for
+! the same SetID in the {Dept_Tbl}
+!***********************************************************************
+
+begin-SELECT
+B.SETID ()      on-break print=never procedure=reset-count-toplevel
+B.DEPTID
+
+    add 1 to #count_toplevel
+
+    if #count_toplevel > 1
+        display 'In order to convert {Dept_Tbl} into a valid security tree, all departments must'
+        display 'ultimately report to a single department for the same SetID.  This {Dept_Tbl}'
+        display 'contains multiple independent department reporting structures for the same'
+        display 'SetID.  All top-level departments in {Dept_Tbl} within one SetID are listed below.'
+        display ' '
+        SHOW '         SetID  Department ID  Reports To'
+
+        do Multiple-Heads
+
+        display ''
+        display 'Correct the Department Table, rerun PER507.SQR, then rerun PER508.SQR.'
+        STOP QUIET
+    end-if
+
+FROM {DEPT_TBL} B
+WHERE B.ORGCODE IS NOT NULL
+  AND B.ORGCODE <>  ' '
+  AND B.DEPTID = B.REPORTS_TO_DEPT
+  AND B.SETID = B.SETID_RPDEPT
+ORDER BY B.SETID
+end-SELECT
+
+begin-sql on-error=sql-error
+   UPDATE PSLOCK
+       SET VERSION = VERSION + 1
+end-SQL
+
+begin-SELECT
+VERSION
+FROM PSLOCK
+end-Select
+
+end-procedure
+
+
+!***********************************************************************
+! Procedure: Reset-Count-Toplevel                                      *
+!                                                                      *
+! Description:                                                         *
+! This procedure resets the count_toplevel variable to 0.              *
+!***********************************************************************
+begin-procedure Reset-Count-Toplevel
+let #count_toplevel = 0
+end-procedure Reset-Count-Toplevel
+
+
+!***********************************************************************
+! Procedure: List-SetIDs                                               *
+!                                                                      *
+! Description:                                                         *
+! This procedure lists all SetIDs that are not defined in the          *
+! SetID table.                                                         *
+!***********************************************************************
+begin-procedure List-SetIDs
+begin-SELECT distinct
+A1.SETID
+    display '         '         xxxxxxxxx           noline
+    display &A1.SETID
+FROM {DEPT_TBL} A1
+WHERE A1.ORGCODE  <>  ' '
+  AND NOT EXISTS (SELECT 'X'
+                       FROM PS_SETID_TBL S1
+                      WHERE S1.SETID = A1.SETID)
+end-SELECT
+end-procedure
+
+
+!***********************************************************************
+! Procedure: Multiple-Heads                                            *
+!                                                                      *
+! Description:                                                         *
+! This procedure lists all multiple toplevel departments defined for   *
+! the same SetID table.                                                *
+!***********************************************************************
+begin-procedure Multiple-Heads
+begin-SELECT
+B1.SETID
+B1.DEPTID
+B1.REPORTS_TO_DEPT
+   display '         '         xxxxxxxxx           noline
+   display &B1.SETID             xxxxxxx             noline
+   display &B1.DEPTID             xxxxxxxxxxxxxxx     noline
+   display &B1.REPORTS_TO_DEPT
+FROM {DEPT_TBL} B1
+WHERE B1.ORGCODE IS NOT NULL
+  AND B1.ORGCODE <>  ' '
+  AND B1.DEPTID = B1.REPORTS_TO_DEPT
+  AND B1.SETID = B1.SETID_RPDEPT
+  AND B1.SETID = &B.SETID
+ORDER BY B1.SETID, B1.DEPTID
+end-SELECT
+end-procedure
+
+
+!***********************************************************************
+! Procedure: Determine-Tree-Max-Effdt                                  *
+!                                                                      *
+! Description:                                                         *
+! This procedure determines the max effdt among the rows in {Dept_Tbl} *
+! for one particular SetID.                                            *
+!***********************************************************************
+begin-procedure Determine-Tree-Max-Effdt
+
+begin-SELECT
+MAX(EFFDT)        &Tree_Max_EffDt
+FROM {DEPT_TBL}
+WHERE ORGCODE IS NOT NULL
+  AND ORGCODE <>  ' '
+  AND SETID = &SetID
+end-SELECT
+
+end-procedure
+
+
+!***********************************************************************
+! Procedure: Check-Old-Dept-Security                                   *
+!                                                                      *
+! Description:                                                         *
+! This procedure checks for any already existing department security   *
+! trees in the system and deletes them upon request.                   *
+!***********************************************************************
+begin-procedure Check-Old-Dept-Security
+
+begin-SELECT
+TREE_NAME
+   move {TRUE} to #Tree-Defn-Found
+   EXIT-SELECT
+FROM PSTREEDEFN
+WHERE {SETID_COLNAME} = &SetID
+  AND TREE_NAME       = {SECURITY_TREE_NAME}
+  AND EFFDT           = &Tree_Max_EffDt
+end-SELECT
+
+end-procedure
+
+
+!***********************************************************************
+! Procedure: Delete-Dept-Security-Tree                                 *
+!                                                                      *
+! Description:                                                         *
+! This procedure deletes an already existing department security tree  *
+! for the corresponding SetID to import the new department security    *
+! tree.                                                                *
+!***********************************************************************
+begin-procedure Delete-Old-Dept-Security
+
+begin-SQL on-error=Ignore-SQL-Error
+   DELETE FROM PSTREEDEFN
+       WHERE {SETID_COLNAME} = &SetID
+         AND TREE_NAME       = {SECURITY_TREE_NAME}
+         AND EFFDT           = &Tree_Max_EffDt;
+end-SQL
+
+begin-SQL on-error=Ignore-SQL-Error
+   DELETE FROM PSTREELEAF
+       WHERE {SETID_COLNAME} = &SetID
+         AND TREE_NAME       = {SECURITY_TREE_NAME}
+         AND EFFDT           = &Tree_Max_EffDt;
+end-SQL
+
+begin-SQL on-error=Ignore-SQL-Error
+   DELETE FROM PSTREELEVEL
+       WHERE {SETID_COLNAME} = &SetID
+         AND TREE_NAME       = {SECURITY_TREE_NAME}
+         AND EFFDT           = &Tree_Max_EffDt;
+end-SQL
+
+begin-SQL on-error=Ignore-SQL-Error
+   DELETE FROM PSTREENODE
+       WHERE {SETID_COLNAME} = &SetID
+         AND TREE_NAME       = {SECURITY_TREE_NAME}
+         AND EFFDT           = &Tree_Max_EffDt;
+end-SQL
+
+begin-SQL on-error=Ignore-SQL-Error
+   DELETE FROM PSTREEPROMPT
+       WHERE {SETID_COLNAME} = &SetID
+         AND TREE_NAME       = {SECURITY_TREE_NAME}
+         AND EFFDT           = &Tree_Max_EffDt;
+end-SQL
+
+end-procedure Delete-Old-Dept-Security
+
+
+!***********************************************************************
+! Procedure: Generate-Dept-Security-Tree                               *
+!                                                                      *
+! Description:                                                         *
+! This procedure calls the procedures to generate the department       *
+! security tree.                                                       *
+!***********************************************************************
+begin-procedure Generate-Dept-Security-Tree
+
+   do Dept-Table-Pass1
+   do Dept-Table-Pass2
+   do Update-Tree-EffDt
+   do Insert-TreeDefn
+   do Insert-TreeLevels
+   do Insert-TreeNodes
+   do Insert-TreePrompt
+
+end-procedure
+
+
+!***********************************************************************
+! Procedure: Dept-Table-Pass1                                          *
+!                                                                      *
+! Description:                                                         *
+!***********************************************************************
+begin-procedure Dept-Table-Pass1
+
+   move 0 to #TreeNodeNum
+   move 0 to #MaxLevelNum
+
+begin-SELECT
+SETID          &P1_SETID
+DEPTID         &P1_DeptID
+{DATETIMEOUT-PREFIX}EFFDT{DATETIMEOUT-SUFFIX}  &P1_EffDt
+ORGCODE        &P1_OrgCode
+
+   let $SetId = rtrim(&P1_SetId, ' ')
+   let $DeptID  = rtrim(&P1_DeptID, ' ')
+   let $OrgCode = rtrim(&P1_OrgCode, ' ')
+
+   add 1 to #TreeNodeNum
+   let #LevelNum = length($OrgCode)/#OrgCodeUnitSize
+   if #LevelNum  > #MaxLevelNum
+       move #LevelNum to #MaxLevelNum
+   end-if
+   do Update-Tree-Node-And-Level
+
+FROM {DEPT_TBL}
+WHERE ORGCODE IS NOT NULL
+  AND ORGCODE <>  ' '
+  AND SETID = &SetID
+ORDER BY ORGCODE
+end-SELECT
+
+   move #TreeNodeNum to #MaxNodeNum
+end-procedure
+
+
+!***********************************************************************
+! Procedure: Update-Tree-Node-And-Level                                *
+!                                                                      *
+! Description:                                                         *
+! This procedure updates the Tree-Node and -Level in the {Dept_Tbl}    *
+! with the values determined in Dept-Table-Pass1                       *
+!***********************************************************************
+begin-procedure Update-Tree-Node-And-Level
+begin-sql on-error=sql-error
+   UPDATE {DEPT_TBL}
+       SET TREE_NODE_NUM  = #TreeNodeNum,
+           TREE_LEVEL_NUM = #LevelNum
+       WHERE DEPTID       = $DeptID
+         AND SETID        = $SetId
+         AND EFFDT        = {DATETIMEIN-PREFIX}&P1_EFFDT{DATETIMEIN-SUFFIX}
+end-SQL
+end-procedure
+
+
+!***********************************************************************
+! Procedure: Dept-Table-Pass2                                          *
+!                                                                      *
+! Description:                                                         *
+!***********************************************************************
+begin-procedure Dept-Table-Pass2
+
+begin-SELECT
+SETID                &P2_SETID
+DEPTID               &P2_DeptID
+{DATETIMEOUT-PREFIX}EFFDT{DATETIMEOUT-SUFFIX}  &P2_EffDt
+SETID_RPDEPT         &P2_SETID_RPDEPT
+REPORTS_TO_DEPT      &P2_Reports_To_Dept
+ORGCODE              &P2_OrgCode
+
+   LET $SETID = RTRIM(&P2_SETID,' ')
+   LET $SETID_RPDEPT = RTRIM(&P2_SETID_RPDEPT,' ')
+   let $DeptID          = rtrim(&P2_DeptID, ' ')
+   let $Reports_To_Dept = rtrim(&P2_Reports_To_Dept, ' ')
+   let $OrgCode         = rtrim(&P2_OrgCode, ' ')
+
+   do Determine-Parent-Node-Num
+   do Determine-Node-Num-End
+   do Update-Tree-Parent-And-NumEnd
+   add 1 to #TreeNodeNum
+
+FROM {DEPT_TBL}
+WHERE ORGCODE IS NOT NULL
+  AND ORGCODE <>  ' '
+  AND SETID = &SetID
+ORDER BY ORGCODE
+end-SELECT
+
+end-procedure
+
+
+!***********************************************************************
+! Procedure: Determine-Parent-Node-Num                                 *
+!                                                                      *
+! Description:                                                         *
+!***********************************************************************
+begin-procedure Determine-Parent-Node-Num
+   if $DeptID = $Reports_To_Dept  AND $SETID = $SETID_RPDEPT
+       move 0 to #Parent-Node
+   else
+       let $ParentOrgCode = {ps-substr}($OrgCode, 1, length($OrgCode)-#OrgCodeUnitSize)
+       do Select-Parent-Node-Num
+   end-if
+end-procedure
+
+
+!***********************************************************************
+! Procedure: Select-Parent-Node-Num                                    *
+!                                                                      *
+! Description:                                                         *
+!***********************************************************************
+begin-procedure Select-Parent-Node-Num
+begin-SELECT
+TREE_NODE_NUM
+   move &Tree_Node_Num to #Parent-Node
+FROM {DEPT_TBL}
+WHERE ORGCODE = $ParentOrgCode
+  AND SETID = &SetID
+end-SELECT
+end-procedure
+
+
+!***********************************************************************
+! Procedure: Determine-Node-Num-End                                    *
+!                                                                      *
+! Description:                                                         *
+!***********************************************************************
+begin-procedure Determine-Node-Num-End
+   move $OrgCode to $OrgCodeMax
+   if length($OrgCode) < &OrgCode_Length
+       concat 'þ' with $OrgCodeMax
+   end-if
+
+begin-SELECT
+MAX(TREE_NODE_NUM)      &MaxTreeNodeNum
+   move &MaxTreeNodeNum to #Node-Num-End
+FROM {DEPT_TBL}
+WHERE ORGCODE BETWEEN $OrgCode AND $OrgCodeMax
+  AND SETID = &SetID
+end-SELECT
+end-procedure
+
+
+!***********************************************************************
+! Procedure: Update-Tree-Parent-And-NumEnd                             *
+!                                                                      *
+! Description:                                                         *
+!***********************************************************************
+begin-procedure Update-Tree-Parent-And-NumEnd
+begin-sql on-error=sql-error
+   UPDATE {DEPT_TBL}
+       SET PARENT_NODE_NUM   = #Parent-Node,
+           TREE_NODE_NUM_END = #Node-Num-End
+       WHERE DEPTID = $DeptID
+         AND SETID = $SETID
+         AND EFFDT  = {DATETIMEIN-PREFIX}&P2_EFFDT{DATETIMEIN-SUFFIX}
+end-SQL
+end-procedure
+
+
+!***********************************************************************
+! Procedure: Update-Tree-EffDt                                         *
+!                                                                      *
+! Description:                                                         *
+!***********************************************************************
+begin-procedure Update-Tree-EffDt
+begin-sql on-error=sql-error
+   UPDATE {DEPT_TBL}
+       SET TREE_EFFDT = &Tree_Max_EffDt
+    WHERE ORGCODE IS NOT NULL
+      AND ORGCODE <>  ' '
+      AND SETID = &SetID
+end-SQL
+end-procedure
+
+
+!***********************************************************************
+! Procedure: Insert-TreeDefn                                           *
+!                                                                      *
+! Description:                                                         *
+!***********************************************************************
+begin-procedure Insert-TreeDefn
+
+begin-sql on-error=sql-error
+
+  INSERT INTO PSTREEDEFN ({SETID_COLNAME}, SETCNTRLVALUE, TREE_NAME, EFFDT, EFF_STATUS,
+                          VERSION, TREE_STRCT_ID, DESCR, ALL_VALUES, USE_LEVELS,
+                          VALID_TREE, LEVEL_COUNT, NODE_COUNT, LEAF_COUNT,
+                          TREE_HAS_RANGES,DUPLICATE_LEAF,TREE_CATEGORY,TREE_ACC_METHOD,
+                          TREE_ACC_SELECTOR,TREE_ACC_SEL_OPT, LASTUPDDTTM, LASTUPDOPRID,
+                          TREE_IMAGE, BRANCH_IMAGE, NODECOL_IMAGE, NODEEXP_IMAGE, LEAF_IMAGE)
+  VALUES (&SetID, ' ', {Security_Tree_Name}, &Tree_Max_EffDt, 'A', &Version, {SECURITY_STRCT_ID}, 'Departmental Security',
+          'N', 'S', 'Y', #MaxLevelNum, #MaxNodeNum, 0, 'N','N','HR','S','S','R', NULL, 'PPLSOFT',
+          ' ', ' ', ' ', ' ', ' ')
+
+end-SQL
+end-procedure
+
+
+!***********************************************************************
+! Procedure: Insert-TreeLevels                                         *
+!                                                                      *
+! Description:                                                         *
+!***********************************************************************
+begin-procedure Insert-TreeLevels
+   move 1 to #LevelNum
+   move 'Y' to $All_Values
+   while #LevelNum <= #MaxLevelNum
+       move 'LEVEL' to $LevelName
+       let $TempNum = to_char(#LevelNum)
+       concat $TempNum with $LevelName
+       do Insert-TreeLevel
+       add 1 to #LevelNum
+       move 'N' to $All_Values
+   end-while
+end-procedure
+
+
+!***********************************************************************
+! Procedure: Insert-TreeLevel                                          *
+!                                                                      *
+! Description:                                                         *
+!***********************************************************************
+begin-procedure Insert-TreeLevel
+begin-sql on-error=sql-error
+   INSERT INTO PSTREELEVEL ({SETID_COLNAME}, SETCNTRLVALUE, TREE_NAME, EFFDT, TREE_LEVEL,
+           TREE_LEVEL_NUM, ALL_VALUES)
+       VALUES (&SetID, ' ', {Security_Tree_Name}, &Tree_Max_EffDt,
+           $LevelName, #LevelNum, $All_Values)
+end-SQL
+end-procedure
+
+
+!***********************************************************************
+! Procedure: Insert-TreeNodes                                          *
+!                                                                      *
+! Description:                                                         *
+!***********************************************************************
+begin-procedure Insert-TreeNodes
+begin-sql on-error=sql-error
+   INSERT INTO PSTREENODE ({SETID_COLNAME}, SETCNTRLVALUE, TREE_NAME, EFFDT, TREE_NODE,
+           TREE_LEVEL_NUM, PARENT_NODE_NUM, PARENT_NODE_NAME, TREE_NODE_NUM,
+           TREE_NODE_NUM_END,TREE_NODE_TYPE,TREE_BRANCH,OLD_TREE_NODE_NUM,NODECOL_IMAGE,NODEEXP_IMAGE)
+       SELECT SETID, ' ', {SECURITY_TREE_NAME}, TREE_EFFDT,
+           DEPTID, TREE_LEVEL_NUM, PARENT_NODE_NUM, ' ', TREE_NODE_NUM,
+           TREE_NODE_NUM_END,'G', ' ','N',' ',' '
+       FROM {DEPT_TBL}
+       WHERE ORGCODE IS NOT NULL
+         AND ORGCODE <>  ' '
+         AND SETID = &SetID
+end-SQL
+end-procedure
+
+!***********************************************************************
+! Procedure: Insert-TreePrompt                                         *
+!                                                                      *
+! Description:                                                         *
+!***********************************************************************
+begin-procedure Insert-TreePrompt
+
+begin-sql on-error=sql-error
+
+  INSERT INTO PSTREEPROMPT ({SETID_COLNAME}, SETCNTRLVALUE, TREE_NAME, EFFDT, TREE_BRANCH)
+  VALUES (&SetID, ' ', {Security_Tree_Name}, &Tree_Max_EffDt, ' ')
+
+end-SQL
+end-procedure
+
+!***********************************************************************
+! Procedure: Ignore-SQL-Error                                          *
+!                                                                      *
+! Description:                                                         *
+!***********************************************************************
+begin-procedure Ignore-SQL-Error
+   !do nothing
+end-procedure
+
+
+!***********************************************************************
+! Procedure: Terminate                                                 *
+!                                                                      *
+! Description:                                                         *
+! This procedure displays the creation of the department security tree *
+!***********************************************************************
+begin-procedure Terminate
+   display 'Department Security Tree sucessfully created.'
+   display '         Tree Definition'
+   display ' *Set ID (BU)   : '                noline
+   display &SetID                xxxxxxxxxx
+   display ' *Tree Name     : '                noline
+   display {Security_Tree_Name}
+   display ' *Effective Date: '                noline
+   move '1' to $Year4
+   move '-' to $DDelimiter
+   do Format-DateTime(&Tree_Max_EffDt, $out, {DEFYMD}, '', '')
+   display $out
+end-procedure
+
+
+#include 'datetime.sqc'            !Common Date & Time Formatting routines
+#Include 'curdttim.sqc'            !Get-Current-DateTime procedure
+#include 'tranctrl.sqc'            !Common Transaction Handling
+#include 'sqrtrans.sqc'
+!#include 'prcsapi.sqc'
+!#include 'prcsdef.sqc'
+#include 'stdapi.sqc'

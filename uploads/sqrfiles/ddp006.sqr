@@ -1,0 +1,408 @@
+!***********************************************************************
+!  DDP006:  Direct Deposit Prenotification Memo                        *
+!           Creates Memo indicating prenote has been sent and that     *
+!             direct deposit will start with next pay period           *
+!                                                                      *
+!           NOTE: This SQR must be run before DDP001 or result         *
+!                 will not contain rows related to RunID used in       *
+!                 DDP001                                               *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+!   This module contains confidential and proprietary information      *
+!   of Oracle; it is not to be copied, reproduced, or transmitted      *
+!   in any form, by any means, in whole or in part, nor is it to       *
+!   be used for any purpose other than that for which it is            *
+!   expressly provided under the applicable license agreement.         *
+!                                                                      *
+!   Copyright (C) 2006 Oracle. All Rights Reserved.                    *
+!***********************************************************************
+! PeopleSoft, Inc.; it is not to be copied, reproduced, or transmitted *
+!                                                                      *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+!                $Date:  2006/04/21:12:23:42                           !
+!             $Release:  HR9                                           !
+!            $Revision:  102                                           !
+!                                                                      *
+!***********************************************************************
+
+#include 'setenv.sqc' !Set environment
+#Include 'setup31.sqc'  !printer and page-size initialization
+
+begin-report
+  do Init-Report
+  do Stdapi-Term
+end-report
+
+
+begin-procedure Init-Report
+  move 'DDP006' to $ReportID
+  move 'Direct Deposit Prenotification Memo' to $ReportTitle
+
+  do Init-DateTime
+  do Init-Number
+  do Stdapi-Init
+
+  move 'N' to $CyclePrompts     !Don't prompt for On/Off cycle in PAYINIT
+  do Payroll-Report-Initialization
+end-procedure
+
+
+begin-PROCEDURE Report
+  move '              Transit                       Account                          ' to $Head1
+  move '    Priority  Number     Account Number        Type      Deposit Instructions' to $Head2
+  move 'Y' to $First_Time
+
+
+  if $SlctRunID <> '*'
+      move  'AA.RUN_ID = '''                to $DdovbankID
+      concat $SlctRunID                   with $DdovbankID
+      concat ''''                         with $DdovbankID
+    else
+      move  'AA.COMPANY = '''               to $DdovbankID
+      concat $SlctCompany                 with $DdovbankID
+      concat ''' AND AA.PAYGROUP = '''    with $DdovbankID
+      concat $SlctPayGroup                with $DdovbankID
+      concat ''' AND AA.PAY_END_DT = '''  with $DdovbankID
+      concat $SlctPayEndDt                with $DdovbankID
+      concat ''''                         with $DdovbankID
+  end-if
+
+begin-SELECT
+AA.COMPANY
+AA.PAYGROUP
+AA.PAY_END_DT
+AA.CHECK_DT
+BB.SRC_BANK_ID
+BB.DD_SRC_BANK_ID
+
+  if isblank(&BB.DD_Src_bank_id)
+    move &BB.Src_bank_id      to $Bank_ID
+    move 'B.SRC_BANK_ID'      to $Bank_ID_to_Use_B
+    move 'PT.SRC_BANK_ID'     to $Bank_ID_to_Use_PT
+  else
+    move &BB.DD_Src_bank_id   to $Bank_ID
+    move 'B.DD_SRC_BANK_ID'   to $Bank_ID_to_Use_B
+    move 'PT.DD_SRC_BANK_ID'  to $Bank_ID_to_Use_PT
+  end-if
+
+FROM PS_PAY_CALENDAR AA,
+      PS_PAYGROUP_TBL BB
+WHERE [$DdovbankID]
+  AND AA.PAYGROUP         = BB.PAYGROUP
+  AND AA.COMPANY          = BB.COMPANY
+  AND BB.EFFDT            =
+      (SELECT MAX(EFFDT)
+         FROM PS_PAYGROUP_TBL
+        WHERE COMPANY    = AA.COMPANY
+          AND PAYGROUP   = AA.PAYGROUP
+          AND EFF_STATUS = 'A'
+          AND EFFDT     <= AA.PAY_END_DT)
+  AND AA.PAY_CONFIRM_RUN  = 'Y'
+  AND AA.PAY_CHECKS_RUN   = 'N'
+ORDER BY AA.COMPANY,
+         AA.PAYGROUP,
+         AA.PAY_END_DT
+end-SELECT
+
+
+begin-SELECT
+A.COMPANY
+A.PAYGROUP
+A.PAY_END_DT
+S.SRC_BANK_ID
+
+  if $Company <> &A.Company
+        or &S.SRC_BANK_ID <> $priorTransit#
+    if $First_Time <> 'Y'
+        do Format-DateTime(&A.Pay_End_Dt, $MemoDate, {DEFDATE}, '', '')
+        do Write-Prenotes
+        move &A.Company to $Company
+        move &S.SRC_BANK_ID to $priorTransit#
+    else
+        do Format-DateTime(&A.Pay_End_Dt, $MemoDate, {DEFDATE}, '', '')
+        move &A.Company to $Company
+        move &S.SRC_BANK_ID to $priorTransit#
+        move 'N' to $First_Time
+    end-if
+  end-if
+
+FROM PS_PAY_CALENDAR A,
+     PS_PAYGROUP_TBL B,
+     PS_SRC_BANK     S
+WHERE [$SlctCalendar]
+  AND A.PAYGROUP         = B.PAYGROUP
+  AND A.COMPANY          = B.COMPANY
+  AND B.EFFDT            =
+      (SELECT MAX(EFFDT)
+         FROM PS_PAYGROUP_TBL
+        WHERE COMPANY    = A.COMPANY
+          AND PAYGROUP   = A.PAYGROUP
+          AND EFF_STATUS = 'A')
+  AND A.PAY_CONFIRM_RUN  = 'Y'
+  AND A.PAY_CHECKS_RUN   = 'N'
+  AND S.SRC_BANK_ID      = [$Bank_ID_to_Use_B]
+ORDER BY A.COMPANY,
+         S.SRC_BANK_ID
+end-SELECT
+
+  do Write-Prenotes
+
+end-PROCEDURE
+
+
+begin-procedure Write-Prenotes
+
+begin-SELECT
+PD.NAME
+DD.EMPLID
+DD.EFFDT
+DD.ACCOUNT_TYPE
+DD.ACCOUNT_NUM
+DD.BANK_CD
+
+  if &DD.EmplID <> $priorEmplID
+    move &DD.EmplID to $priorEmplID
+    move &PD.Name to $Name
+    do Rotate-Name
+    do Get-DDP-Data
+    do Memo
+    NEW-PAGE
+  end-if
+
+FROM PS_DIR_DEP_DISTRIB DD,
+     PS_NAMES           PD,
+     PS_PAYGROUP_TBL    PT,
+     PS_JOB              J,
+     PS_DIRECT_DEPOSIT  PS
+WHERE DD.EMPLID           = PD.EMPLID
+  AND PS.EMPLID           = PD.EMPLID
+  AND DD.PRENOTE_STATUS   = 'N'           !Not Submitted
+  AND DD.PRENOTE_REQD     = 'Y'
+  AND DD.ACCOUNT_TYPE    <> '$'           !not ISSUE CHECK
+  AND DD.EFFDT =
+      (SELECT MAX(DD1.EFFDT)
+         FROM PS_DIR_DEP_DISTRIB DD1
+        WHERE DD.EMPLID    = DD1.EMPLID
+          AND DD1.EFFDT <= &A.Pay_End_Dt)
+  AND PD.NAME_TYPE = 'PRI'
+  AND PD.EFFDT =
+      (SELECT MAX(PX.EFFDT)
+       FROM   PS_NAMES PX
+       WHERE  PX.EMPLID    = PD.EMPLID
+         AND  PX.NAME_TYPE = PD.NAME_TYPE
+         AND  PX.EFFDT    <= &A.Pay_End_Dt)
+  AND  J.EMPLID           = PS.EMPLID
+  AND  J.EMPLID           = DD.EMPLID
+  AND  J.EFFDT =
+        (SELECT MAX(EFFDT)
+          FROM  PS_JOB
+         WHERE  EMPLID    = J.EMPLID
+           AND  EMPL_RCD  = J.EMPL_RCD
+           AND  EFFDT    <= &A.Pay_End_Dt)
+   AND J.EFFSEQ =
+        (SELECT MAX(EFFSEQ)
+         FROM   PS_JOB
+         WHERE  EMPLID    = J.EMPLID
+           AND  EMPL_RCD  = J.EMPL_RCD
+           AND  EFFDT     = J.EFFDT)
+  AND PS.EFF_STATUS       = 'A'
+  AND PS.EFFDT            = DD.EFFDT
+  AND PT.COMPANY          = J.COMPANY
+  AND PT.PAYGROUP         = J.PAYGROUP
+  AND PT.EFFDT =
+        (SELECT MAX(EFFDT)
+          FROM  PS_PAYGROUP_TBL
+         WHERE  COMPANY   = PT.COMPANY
+           AND  PAYGROUP  = PT.PAYGROUP
+           AND  EFFDT    <= &A.Pay_End_Dt)
+  AND PT.COMPANY          = $Company
+  AND [$Bank_ID_to_Use_PT] = $priorTransit#
+ORDER BY DD.EMPLID
+end-SELECT
+
+end-PROCEDURE
+
+
+begin-PROCEDURE Get-DDP-Data
+
+#ifdef USA
+  move 'Balance of Net Pay account: None Designated - Check will be issued' to $BalanceAccount
+#endif
+
+#ifdef CANADA
+  move 'Balance of Net Pay account: None Designated - Cheque will be issued' to $BalanceAccount
+#endif
+
+  position () @array
+
+begin-SELECT
+C.PRIORITY
+C.BANK_CD
+C.BRANCH_EC_CD
+C.PRENOTE_STATUS
+C.ACCOUNT_TYPE
+C.ACCOUNT_NUM
+C.DEPOSIT_AMT
+C.AMOUNT_PCT
+C.DEPOSIT_TYPE
+
+  print &C.Priority               (+1,8)     edit 999
+  let $Bank_Branch_Code = rtrim(&C.BANK_CD,'') || &C.BRANCH_EC_CD
+  print $Bank_Branch_Code         (+0,15)
+
+  if &C.Account_Type <> '$'
+    if &C.Prenote_Status = 'N'
+      print '*'                   (+0,25)
+    end-if
+  end-if
+
+  print &C.Account_Num            (+0,26)
+
+  if &C.Account_Type <> '$'
+    move 'ACCOUNT_TYPE' to $FieldName
+    move &C.Account_Type to $FieldValue
+    do Read-Translate-Table
+    print $XlatLongName           (+0,45)
+  end-if
+
+  if &C.DEPOSIT_TYPE = 'B'
+    move 'DEPOSIT_TYPE' to $FieldName
+    move &C.DEPOSIT_TYPE to $FieldValue
+    do Read-Translate-Table
+    print $XlatLongName           (+0,58)
+    move '' to $BalanceAccount
+  else
+    move '' to $BalNetPay
+  end-if
+
+  if &C.Deposit_Amt <> 0
+      move &C.Deposit_Amt to $String  b99999.99
+      do LJustify
+
+      if &C.Account_Type = '$'
+
+#ifdef USA
+        print 'Issue Check  for $'  (+0,58)
+#endif
+
+#ifdef CANADA
+        print 'Issue Cheque for $'  (+0,58)
+#endif
+
+        print $String               (+0,0)
+      else
+        print '$'                   (+0,58)
+        print $String               (+0,0)
+      end-if
+
+  else
+      if &C.Amount_Pct <> 0
+        move &C.Amount_Pct to $String b99.99
+        do LJustify
+
+        if &C.Account_Type = '$'
+
+#ifdef USA
+          print 'Issue Check  for '    (+0,58)
+#endif
+
+#ifdef CANADA
+          print 'Issue Cheque for '    (+0,58)
+#endif
+
+          print $String               (+0,0)
+          print '% of Net Pay'        (+0,0)
+        else
+          print $String               (+0,58)
+          print '% of Net Pay'        (+0,0)
+        end-if
+      end-if
+  end-if
+
+FROM PS_DIR_DEP_DISTRIB C
+WHERE C.EMPLID          = &DD.EmplID
+  AND C.EFFDT           = &DD.EffDt
+end-SELECT
+
+end-procedure
+
+
+begin-procedure Memo
+
+  let $MemoDateDot = $MemoDate || '.'
+
+begin-document (1,1,0)
+                                                                                   INTEROFFICE MEMO
+.b
+.b
+    DATE: $AsOfToday
+.b
+.b
+      TO: $Name
+.b
+.b
+    FROM: Payroll Department
+.b
+.b
+ SUBJECT: Direct Deposit
+.b
+.b
+.b
+.b
+  Your Direct Deposit instructions have been entered into the payroll system and are summarized below.
+.b
+.b
+$Head1
+$Head2
+.b
+ @array
+.b
+.b
+.b
+.b
+.b
+.b
+.b
+.b
+.b
+.b
+.b
+       $BalanceAccount
+.b
+  Prenotification for accounts preceded by an asterisk will be sent on $MemoDateDot  Assuming
+  the account information is verified, your next check will be processed according to the above
+  instructions.
+.b
+  If you have any questions, please contact the Payroll Department.
+end-document
+end-procedure
+
+
+begin-procedure LJustify
+  move 0 to #BlankPosition
+
+  while #BlankPosition = 0
+    find ' ' in $String 0 #BlankPosition
+
+    if #BlankPosition = 0
+      extract $String from $String 1 20
+    end-if
+
+  end-while
+
+end-procedure
+
+#Include 'getcodta.sqc'  !Get-Company-Data procedure
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'payinit.sqc'   !Report Initialization and Timing
+#Include 'rotname1.sqc'  !Rotate-Name procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'readxlat.sqc'  !Read Translate Table procedure
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'stdapi.sqc'    !Update Process API
+#Include 'payrnctl.sqc'  !Get-Run-Control procedure

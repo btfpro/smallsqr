@@ -1,0 +1,810 @@
+!***********************************************************************
+! GEXPY606: Workers Comp 13 Week File                                  *
+!           This program creates a weekly subtotal report by store/    *
+!           department of the total current wages and total current    *
+!           hours.  Also, at the end of the  13 week cycle, a Quarterly*                                                    
+!           subtotal report will be created in the same format.        *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module is the confidential and proprietary information of       *
+! Giant Eagle, Inc.; it is not to be copied, reproduced, or transmitted*
+! in any form, by any means, in whole or in part, nor is it to be used *
+! for any purpose other than that for which it is expressly provided   *
+! without the written permission of Giant Eagle.                       *
+!                                                                      *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+!  $Date:: 01/19/98 04:00p      $                                      *
+!  $Revision:: 01               $                                      *
+!  $Workfile:: GEXPY606.SQR     $                                      *
+!***********************************************************************
+!                         MODIFICATION HISTORY                         *
+!***********************************************************************
+!  INITIALS    DATE           DESCRIPTION OF THE CHANGE                *        
+!***********************************************************************
+!  GXD         01/19/1998     INITIAL CREATION                         *
+!                                                                      *
+!  DAH         01/29/1999     Change the positioning of the reportid   *
+!                             from line 1 to line 2.                   *
+!                                                                      *
+!  JDH         02/15/1999     Added logic to populate from and thru    *
+!                             dates if left blank.                     *
+!                             Performance Tuning.                      *
+!                             Added logic to exclude non-productive    *
+!                             earnings codes.                          *
+!                                                                      *
+!  CWB         09/01/1999     Added logic to pick up hours for         * 
+!                             salaried EEs.                            *
+!                                                                      *
+!  AXL         06/11/2003     Drop AcctCD sub-totals for non STORE     *
+!                             deptid's. Create a prn file for Excel.   *
+!                             Add logic                                *
+!                                                                      *
+! AXL          12/03/2003     Drop OTH_PAY from Wages calculation.     *
+!                             Adding OTH_PAY and OTH_EARNS was         *
+!                             inflating reported wages.                *
+!                                                                      *
+! AXL          04/14/2004     Streamline hours and earnings select and *
+!                             summing.                                 *
+!                                                                      *
+! AXL          01/12/2004     Add logic to recognize year-end run cntls*
+!GEX_PY296 SXD   08/23/2007     Changed XLATTABLE to PSXLATITEM and      * 
+!                               Language_cd field is removed.           *               *
+!***********************************************************************
+
+#include 'setenv.sqc' !Set environment
+#include 'setup01.sqc'
+
+#define #column1     1
+#define #column2    29
+#define #column3    42
+#define #column4    66
+#define #column5    90
+
+!***********************************************************************
+begin-heading 7
+!***********************************************************************
+#Include 'stdhdg01.sqc'
+
+  print ' CURRENT WAGES'        (+2,{#column3})
+  print ' CURRENT HOURS'        (0,{#column4})
+  print 'EMPLOYEE COUNT'        (0,{#column5})
+
+  print '-'                     (+1,{#column3},14)  FILL
+  print '-'                     (0,{#column4},14)   FILL
+  print '-'                     (0,{#column5},14)   FILL
+end-heading
+
+!***********************************************************************
+begin-report
+!***********************************************************************
+  do Init-DateTime
+  do Init-Number
+  do Get-Current-DateTime  
+  do P100-Init-Report
+  do Open-File			!AXL 6/11/2003
+  do P200-Process-Data
+  date-time () hh:mi:ss &timeEnded
+  display 'Report Ended: ' noline
+  display &timeEnded
+  do EOJ-Process
+  do Reset
+  do Stdapi-Term
+end-report
+
+!***********************************************************************
+begin-procedure P100-Init-Report
+!***********************************************************************
+#debug9 Show 'P100-Init-Report'
+
+  do Stdapi-Init
+
+  Let $GEXXX901_Company_Alias  = 'PE.company'
+  Let $GEXXX901_Paygroup_Alias = 'PE.paygroup'
+  Let $GEXXX907_Div_CD_Alias   = 'GDT.GEX_COMPANY_DIV_CD'
+  let $GEXXX909_Acct_Cd_Alias  = 'PE.ACCT_CD'
+
+  If $prcs_process_instance = ''
+    Do P110-SQRW-Run-Controls
+  Else
+    Do P120-Process-Scheduler-Run-Controls
+  End-If
+
+  show '$Prcs_Run_Cntl_ID ' $Prcs_Run_Cntl_ID
+  
+  !interrogate the run control  AXL 6/11/2003
+  Evaluate $Prcs_Run_Cntl_ID
+    When = 'gexpy606'
+    When = 'gexpy606_y'		!AXL 1/12/2005
+      let $ReportID = 'PY606'
+         break
+    When = 'gexpy606b'
+    When = 'gexpy606_yb'	!AXL 1/12/2005	
+      let $ReportID = 'PY606B'
+         break
+    When-Other
+      let $ReportID = 'GEXPY606'
+  End-Evaluate
+  
+  date-time () hh:mi:ss &timeBegan
+  display 'Report Began: ' noline
+  display &timeBegan
+
+  If Rtrim($FromDate,' ') = '' Or
+     Rtrim($ThruDate,' ') = ''
+    Do P125-Get-Date-Range
+  End-If
+
+  let #subtract_Days = 6
+  let $T_date = $ThruDate
+
+  do Convert-To-DTU-Date($T_date, $Tdate)
+  do dtu-subtract-days($Tdate, #subtract_Days, $Check_Date)
+  do Convert-From-DTU-Date($Check_Date, $Check)
+
+  !AXL 6/11/2003 Not a weekly report 
+  !if $FromDate >= $Check
+  !  move 'Workers Comp Weekly Summary' to $ReportTitle
+  !else
+  move 'Worker''s Comp 13 Week Summary' to $ReportTitle
+  !end-if
+
+
+!  display 'From Date: ' noline
+!  display $FromDate
+!  display 'Check Date: ' noline
+!  display $Check
+!  display $ReportTitle
+
+  !AXL 6/11/2003 New focus by Division and not Company 
+  !Let $X000_Order_By = 'Company, DeptID, Account Code'
+  Let $X000_Order_By = 'Division, DeptID, Account Code'
+
+  Do Format-DateTime($FromDate, $From_Date, {DEFDATE}, '', '')
+  Do Format-DateTime($ThruDate, $Thru_Date, {DEFDATE}, '', '')
+
+  Do P130-Print-Cover-Page
+  Do P140-Get-Last-Confirmed-Pay
+
+  Let $GEXERNCD_Erncd_Alias = 'POE.ERNCD'
+  Do Get-Non-Productive-Erncds
+end-procedure
+!AXL 6/11/2003 New procedure - Begin
+!***********************************************************************
+begin-procedure Open-File
+!***********************************************************************
+
+  let $file1 = $file_path || lower($ReportID) || '.txt'
+  display 'file1 <' noline
+  display $file1 noline
+
+  open $file1 as 1 for-writing
+        record=85:fixed	
+        status=#filestat
+  if #filestat < 0
+     display 'Open failed for file <' noline
+     display $file1 noline
+     display '>'
+     stop
+  end-if
+
+end-procedure
+!AXL 6/11/2003 New procedure - End
+
+!***********************************************************************
+Begin-Procedure P110-SQRW-Run-Controls
+!***********************************************************************
+#debug9 Show 'P110-SQRW-Run-Controls'
+
+
+  !AXL 06/11/2003 Establish network path
+  Display 'Enter File Path  (\\nt5\directory\subdir\)'
+  While 1=1
+    Input $file_path Maxlen=50 'File Path'
+    If Rtrim($file_path, ' ') = ''
+      Break
+    End-If
+  End-While
+
+  Do Ask-From-Thru-Date
+
+  Display 'Enter Company/Paygroup to exclude or leave blank to exit.'
+  While 1=1
+    Input $In-Company Maxlen=3 'Company'
+    Uppercase $In-Company
+    If Rtrim($In-Company, ' ') = ''
+      Break
+    Else
+      Input $In-Paygroup Maxlen=3 'Paygroup'
+      Uppercase $In-Paygroup
+      If Rtrim($In-Paygroup, ' ') = ''
+        Let $Exclude_Condition = '(' || $GEXXX901_Company_Alias || ' != '''  || $In-Company || ''')'
+      Else
+        Let $Exclude_Condition = '(' || $GEXXX901_Company_Alias || ' != '''  || $In-Company || ''' Or ' || $GEXXX901_Paygroup_Alias || ' != '''  || $In-Paygroup || ''')'
+      End-If
+      Add 1 To #GEX_RC_PAYGROUP_ROWS
+      If #GEX_RC_PAYGROUP_ROWS = 1
+        Let $GEXXX901_EXCLUDE_COMPANY_PAYGROUP_CRITERIA = '(' || $Exclude_Condition
+      Else
+        Let $GEXXX901_EXCLUDE_COMPANY_PAYGROUP_CRITERIA = $GEXXX901_EXCLUDE_COMPANY_PAYGROUP_CRITERIA || ' And '  || $Exclude_Condition
+      End-If
+    End-If
+  End-While
+
+  If #GEX_RC_PAYGROUP_ROWS = 0
+    Let $GEXXX901_EXCLUDE_COMPANY_PAYGROUP_CRITERIA = '1=1'
+    Let $GEXXX901_EXCLUDE_COMPANY_PAYGROUP_DISPLAY_CRITERIA = 'NONE'
+  Else
+    Let $GEXXX901_EXCLUDE_COMPANY_PAYGROUP_CRITERIA = $GEXXX901_EXCLUDE_COMPANY_PAYGROUP_CRITERIA || ')'
+    Let $GEXXX901_EXCLUDE_COMPANY_PAYGROUP_DISPLAY_CRITERIA = $GEXXX901_EXCLUDE_COMPANY_PAYGROUP_CRITERIA
+  End-If
+
+  !AXL 6/11/2003 New run control variables - Begin
+  Display 'Enter Company Division Code to exclude or leave blank to exit.'
+  While 1=1
+    Input $In-DivCd Maxlen=3 'Company Division Code'
+    Uppercase $In-DivCd
+    If Rtrim($In-DivCd, ' ') = ''
+      Concat '''' With $DivCdString
+      Break
+    End-If
+    If $DivCdString <> ''''
+      Concat ''',''' With $DivCdString
+    End-If
+    Concat $In-DivCd With $DivCdString
+  End-While
+
+  If $DivCdString = ''''''
+    Let $GEXXX907_EXCLUDE_DIV_CD_CRITERIA = '1=1'
+    Let $GEXXX907_EXCLUDE_DIV_CD_DISPLAY_CRITERIA = 'ALL'
+  Else
+    Let $GEXXX907_EXCLUDE_DIV_CD_CRITERIA = $GEXXX907_Div_CD_Alias || ' Not In (' || $DivCdString || ')'
+    Let $GEXXX907_EXCLUDE_DIV_CD_DISPLAY_CRITERIA = $GEXXX907_EXCLUDE_DIV_CD_CRITERIA
+  End-If
+
+  Display 'Enter Account Code or leave blank to exit.'
+  While 1=1
+    Input $In-AcctCd Maxlen=25 'Account Code'
+    Uppercase $In-AcctCd
+    If Rtrim($In-AcctCd, ' ') = ''
+      Concat '''' With $AcctCdString
+      Break
+    End-If
+    If $AcctCdString <> ''''
+      Concat ''',''' With $AcctCdString
+    End-If
+    Concat $In-AcctCd With $AcctCdString
+  End-While
+
+  If $AcctCdString = ''''''
+    Let $GEXXX909_INCLUDE_ACCT_CD_CRITERIA = '1=1'
+    Let $GEXXX909_INCLUDE_ACCT_CD_DISPLAY_CRITERIA = 'ALL'
+  Else
+    Let $GEXXX909_INCLUDE_ACCT_CD_CRITERIA = $GEXXX909_Acct_CD_Alias || ' In (' || $AcctCdString || ')'
+    Let $GEXXX909_INCLUDE_ACCT_CD_DISPLAY_CRITERIA = $GEXXX909_INCLUDE_ACCT_CD_CRITERIA
+  End-If
+  !AXL 6/11/2003 New run control variables - End
+
+End-Procedure
+
+!***********************************************************************
+Begin-Procedure P120-Process-Scheduler-Run-Controls
+!***********************************************************************
+#debug9 Show 'P120-Process-Scheduler-Run-Controls'
+  Do GEXXX922-Select-Parameters
+  Do GEXXX901-Select-Company-Paygroup-Parameters
+  Do GEXXX907-Select-DIV-CD-Parameters		!AXL 6/11/2003 New Run Ctl
+  Do GEXXX909-Select-Acct-CD-Parameters		!AXL 6/11/2003 New Run Ctl
+
+  Let $FromDate  = $GEX_RC_PAY.FromDate
+  Let $ThruDate  = $GEX_RC_PAY.ThruDate
+  let $file_path = lower($GEX_RC_PAY.GEX_FILE_LOCATION)		!AXL 6/11/2003 New Run Ctl
+
+End-Procedure
+
+!***********************************************************************
+Begin-Procedure P125-Get-Date-Range
+!***********************************************************************
+#debug9 Show 'P125-Get-Date-Range'
+  Let $Year4 = '1'
+  Do Format-DateTime($AsOfToday, $AsOfToday_MMDDYYYY, {DEFDATE}, '', '')
+  Let $AsOfMM = Substr($AsOfToday_MMDDYYYY,1,2)
+  Let #AsOfMM = $AsOfMM
+  Let $AsOfYYYY = Substr($AsOfToday_MMDDYYYY,7,4)
+  Let #Current_Year = $AsOfYYYY
+  Let #Previous_Year = #Current_Year - 1
+  Move #Current_Year  To $Current_Year 9999
+  Move #Previous_Year To $Previous_Year 9999
+
+  Evaluate #AsOfMM
+    When <= 3
+      Let $FromDate = '01-OCT-' || $Previous_Year
+      Let $ThruDate = '31-DEC-' || $Previous_Year
+      Break
+    When <= 6
+      Let $FromDate = '01-JAN-' || $Current_Year
+      Let $ThruDate = '31-MAR-' || $Current_Year
+      Break
+    When <= 9
+      Let $FromDate = '01-APR-' || $Current_Year
+      Let $ThruDate = '30-JUN-' || $Current_Year
+      Break
+    When <= 12
+      Let $FromDate = '01-JUL-' || $Current_Year
+      Let $ThruDate = '30-SEP-' || $Current_Year
+      Break
+  End-Evaluate  
+End-Procedure
+
+!***********************************************************************
+begin-procedure P130-Print-Cover-Page
+!***********************************************************************
+#debug9 Show 'P130-Print-Cover-Page'
+  Print 'RUN CONTROL INFORMATION FOR THIS REPORT RUN:'            (+5,1)
+  Print '$Prcs_OprID          ='                                  (+2,5)
+  Print $Prcs_OprID                                               (0,+2)
+  Print '$Prcs_Run_Cntl_ID    ='                                  (+1,5)
+  Print $Prcs_Run_Cntl_ID                                         (0,+2)
+
+  Print 'SELECTION CRITERIA FOR THIS REPORT RUN:'                 (+5,2)
+  print '$GEXXX901_EXCLUDE_COMPANY_PAYGROUP_DISPLAY_CRITERIA ='   (+1,5)
+  print $GEXXX901_EXCLUDE_COMPANY_PAYGROUP_DISPLAY_CRITERIA 	  (0,+2)
+  print '$GEXXX907_EXCLUDE_DIV_CD_DISPLAY_CRITERIA           ='   (+1,5)
+  print $GEXXX907_EXCLUDE_DIV_CD_DISPLAY_CRITERIA        	  (0,+2)
+  print '$GEXXX909_INCLUDE_ACCT_CD_DISPLAY_CRITERIA          ='   (+1,5)
+  print $GEXXX909_INCLUDE_ACCT_CD_DISPLAY_CRITERIA                (0,+2)
+  
+
+  Print 'From Date:'                        (+2,5)
+  Print $From_Date                          (0,+2)
+  Print 'Thru Date:'                        (+1,5)
+  Print $Thru_Date                          (0,+2)
+
+  Print 'SORT ORDER FOR THIS REPORT RUN:'   (+5,2)
+  Print $X000_Order_By                      (+2,5)
+
+  Let #PAGE-COUNT = 0
+  NEW-PAGE
+End-Procedure
+
+!***********************************************************************
+Begin-Procedure P140-Get-Last-Confirmed-Pay
+!***********************************************************************
+#debug9 Show 'P140-Get-Last-Confirmed-Pay'
+Begin-Select
+Max(pay_end_dt) &pay_end_dt
+
+  Let $pay_end_dt = &pay_end_dt
+
+  If Rtrim($pay_end_dt,' ') = ''
+    Show 'No confirmed pay period found in calendar'
+    Stop
+  End-If
+
+From   ps_pay_calendar
+
+Where  pay_end_dt         =
+      (Select Max(pay_end_dt)
+       From   ps_pay_calendar
+       Where  pay_end_dt <= $ThruDate
+       And    pay_confirm_run = 'Y')
+
+And    pay_confirm_run = 'Y'
+End-Select
+End-Procedure
+
+!***********************************************************************
+Begin-Procedure P200-Process-Data
+!***********************************************************************
+#debug9 Show 'P200-Process-Data'
+  move 'N' to $rowfound
+  
+Begin-Select ON-ERROR=SQL-Error-Found('P200-Process-data')
+
+!AXL 6/11/2003 New var to break on
+GDT.GEX_COMPANY_DIV_CD ()  on-break
+                      level=1
+                      after=P250-Print-Division-Totals
+                      save=$save_division
+                      print=never
+
+!PE.COMPANY        ()  on-break
+!                      level=1
+!                      after=P250-Print-Company-Totals
+!                      save=$save_division
+!                      print=never
+
+PE.DEPTID         ()  on-break
+                      level=2
+                      after=P240-Print-Deptid-Totals
+                      save=$save_deptid
+                      print=never
+
+PE.ACCT_CD        ()  on-break
+                      level=3
+                      after=P230-Print-Acct-Cd-Totals
+                      save=$save_acct_cd
+                      print=never
+
+PE.EMPLID         ()  on-break
+                      level=4
+                      print=never
+
+PE.EMPL_RCD      ()  on-break
+                      level=5
+                      after=P220-Employee-Count
+                      print=never
+PE.COMPANY
+PE.PAYGROUP
+PE.PAY_END_DT
+PE.OFF_CYCLE
+PE.PAGE_NUM
+PE.LINE_NUM
+PE.ADDL_NBR
+PE.SEPCHK
+!AXL 04/14/2004  Streamline hours and earnings select and summing - Begin
+SUM(PE.REG_HRS   + PE.OT_HRS         + PE.REG_EARN_HRS)  &hours
+SUM(PE.REG_EARNS + PE.REG_HRLY_EARNS + PE.OT_HRLY_EARNS) &earnings
+!AXL 04/14/2004  Streamline hours and earnings select and summing - End
+
+  move 'Y' to $rowfound
+  Add &hours          To #acct_tot_hrs
+
+  Add &earnings       To #acct_tot_earns
+
+  do P210-Get-Other-Earnings
+
+  Add &other_hours    To #acct_tot_hrs
+  Add &other_earnings To #acct_tot_earns
+  
+  !AXL 6/11/2003 Sub-total displays depend on retail classification
+  Evaluate &PE.PAYGROUP
+    When = 'RET'
+    When = 'PHM'
+    When = 'RE2'
+    When = 'PH2'
+    When = 'RE3'
+    When = 'PH3'
+    When = 'RE4'
+    When = 'PH4'
+         let $Non_Retail_Flag='N'
+         break
+    When-Other
+         let $Non_Retail_Flag='Y'
+  End-Evaluate
+  !AXL 6/11/2003 Sub-total displays depend on retail classification - End
+   
+FROM   PS_PAY_EARNINGS PE ,
+       PS_GEX_DEPT_TBL  GDT
+
+WHERE  PE.PAY_END_DT  BETWEEN $FromDate AND $ThruDate
+
+AND    PE.OK_TO_PAY         = 'Y'
+
+AND    PE.SINGLE_CHECK_USE IN ('C','N')
+AND    PE.PAY_LINE_STATUS  IN ('C','F')
+
+AND    PE.DEPTID  = GDT.DEPTID
+
+AND    GDT.EFFDT =
+      (Select Max(effdt) From  ps_gex_dept_tbl
+       Where  deptid             = gdt.deptid
+       And    effdt             <= $ThruDate)
+AND    GDT.sequence_number       =
+      (Select Max(sequence_number) From ps_gex_dept_tbl
+       Where  deptid             = gdt.deptid
+       And    effdt              = gdt.effdt)
+
+AND   [$GEXXX901_EXCLUDE_COMPANY_PAYGROUP_CRITERIA]
+AND   [$GEXXX907_EXCLUDE_DIV_CD_CRITERIA]
+AND   [$GEXXX909_INCLUDE_ACCT_CD_CRITERIA]
+
+GROUP BY GDT.GEX_COMPANY_DIV_CD,
+         !PE.COMPANY,
+         PE.DEPTID,
+         PE.ACCT_CD,
+         PE.EMPLID,
+         PE.EMPL_RCD,
+         PE.COMPANY,
+         PE.PAYGROUP,
+         PE.PAY_END_DT,
+         PE.OFF_CYCLE,
+         PE.PAGE_NUM,
+         PE.LINE_NUM,
+         PE.ADDL_NBR,
+         PE.SEPCHK
+
+ORDER BY GDT.GEX_COMPANY_DIV_CD,
+         !PE.COMPANY,
+         PE.DEPTID,
+         PE.ACCT_CD,
+         PE.EMPLID,
+         PE.EMPL_RCD
+
+End-Select
+
+  if $rowfound = 'N'
+    display 'No Employees found for the Workers Comp Report.' 
+  else
+    print '* * * * *      GRAND TOTALS'  (+2,{#column1})
+    print #grand_tot_earns            (0,{#column3})  Edit 999,999,990.00
+    print #grand_tot_hrs              (0,{#column4})  Edit 999,999,990.00
+    print #grand_tot_empl_count       (0,{#column5})  Edit 99,999,999,990
+
+    !AXL 6/11/2003 - New print routines
+    let $row_id = 'Grand Totals '
+    let $filler4 = '****'
+    let $filler3 = '***'
+
+    do format-number(#grand_tot_earns,$grand_tot_earns,'999999999.99')
+    do format-number(#grand_tot_hrs,$grand_tot_hrs,'999999999.99')
+    do format-number(#grand_tot_empl_count,$grand_empl_count,'999999')
+
+    write 1 from         '"':1
+                         $filler3:3
+                         '","':3
+                         $filler4:4
+                         '","':3
+                         $filler3:3		
+                         '","':3
+                         $grand_tot_earns:12
+                         '","':3
+                         $grand_tot_hrs:12
+                         '","':3
+                         $grand_empl_count:8
+                         '"':1	
+
+  end-if
+end-procedure
+
+!***********************************************************************
+begin-procedure P210-Get-Other-Earnings
+!***********************************************************************
+#debug9 Show 'P210-Get-Other-Earnings'
+begin-select ON-ERROR=SQL-Error-Found('P210-Get-Other-Earnings')
+
+SUM(POE.OTH_HRS) &other_hours
+
+!AXL 12/3/2003 Drop OTH_PAY from calculation - Begin
+!SUM(POE.OTH_PAY+POE.OTH_EARNS) &other_earnings
+SUM(POE.OTH_EARNS) &other_earnings
+!AXL 12/3/2003 Drop OTH_PAY from calculation - End
+
+FROM   PS_PAY_OTH_EARNS POE
+
+WHERE  POE.COMPANY    = &pe.company
+AND    POE.PAYGROUP   = &pe.paygroup
+AND    POE.PAY_END_DT = &pe.pay_end_dt
+AND    POE.OFF_CYCLE  = &pe.off_cycle
+AND    POE.PAGE_NUM      = &pe.page_num
+AND    POE.LINE_NUM      = &pe.line_num
+AND    POE.ADDL_NBR      = &pe.addl_nbr
+AND    POE.SEPCHK        = &pe.sepchk
+
+AND   [$GEXERNCD_EXCLUDE_ERNCD_CRITERIA]
+
+end-select
+end-procedure
+
+!***********************************************************************
+Begin-Procedure P220-Employee-Count
+!***********************************************************************
+#debug9 Show 'P220-Employee-Count'
+  Add 1 To #acct_empl_count
+End-Procedure
+
+!***********************************************************************
+Begin-Procedure P230-Print-Acct-Cd-Totals
+!***********************************************************************
+#debug9 Show 'P230-Print-Acct-Cd-Totals'
+
+  If $Non_Retail_Flag = 'Y'
+     If #acct_tot_hrs   > 0 Or
+        #acct_tot_earns > 0
+        !AXL 6/11/2003 New print routines
+        if $save_division = 'CLW' or $save_division = 'WHS'
+
+           print '* * TOTALS FOR ACCOUNT CODE' (+1,{#column1})
+           print $save_acct_cd                 (0,{#column2})
+  
+           print #acct_tot_earns               (0,{#column3})  Edit 999,999,990.00
+           print #acct_tot_hrs                 (0,{#column4})  Edit 999,999,990.00
+           print #acct_empl_count              (0,{#column5})  Edit 99,999,999,990
+
+           let $row_id = 'Totals for ' || $save_division || '/' || $save_deptid || '/' ||$save_acct_cd
+
+           do format-number(#acct_tot_earns,$acct_tot_earns,'999999999.99')
+           do format-number(#acct_tot_hrs,$acct_tot_hrs,'999999999.99')
+           do format-number(#acct_empl_count,$acct_empl_count,'9999')
+
+           write 1 from 
+                             '"':1
+                             $save_division:3
+                             '","':3
+                             $save_deptid:4
+                             '","':3
+                             $save_acct_cd:3
+                             '","':3
+                             $acct_tot_earns:12
+                             '","':3
+                    	     $acct_tot_hrs:12
+                             '","':3
+                             $acct_empl_count:8
+                             '"':1	       
+        End-If
+     End-If
+  End-if
+
+  add #acct_tot_hrs      to #dept_tot_hrs
+  add #acct_tot_earns    to #dept_tot_earns
+  add #acct_empl_count   to #dept_empl_count
+
+  move 0 to #acct_tot_hrs
+  move 0 to #acct_tot_earns
+  move 0 to #acct_empl_count
+End-Procedure
+
+!***********************************************************************
+begin-procedure P240-Print-Deptid-Totals
+!***********************************************************************
+#debug9 Show 'P240-Print-Deptid-Totals'
+  If #dept_tot_hrs   > 0 Or
+     #dept_tot_earns > 0
+    print '* * * TOTALS FOR DEPARTMENT'(+2,{#column1})
+    print $save_deptid                 (0,{#column2})
+   
+    print #dept_tot_earns              (0,{#column3})  Edit 999,999,990.00
+    print #dept_tot_hrs                (0,{#column4})  Edit 999,999,990.00
+    print #dept_empl_count             (0,{#column5})  Edit 99,999,999,990
+    print ' '                          (+1,1)
+
+    !AXL 6/11/2003 New print routines.
+    let $row_id = 'Totals for ' || $save_division || '/' || $save_deptid
+    let $filler4 = '****'
+    let $filler3 = '***'
+
+    do format-number(#dept_tot_earns,$dept_tot_earns,'999999999.99')
+    do format-number(#dept_tot_hrs,$dept_tot_hrs,'999999999.99')
+    do format-number(#dept_empl_count,$dept_empl_count,'9999')
+
+    write 1 from         '"':1
+                         $save_division:3
+                         '","':3
+                         $save_deptid:4
+                         '","':3
+                         $filler3:3		
+                         '","':3
+                         $dept_tot_earns:12
+                         '","':3
+                         $dept_tot_hrs:12
+                         '","':3
+                         $dept_empl_count:8
+                         '"':1	
+
+    add #dept_tot_hrs      to #comp_tot_hrs
+    add #dept_tot_earns    to #comp_tot_earns
+    add #dept_empl_count   to #comp_empl_count
+
+    move 0 to #dept_tot_hrs
+    move 0 to #dept_tot_earns
+    move 0 to #dept_empl_count
+  End-If
+end-procedure
+
+!AXL 6/11/2003 - New focus on Divisions
+!***********************************************************************
+begin-procedure P250-Print-Division-Totals
+!***********************************************************************
+#debug9 Show 'P250-Print-Division-Totals'
+
+  Do Get-Div-Name
+
+  If #comp_tot_hrs   > 0 Or
+     #comp_tot_earns > 0
+    !AXL 6/11/2003 New focus on DIVISION and new print routines
+    print '* * * *TOTALS FOR DIVISION-'  (+2,{#column1})
+    print $save_division                  (0,{#column2})
+
+    print #comp_tot_earns                (0,{#column3})  Edit 999,999,990.00
+    print #comp_tot_hrs                  (0,{#column4})  Edit 999,999,990.00
+    print #comp_empl_count               (0,{#column5})  Edit 99,999,999,990
+    print $Div_Name                      (+1,8)
+    print ' '                            (+3,1)
+
+    let $row_id = 'Totals for ' || $save_division
+    let $filler4 = '****'
+    let $filler3 = '***'
+
+    do format-number(#comp_tot_earns,$comp_tot_earns,'999999999.99')
+    do format-number(#comp_tot_hrs,$comp_tot_hrs,'999999999.99')
+    do format-number(#comp_empl_count,$comp_empl_count,'9999')
+
+    write 1 from 
+                         '"':1
+                         $save_division:3
+                         '","':3
+                         $filler4:4
+                         '","':3
+                         $filler3:3		
+                         '","':3
+                         $comp_tot_earns:12	
+                         '","':3
+                         $comp_tot_hrs:12	
+                         '","':3
+                         $comp_empl_count:8 
+                         '"':1
+
+    add #comp_tot_hrs     to #grand_tot_hrs
+    add #comp_tot_earns   to #grand_tot_earns
+    add #comp_empl_count  to #grand_tot_empl_count
+
+    move 0 to #comp_tot_hrs
+    move 0 to #comp_tot_earns
+    move 0 to #comp_empl_count
+  End-If
+end-procedure
+
+!***********************************************************************
+begin-procedure Get-Div-Name 
+!***********************************************************************
+#debug9 Show 'Get-Div-Name'
+
+begin-select
+
+X1.XLATLONGNAME
+
+ let $Div_Name = &X1.XLATLONGNAME
+!GEX_PY296  SXD   08/23/2007     Begin
+!From  XLATTABLE X1
+From PSXLATITEM X1
+!Where X1.EFFDT = (SELECT MAX(EFFDT) FROM XLATTABLE
+Where X1.EFFDT = (SELECT MAX(EFFDT) FROM PSXLATITEM
+        WHERE x1.FIELDNAME = FIELDNAME
+        !  GEX_PY296 SXD  08/28/2007  Begin
+!          AND x1.LANGUAGE_CD = LANGUAGE_CD 
+        !  GEX_PY296 SXD  08/27/2007  End 
+          AND x1.FIELDVALUE = FIELDVALUE
+          AND EFFDT <= SYSDATE)
+  AND X1.FIELDNAME  = 'GEX_COMPANY_DIV_CD'
+  AND X1.fieldvalue = $save_division
+!GEX_PY296 SXD  08/23/2007      End
+end-select
+
+end-procedure
+
+!***********************************************************************
+begin-procedure SQL-Error-Found($Proc_Name) 
+!***********************************************************************
+#debug9 Show 'SQL-Error-Found'
+  display 'SQL Error in ' 
+  display $Proc_Name 
+  display $_sql-error
+  display 'sql-status:' 
+  display #_sql-status 
+  stop
+end-procedure
+
+!***********************************************************************
+Begin-Procedure EOJ-Process
+!***********************************************************************
+
+  close 1
+
+end-procedure
+
+#Include 'gexxx922.sqc'  !Get gex_rc_pay run controls
+#Include 'gexxx901.sqc'  !Get multiple company/paygroup run controls
+#Include 'askftd.sqc'    !From Thru Date input
+#Include 'reset.sqc'     !Reset printer procedure
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'stdapi.sqc'    !Update Process API
+#Include 'datemath.sqc'  !Does the date-math functions
+#include 'gexerncd.sqc'  
+#include 'gexxx909.sqc'  !Get acct_cd code multiple row table
+#Include 'gexxx907.sqc'  !Retrieve multiple company division run controls

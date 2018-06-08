@@ -1,0 +1,702 @@
+!***********************************************************************
+! GEXBN614:  Marsh Voluntary Benefits Deductions-Outbound File         *
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module is the confidential and proprietary information of       *
+! Giant Eagle, Inc.; it is not to be copied, reproduced,or transmitted *
+! in any form, by any means, in whole or in part, nor is it to be used *
+! for any purpose other than that for which it is expressly provided   *
+! without the written permission of Giant Eagle.                       *
+!                                                                      *
+! Copyright (c) 1997-1998 Giant Eagle,Inc. All Rights Reserved         *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+! GEXBN614 :            Marsh Voluntary Benefits Deductions: Outbound  *
+!                        file for voluntary deductions paid in the last*
+!                        month.                                        *
+!                                                                      *
+! Narrative:            This SQR is designed to produce a file with pay*
+!                         deduction information for Marsh voluntary    *
+!                         benefit deductions for the last month.       *
+!                                                                      *
+! #Debugx Used:         #debug9 paragraph trace                        *
+!                       #debug8 key variable values                    *
+!                       #debug7 data returned from sql calls           *
+!                                                                      *
+! SQL Tables:           job                                            *
+!                       job_labor                                      *
+!                       personal_data                                  *
+!                       pay_deduction                                  *
+!                       pay_check                                      *
+!                       pay_cal_bal_id                                 *
+!                       pay_calendar                                   *
+!                                                                      *
+! Written by:           Gene Davis                                     *
+!                                                                      *
+! Normally Run:         Monthly                                        *
+!                                                                      *
+! Control Parms:        AsOfDate                                       *
+!                                                                      *
+!***********************************************************************
+!                         MODIFICATION HISTORY                         *
+!***********************************************************************
+! INITIALS  DATE        DESCRIPTION OF THE CHANGE                      *
+!***********************************************************************
+! GBD       01/31/2003  Initial Creation - Cloned from gexbn609        *
+!                                                                      *
+! GBD       04/21/2003  v8.3 Upgrade                                   *
+!                                                                      *
+! GBD       08/07/2003  Added code to pull prior month non-active      *
+!                       employees with current month deductions. This  *
+!                       will cover employees who are termed with pre-  *
+!                       dated effective dates.                         *
+!                                                                      *
+! AXL       03/07/2006  Broke out detail by dedcd instead of grouping  *
+!                       and summing by emplid.  Added run control logic*
+!										           *
+! DXS       03/11/2008  Added order by clause in P220-Get-Employee-Data*
+! GEX_SEC_REENG 2015-04-29 Vahini Katta                                *
+! Changes related to gex_emplid_mapp/7 digit emplid                    *
+!***********************************************************************
+
+#include 'setenv.sqc'    !Set environment
+#Include 'setup32.sqc'   !Printer and Page-Size Initialization (Landscape)
+
+#define #column1     1
+#define #column2    12
+#define #column3    18
+#define #column4    55
+#define #column5    64
+#define #column6    74
+#define #column7    82
+#define #column8    96		!AXL 03/07/2006
+#define #column9   107		
+!#define #column9a  123		 AXL 03/07/2006
+!#define #column10  139		 AXL 03/07/2006
+
+Begin-Setup
+Declare-Report Log-Report
+! Printer-Type=HPLASERJET
+! Layout=Default
+    layout=default
+    printer-type=HP
+End-Declare
+
+Declare-Report Paid-Report
+ !Printer-Type=HPLASERJET
+ !Layout=Default
+    layout=default
+    printer-type=HP
+End-Declare
+End-Setup
+
+
+Begin-Report
+#debug9 Show 'Begin-Report'
+  Use-Report Log-Report
+  Do P100-Initialization
+  Do P200-Main-Process
+  Do P400-Finalization
+End-Report
+
+begin-procedure Print-Cover-Page
+#debug9 Show 'Print-Cover-Page'
+  Print 'RUN CONTROL INFORMATION FOR THIS REPORT RUN:'            (+5,1)
+  Print '$Prcs_OprID          ='                                  (+2,5)
+  Print $Prcs_OprID                                               (0,+2)
+  Print '$Prcs_Run_Cntl_ID    ='                                  (+1,5)
+  Print $Prcs_Run_Cntl_ID                                         (0,+2)
+
+  Print 'SELECTION CRITERIA FOR THIS REPORT RUN:'                 (+5,2)
+  !AXL 03/07/2006 - Begin
+  Print '$GEXXX919_INCLUDE_DEDCD_DISPLAY_CRITERIA = '             (+2,5)
+  Print $GEXXX919_INCLUDE_DEDCD_DISPLAY_CRITERIA                  (0,+2)
+  !AXL 03/07/2006 - End 
+  Print 'As Of Date :'                      (+2,5)
+  Print $asofdate_out                       (0,+2)
+
+  Let #PAGE-COUNT = 0
+  NEW-PAGE
+  Let #PAGE-COUNT = 1
+End-Procedure
+
+!********************************************
+Begin-Heading 7 For-Reports=(Paid-Report)
+!********************************************
+#debug9 Show 'Begin-Heading (Paid-Report)'
+  Let $ReportID      =   'GEXBN614'
+  Let $ReportTitle   =   'Marsh Voluntary Benefits Deductions'
+  Let $ReportTitle2  =   'Monthly Report'
+
+  #Include 'stdhdg01.sqc'
+  Print $ReportTitle2      (3,) Center
+
+  Print 'EMPLID'           (+3,{#column1})
+  Print 'RCD#'             (+0,{#column2})
+  Print 'NAME'             (+0,{#column3})
+  Print 'COMPANY'          (+0,{#column4})
+  Print 'PAYGROUP'         (+0,{#column5})
+  Print 'STATUS'           (+0,{#column6})
+  Print 'EFFDT'            (+0,{#column7})
+  Print 'DEDCD'		   (+0,{#column8})	!AXL 03/07/2006
+  Print '    DED AMT'       (+0,{#column9})	!AXL 03/07/2006 was column10
+
+  Print '-'                (+1,{#column1},9)   Fill
+  Print '-'                (+0,{#column2},4)   Fill
+  Print '-'                (+0,{#column3},35)  Fill
+  Print '-'                (+0,{#column4},7)   Fill
+  Print '-'                (+0,{#column5},8)   Fill
+  Print '-'                (+0,{#column6},6)   Fill
+  Print '-'                (+0,{#column7},10)  Fill
+  Print '-'                (+0,{#column8},9)  Fill
+  Print '-'                (+0,{#column9},11)  Fill
+ 
+End-Heading
+
+
+!********************************************
+Begin-Procedure P100-Initialization
+!********************************************
+#debug9 Show 'P100-Initialization'
+  Do Init-DateTime           !datetime.sqc
+  Do Init-Number             !number.sqc
+  Do Get-Current-DateTime    !curdttim.sqc
+  Do Stdapi-Init             !stdapi.sqc
+
+  Let $ReportID      =   'GEXBN614'
+  Let $ReportTitle   =   'Marsh Voluntary Benefit Deductions'
+
+  Show '$ReportID    = ' $ReportID
+  Show '$ReportTitle = ' $ReportTitle
+
+  Let $GEXXX919_Dedcd_Alias = 'DE.DEDCD'	!AXL 03/07/2006
+
+  If $prcs_process_instance = ''
+    Do Ask-As-Of-Date
+    !AXL 03/07/2006 - New
+    Let $DedcdString = ''''
+    Display 'Enter Dedcd or leave blank to exit.'
+    While 1=1
+      Input $Dedcd Maxlen=6 'Dedcd'
+      Uppercase $Dedcd
+      If Rtrim($Dedcd, ' ') = ''
+        Concat '''' With $DedcdString
+        Break
+      End-If
+      If $DedcdString <> ''''
+        Concat ''',''' With $DedcdString
+      End-If
+      Concat $Dedcd With $DedcdString
+    End-While
+
+    If $DedcdString = ''''''
+      Let $GEXXX919_INCLUDE_DEDCD_CRITERIA = '1=1'
+      Let $GEXXX919_INCLUDE_DEDCD_DISPLAY_CRITERIA = 'ALL'
+    Else
+      Let $GEXXX919_INCLUDE_DEDCD_CRITERIA = $GEXXX919_Dedcd_Alias || ' In (' || $DedcdString || ')'
+      Let $GEXXX919_INCLUDE_DEDCD_DISPLAY_CRITERIA = $GEXXX919_INCLUDE_DEDCD_CRITERIA
+    End-If
+    !AXL 03/07/2006 - End
+  Else
+    Do GEXRCBN1-SELECT-PARAMETERS
+    Let $AsOfDate = &GEX_RC_BEN.ASOFDATE
+    If Rtrim($AsOfDate, ' ') = ''
+      Let $AsOfDate = $AsOfToday
+    End-If
+   
+    Do GEXXX919-Select-DEDCD-Parameters		!AXL 03/07/2006
+
+  End-If
+
+  let $Year4=1
+  Show $AsOfDate
+  Do Format-DateTime($AsOfDate,$asofdate_out,{DEFMDY},'','')
+  show '$asofdate_out: ' $asofdate_out
+  let $aod_mm = substr($asofdate_out,1,2)
+  let $aod_dd = substr($asofdate_out,4,2)
+  let $aod_yy = substr($asofdate_out,7,4)
+  let $out_effdt = $aod_mm||'/'||$aod_dd||'/'||$aod_yy  
+  Show '$out_effdt: ' $out_effdt
+
+  date-time () HH:MI:SS &timeBegan
+  date-time () MM/DD/YYYY &dateBegan
+  show 'Report Began at ' &timeBegan ' on ' &dateBegan
+  show ' '
+
+  let $Data-Found-Flag = 'N'
+
+  Use-Report Paid-Report
+  Do Print-Cover-Page
+
+  Do P110-Open-File
+End-Procedure
+
+!********************************************
+Begin-Procedure P110-Open-File
+!********************************************
+#debug9 Show 'P110-Open-File'
+
+!Open Output file
+!****************
+  let $filename = '{OUTFILE}'|| Lower($ReportID) || '.dat'
+  !let $filename = 'c:\temp\'||Lower($ReportID) || '.dat'
+  open $filename as 1
+     for-writing record=66
+
+  if #writestat != 0
+    display 'Error Opening output file.  Program terminating.'
+    stop
+  end-if
+
+  Do P300-Header-Record
+
+End-Procedure
+
+
+!********************************************
+Begin-Procedure P200-Main-Process
+!********************************************
+#debug9 Show 'P200-Main-Process'
+
+    Use-Report Log-Report
+    Do P210-Get-Last-Confirmed-Pay
+
+    Do P220-Get-Employee-Data
+
+End-Procedure
+
+
+!********************************************
+Begin-Procedure P210-Get-Last-Confirmed-Pay
+!********************************************
+#debug9 Show 'P210-Get-Last-Confirmed-Pay'
+Begin-Select Loops=1
+pc.pay_end_dt
+To_Number(To_Char(pc.pay_end_dt,'MM'))          &balance_period
+To_Number(To_Char(pc.pay_end_dt,'YYYY'))        &balance_year
+To_Char(pc.pay_end_dt,'fmMonth YYYY')           &period
+
+  Let $AsOfDate         = &pc.pay_end_dt
+  Let $pay_end_dt       = &pc.pay_end_dt
+  Let #balance_year     = &balance_year
+  Let #balance_period   = &balance_period
+  Let $Reporting_Period = &period
+
+  let #balance_qtr = #balance_period
+  let #balance_qtr = ((#balance_qtr - 1)/ 3) + 1
+  do Format-Number(#balance_qtr, $balance_qtr, '9.99') !avoid rounding the integer portion
+  move $balance_qtr to $balance_qtr x     !save the integer portion
+  let #balance_qtr = $balance_qtr
+
+  Do Format-Number(#balance_year, $balance_year, '9999')
+  Do Format-Number(#balance_period, $balance_period, '99')
+
+!GBD 08/07/2003 Begin
+  If substr($balance_period,1,1) = ' '
+     let $balance_period = '0'||substr($balance_period,2,1)
+  End-if
+!GBD 08/07/2003 End
+
+  If Rtrim($pay_end_dt,' ') = ''
+    Show 'No confirmed pay period found in calendar'
+    Stop
+  Else
+    Show 'Last confirmed pay end date:  ' $pay_end_dt
+    Show 'Reporting Period:  ' $Reporting_Period
+  End-If
+
+  display 'Balance year :   ' noline
+  display #balance_year
+  display 'Balance period:  'noline
+  display #balance_period
+  display 'Balance Qtr :    'noline
+  display #balance_qtr   
+
+From   ps_pay_calendar pc
+
+Where  pc.pay_end_dt         =
+      (Select Max(pay_end_dt)
+       From   ps_pay_calendar
+       Where  pay_end_dt <= $AsOfDate
+       And    pay_confirm_run = 'Y')
+
+And    pc.pay_confirm_run = 'Y'
+And    pc.run_id not like '%YE'
+End-Select
+End-Procedure
+
+
+!********************************************
+Begin-Procedure P220-Get-Employee-Data
+!********************************************
+#debug9 Show 'P220-Get-Employee-Data'
+!  Show 'P220-Get-Employee-Data'
+
+  let #DedMTD     = 0
+  !AXL 03/07/2006 - Begin
+  !let #MARSH1     = 0		
+  !let #MARSH1_tot = 0		
+  !let #MARSH2     = 0
+  !let #MARSH2_tot = 0
+  !AXL 03/07/2006 - End
+  
+  let #tamount    = 0
+  let #tcount     = 0
+
+  show 'Balance_Year:   ' $balance_year
+  show 'Balance_Period: ' $balance_period
+
+  let $first = 'Y'
+
+begin-select ON-ERROR=SQL-Error-Found('Get-Employee-Data')
+!GEX_SEC_REENG 2015-04-29 Vahini Katta Begins
+PN.NATIONAL_ID
+!C1.EMPLID
+!GEX_SEC_REENG 2015-04-29 Vahini Katta Ends
+C1.EMPL_RCD
+PD.NAME
+J.EFFDT
+C1.COMPANY
+C1.PAYGROUP
+DE.DEDCD
+J.EMPL_STATUS
+PCBI.BALANCE_QTR
+PCBI.BALANCE_PERIOD
+SUM(DE.DED_CUR)     &Ded_CUR
+
+  let $Data-Found-Flag = 'Y'
+
+  move 'N' to $errorfound
+
+  let $Company        = &C1.COMPANY
+  let $Paygroup       = &C1.PAYGROUP
+  let $Dedcd          = &DE.DEDCD
+  let $name           = &PD.NAME
+  let $empl_status    = &J.EMPL_STATUS
+  !GEX_SEC_REENG 2015-04-29 Vahini Katta Begins
+  !let $emplid         = &C1.EMPLID
+  let $emplid         = &PN.NATIONAL_ID
+  !GEX_SEC_REENG 2015-04-29 Vahini Katta Begins
+  let #empl_rcd       = &C1.EMPL_RCD
+  let $effdt          = &J.EFFDT
+
+  If &DED_CUR = 0                                         !GBD 08/07/2003
+     show $emplid ' ' $company ' ' $empl_status ' had a deduction amount of zero.'
+  Else                                                    !GBD 08/07/2003
+
+    Do Format-Number(#empl_rcd, $empl_rcd, '9')
+    Add &Ded_CUR to #DedMTD
+    Let $dedcd= rtrim($dedcd,' ')
+    Use-Report Paid-Report
+    Do P310-Detail-Record
+    Do P315-Print-Detail-Record
+    Add &Ded_CUR to #tamount
+  End-if                                                 
+
+FROM   ps_job             J,
+       PS_JOB_LABOR 	  JL,
+       ps_personal_data   PD,
+       ps_pay_deduction   DE,
+       ps_pay_check       C1,
+       ps_pay_cal_bal_id  PCBI,
+       ps_pers_nid   PN !GEX_SEC_REENG 2015-04-29 Vahini Katta
+WHERE  PD.EMPLID           = C1.EMPLID
+!GEX_SEC_REENG 2015-04-29 Vahini Katta
+AND    PD.EMPLID=PN.EMPLID
+AND    PN.COUNTRY='USA'
+AND    PN.NATIONAL_ID_TYPE='PR'
+!GEX_SEC_REENG 2015-04-29 Vahini Katta
+AND    JL.EMPLID           = C1.EMPLID
+AND    JL.EMPL_RCD         = C1.EMPL_RCD
+And    J.EMPLID            = C1.emplid
+And    J.EMPL_RCD          = C1.empl_rcd
+AND    J.EFFDT             =
+      (SELECT MAX(EFFDT)
+       FROM   PS_JOB
+       WHERE  EMPLID       = J.EMPLID
+       AND    EMPL_RCD     = J.EMPL_RCD
+       AND    EFFDT       <= $pay_end_dt)
+AND    J.EFFSEQ            =
+      (SELECT MAX(EFFSEQ)
+       FROM   PS_JOB 
+       WHERE  EMPLID       = J.EMPLID
+       AND    EMPL_RCD     = J.EMPL_RCD
+       AND    EFFDT        = J.EFFDT)
+! Active Employees
+AND  ((J.EMPL_STATUS IN ('A','L','P','S'))
+! Terminated Employees 
+ OR  ((J.EMPL_STATUS NOT IN ('A','L','P','S'))
+!GBD 08/07/2003 Begin
+!AND   (substr(to_char(J.EFFDT,'mm/dd/yyyy'),1,2) = $balance_period)
+!AND   (substr(to_char(J.EFFDT,'mm/dd/yyyy'),7,4) = $balance_year)))
+ AND  (J.EFFDT <= $pay_end_dt)))
+!GBD 08/07/2003 End
+AND    JL.EFFDT               =
+      (SELECT MAX(EFFDT)
+       FROM   PS_JOB_LABOR
+       WHERE  EMPLID          = JL.EMPLID
+       AND    EMPL_RCD        = JL.EMPL_RCD
+       AND    EFFDT          <= $pay_end_dt)
+AND    JL.EFFSEQ              =
+      (SELECT MAX(EFFSEQ)
+       FROM   PS_JOB_LABOR
+       WHERE  EMPLID          = JL.EMPLID
+       AND    EMPL_RCD        = JL.EMPL_RCD
+       AND    EFFDT           = JL.EFFDT)
+And    C1.PAY_END_DT      <= $pay_end_dt
+And    C1.PAY_END_DT       = PCBI.PAY_END_DT
+And    DE.COMPANY          = C1.COMPANY
+And    DE.PAYGROUP         = C1.PAYGROUP
+And    DE.PAY_END_DT       = C1.PAY_END_DT
+And    DE.OFF_CYCLE        = C1.OFF_CYCLE
+And    DE.PAGE_NUM         = C1.PAGE_NUM
+And    DE.LINE_NUM         = C1.LINE_NUM
+And    DE.SEPCHK           = C1.SEPCHK
+!And    DE.DEDCD            IN ('MARSH1','MARSH2','MARSH3')	AXL 03/07/2006
+And    PCBI.COMPANY        = C1.COMPANY
+And    PCBI.PAYGROUP       = C1.PAYGROUP
+And    PCBI.BALANCE_ID     = 'CY'
+And    PCBI.BALANCE_YEAR   = #balance_year
+And    PCBI.BALANCE_QTR    = #balance_qtr
+And    PCBI.BALANCE_PERIOD = #balance_period
+AND   [$GEXXX919_INCLUDE_DEDCD_CRITERIA]	!AXL 03/07/2006
+GROUP BY PN.NATIONAL_ID,!C1.EMPLID, !GEX_SEC_REENG 2015-04-29 Vahini Katta
+         C1.EMPL_RCD,
+         PD.NAME,
+         J.EFFDT,
+         C1.COMPANY,
+         C1.PAYGROUP,
+         DE.DEDCD,
+         J.EMPL_STATUS,
+         PCBI.BALANCE_QTR,
+         PCBI.BALANCE_PERIOD
+ORDER BY PN.NATIONAL_ID,!C1.EMPLID,	!GEX_SEC_REENG 2015-04-29 Vahini Katta			! Deepak, 3/11/08, Added order by clause 
+         C1.EMPL_RCD,
+         PD.NAME,
+         J.EFFDT,
+         C1.COMPANY,
+         C1.PAYGROUP,
+         DE.DEDCD,
+         J.EMPL_STATUS,
+         PCBI.BALANCE_QTR,
+         PCBI.BALANCE_PERIOD
+
+End-Select
+ 
+End-Procedure
+
+!********************************************
+Begin-Procedure P300-Header-Record
+!********************************************
+#debug9 Show 'P300-Header-Record'
+
+  let $hrec = ' '
+  let $htype = 'H'
+  let $hgroup = '16335'
+  let $hname = 'Giant Eagle, Inc.'
+
+  Date-time () MM/DD/YYYY &HDate
+  Let $HDate = &HDate
+
+  let $header_mm = substr($HDate,1,2)
+  let $header_dd = substr($HDate,4,2)
+  let $header_yy = substr($HDate,7,4)
+  let $headerdate = $header_mm||$header_dd||$header_yy
+  
+  write 1 from $htype                    !Header Type
+               $hgroup:10                !Header Group
+               $hname:30                 !Header Name
+               $headerdate:8             !Header Date
+
+End-Procedure
+
+
+!********************************************
+Begin-Procedure P310-Detail-Record
+!********************************************
+#debug9 Show 'P310-Detail-Record'
+!  show 'P310-detail-record'
+  let $dtype = 'D'
+  let $dpolicy = ' '
+
+  let $name = substr($name,1,28)
+
+  do Format-Number(&Ded_CUR,$damount,'BBBBBB9.99')
+
+  Unstring $damount By '.' Into $damt1 $damt2
+  let $damount = $damt1 || $damt2
+  let $damount = rtrim($damount,' ')
+  let $damount = lpad((ltrim($damount,' ' )),9,'0')
+
+  let $Year4=1
+  Do Format-DateTime($effdt,$det_effdt,{DEFDMY},'','')
+
+  let $det_dd = substr($det_effdt,1,2)
+  let $det_mm = substr($det_effdt,4,2)
+  let $det_yy = substr($det_effdt,7,2)
+  Do MakeYear4Digits($det_yy)
+  let $det_effdt = $det_mm||$det_dd||$det_yy
+
+  write 1 from $dtype           !Detail Type
+               $emplid:9        !Detail SSN
+               $name:28         !Detail Name
+	       !$dpolicy:10      no longer needed	AXL 03/07/2006
+               $dedcd:10        !Detail Dedcd		AXL 03/07/2006
+               $damount:9       !Detail Payment Amount
+               $empl_status:1	!Detail Status
+               $det_effdt:8     !Detail Status Date
+
+End-Procedure
+
+
+!********************************************
+Begin-Procedure P315-Print-Detail-Record
+!********************************************
+#debug9 Show 'P315-Print-Detail-Record'
+!  show 'P315-Print-Detail-Record'
+
+  Use-Report Paid-Report
+
+  If #line-count >= 55
+     new-page
+  End-If
+
+
+  let $Year4=1
+  Do Format-DateTime($effdt,$effdt_out,{DEFDMY},'','')
+
+  let $out_dd = substr($effdt_out,1,2)
+  let $out_mm = substr($effdt_out,4,2)
+  let $out_yy = substr($effdt_out,7,2)
+  Do MakeYear4Digits($out_yy)
+  let $out_effdt = $out_mm||'/'||$out_dd||'/'||$out_yy
+
+  move &Ded_CUR  to $sum_ded_cur  9999,999.99
+
+  Print $emplid         (+1,{#column1})
+  Print $empl_rcd       (+0,{#column2})
+  Print $name           (+0,{#column3})
+  Print $company        (+0,{#column4})
+  Print $paygroup       (+0,{#column5})
+  Print $empl_status	(+0,{#column6})
+  Print $effdt		(+0,{#column7})
+  Print $dedcd		(+0,{#column8})		!AXL 03/07/2006 Was MARSH1,2,3
+  Print $sum_ded_cur       (+0,{#column9})
+
+  Add 1 to #tcount
+
+End-Procedure
+
+
+!********************************************
+Begin-Procedure P320-Trailer-Record
+!********************************************
+#debug9 Show 'P320-Trailer-Record'
+
+  let $ttype = 'T'
+
+  Do Format-Number(#tcount,$tcount,'999999999')
+  let $tcount = LPAD(ltrim($tcount,' '),9,'0')
+
+  do Format-Number(#tamount,$tamount,'BBBBBB9.99')
+  Unstring $tamount By '.' Into $tamt1 $tamt2
+  let $tamount = $tamt1 || $tamt2
+  let $tamount = rtrim($tamount,' ')
+  let $tamount = LPAD(ltrim($tamount,' '),9,'0')
+  
+  write 1 from $ttype                    !Trailer Type
+               $tcount:9                 !Trailer Count
+               $tamount:9                !Trailer Amount
+
+End-Procedure
+
+
+!********************************************
+Begin-Procedure P325-Print-Trailer-Record
+!********************************************
+#debug9 Show 'P325-Print-Trailer-Record'
+
+  Use-Report Paid-Report
+
+  If #line-count >= 55
+     new-page
+  End-If
+
+  Do Format-Number(#tamount, $tot_ded_cur, '9999,999.99')
+  Do Format-Number(#tcount, $tot_count, '9,999,999')
+
+  show 'Total Count:      ' $tot_count
+  show 'Total Deductions: ' $tot_ded_cur
+
+  Print 'Total'                 (+2,{#column1})
+  Print $tot_count              (+0,{#column2})
+  Print $tot_ded_cur            (+0,{#column9})
+
+End-Procedure
+
+!********************************************
+Begin-Procedure P400-Finalization
+!********************************************
+#debug9 Show 'P400-Finalization'
+
+  Do P325-Print-Trailer-Record
+  Do P320-Trailer-Record
+  Do P410-Close-File
+
+! Do Rollback-Transaction
+
+  Do Reset                   !reset.sqc
+  Do Stdapi-Term             !stdapi.sqc
+
+  date-time () HH:MI:SS &timeEnded
+  date-time () MM/DD/YYYY &dateEnded
+  show ' '
+  show 'Report Ended at ' &timeEnded ' on ' &dateEnded
+
+  Show 'Successful end of report'
+End-Procedure
+
+
+!********************************************
+Begin-Procedure P410-Close-File
+!********************************************
+#debug9 Show 'P410-Close-File'
+  Close 1
+
+  If #filestat != 0
+     Show 'Error closing input file.  Program terminating.'
+     Stop
+  End-If
+End-Procedure
+
+
+!********************************************
+Begin-Procedure SQL-Error-Found($Proc_Name) 
+!********************************************
+  print 'SQL Error in ' (,21)
+  print $Proc_Name (,35)  
+  print $_sql-error (+1,1) 
+  print 'sql-status:' (+1,1)
+  print #_sql-status () edit 99999 
+  show $SSN_In $company noline
+  display ' : SQL error ' noline
+  display #_sql-status
+  stop
+
+End-Procedure
+
+!**********************************************************************
+#Include 'gexxx919.sqc'  !Get Dedcd multiple row table  
+#Include 'gexxx920.sqc'  !Run Control parameters from GEX_RC_BEN record
+#Include 'gexxx951.sqc'  !Oracle Database Name
+#include 'askaod.sqc'    !Ask-As-Of-Date procedure
+#Include 'stdapi.sqc'    !Process Scheduler Interface
+#Include 'reset.sqc'     !Reset Printer Procedure
+#Include 'curdttim.sqc'  !Get-Current-DateTime Procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'datemath.sqc'  !Routines for date math
+#Include 'tranctrl.sqc'  !Commit/Rollback Procedures

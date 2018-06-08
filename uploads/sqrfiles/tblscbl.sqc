@@ -1,0 +1,291 @@
+!***********************************************************************
+! TBLSCBL: Analysis of Table Access by COBOL Programs
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module contains confidential and proprietary information        *
+! of Oracle; it is not to be copied, reproduced, or transmitted        *
+! in any form, by any means, in whole or in part, nor is it to         *
+! be used for any purpose other than that for which it is              *
+! expressly provided under the applicable license agreement.           *
+!                                                                      *
+! Copyright (C) 2006 Oracle. All Rights Reserved.                      *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+!          $Date:  2006/07/19:15:35:10                                 !
+!       $Release:  HR9                                                 !
+!      $Revision:  101                                                 !
+!                                                                      *
+!***********************************************************************
+
+#define CBL_EXT          'cbl'
+#define TOOLS_MODULE     'PTP'
+#define TOKEN_CALL       ' CALL '''
+#define TOKEN_SQUOTE     ''''
+#define TOKEN_SPACE      ' '
+
+!***********************************
+begin-procedure Analyze-CBL-Programs
+!***********************************
+
+   do Init-CBL-Report
+   do Step-Through-TopLevel-CBLs
+
+end-procedure
+
+!******************************
+begin-procedure Init-CBL-Report
+!******************************
+
+   !----- Establish global variables -----
+
+   !----- Initialize Utility Libraries -----
+   do Set-Ignore-Quoted-String(0)
+   do Init-Link-Lists-Lib(0)
+
+end-procedure
+
+!*****************************************
+begin-procedure Step-Through-TopLevel-CBLs
+!*****************************************
+
+   display ''
+
+Begin-SELECT Distinct
+P.PRCSNAME    &CBL.PRCSNAME
+P.DESCR       &CBL.DESCR
+
+   !Reset to prepare for analysis...
+   do ClearLinkedList
+   do Init-Link-Lists-Lib(0)
+   do ClearStack
+   let #PgmNotFound = 0
+   let #AnalysisError = 0
+
+   let $PgmFile = RTrim(&CBL.PRCSNAME,' ')
+   let $PgmTitle = &CBL.DESCR
+
+   let #ItemCnt = #ItemCnt + 1
+   do Progress-Display($PgmFile)
+
+   do Push($PgmFile)
+   do Analyze-CBL-Call-Tree
+   do Transfer-CallTree-To-Stack
+   if Not (#PgmNotFound)
+      do Analyze-CBL-Table-Usage
+      do Validate-Tables($IncludeToolsTables)
+   end-if
+   do Print-Table-Access-Report
+
+From PS_PRCSDEFN P,
+     PS_PRCSDEFNPNL C,
+     PSPNLGRPDEFN G
+Where P.PRCSTYPE = 'COBOL SQL'
+[$TargetPgmClause]
+And C.PRCSNAME = P.PRCSNAME
+And G.PNLGRPNAME = C.PNLGRPNAME
+[$OwnerIDClause]
+UNION
+Select
+P.PRCSNAME,
+J.DESCR
+From PS_PRCSJOBDEFN J,
+     PS_PRCSJOBITEM P,
+     PS_PRCSJOBPNL C,
+     PSPNLGRPDEFN G
+Where P.PRCSJOBNAME=J.PRCSJOBNAME
+And P.PRCSTYPE = 'COBOL SQL'
+[$TargetPgmClause]
+And C.PRCSJOBNAME=J.PRCSJOBNAME
+And G.PNLGRPNAME=C.PNLGRPNAME
+[$OwnerIDClause]
+UNION
+Select Distinct
+#ifdef SYBASE
+CONVERT(CHAR(12),P.TAU_APPNAME),
+#else
+P.TAU_APPNAME,
+#endif
+[$XRPT-NO-DESCR-AVAIL]
+From PS_TAU_PGM_LIST P
+Where P.TAU_APPNAME Not In
+   (Select PRCSNAME
+    From PS_PRCSDEFN
+    Where PRCSTYPE = 'COBOL SQL')
+Order By 1, 2
+End-SELECT
+
+end-procedure
+
+!*************************************
+begin-procedure Analyze-CBL-Call-Tree
+!*************************************
+
+   !Step through each module and log a complete call list...
+
+   do Pop($FileName, #EOS)
+   while Not (#EOS)
+
+      do Add-Key-To-List($FileName, #Link)
+
+      let $Extension = {CBL_EXT}
+#ifdef UNIX
+      let $Extension = Lower({CBL_EXT})
+#end-if
+      do Make-FileSpec($SourcePath, $FileName, $Extension, $FileSpec)
+      do Open-File($FileSpec, {MAX_BUFFER}, #PgmFileNo)
+      if (#PgmFileNo)
+
+         do Read-Line(#PgmFileNo, $Str, #EOF)
+         while (Not #EOF)
+
+            do PreProcess-CBL-Line($Str)
+            do Is-Module-Call($Str, $CalledModule)
+            if Not IsBlank($CalledModule)
+               do Find-Key($CalledModule, #IsAlreadyAnalyzed)
+               if Not (#IsAlreadyAnalyzed)
+                  do Push($CalledModule)
+               end-if
+            end-if
+
+            do Read-Line(#PgmFileNo, $Str, #EOF)
+         end-while
+
+         do Close-File(#PgmFileNo)
+      else
+
+         let #FileAccessErrors = 1
+         let #AnalysisError = 1
+         if ($FileName = $PgmFile)
+            let #PgmNotFound = 1
+         end-if
+      end-if
+
+      do Pop($FileName, #EOS)
+   end-while
+
+end-procedure
+
+!**********************************************
+begin-procedure Is-Module-Call ($Str, :$Module)
+!**********************************************
+
+   !Determine if this source line represents a CALL statement...
+
+   let $Module = ''
+
+   let #Pos = InStr($Str, {TOKEN_CALL}, 1)
+   if (#Pos)
+      let $Str = SubStr($Str, #Pos, Length($Str))
+      do Parse_Token($Str, {TOKEN_SQUOTE}, $Dummy, $Str)
+      if InStr($Str, {TOKEN_SQUOTE}, 1)
+         do Parse_Token($Str, {TOKEN_SQUOTE}, $Module, $Str)
+      end-if
+   end-if
+
+   if ($_IncludeToolsTables = 'N')
+      if InStr($Module,{TOOLS_MODULE},1)
+         let $Module = ''
+      end-if
+   end-if
+
+   !These are C-language module calls to be ingored...
+   if (InStr($Module,'C_',1) = 1) Or
+      (InStr($Module,'CBL_GET_',1) = 1) Or
+      (InStr($Module,'PSSQL',1) = 1) Or
+      (InStr($Module,'PSCOBNET',1) = 1)
+
+      let $Module = ''
+   end-if
+
+end-procedure
+
+!*****************************************
+begin-procedure PreProcess-CBL-Line(:$Str)
+!*****************************************
+
+   let $Str = Upper($Str)
+   !Truncate Comment lines ...
+   if (SubStr($Str, 7, 1) <> {TOKEN_SPACE})
+      let $Str = ''
+   end-if
+
+end-procedure
+
+!****************************************
+begin-procedure  Analyze-CBL-Table-Usage
+!****************************************
+
+   !For each called module, if the module has stored
+   !SQL associated with it, analyse the SQL...
+
+   do Pop($FileName, #EOS)
+   while Not (#EOS)
+
+      do Analyze-CBL-SQL($FileName)
+
+      do Pop($FileName, #EOS)
+   end-while
+
+end-procedure
+
+!*****************************************
+begin-procedure Transfer-CallTree-To-Stack
+!*****************************************
+
+   !Transfer the list of called modules back onto the stack to facilitate
+   !their subsequent analysis.  We do this in reverse order so we are left
+   !with the original parent module on top.
+
+   do ClearStack
+
+   do Bottom-Of-List(#Idx)
+   while (#Idx > 0)
+
+      get $ModuleName #NextLink from List(#Idx) ListKey BackwardLink
+      do Push($ModuleName)
+      let #Idx = #NextLink
+   end-while
+
+   do ClearLinkedList
+   do Init-Link-Lists-Lib(1)
+
+end-procedure
+
+!****************************************
+begin-procedure Analyze-CBL-SQL ($Module)
+!****************************************
+
+Begin-SELECT
+S.STMT_NAME,
+S.STMT_TYPE,
+S.STMT_TEXT
+
+   let $WorkStr = Upper(&S.STMT_TEXT)
+   let $Access = &S.STMT_TYPE
+
+   do Get-PS-Table($WorkStr, $TableName)
+   while Not IsBlank($TableName)
+
+      do Find-Key($TableName, #Link)
+      if Not (#Link)
+         do Add-Key-To-List($TableName, #Link)
+      end-if
+      do Set-Access(#Link, $Access, $AccessList)
+      do Record-Module(#Link, $Module, $ModuleList)
+      put $AccessList $ModuleList into List(#Link) StrData1 StrData2
+      let $Access = 'S'
+
+      do Get-PS-Table($WorkStr, $TableName)
+   end-while
+
+From PS_SQLSTMT_TBL S
+Where S.PGM_NAME = $Module
+Order By S.STMT_NAME, S.STMT_TYPE
+End-SELECT
+
+end-procedure
+
+!*************************** End of TBLS_CBL.SQC ******************************

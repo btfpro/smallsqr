@@ -1,0 +1,603 @@
+!***********************************************************************
+!  GEXPYVHU:  This sqc populates PS_VOUCHER_TBL and PS_DISTRIB_TBL.
+!       The following SQR programs are using this sqc.
+!               GEXPY050
+!               GEXPY021
+!               GEXPY002
+!               PAY016B
+!               GEXPY619
+!               GEXPY088
+!
+!       The input values for this sqc are
+!               $V_AP_VENDOR_ID
+!               $V_DEPTID
+!               $V_INVOICE_DT
+!               #V_GROSS_AMT
+!               $V_ENTERED_DT
+!               $V_ACCOUNT
+!               $V_DUE_DT
+!		$V_DEDCD   This is only from GEXPY002
+!       The output values are
+!               $bu_found 
+!       The calling SQR programs should be checking this flag. If it is
+!               'Y', program is successful otherwise, program should stop
+!               processing.
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module is the confidential and proprietary information of       *
+! Giant Eagle, Inc.; it is not to be copied, reproduced,or transmitted *
+! in any form, by any means, in whole or in part, nor is it to be used *
+! for any purpose other than that for which it is expressly provided   *
+! without the written permission of Giant Eagle.                       *
+!                                                                      *
+! Copyright (c) 1997-1998 Giant Eagle,Inc. All Rights Reserved         *
+!                                                                      *
+!***********************************************************************
+!                         MODIFICATION HISTORY                         *
+!***********************************************************************
+!       INITIALS        DATE            DESCRIPTION OF THE CHANGE      *
+!***********************************************************************
+!       SXK             05/12/99        Initial Creation               *
+!                                                                      *
+!       AXL             07/02/99        Added Check-Exception-Tbl proc *
+!                                       to check for rows in Vendor/   *
+!                                       Location Exception Table.      *
+!                                                                      *
+!       sxk             10/09/1999      Modified to have company       *
+!	 				in voucher_Tbl and distrib_tbl *
+!                                                                      *
+!       sxk             10/20/1999      Modified to have 0000 as Depart*
+!					ment for account code 509155   *
+!                                                                      *
+!	sxk 		11/07/1999	Modified to check for TX as    *
+!					orig_source from gexpy021      *
+!                                                                      *
+!       AXL             07/20/2000      Added a procedure to delete    *
+!                                       old rows in the voucher tbl.   *
+!                                                                      *
+!       AXL             04/13/2001      AP no longer wants 0000's sent *
+!                                       over for account 509155.  Undo *
+!                                       10/20/1999 modification.       *
+!                                       Accept Dedcd from GEXPY002 &   *
+!                                       GEXPY050.                      *
+!                                                                      *
+!       AXL             07/05/02001     Add DEPTID to PS_DISTRIB_TBL   *
+!  9.0 GEX ISDVNPK 01/15/2008 Changed to fetch the overide DEPTID & Pay check COMPANY
+!***********************************************************************
+
+Begin-Procedure Create-AP-Voucher
+
+ !AXL 07/20/2000 New file clean-up - Begin+
+ let $cutoff_dt = dateadd(datenow(), 'MONTH' , -1)
+ display 'cutoff date ' noline
+ display $cutoff_dt
+ do  delete-prior-entries  ! GEX ISDVNPK Uncommented this; will be Commented for testing
+ !AXL 07/20/2000 New file clean-up - End
+
+ let $orig_source = rtrim($orig_source,' ')
+ evaluate $orig_source
+     when = 'DED'
+       if #source_count_Ded = 0
+          do delete-existing-entries
+          add 1 to #source_count_ded
+       end-if
+     when = 'BND'
+       if #source_count_bnd = 0
+          do delete-existing-entries
+          let $ap_dedcd = ' '		!AXL 4/17/2001
+	  add 1 to #source_count_bnd
+       end-if
+     when = 'GRN'
+       if #source_count_grn = 0
+          do delete-existing-entries
+          add 1 to #source_count_grn
+       end-if
+!SXK 11/07/1999 Begin
+     when-other
+       if #source_count_tax = 0 ! and substr($orig_source,2,2) = 'TX'  ! GEX ISDVNPK 11/19/2007 Commented for TAX 
+          do delete-existing-entries
+          let $ap_dedcd = ' '		!AXL 4/17/2001
+	  add 1 to #source_count_tax
+       end-if
+!SXK 11/07/1999 End
+ end-evaluate
+let $bu_found = 'N'
+do check-input
+if $bu_found = 'N'
+   goto exit-process-ap
+end-if
+#debug9 show 'Create-AP-Voucher'
+let $bu_found = 'N'
+let $dept_bu_found = 'N'
+begin-select on-error=sql-error-found('Create-AP-Voucher')
+VB.COMPANY    !SXK 10/09/1999
+VA.DEPARTMENT
+VA.BUSINESS_UNIT
+VA.GEX_COMPANY_DIV_CD
+! 09/21/2000 - CJH - retrieve the AP business unit and override the GL BU, if AP exists
+VA.GEX_BUS_UNIT_AP
+! 09/21/2000 - CJH
+VA.GEX_AP_ORIGIN
+
+    if rtrim(&VB.COMPANY,' ') <> ''
+       let $dept_bu_found = 'Y'
+    end-if
+
+   !AXL 04/13/2001 - AP DEPT No longer wants 0000's sent over - Begin
+    !SXK 10/20/1999 Begin
+    !if rtrim($V_ACCOUNT,' ') = '509155'
+    !   move '0000' to $DEPARTMENT
+    !else
+   move &VA.DEPARTMENT TO $DEPARTMENT
+    !end-if
+    !SXK 10/20/1999 End
+   !AXL 04/13/2001 - AP DEPT No longer wants 0000's sent over - End
+
+! CJH - 09/21/2000 - use the AP Business Unit, if populated
+          move &VA.GEX_BUS_UNIT_AP to $gex_bus_unit_ap
+         if Rtrim($gex_bus_unit_ap,' ') = ''
+            move &VA.BUSINESS_UNIT to $ap_business_unit
+         else
+            move $gex_bus_unit_ap to $ap_business_unit
+         end-if
+         
+        !GEX ISDVNPK 01/28/2008  Begin
+        let $origin = &VA.GEX_AP_ORIGIN
+ 				 if $V_COMPANY > '999'   ! Does not apply to Independants
+    			 if $orig_source ='DED' or $orig_source ='GRN'
+       			 do get-ap-override
+        			if isblank(&X.GEX_AP_ORIGIN) = 0	! Not blank - Override with Deduction Tbl value
+          			 let $origin = &X.GEX_AP_ORIGIN
+        			end-if
+     				end-if
+  				end-if
+ 				!GEX ISDVNPK 01/28/2008   End    
+         
+         
+         
+ display 'GL Bus Unit :' noline
+ display &VA.BUSINESS_UNIT
+ display 'AP Bus Unit :' noline
+ display $ap_business_unit
+ display 'AP ORIGIN :' noline
+ display $origin
+
+! CJH - 09/21/2000
+
+FROM PS_GEX_DEPT_TBL VA, PS_DEPT_TBL VB
+WHERE VA.DEPTID = $V_DEPTID
+AND VA.DEPTID = VB.DEPTID
+!AND VB.EFF_STATUS = 'A' ! GEX ISDVNPK removed as per mail from Cynthia/Patricia on 01/17/2008 to even consider inactive deptids
+AND VA.EFFDT = (select max(effdt)
+		from ps_gex_dept_tbl
+		where deptid = va.deptid
+		and sequence_number = 0
+		and effdt <= $v_entered_Dt)
+AND VB.EFFDT = (select max(effdt)
+		from ps_dept_tbl
+		where deptid = vb.deptid
+		and effdt <= $v_entered_dt)
+end-select
+
+if $dept_bu_found = 'Y'
+   do Check-Exception-Tbl				! HR472-Add-AXL
+   if $Except_line_exists = 'Y'			! HR472-Add-AXL
+      let $V_AP_VENDOR_ID = &EX.AP_VENDOR_ID_10||to_Char(&EX.ADDRESS_SEQ_NUM)
+      let $V_AP_VENDOR_ID = substr($V_AP_VENDOR_ID,1,13)
+   end-if			                        ! HR472-Add-AXL
+
+   let $address_seq_num = substr($V_AP_VENDOR_ID,11,3)
+   let #len = length($address_seq_num)
+   let #ix = 0
+   let #loops = 3 - #len
+   while #ix < #loops
+        let $address_seq_num = '0'||$address_seq_num
+        add 1 to #ix
+   end-while
+   let #address_seq_num = to_number($address_Seq_num)
+   do convert-to-dtu-date($V_INVOICE_DT,$V_INVOICE_DT_DTU)
+   let $v_invoice_dt_mdy = substr($v_invoice_dt_dtu,6,2)||
+			   substr($v_invoice_dt_dtu,9,2)||
+			   substr($v_invoice_dt_dtu,3,2)
+   evaluate $ap_frequency
+     when = 'W'
+       let $ap_freq_1 = 'WK'
+     when = 'M'
+       let $ap_freq_1 = 'MN'
+     when = 'S'
+       let $ap_freq_1 = 'SM'
+     when-other
+       let $ap_freq_1 = 'QT'
+   end-evaluate
+
+   if &VA.GEX_COMPANY_DIV_CD = 'COR' or &VA.GEX_COMPANY_DIV_CD = 'WHS'
+      let $invoice_id = &VA.BUSINESS_UNIT||$v_invoice_dt_mdy||$ap_freq_1||$address_seq_num
+   else
+     if &VA.GEX_COMPANY_DIV_CD = 'GEM' or &VA.GEX_COMPANY_DIV_CD = 'GPH' or 
+        &VA.GEX_COMPANY_DIV_CD = 'VDO'
+      let $invoice_id = 'G'||$V_DEPTID||$v_invoice_dt_mdy||$ap_freq_1||$address_seq_num
+     else
+      let $invoice_id = '0'||$V_DEPTID||$v_invoice_dt_mdy||$ap_freq_1||$address_seq_num
+     end-if
+   end-if
+   let $ap_vendor_id = substr($V_AP_VENDOR_ID,1,10)
+#debug9 show '$V_AP_VENDOR_ID ' $AP_VENDOR_ID
+#debug9 show 'Address seq num ' #address_Seq_num
+#debug9 show 'Company ' $V_COMPANY    ! &VB.COMPANY !  9.0 GEX ISDVNPK 01/15/2008 
+#debug9 show 'Business unit ' &VA.BUSINESS_UNIT
+#debug9 show 'AP Business unit ' $ap_business_unit
+#debug9 show 'Invoice ID ' $invoice_id
+#debug9 show '$V_ACCOUNT ' $V_ACCOUNT
+#debug9 show '#V_GROSS_AMT ' #V_GROSS_AMT
+#debug9 show '$V_ENTERED_DT ' $V_ENTERED_DT
+#debug9 show '$V_INVOICE_DT ' $V_INVOICE_DT
+#debug9 show '$V_DUE_DT ' $V_DUE_DT
+#debug9 show '$orig_source' $orig_source
+#debug9 show 'Distirb Num ' #new_distrib_line
+#debug9 show 'Department ' $DEPARTMENT
+#debug9 show '$V_ACCOUNT ' $V_ACCOUNT
+#debug9 show '#V_GROSS_AMT ' #V_GROSS_AMT
+
+   do check-distrib-line
+   if $distrib_line_exists = 'Y'
+       display 'update distrib line'
+ !     if &vc.gross_amt <> #V_GROSS_AMT
+         move #V_GROSS_AMT to #save_gross_amt
+         add &vc.gross_amt to #V_GROSS_AMT
+	 do update-distrib-line
+         move #save_gross_amt to #V_GROSS_AMT
+ !     end-if
+      let $bu_found = 'Y'
+   else
+      do check-voucher-line
+      if $voucher_line_exists = 'Y'
+	 do get-max-distrib-num
+	 let #new_distrib_line = &VD.DISTRIB_NUM + 1
+         display 'insert distrib line'
+	 do insert-distrib-line
+      let $bu_found = 'Y'
+      else
+	 let #new_distrib_line = 1
+!         do Check-Exception-Tbl				! HR472-Add-AXL
+!	 if $Except_line_exists = 'Y'			! HR472-Add-AXL
+!           let #address_seq_num = &EX.ADDRESS_SEQ_NUM	! HR472-Add-AXL	
+!         end-if			                        ! HR472-Add-AXL
+           display 'insert vhr & distrib line'
+           do insert-voucher-line
+	   do insert-distrib-line				
+      let $bu_found = 'Y'
+      end-if
+   end-if
+else
+   use-report report-log
+   print 'Business unit information is not found for deptid ' (+1,1)
+    print $V_DEPTID ()
+end-if
+
+exit-process-ap:
+
+if $bu_found = 'Y'
+   let $V_AP_VENDOR_ID = ' '
+   let $V_DEPTID = ' '
+   let $V_INVOICE_DT = ' '
+   let #GROSS_AMT = 0
+   let $V_ENTERED_DT = ' '
+   let $V_ACCOUNT = ' '
+   let $V_DUE_DT = ' '
+end-if
+End-Procedure
+
+begin-procedure delete-existing-entries
+!show 'delete-existing-entries'
+begin-sql
+delete from ps_gex_voucher_tbl 
+where
+orig_source = $orig_source
+and invoice_dt = $V_INVOICE_DT
+end-sql
+begin-sql
+delete from ps_gex_distrib_tbl
+where
+orig_source = $orig_source
+and invoice_dt = $V_INVOICE_DT
+end-sql
+end-procedure
+
+!**********************************************************************
+begin-procedure delete-prior-entries
+!**********************************************************************
+!7/20/2000 AXL - New procedure to delete existing entries with
+!                due dates older than a month
+
+begin-sql
+delete from ps_gex_voucher_tbl 
+where due_dt < $cutoff_dt
+end-sql
+
+begin-sql
+delete from ps_gex_distrib_tbl
+where due_dt < $cutoff_dt
+end-sql
+
+end-procedure
+
+!**********************************************************************
+Begin-Procedure Check-Input
+!**********************************************************************
+
+if rtrim($V_AP_VENDOR_ID,' ') = '' or
+   rtrim($V_DEPTID,' ') = '' or
+   rtrim($V_INVOICE_DT,' ') = '' or
+!   #V_GROSS_AMT = 0 or 
+   rtrim($V_ENTERED_DT,' ') = '' or
+   rtrim($V_ACCOUNT,' ') = '' or
+   rtrim($V_DUE_DT,' ') = '' or rtrim($V_AP_VENDOR_ID,'0') = ''
+   use-report report-log
+   print 'One or more of the AP interface values are blank' (+1,1)
+   let $bu_found = 'N'
+else
+  if #V_GROSS_AMT = 0
+     let $bu_found = 'N'
+  else
+   let $bu_found = 'Y'
+  end-if
+end-if
+
+end-procedure
+   
+!**********************************************************************
+Begin-Procedure Check-Distrib-Line
+!**********************************************************************
+#debug9 display 'Check-Distrib-Line'
+move 'N' to $Distrib_line_exists 
+Begin-Select on-error=sql-error-found('Check-Distrib-Line')
+vc.gross_amt
+   let $distrib_line_exists = 'Y'
+FROM PS_GEX_DISTRIB_TBL VC
+WHERE VC.AP_VENDOR_ID_10 = substr($V_AP_VENDOR_ID,1,10)
+  AND VC.ADDRESS_SEQ_NUM = #address_seq_num
+  AND VC.COMPANY = $V_COMPANY    ! &VB.COMPANY !  9.0 GEX ISDVNPK 01/15/2008 
+! CJH - 09/21/2000
+!  AND VC.BUSINESS_UNIT = &VA.BUSINESS_UNIT
+  AND VC.BUSINESS_UNIT = $ap_business_unit
+! CJH - 09/21/2000
+  AND VC.INVOICE_ID = $invoice_id
+  AND VC.INVOICE_DT = $V_INVOICE_DT
+  AND VC.DEPARTMENT = $DEPARTMENT
+  AND VC.ACCOUNT = $V_ACCOUNT
+  AND VC.PRODUCT = '0000'
+  AND VC.DUE_DT = $V_DUE_DT
+!  AND VC.ORIG_SOURCE = $ORIG_SOURCE
+end-select
+end-procedure
+
+!**********************************************************************
+Begin-Procedure Update-Distrib-Line
+!**********************************************************************
+#debug9 display 'Update-Distrib-Line'
+
+Begin-Sql on-error=sql-error-found('Update-Distrib-Line')
+update PS_GEX_DISTRIB_TBL VC1
+SET VC1.GROSS_AMT = #V_GROSS_AMT
+WHERE VC1.AP_VENDOR_ID_10 = substr($V_AP_VENDOR_ID,1,10)
+  AND VC1.ADDRESS_SEQ_NUM = #address_seq_num
+  AND VC1.COMPANY = $V_COMPANY    ! &VB.COMPANY !  9.0 GEX ISDVNPK 01/15/2008 
+! CJH - 09/21/2000
+!  AND VC1.BUSINESS_UNIT = &VA.BUSINESS_UNIT
+  AND VC1.BUSINESS_UNIT = $ap_business_unit
+! CJH - 09/21/2000
+  AND VC1.INVOICE_ID = $invoice_id
+  AND VC1.INVOICE_DT = $V_INVOICE_DT
+  AND VC1.DEPARTMENT = $DEPARTMENT
+  AND VC1.ACCOUNT = $V_ACCOUNT
+  AND VC1.PRODUCT = '0000'
+  AND VC1.DUE_DT = $V_DUE_DT
+!  and vc1.orig_source = $orig_source
+end-sql
+end-procedure
+
+
+!**********************************************************************
+Begin-Procedure Get-Max-Distrib-Num
+!**********************************************************************
+#debug9 display 'Get-Max-Distrib-Num'
+
+Begin-Select on-error=sql-error-found('Get-Max-Distrib-Num')
+max(VD.DISTRIB_NUM) &VD.DISTRIB_NUM
+
+FROM PS_GEX_DISTRIB_TBL VD
+WHERE VD.AP_VENDOR_ID_10 = substr($V_AP_VENDOR_ID,1,10)
+  AND VD.ADDRESS_SEQ_NUM = #address_seq_num
+  AND VD.COMPANY = $V_COMPANY    ! &VB.COMPANY !  9.0 GEX ISDVNPK 01/15/2008 
+! CJH - 09/21/2000
+!  AND VD.BUSINESS_UNIT = &VA.BUSINESS_UNIT
+  AND VD.BUSINESS_UNIT = $ap_business_unit
+! CJH - 09/21/2000
+  AND VD.INVOICE_ID = $invoice_id
+  AND VD.INVOICE_DT = $V_INVOICE_DT
+  AND VD.DUE_DT = $V_DUE_DT
+!  and vd.orig_source = $orig_source
+end-select
+end-procedure
+
+!**********************************************************************
+Begin-Procedure Check-voucher-Line
+!**********************************************************************
+#debug9 display 'Check-Voucher-Line'
+move 'N' to $Voucher_Line_exists 
+Begin-Select on-error=sql-error-found('Check-Voucher-line')
+'Y'
+  let $Voucher_line_exists = 'Y'
+FROM PS_GEX_VOUCHER_TBL VE
+WHERE VE.AP_VENDOR_ID_10 = substr($V_AP_VENDOR_ID,1,10)
+  AND VE.ADDRESS_SEQ_NUM = #address_seq_num
+  AND VE.COMPANY = $V_COMPANY    ! &VB.COMPANY !  9.0 GEX ISDVNPK 01/15/2008 
+! CJH - 09/21/2000
+!  AND VE.BUSINESS_UNIT = &VA.BUSINESS_UNIT
+  AND VE.BUSINESS_UNIT = $ap_business_unit
+! CJH - 09/21/2000
+  AND VE.INVOICE_ID = $invoice_id
+  AND VE.INVOICE_DT = $V_INVOICE_DT
+  AND VE.DUE_DT = $V_DUE_DT
+end-select
+end-procedure
+
+!**********************************************************************
+Begin-Procedure Check-Exception-Tbl
+!**********************************************************************
+move 'N' to $Except_line_exists
+Begin-Select on-error=sql-error-found('Check-Exception-Tbl')
+EX.AP_VENDOR_ID_10
+EX.ADDRESS_SEQ_NUM
+   let $Except_line_exists = 'Y'
+   
+FROM PS_GEX_DEPT_VND_EX EX
+WHERE EX.DEPTID		 = $V_DEPTID
+  AND EX.DEDCD = $V_DEDCD
+end-select
+let $V_DEDCD = ' '
+end-procedure
+
+!**********************************************************************
+Begin-Procedure Insert-Voucher-Line
+!**********************************************************************
+#debug9 display 'Insert-Vocuher-Line'
+#debug8 show '$V_AP_VENDOR_ID ' $AP_VENDOR_ID
+#debug8 show 'Address seq num ' #address_Seq_num
+#debug8 show 'Company ' $V_COMPANY    ! &VB.COMPANY !  9.0 GEX ISDVNPK 01/15/2008 
+#debug8 show 'Business unit ' &VA.BUSINESS_UNIT
+#debug8 show 'AP Business unit ' $ap_business_unit
+#debug8 show 'Invoice ID ' $invoice_id
+#debug8 show '$V_ACCOUNT ' $V_ACCOUNT
+#debug8 show '#V_GROSS_AMT ' #V_GROSS_AMT
+#debug8 show '$V_ENTERED_DT ' $V_ENTERED_DT
+#debug8 show '$V_INVOICE_DT ' $V_INVOICE_DT
+#debug8 show '$V_DUE_DT ' $V_DUE_DT
+#debug8 show '$orig_source' $orig_source
+#debug8 show '$ap_dedcd ' $ap_dedcd
+
+Begin-Sql on-error=sql-error-found('Insert-Voucher-Line')
+insert into PS_GEX_VOUCHER_TBL
+(AP_VENDOR_ID_10,
+ADDRESS_SEQ_NUM,
+COMPANY,
+BUSINESS_UNIT,
+INVOICE_ID,
+INVOICE_DT,
+MESSAGE_TEXT_WRK,
+ENTERED_DT,
+DUE_DT,
+ORIG_SOURCE,
+DEDCD, ! AXL - New fields
+GEX_AP_ORIGIN)			! GEX ISDVNPK - New fields
+VALUES ($ap_Vendor_id,
+#address_seq_num,
+$V_COMPANY,    ! &VB.COMPANY !  9.0 GEX ISDVNPK 01/15/2008 
+!&VA.BUSINESS_UNIT,
+$ap_business_unit,
+$invoice_id,
+$V_INVOICE_DT,
+' ',
+$V_ENTERED_DT,
+$V_DUE_DT,
+$orig_source,
+$ap_dedcd, !AXL 4/17/2001
+$origin)		! GEX ISDVNPK - New fields
+end-sql
+end-procedure
+
+!**********************************************************************
+Begin-Procedure Insert-Distrib-Line
+!**********************************************************************
+#debug9 display 'Insert-Distrib-Line'
+#debug8 show 'Distirb Num ' #new_distrib_line
+#debug8 show 'Department ' $DEPARTMENT
+#debug8 show '$V_ACCOUNT ' $V_ACCOUNT
+#debug8 show '#V_GROSS_AMT ' #V_GROSS_AMT
+
+Begin-Sql on-error=sql-error-found('Insert-Distrib-Line')
+insert into PS_GEX_DISTRIB_TBL
+(AP_VENDOR_ID_10,
+ADDRESS_SEQ_NUM,
+COMPANY,
+BUSINESS_UNIT,
+INVOICE_ID,
+INVOICE_DT,
+DISTRIB_NUM,
+DEPARTMENT,
+ACCOUNT,
+PRODUCT,
+GROSS_AMT,
+orig_source,
+due_dt,
+deptid)			!AXL 7/5/2001 new field
+VALUES
+($ap_Vendor_id,
+#address_seq_num,
+$V_COMPANY,    ! &VB.COMPANY !  9.0 GEX ISDVNPK 01/15/2008 
+$ap_business_unit,
+!&VA.BUSINESS_UNIT,
+$invoice_id,
+$V_INVOICE_DT,
+#new_distrib_line,
+$DEPARTMENT,
+$V_ACCOUNT,
+'0000',
+#V_GROSS_AMT,
+$orig_source,
+$V_DUE_DT,
+$V_DEPTID)		!AXL 7/5/2001 new field
+end-sql
+
+end-procedure
+
+
+!GEX ISDVNPK  01/29/2008  Begin
+!*********************************************************************
+begin-procedure Get-AP-Override
+!*********************************************************************
+#debug9 Show 'Get-AP-Override'
+
+  let $ap_origin_found = 'N'
+begin-select 
+
+X.GEX_AP_ORIGIN
+
+  move 'Y' to $ap_origin_found
+
+  #debug8 display 'Override found for DEDCD: ' noline
+  #debug8 display $ap_dedcd
+  
+FROM PS_GENL_DED_TBL  x
+WHERE X.EFFDT =
+        (SELECT MAX(EFFDT) FROM PS_GENL_DED_TBL
+        WHERE X.DEDCD = DEDCD
+        AND EFFDT <= $v_entered_dt)
+AND dedcd  = $ap_dedcd
+ 
+end-select
+
+end-procedure   
+!GEX ISDVNPK  01/29/2008  End
+
+
+
+!*********************************************************************
+!Displays the error messages and stops execution
+!*********************************************************************
+ 
+!begin-procedure SQL-Error-Found($Proc_Name) 
+
+!  display 'SQL Error in ' 
+!  display $Proc_Name 
+!  display $_sql-error
+!  display 'sql-status:' 
+!  display #_sql-status 
+
+!  STOP
+
+!end-procedure
+
+

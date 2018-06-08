@@ -1,0 +1,1342 @@
+!***********************************************************************
+! RSI940A:  Print Addendum entry for TAX940A                           *
+!***********************************************************************
+!***********************************************************************
+! Rimini Street Modification Log                                       *
+!                                                                      *
+!  02/23/2012 RSI-HCM102632  v1.0                                      *
+!  Descr: Created new RSITAX940A SQR to print the Addendum for TAX940A *
+!                                                                      *
+!  03/22/2013 RSI-HCM103334  v2.0                                      *
+!  Descr: Changing process instance variable mask to accomodate upto   *
+!         10 digits                                                    *
+!                                                                      *
+!  03/22/2013 RSI-HCM103542  v3.0                                      *
+!  Descr: Modified the program to make it compatibile with 9.1 release *
+!         Include the custom procedure to read output location         *
+!                                                                      *
+!  12/04/2014 RSI-HCM104214  v4.0                                      *
+!  Descr: Modified the program to use updated form image files for     *
+!         2013 and 2014. These new JPG files were created using        *
+!         Photo Shop software for a more consistent image.             *
+!                                                                      *
+!  12/08/2015 RSI-HCM105375  v5.0                                      *
+!  Descr: Modified for 2015, and to add the ability to print           *
+!         graphic types other than JPEG.                               *
+!                                                                      *
+!  12/08/2016 RSI-HCM105857  v6.0                                      *
+!  Descr: Modified for 2016, for all tax years greater than 2014,      *
+!         use a GIF image file.                                        *
+!                                                                      *
+!***********************************************************************
+
+#include 'setenv.sqc'      ! Set Environment Procedure
+#include 'rsicdver.sqc'    ! Client Specific PeopleSoft Application Information
+#include 'setup31.sqc'     ! Printer and page-size initialization
+#include 'usarpt.sqc'      ! USA-specific variables
+
+!***********************************************************************
+! Procedure: Setup
+!***********************************************************************
+Begin-Setup
+  #Define Prgm_Ver '6.0'          !Corresponds to Modification History above.  ! RSI-HCM105857
+  #Define Page_Max_Lines 81                         ! RSI-HCM104214   
+  #Define Page_Max_Cols  125
+  #define LINE_HEIGHT 10
+  #Define ImgWidth       123
+  #Define ImgHeight      80                         ! RSI-HCM104214
+
+  Declare-Report PRINTFORMS
+    layout       = FORMS
+    printer-type = HP
+  End-Declare
+
+Declare-Layout FORMS
+  paper-size  = (8.5,11)
+  orientation = portrait
+  left-margin = 0.1
+  line-height = {LINE_HEIGHT}
+  max-lines   = {Page_Max_Lines}
+  max-columns = {Page_Max_Cols}
+End-Declare
+
+#Define Dyn-S          [
+#Define Dyn-E          ]
+
+#If {sqr-platform} = mvs
+     #Define Dyn-S \
+     #Define Dyn-E \
+#EndIf
+
+#If {sqr-platform} = as400
+     #Define Dyn-S \
+     #Define Dyn-E \
+#EndIf
+
+! RSI-HCM105375 BEGIN
+#define jpeg           'jpg'
+#define gif            'gif'
+! RSI-HCM105375 END
+
+End-Setup
+
+!***********************************************************************
+! Procedure: Begin-Program
+!***********************************************************************
+Begin-Program
+
+  do Init-Report
+  do Process-Main
+  do Update-Prcs-Run-Status
+  do Get-Current-Datetime
+
+  show ' '
+  show 'Process End Date/Time: ' $AsOfToday ' ' $AsOfNow
+
+End-Program
+
+!***********************************************************************
+! Procedure: Init-Report
+! Descr:     Report initialization procedure.  Set titles, parameters.
+!            This is called from the Begin-Program procedure.
+!***********************************************************************
+Begin-Procedure Init-Report
+
+  do Init-Datetime
+  do Init-Number
+  do stdapi-Init
+  do Get-Current-Datetime
+  do Initialization
+
+  show ' '
+  show 'Process Start Date/Time: ' $AsOfToday ' ' $AsOfNow
+
+End-Procedure Init-Report
+
+!***********************************************************************
+! Procedure: Initialization
+! Descr :    Read the current Tax Reporting Year
+!***********************************************************************
+Begin-Procedure Initialization
+
+  Show 'RSI940A.SQR - Version '  {Prgm_Ver}
+  move '1' to $MMLZero
+  move '1' to $Year4
+  do Format-DateTime($AsOfToday, $940Date, {DEFYMD},'','')
+
+  move $940Date to $AsOfYear xxxx   !extract the current year
+  move $AsOfYear  to #AsOfYear
+  move #AsOfYear  to #saveAsOfYear
+  subtract 1    from #AsOfYear
+  do Get-Calendar-Year-Id
+
+  do Get-Tax-Reporting-Run-Controls
+
+  move &TX.Balance_Year    to $AsOfDate
+  move &TX.BALANCE_ID      to $Bal_id
+
+  let $AsOfDate = $AsOfDate || '1231'
+  do Format-DateTime($AsOfDate, $AsOfDate, {DEFCMP}, '', 'native')
+
+  move &TX.Balance_Year to $CalYear 9999
+
+  do Select-Year-End-Parameters
+  do Open-File
+  do Alter-Printer-Small-P10
+
+  let $Sp = ','
+  let #State_Number = 0
+
+  ! Delete all the records in Temp. table
+  BEGIN-SQL
+    DELETE FROM PS_RSI_TAX_BALANCE
+  END-SQL
+
+  let #max_futa = 0
+
+BEGIN-SELECT
+SOTT.MAX_GROSS
+
+  let #max_futa = &SOTT.max_gross
+
+FROM PS_ST_OTH_TAX_TBL SOTT
+WHERE STATE = '$U' AND TAX_CLASS = 'U'
+  AND EFFDT = (SELECT MAX(EFFDT) FROM PS_ST_OTH_TAX_TBL WHERE STATE = SOTT.STATE AND TAX_CLASS = SOTT.TAX_CLASS AND EFFDT <= $AsOfDate)
+END-SELECT
+
+let $FUTA_ST_Tbl_91  = ' PS_STT_FUTA_CR_RT SOT91 '
+
+! RSI-HCM105857 Begin
+  let #CalYear = $CalYear
+
+  If #CalYear > 2014
+     Let $Suffix = $CalYear || '.GIF'
+     Let $Graphic_Type = {gif}
+  Else
+     Let $Suffix = $CalYear || '.JPG'
+     Let $Graphic_Type = {jpeg}
+  End-If
+! RSI-HCM105857 End
+
+End-Procedure Initialization
+
+!***********************************************************************
+! Procedure: Process-Main
+! Descr :    Starts the transaction and initializes variables
+!            and other report variables.
+!***********************************************************************
+Begin-Procedure Process-Main
+
+ do Read-Company-Tbl
+ do Populate-PDF           ! Populate the PDF file
+ do Print-Company-Totals
+ do Print-940A-Instr
+
+ close 10
+
+ show ' '
+ show 'The employee detail has been written to a comma delimited file that can be found under: ' $FileID
+ show ' '
+
+End-Procedure Process-Main
+
+!***********************************************************************
+! Procedure: Read-Company-Tbl
+!***********************************************************************
+Begin-Procedure Read-Company-Tbl
+
+BEGIN-SELECT
+A.COMPANY
+
+  move &A.Company to $StoredCompany
+
+  do Read-Empl-Record
+
+FROM PS_COMPANY_TBL A
+WHERE A.COUNTRY = 'USA'
+[$A.SelectedCos]
+  AND EFFDT = (SELECT MAX(EFFDT) FROM PS_COMPANY_TBL WHERE COMPANY = A.COMPANY AND EFFDT <= $AsOfDate)
+ORDER BY A.FEDERAL_EIN, A.COMPANY
+END-SELECT
+
+End-Procedure Read-Company-Tbl
+
+!***********************************************************************
+! Procedure: Read-Empl-Record
+! Descr :    Read the company transaction
+!***********************************************************************
+Begin-Procedure Read-Empl-Record
+
+  let #RecordCount = 0
+  let #Empl-FUTA = 0
+  let $FirstEmpl = 'Y'
+  let $FirstCompany = 'Y'
+
+BEGIN-SELECT
+B.EMPLID       () on-Break print=never level=1 before=Empl-MS-Break
+B.COMPANY      () on-Break print=never level=2 before=Company-MS-Break
+B.STATE
+B.BALANCE_PERIOD
+Sum(B.TXGRS_YTD) &TXGRS_YTD
+
+  let $Emplid = &B.Emplid
+  let $State  = rtrim(&B.State, ' ')
+
+  do Get-State-Rate
+  #If RSI_APP_REL >= 9.10
+     #If LAST_ORACLE_UPDATE >= 2013.1
+         do Get-State-Rate-91
+     #EndIf
+  #EndIf
+
+  If $FirstEmpl = 'Y'
+     let $FirstEmpl = 'N'
+  End-If
+
+  let #TXGRS_YTD = &TXGRS_YTD
+
+  If $FirstCompany = 'Y'
+     let $FirstCompany = 'N'
+     If #TXGRS_YTD > #max_futa
+        let #TXGRS_YTD = #max_futa
+     End-If
+     let #Empl-FUTA = #Empl-FUTA + #TXGRS_YTD
+  Else
+     let #TXGRS_Bal = #max_futa - #Empl-FUTA
+     If #TXGRS_YTD > #TXGRS_BAL
+        let #TXGRS_YTD = #TXGRS_BAL
+     End-If
+     let #Empl-FUTA = #Empl-FUTA + #TXGRS_YTD
+  End-If
+
+  let #mPeriod = &B.BALANCE_PERIOD
+
+  If #TXGRS_YTD > 0
+     let #Empl_Credit = round(#TXGRS_YTD * #state_rate,2)
+     do Insert-Empl-Table
+  End-If
+
+  Add 1 to #RecordCount
+
+FROM PS_TAX_BALANCE B
+ WHERE  B.COMPANY = $StoredCompany AND  B.BALANCE_YEAR = &TX.Balance_Year
+    AND B.BALANCE_ID = $Bal_id AND B.TAX_CLASS = 'U'
+    AND B.STATE IN (SELECT T.STATE FROM PS_STATE_NAMES_TBL T WHERE COUNTRY='USA' AND NUMERIC_CD <> ' ')
+    AND B.BALANCE_PERIOD = (SELECT MAX(A2.BALANCE_PERIOD) FROM PS_TAX_BALANCE A2
+                            WHERE B.EMPLID = A2.EMPLID AND B.COMPANY = A2.COMPANY
+                              AND B.BALANCE_ID = A2.BALANCE_ID AND B.BALANCE_YEAR = A2.BALANCE_YEAR
+                              AND  B.STATE = A2.STATE AND B.TAX_CLASS = A2.TAX_CLASS )
+   GROUP BY B.EMPLID, B.COMPANY, B.BALANCE_PERIOD, B.STATE
+   ORDER BY B.EMPLID, B.COMPANY, B.BALANCE_PERIOD ASC, B.STATE
+END-SELECT
+
+  If #RecordCount = 0
+     show 'Company ' $StoredCompany ' did not have any FUTA Taxable Wages - Total Credit Reduction is $0.00 '
+  End-If
+
+End-Procedure Read-Empl-Record
+
+!***********************************************************************
+! Procedure: Empl-MS-Break
+!***********************************************************************
+Begin-Procedure Empl-MS-Break
+
+   let #Empl-FUTA = 0
+   let $FirstEmpl = 'Y'
+
+End-Procedure Empl-MS-Break
+
+!***********************************************************************
+! Procedure: Company-MS-Break
+!***********************************************************************
+Begin-Procedure Company-MS-Break
+
+   let $FirstCompany = 'Y'
+
+End-Procedure Company-MS-Break
+
+!***********************************************************************
+! Procedure: Insert-Empl-Table
+!***********************************************************************
+Begin-Procedure Insert-Empl-Table
+
+  BEGIN-SQL
+    INSERT INTO PS_RSI_TAX_BALANCE (COMPANY, EMPLID, BALANCE_PERIOD, STATE, TXGRS_YTD, TAX_RT, CREDIT_AMOUNT) VALUES
+       ($StoredCompany, $Emplid, #mPeriod, $State, #TXGRS_YTD, #state_rate, #Empl_Credit)
+  END-SQL
+
+End-Procedure Insert-Empl-Table
+
+!***********************************************************************
+! Procedure: Get-State-Rate
+!***********************************************************************
+Begin-Procedure Get-State-Rate
+
+  let #state_rate = 0
+
+BEGIN-SELECT
+SOT.TAX_RT
+
+   let #state_rate = &SOT.TAX_RT
+
+FROM PS_ST_OTH_TAX_TBL SOT
+WHERE STATE = &B.STATE AND ( ( TAX_CLASS = 'S' AND STATE <> 'MA' ) OR ( TAX_CLASS = '5' AND STATE = 'MA' ) )
+      AND EFFDT = ( SELECT MAX(EFFDT) FROM PS_ST_OTH_TAX_TBL WHERE STATE = SOT.STATE AND TAX_CLASS = SOT.TAX_CLASS AND EFFDT <= $AsOfDate)
+END-SELECT
+
+  If #state_rate < 0
+     Let #state_rate = 0
+  End-If
+
+End-Procedure Get-State-Rate
+
+!***********************************************************************
+! Procedure: Get-State-Rate-91
+!***********************************************************************
+Begin-Procedure Get-State-Rate-91
+
+  let #state_rate = 0
+
+BEGIN-SELECT
+SOT91.TAX_RT
+
+   let #state_rate = &SOT91.TAX_RT
+
+FROM {Dyn-S}$FUTA_ST_Tbl_91{Dyn-E}
+WHERE STATE = &B.STATE AND  FUTA_CR_ID = 'F' AND TAX_YEAR = &TX.Balance_Year AND FUTA_CR_REDUCTION = 'Y'
+       AND EFFDT = ( SELECT MAX(EFFDT) FROM PS_STT_FUTA_CR_RT WHERE STATE = SOT91.STATE AND  FUTA_CR_ID = SOT91.FUTA_CR_ID AND TAX_YEAR = SOT91.TAX_YEAR
+                                                                    AND FUTA_CR_REDUCTION = SOT91.FUTA_CR_REDUCTION AND EFFDT <= $AsOfDate)
+END-SELECT
+
+  If #state_rate < 0
+     Let #state_rate = 0
+  End-If
+
+End-Procedure Get-State-Rate-91
+
+!***********************************************************************
+! Procedure: Populate-PDF
+!***********************************************************************
+Begin-Procedure Populate-PDF
+
+  let #State_TXGRS   = 0
+  let #Company_TXGRS = 0
+  let $Templ_Printed = 'N'
+
+BEGIN-SELECT
+RTB.COMPANY             () on-Break print=never level=1 before=Get-Company-EIN  after=Print-Company-Totals
+RTB.EMPLID
+RTB.BALANCE_PERIOD
+RTB.STATE               () on-Break print=never level=2 after=State-Totals
+RTB.TXGRS_YTD
+RTB.TAX_RT
+RTB.CREDIT_AMOUNT
+
+  let $Emplid   = &RTB.EMPLID
+  let $Company  = &RTB.COMPANY
+  let $pBPeriod = &RTB.BALANCE_PERIOD
+  let $State    = rtrim(ltrim(&RTB.STATE, ' '), ' ')
+
+  let #State_TXGRS   = #State_TXGRS   + &RTB.TXGRS_YTD
+  let #state_rate    = &RTB.TAX_RT
+  let #Company_TXGRS = #Company_TXGRS + &RTB.TXGRS_YTD
+
+  move &RTB.TXGRS_YTD     to $TXGRS        999999.99
+  move &RTB.CREDIT_AMOUNT to $Empl_Credit   99999.99
+  move #state_rate        to $state_rate    99.9999
+
+  write 10 from $StoredCompany:6
+                $Sp:1
+                $Emplid:11
+                $Sp:1
+                $State:2
+                $Sp:1
+                $TXGRS:19
+                $Sp:1
+                $state_rate:8
+                $Sp:1
+                $Empl_Credit:10
+
+FROM PS_RSI_TAX_BALANCE RTB
+ORDER BY RTB.COMPANY, RTB.STATE, RTB.EMPLID, RTB.BALANCE_PERIOD
+END-SELECT
+
+End-Procedure Populate-PDF
+
+!***********************************************************************
+! Procedure: Get-Company-EIN
+!***********************************************************************
+Begin-Procedure Get-Company-EIN
+
+BEGIN-SELECT
+CT.FEDERAL_EIN
+CT.DESCR
+CT.COMPANY
+
+   move &CT.Federal_EIN to $StoredEIN     099999999
+   move &CT.Company     to $StoredCompany
+   move &CT.Descr       to $StoredDescr
+
+FROM PS_COMPANY_TBL CT
+WHERE CT.COUNTRY = 'USA'
+  AND CT.COMPANY = &RTB.COMPANY
+  AND EFFDT = (SELECT MAX(EFFDT) FROM PS_COMPANY_TBL WHERE COMPANY = CT.COMPANY AND EFFDT <= $AsOfDate)
+END-SELECT
+
+End-Procedure Get-Company-EIN
+
+!***********************************************************************
+! Procedure: Print-Company-Totals
+!***********************************************************************
+Begin-Procedure Print-Company-Totals
+
+  If #Company_TXGRS > 0 and $Templ_Printed = 'Y'
+
+     move #Company_Credit  to $Str_Number  BBB,BBB,BB9.99
+
+     let $Str_Number = rtrim(ltrim($Str_Number, ' '), ' ')
+     let $Company_Credit = translate(lpad($Str_Number, 14, '.'), '.', ' ')
+                                                                           ! RSI-HCM104214 Begin
+     if #CalYear < 2013                                                    ! RSI-HCM105857
+        let #pcol = 114
+        let #prow = 72
+     else
+        let #pcol = 119
+        let #prow = 77
+     end-if
+                                                                           ! RSI-HCM104214 End
+     let #i = length($State_Credit)
+     While #i > 0
+        let $mnbr = substr($Company_Credit,#i, 1)
+        print $mnbr (#prow, #pcol)                                         ! RSI-HCM104214
+        let #pcol = #pcol - 1
+        let #i = #i - 1
+     End-While
+  End-If
+
+  let #State_TXGRS   = 0
+  let #Company_TXGRS = 0
+
+  If $Templ_Printed = 'Y'
+     new-page
+  End-If
+
+  let #Company_Credit = 0
+  let $Templ_Printed = 'N'
+
+End-Procedure Company-Totals
+
+!***********************************************************************
+! Procedure: State-Totals
+!***********************************************************************
+Begin-Procedure State-Totals
+
+  let #mrow       = 0
+
+   ! Following lines can be used to populated all the left hand side State with the same values as AK for TESTING purpose
+   !  If $State = 'CA'
+   !      let #mrow = 24
+   !      let #mcol = 1
+   !      do Print-State-Total
+   !      While #mrow < 73
+   !          let #mrow = #mrow + 1
+   !          let $mrow = edit(#mrow, '99')
+   !          print $mrow ( #mrow, 11)
+   !          print $mrow ( #mrow, 64)
+   !      End-While
+   ! End-If
+
+                                              ! RSI-HCM104214 Begin
+   if #CalYear < 2013                         ! RSI-HCM105857
+      do Set-Print-Location-Pre-2013
+   else
+      do Set-Print-Location-Post-2013
+   end-if
+
+   do Print-State-Total
+
+End-Procedure State-Totals
+
+!***********************************************************************
+! Procedure: Set-Print-Location-Pre-2013
+!***********************************************************************
+Begin-Procedure Set-Print-Location-Pre-2013
+
+     Evaluate  $State
+        When = 'AK'
+            let #mrow= 24
+            let #mcol = 1
+            Break
+        When = 'AL'
+            let #mrow= 26
+            let #mcol = 1
+            Break
+        When = 'AR'
+            let #mrow= 27
+            let #mcol = 1
+            Break
+        When = 'AZ'
+            let #mrow= 29
+            let #mcol = 1
+            Break
+        When = 'CA'
+            let #mrow= 31
+            let #mcol = 1
+            Break
+        When = 'CO'
+            let #mrow= 33
+            let #mcol = 1
+            Break
+        When = 'CT'
+            let #mrow= 34
+            let #mcol = 1
+            Break
+        When = 'DC'
+            let #mrow= 36
+            let #mcol = 1
+            Break
+        When = 'DE'
+            let #mrow= 38
+            let #mcol = 1
+            Break
+        When = 'FL'
+            let #mrow= 40
+            let #mcol = 1
+            Break
+        When = 'GA'
+            let #mrow= 42
+            let #mcol = 1
+            Break
+        When = 'HI'
+            let #mrow= 43
+            let #mcol = 1
+            Break
+        When = 'IA'
+            let #mrow= 45
+            let #mcol = 1
+            Break
+        When = 'ID'
+            let #mrow= 47
+            let #mcol = 1
+            Break
+        When = 'IL'
+            let #mrow= 49
+            let #mcol = 1
+            Break
+        When = 'IN'
+            let #mrow= 50
+            let #mcol = 1
+            Break
+        When = 'KS'
+            let #mrow= 52
+            let #mcol = 1
+            Break
+        When = 'KY'
+            let #mrow= 54
+            let #mcol = 1
+            Break
+        When = 'LA'
+            let #mrow= 56
+            let #mcol = 1
+            Break
+        When = 'MA'
+            let #mrow= 57
+            let #mcol = 1
+            Break
+        When = 'MD'
+            let #mrow= 59
+            let #mcol = 1
+            Break
+        When = 'ME'
+            let #mrow= 61
+            let #mcol = 1
+            Break
+        When = 'MI'
+            let #mrow= 63
+            let #mcol = 1
+            Break
+        When = 'MN'
+            let #mrow= 65
+            let #mcol = 1
+            Break
+        When = 'MO'
+            let #mrow= 66
+            let #mcol = 1
+            Break
+        When = 'MS'
+            let #mrow= 68
+            let #mcol = 1
+            Break
+        When = 'MT'
+            let #mrow= 70
+            let #mcol = 1
+            Break
+        When = 'NC'
+            let #mrow = 24
+            let #mcol = 2
+            Break
+        When = 'ND'
+            let #mrow = 26
+            let #mcol = 2
+            Break
+        When = 'NE'
+            let #mrow = 27
+            let #mcol = 2
+            Break
+        When = 'NH'
+            let #mrow = 29
+            let #mcol = 2
+            Break
+        When = 'NJ'
+            let #mrow = 31
+            let #mcol = 2
+            Break
+        When = 'NM'
+            let #mrow= 33
+            let #mcol = 2
+            Break
+        When = 'NV'
+            let #mrow= 34
+            let #mcol = 2
+            Break
+        When = 'NY'
+            let #mrow= 36
+            let #mcol = 2
+            Break
+        When = 'OH'
+            let #mrow= 38
+            let #mcol = 2
+            Break
+        When = 'OK'
+            let #mrow= 40
+            let #mcol = 2
+            Break
+        When = 'OR'
+            let #mrow= 42
+            let #mcol = 2
+            Break
+        When = 'PA'
+            let #mrow= 43
+            let #mcol = 2
+            Break
+        When = 'RI'
+            let #mrow= 45
+            let #mcol = 2
+            Break
+        When = 'SC'
+            let #mrow= 47
+            let #mcol = 2
+            Break
+        When = 'SD'
+            let #mrow= 49
+            let #mcol = 2
+            Break
+        When = 'TN'
+            let #mrow= 50
+            let #mcol = 2
+            Break
+        When = 'TX'
+            let #mrow= 52
+            let #mcol = 2
+            Break
+        When = 'UT'
+            let #mrow= 54
+            let #mcol = 2
+            Break
+        When = 'VA'
+            let #mrow= 56
+            let #mcol = 2
+            Break
+        When = 'VT'
+            let #mrow= 57
+            let #mcol = 2
+            Break
+        When = 'WA'
+            let #mrow= 59
+            let #mcol = 2
+            Break
+        When = 'WI'
+            let #mrow= 61
+            let #mcol = 2
+            Break
+        When = 'WV'
+            let #mrow= 63
+            let #mcol = 2
+            Break
+        When = 'WY'
+            let #mrow= 65
+            let #mcol = 2
+            Break
+        When = 'PR'
+            let #mrow= 66
+            let #mcol = 2
+            Break
+        When = 'VI'
+            let #mrow= 68
+            let #mcol = 2
+            Break
+      End-Evaluate
+
+End-Procedure Set-Print-Location-Pre-2013
+
+!***********************************************************************
+! Procedure: Set-Print-Location-Post-2013
+!***********************************************************************
+Begin-Procedure Set-Print-Location-Post-2013
+
+     Evaluate  $State
+        When = 'AK'
+            let #mrow= 23
+            let #mcol = 1
+            Break
+        When = 'AL'
+            let #mrow= 25
+            let #mcol = 1
+            Break
+        When = 'AR'
+            let #mrow= 27
+            let #mcol = 1
+            Break
+        When = 'AZ'
+            let #mrow= 29
+            let #mcol = 1
+            Break
+        When = 'CA'
+            let #mrow= 31
+            let #mcol = 1
+            Break
+        When = 'CO'
+            let #mrow= 33
+            let #mcol = 1
+            Break
+        When = 'CT'
+            let #mrow= 35
+            let #mcol = 1
+            Break
+        When = 'DC'
+            let #mrow= 37
+            let #mcol = 1
+            Break
+        When = 'DE'
+            let #mrow= 39
+            let #mcol = 1
+            Break
+        When = 'FL'
+            let #mrow= 41
+            let #mcol = 1
+            Break
+        When = 'GA'
+            let #mrow= 43
+            let #mcol = 1
+            Break
+        When = 'HI'
+            let #mrow= 45
+            let #mcol = 1
+            Break
+        When = 'IA'
+            let #mrow= 47
+            let #mcol = 1
+            Break
+        When = 'ID'
+            let #mrow= 49
+            let #mcol = 1
+            Break
+        When = 'IL'
+            let #mrow= 51
+            let #mcol = 1
+            Break
+        When = 'IN'
+            let #mrow= 53
+            let #mcol = 1
+            Break
+        When = 'KS'
+            let #mrow= 55
+            let #mcol = 1
+            Break
+        When = 'KY'
+            let #mrow= 57
+            let #mcol = 1
+            Break
+        When = 'LA'
+            let #mrow= 59
+            let #mcol = 1
+            Break
+        When = 'MA'
+            let #mrow= 61
+            let #mcol = 1
+            Break
+        When = 'MD'
+            let #mrow= 63
+            let #mcol = 1
+            Break
+        When = 'ME'
+            let #mrow= 65
+            let #mcol = 1
+            Break
+        When = 'MI'
+            let #mrow= 67
+            let #mcol = 1
+            Break
+        When = 'MN'
+            let #mrow= 69
+            let #mcol = 1
+            Break
+        When = 'MO'
+            let #mrow= 71
+            let #mcol = 1
+            Break
+        When = 'MS'
+            let #mrow= 73
+            let #mcol = 1
+            Break
+        When = 'MT'
+            let #mrow= 75
+            let #mcol = 1
+            Break
+        When = 'NC'
+            let #mrow = 23
+            let #mcol = 2
+            Break
+        When = 'ND'
+            let #mrow = 25
+            let #mcol = 2
+            Break
+        When = 'NE'
+            let #mrow = 27
+            let #mcol = 2
+            Break
+        When = 'NH'
+            let #mrow = 29
+            let #mcol = 2
+            Break
+        When = 'NJ'
+            let #mrow = 31
+            let #mcol = 2
+            Break
+        When = 'NM'
+            let #mrow= 33
+            let #mcol = 2
+            Break
+        When = 'NV'
+            let #mrow= 35
+            let #mcol = 2
+            Break
+        When = 'NY'
+            let #mrow= 37
+            let #mcol = 2
+            Break
+        When = 'OH'
+            let #mrow= 39
+            let #mcol = 2
+            Break
+        When = 'OK'
+            let #mrow= 41
+            let #mcol = 2
+            Break
+        When = 'OR'
+            let #mrow= 43
+            let #mcol = 2
+            Break
+        When = 'PA'
+            let #mrow= 45
+            let #mcol = 2
+            Break
+        When = 'RI'
+            let #mrow= 47
+            let #mcol = 2
+            Break
+        When = 'SC'
+            let #mrow= 49
+            let #mcol = 2
+            Break
+        When = 'SD'
+            let #mrow= 51
+            let #mcol = 2
+            Break
+        When = 'TN'
+            let #mrow= 53
+            let #mcol = 2
+            Break
+        When = 'TX'
+            let #mrow= 55
+            let #mcol = 2
+            Break
+        When = 'UT'
+            let #mrow= 57
+            let #mcol = 2
+            Break
+        When = 'VA'
+            let #mrow= 59
+            let #mcol = 2
+            Break
+        When = 'VT'
+            let #mrow= 61
+            let #mcol = 2
+            Break
+        When = 'WA'
+            let #mrow= 63
+            let #mcol = 2
+            Break
+        When = 'WI'
+            let #mrow= 65
+            let #mcol = 2
+            Break
+        When = 'WV'
+            let #mrow= 67
+            let #mcol = 2
+            Break
+        When = 'WY'
+            let #mrow= 69
+            let #mcol = 2
+            Break
+        When = 'PR'
+            let #mrow= 71
+            let #mcol = 2
+            Break
+        When = 'VI'
+            let #mrow= 73
+            let #mcol = 2
+            Break
+      End-Evaluate
+
+End-Procedure Set-Print-Location-Post-2013
+                                              ! RSI-HCM104214 End
+
+!***********************************************************************
+! Procedure: Print-State-Total
+!***********************************************************************
+Begin-Procedure Print-State-Total
+
+  let  #State_Credit   = round(#State_TXGRS * #state_rate,2)
+  move #State_Credit  to $Str_Number  BBB,BBB,BB9.99
+  let  $Str_Number     = rtrim(ltrim($Str_Number, ' '), ' ')
+  let  $State_Credit   = translate(lpad($Str_Number, 14, '.'), '.', ' ')
+  move #State_TXGRS   to $Str_Number  BBB,BBB,BB9.99
+  let  $Str_Number     = rtrim(ltrim($Str_Number, ' '), ' ')
+  let  $State_TXGRS    = translate(lpad($Str_Number, 14, '.'), '.', ' ')
+  let  #Company_Credit = #Company_Credit + #State_Credit
+
+  If $Templ_Printed = 'N'
+     do Print-940A-Form
+     let $Templ_Printed = 'Y'
+  End-If
+
+  If #mrow > 0
+     If #mcol = 1
+                                         ! RSI-HCM105857 Begin
+        Evaluate #CalYear  
+           When < 2013
+              print 'X' ( #mrow,11)
+              break
+           When = 2015   
+              print 'X' ( #mrow,5)
+              break
+           When > 2015
+              print 'X' ( #mrow,6)
+              break           
+        End-Evaluate
+                                         ! RSI-HCM105857 End
+        If #State_Credit > 0
+                                         ! RSI-HCM104214 Begin
+           if #CalYear < 2013            ! RSI-HCM105857
+              let #pcol = 35
+           else
+              let #pcol = 31
+           end-if
+                                         ! RSI-HCM104214 End
+           let #i = length($State_TXGRS)
+
+           While #i > 0
+             let $mnbr = substr($State_TXGRS,#i, 1)
+             print $mnbr (#mrow, #pcol)
+             let #pcol = #pcol - 1
+             let #i = #i - 1
+           End-While
+                                         ! RSI-HCM104214 Begin
+           if #CalYear < 2013            ! RSI-HCM105857
+              let #pcol = 61
+           else
+              let #pcol = 60
+           end-if
+                                         ! RSI-HCM104214 End
+           let #i = length($State_Credit)
+           While #i > 0
+	           let $mnbr = substr($State_Credit,#i, 1)
+	           print $mnbr (#mrow, #pcol)
+	           let #pcol = #pcol - 1
+	           let #i = #i - 1
+           End-While
+        End-If
+     Else
+        print 'X' ( #mrow,64)
+
+        If #State_Credit > 0
+                                         ! RSI-HCM104214 Begin
+           if #CalYear < 2013            ! RSI-HCM105857
+              let #pcol = 90
+           else
+              let #pcol = 92
+           end-if
+                                         ! RSI-HCM104214 End
+           let #i = length($State_TXGRS)
+
+           While #i > 0
+             let $mnbr = substr($State_TXGRS,#i, 1)
+             print $mnbr (#mrow, #pcol)
+             let #pcol = #pcol - 1
+             let #i = #i - 1
+           End-While
+                                         ! RSI-HCM104214 Begin
+           if #CalYear < 2013            ! RSI-HCM105857
+              let #pcol = 116
+           else
+              let #pcol = 120
+           end-if
+                                         ! RSI-HCM104214 End
+           let #i = length($State_Credit)
+           While #i > 0
+	           let $mnbr = substr($State_Credit,#i, 1)
+	           print $mnbr (#mrow, #pcol)
+	           let #pcol = #pcol - 1
+	           let #i = #i - 1
+           End-While
+        End-If
+     End-If
+   End-If
+
+  let #State_TXGRS = 0
+
+End-Procedure Print-State-Total
+
+!***********************************************************************
+! Procedure: Print-940A-Form
+! Descr:     Prints the 940A form
+!***********************************************************************
+Begin-Procedure Print-940A-Form
+
+  let $Image_Path = getenv('PS_HOME')
+
+! RSI-HCM105375 BEGIN
+#IFDEF UNIX
+  let $Src = $Image_Path || '/sqr/F940_' || $Suffix
+#Else
+  let $Src = $Image_Path || '\sqr\F940_' || $Suffix
+#End-If
+  let #fstatus = exists($Src)
+
+  If #fstatus <> 0
+     show 'Form 940A ' $Src '  template not found, Please download the form in jpg format from www.irs.gov ;'
+     stop
+  End-If
+
+  DO Print-Form-Graphic
+! RSI-HCM105375 END
+
+ ! Print the company EIN and Description
+
+  let $EIN = substr($StoredEIN,1,1)
+  let $EIN2 = substr($StoredEIN,2,1)
+  let $EIN3 = substr($StoredEIN,3,1)
+  let $EIN4 = substr($StoredEIN,4,1)
+  let $EIN5 = substr($StoredEIN,5,1)
+  let $EIN6 = substr($StoredEIN,6,1)
+  let $EIN7 = substr($StoredEIN,7,1)
+  let $EIN8 = substr($StoredEIN,8,1)
+  let $EIN9 = substr($StoredEIN,9,1)
+
+                                                       ! RSI-HCM105857 Begin                                                  
+  Evaluate #CalYear 
+     When < 2013
+        print $EIN    (11,40)
+        print $EIN2   (11,45)
+        print $EIN3   (11,53)
+        print $EIN4   (11,58)
+        print $EIN5   (11,63)
+        print $EIN6   (11,68)
+        print $EIN7   (11,73)
+        print $EIN8   (11,78)
+        print $EIN9   (11,83)
+        print $StoredDescr (13,35)
+        break
+     When = 2015   
+        print $EIN    (9,37)
+        print $EIN2   (9,42)
+        print $EIN3   (9,51)
+        print $EIN4   (9,57)
+        print $EIN5   (9,62)
+        print $EIN6   (9,67)
+        print $EIN7   (9,73)
+        print $EIN8   (9,79)
+        print $EIN9   (9,85)
+        print $StoredDescr (11,30)
+        break
+     When > 2015   
+        print $EIN    (8,37)
+        print $EIN2   (8,42)
+        print $EIN3   (8,51)
+        print $EIN4   (8,57)
+        print $EIN5   (8,62)
+        print $EIN6   (8,67)
+        print $EIN7   (8,73)
+        print $EIN8   (8,79)
+        print $EIN9   (8,85)
+        print $StoredDescr (11,30) 
+        break
+  End-Evaluate
+                                                       ! RSI-HCM105857 End
+
+End-Procedure Print-940A-Form
+
+!***********************************************************************
+! Procedure: Print-940A-Instr
+! Descr:     Prints the 940A Instruction
+!***********************************************************************
+Begin-Procedure Print-940A-Instr
+
+  let $Image_Path = getenv('PS_HOME')
+
+! RSI-HCM105375 BEGIN
+
+#IFDEF UNIX
+  let $Src = $Image_Path || '/sqr/F940I_' || $Suffix
+#Else
+  let $Src = $Image_Path || '\sqr\F940I_' || $Suffix
+#End-If
+
+let #fstatus = exists($Src)
+
+  If #fstatus <> 0
+     show 'Form 940A Instruction template not found, Please download the instruction page of f940sa.pdf from www.irs.gov and save the template as ' $Src
+     stop
+  End-If
+
+  DO Print-Form-Graphic
+! RSI-HCM105375 END
+
+End-Procedure Print-940A-Instr
+
+!***********************************************************************
+! Procedure: Alter-Printer-Small-P10
+! Descr:     Alters printer settings to print the output to size 10
+!            This is called from Print-Statements procedure
+!***********************************************************************
+Begin-Procedure Alter-Printer-Small-P10
+
+  Alter-Printer
+    font          = 5
+    point-size    = 7.2
+
+End-Procedure Alter-Printer-Small-P10
+
+!***********************************************************************
+! Procedure: Select-Year-End-Parameters
+! Descr:     Read the Runtime parameter from control page
+!***********************************************************************
+Begin-Procedure Select-Year-End-Parameters
+
+BEGIN-SELECT
+
+RC_YE.REG_SELECT_PROC
+
+FROM PS_RC_RSI940A   RC_YE
+WHERE RC_YE.OPRID = $Prcs_OprID
+  AND RC_YE.RUN_CNTL_ID = $Prcs_Run_Cntl_ID
+
+END-SELECT
+
+  let $RC_YE.Reg_Select_Proc = RTRIM(&RC_YE.Reg_Select_Proc, ' ')
+
+  If $RC_YE.Reg_Select_Proc = 'C'
+     do Read-W2-Companies             !Load data for selected reporting companies
+  End-If
+
+End-Procedure Select-Year-End-Parameters
+
+!***********************************************************************
+! Procedure: Read-W2-Companies
+! Descr:     Select W2 Companies
+!***********************************************************************
+Begin-Procedure Read-W2-Companies
+
+  move 'AND A.COMPANY in (''' to $A.SelectedCos
+  move ' ' to $SelectedCos
+
+BEGIN-SELECT
+D.COMPANY
+
+  let $SelectedCos   = rtrim(&D.COMPANY, ' ')
+  If $SelectedCos <> ''
+     let $A.SelectedCos = $A.SelectedCos || $SelectedCos || ''','''
+     move 'Y' to $Company_Selected
+  End-If
+
+FROM PS_RSI_RC_COMP D
+WHERE D.OPRID = $Prcs_OprID
+  AND D.RUN_CNTL_ID = $Prcs_Run_Cntl_ID
+END-SELECT
+
+  let $A.SelectedCos = SUBSTR($A.SelectedCos,1,LENGTH($A.SelectedCos) - 2)
+  let $A.SelectedCos = $A.SelectedCos || ')'
+
+show 'Companies Selected : '  $A.SelectedCos
+
+End-Procedure Read-W2-Companies
+
+!***********************************************************************
+! Procedure: Open-File
+!***********************************************************************
+Begin-Procedure Open-File
+
+  move 0 to #RecordCount
+  move 'csv' to $FileExtension
+  move '0000'    to $PrcsInstance
+
+BEGIN-SELECT
+PRC.PRCSINSTANCE
+
+  move &PRC.PRCSINSTANCE to $PrcsInstance 0000000009
+
+FROM PSPRCSRQST PRC
+WHERE PRC.OPRID = $Prcs_OprID
+  AND PRC.RUNCNTLID = $Prcs_Run_Cntl_ID
+END-SELECT
+
+  #ifdef OS400
+    let $FileExtension = '(D' || $FileExtension || ')'
+  #endif
+
+  #IfDef RSI_TOOLS_8.4   ! 8.4 Tools Support
+     let $FileOutputPath = '{IMPORTPREFIX}'
+  #Else                  ! 8.2 and 7.5 Tools Support
+     let $FileOutputPath = '{FILEPREFIX}'
+  #EndIf
+
+  let #PathLength = length($FileOutputPath)
+  let $End_Char   = substr($FileOutputPath, #PathLength, 1)
+
+  #IfDef NT
+    If $End_Char <> '\'
+       let $FolderSep = '\'
+    Else
+       let $FolderSep = ''
+    End-If
+  #EndIf
+
+  #IfDef UNIX
+    If $End_Char <> '/'
+       let $FolderSep = '/'
+    Else
+       let $FolderSep = ''
+    End-If
+  #EndIf
+
+  let $FileOutputPath = $FileOutputPath || $FolderSep
+
+  let $FileID = $FileOutputPath || 'RSI940A_' || $PrcsInstance || '.' || $FileExtension
+
+  #IfDef HAS
+     do Get_OutPut_Location
+     let $FileID = $g_file_path_out || 'RSI940A_' || $PrcsInstance || '.' || $FileExtension
+  #EndIf
+
+  open $FileID as 10 for-writing record=275:fixed
+
+End-Procedure Open-File
+
+! RSI-HCM105375 BEGIN
+!***********************************************************************
+! Procedure: Print-Form-Graphic
+!***********************************************************************
+
+Begin-Procedure Print-Form-Graphic
+
+  evaluate $Graphic_Type
+
+  when = {jpeg}
+
+  Print-Image (1,2)
+  type='JPEG-FILE'
+  source = $Src
+  Image-Size = ({ImgWidth},{ImgHeight})
+
+  break
+
+  when = {gif}
+
+  Print-Image (1,2)
+  type='GIF-FILE'
+  source = $Src
+  Image-Size = ({ImgWidth},{ImgHeight})
+
+  end-evaluate
+
+End-Procedure Print-Form-Graphics
+! RSI-HCM105375 END
+
+#include 'tranctrl.sqc'  !Transaction Control
+#include 'taxrnctl.sqc'  !Get-Tax-Reporting-Run-Controls procedure
+#include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#include 'datetime.sqc'  !Routines for date and time formatting
+#include 'number.sqc'    !Routines to format numbers
+#include 'getbalid.sqc'  !Get-Calendar-Year-Id
+#include 'stdapi.sqc'    !Update Process API

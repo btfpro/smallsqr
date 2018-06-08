@@ -1,0 +1,547 @@
+
+!***********************************************
+!  PASCOLA:  Process COLA Adjustments          *
+!***********************************************
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+!   This module contains confidential and proprietary information      *
+!   of Oracle; it is not to be copied, reproduced, or transmitted      *
+!   in any form, by any means, in whole or in part, nor is it to       *
+!   be used for any purpose other than that for which it is            *
+!   expressly provided under the applicable license agreement.         *
+!                                                                      *
+!   Copyright (C) 2007 Oracle. All Rights Reserved.                    *
+!***********************************************************************
+!                                                                      *
+!          $Date:  2007/02/21:02:36:19                                 
+!       $Release:  HR9                                                 
+!    $Resolution:  688700                                              
+!                                                                      *
+!***********************************************************************
+!***********************************************************************
+! CHANGE LOG                                                           *
+!                                                                      *
+!  2/20/2006  PY - MODIFY FOR ROLLOVER FUNCTIONALITY WITH REGARD TO    *
+!                  INTERNAL REVENUE CODE SECTION 401(a)(31)            *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+! This SQR is a 'shell' program the processes COLA increases, and can  *
+! easily be modified based on a customer's specific COLA processing    *
+! requirements.                                                        *
+!                                                                      *
+! This program performs the following steps:                           *
+!                                                                      *
+! 1. Reads the PS_PA_RT_PAY_SCHED table, and for each Employee Id/     *
+!    Employee Record Number/Benefit Plan/Payment Number combination    *
+!    determines the max row that is less than or equal to the COLA     *
+!    effective date. If this max row is not the COLA date, then a new  *
+!    row is inserted into the PS_PA_RT_PAY_SCHED table using the COLA  *
+!    effective date. This process insures that for each Employee Id/   *
+!    Employee Record Number/Benefit Plan/Payment Number combination    *
+!    that a row will exist with the COLA effective date.               *
+!                                                                      *
+!    If the COLA only applies to a specific group or groups of payees  *
+!    (e.g. only select retirees retired before a specific date),       *
+!    add any additional selection conditions and/or tables necessary   *
+!    to the Select statement in the Insert-Rows-On-Cola-Date           *
+!    procedure.                                                        *
+!                                                                      *
+! 2. Reads the PS_PA_RT_PAY_SCHED table, and for each row whose EFFDT  *
+!    is greater than or equal to the COLA effective date, multiples    *
+!    the amounts times the COLA percent and updates the row. Lump sum  *
+!    are not automatically increased.                                  *
+!                                                                      *
+!    If the COLA only applies to a specific group or groups of payees  *
+!    (e.g. only select retirees retired before a specific date),       *
+!    add any additional selection conditions and/or tables necessary   *
+!    to the Select statement in the Apply-Cola-Percent procedure.      *
+!                                                                      *
+!***********************************************************************
+
+
+#include 'setenv.sqc'   !Set environment
+#include 'setup31.sqc'  !Printer and page-size initialization
+
+
+begin-report
+  do Init-DateTime
+  do Init-Number
+  do Get-Current-DateTime
+  do Init-Report
+  do Process-Main
+  do StdAPI-Term
+end-report
+
+
+!*******************************************
+begin-procedure Init-Report
+!*******************************************
+
+  do StdAPI-Init
+
+  if $prcs_process_instance = ''
+    do Ask-Values-PA
+  else
+    do Get-Values-PA
+  end-if
+
+  let #Cola_Percent = (#Cola_Percent/100) + 1.0000
+
+end-procedure
+
+
+!*******************************************
+begin-procedure Ask-Values-PA
+!*******************************************
+
+  INPUT $Cola_Benefit_Plan    'Enter Benefit Plan'
+  INPUT $Cola_Date            'Enter As of Date'        type=date
+  INPUT $Cola_Percent         'Enter COLA Percentage'   type=number
+  let #Cola_Percent = to_number($Cola_Percent)
+end-procedure
+
+
+!*******************************************
+begin-procedure Get-Values-PA
+!*******************************************
+
+  do Select-Parameters-PA
+  LET $Cola_Benefit_Plan     = &PA_RUN_CNTL.BENEFIT_PLAN
+  LET $Cola_Date             = &PA_RUN_CNTL.AS_OF_DATE
+  LET #Cola_Percent          = &PA_RUN_CNTL.COLA_ADJ_PCT
+end-procedure
+
+
+!*******************************************
+begin-procedure Process-Main
+!*******************************************
+
+  do Insert-Rows-On-Cola-Date
+  do Apply-Cola-Percent
+
+
+end-procedure
+
+
+!*******************************************
+begin-procedure Insert-Rows-On-Cola-Date
+!*******************************************
+begin-SELECT
+A.EMPLID,
+A.EMPL_RCD,
+A.BENEFIT_PLAN,
+A.PA_PMT_NBR,
+A.EFFDT,
+A.PA_PMT_STAT,
+A.PA_PMT_RSN,
+A.CALC_NAME,
+A.PYMT_FREQ,
+A.FORM_LONG_NAME,
+A.FORM_CODE,
+A.GUARANTEED_PAYMENT,
+A.SETID,
+A.VENDOR_ID,
+A.PA_PMT_CHOICE,
+A.PA_PMT_TYP1,
+A.PA_PMT_TYP2,
+A.PA_PMT_TYP3,
+A.PA_PMT_TYP4,
+A.PA_PMT_AMT1,
+A.PA_PMT_AMT2,
+A.PA_PMT_AMT3,
+A.PA_PMT_AMT4,
+A.PA_PMT_AMT1_NOTAX,
+A.PA_PMT_AMT2_NOTAX,
+A.PA_PMT_AMT3_NOTAX,
+A.PA_PMT_AMT4_NOTAX,
+A.PA_ALT_PAYEE,
+A.PCT_CONTINUED,
+A.DELETE_ON_SAVE,
+A.ROLLOVER_IND
+
+  move &A.EMPLID             to $EmplId
+  move &A.EMPL_RCD           to #EMPL_RCD
+  move &A.BENEFIT_PLAN       to $Benefit_Plan
+  move &A.PA_PMT_NBR         to #Pa_Pmt_Nbr
+  move &A.EFFDT              to $EffDt
+  move &A.EFFDT              to $Orig_EffDt
+  move &A.PA_PMT_STAT        to $Pa_Pmt_Stat
+  move &A.PA_PMT_RSN         to $Pa_Pmt_Rsn
+  move &A.CALC_NAME          to $Calc_Name
+  move &A.PYMT_FREQ          to $Pymt_Freq
+  move &A.FORM_LONG_NAME     to $Form_Long_Name
+  move &A.FORM_CODE          to $Form_Code
+  move &A.GUARANTEED_PAYMENT to #Guaranteed_Payment
+  move &A.SETID              to $Setid
+  move &A.VENDOR_ID          to $Provider
+  move &A.PA_PMT_CHOICE      to $Pa_Pmt_Choice
+  move &A.PA_PMT_TYP1        to $Pa_Pmt_Typ1
+  move &A.PA_PMT_TYP2        to $Pa_Pmt_Typ2
+  move &A.PA_PMT_TYP3        to $Pa_Pmt_Typ3
+  move &A.PA_PMT_TYP4        to $Pa_Pmt_Typ4
+  move &A.PA_PMT_AMT1        to #Pa_Pmt_Amt1
+  move &A.PA_PMT_AMT2        to #Pa_Pmt_Amt2
+  move &A.PA_PMT_AMT3        to #Pa_Pmt_Amt3
+  move &A.PA_PMT_AMT4        to #Pa_Pmt_Amt4
+  move &A.PA_PMT_AMT1_NOTAX  to #Pa_Pmt_Amt1_Notax
+  move &A.PA_PMT_AMT2_NOTAX  to #Pa_Pmt_Amt2_Notax
+  move &A.PA_PMT_AMT3_NOTAX  to #Pa_Pmt_Amt3_Notax
+  move &A.PA_PMT_AMT4_NOTAX  to #Pa_Pmt_Amt4_Notax
+  move &A.PA_ALT_PAYEE       to $Pa_Alt_Payee
+  move &A.PCT_CONTINUED      to #Pct_Continued
+  move &A.ROLLOVER_IND       to $Rollover_Ind
+  if $Pa_Pmt_Stat = 'A' and $Form_Code <> 'LUMP' and $EffDt <> $Cola_Date
+    move $Cola_Date to $EffDt
+    do Insert-Cola-Row
+    if $Rollover_Ind = 'Y'
+      do Schedule-Rollover-Data
+    end-if
+  end-if
+
+FROM  PS_PA_RT_PAY_SCHED A
+WHERE A.BENEFIT_PLAN = $Cola_Benefit_Plan  AND
+      A.EFFDT = (SELECT MAX(EFFDT)
+                 FROM   PS_PA_RT_PAY_SCHED B
+                 WHERE  B.EMPLID       = A.EMPLID
+                 AND    B.EMPL_RCD     = A.EMPL_RCD
+                 AND    B.BENEFIT_PLAN = A.BENEFIT_PLAN
+                 AND    B.PA_PMT_NBR   = A.PA_PMT_NBR
+                 AND    B.EFFDT       <= $Cola_Date)
+ORDER BY
+A.EMPLID,
+A.EMPL_RCD,
+A.BENEFIT_PLAN,
+A.PA_PMT_NBR,
+A.EFFDT
+end-SELECT
+
+end-procedure
+
+
+!*******************************************
+begin-procedure Insert-Cola-Row
+!*******************************************
+
+let $sql-statement = 'PASCOLA - Insert-Cola-Row  1'
+begin-SQL on-error=SQL-Error
+INSERT INTO PS_PA_RT_PAY_SCHED
+ (EMPLID,
+  EMPL_RCD,
+  BENEFIT_PLAN,
+  PA_PMT_NBR,
+  EFFDT,
+  PA_PMT_STAT,
+  PA_PMT_RSN,
+  CALC_NAME,
+  PYMT_FREQ,
+  FORM_LONG_NAME,
+  FORM_CODE,
+  GUARANTEED_PAYMENT,
+  SETID,
+  VENDOR_ID,
+  PA_PMT_CHOICE,
+  PA_PMT_TYP1,
+  PA_PMT_TYP2,
+  PA_PMT_TYP3,
+  PA_PMT_TYP4,
+  PA_PMT_AMT1,
+  PA_PMT_AMT2,
+  PA_PMT_AMT3,
+  PA_PMT_AMT4,
+  PA_PMT_AMT1_NOTAX,
+  PA_PMT_AMT2_NOTAX,
+  PA_PMT_AMT3_NOTAX,
+  PA_PMT_AMT4_NOTAX,
+  PA_ALT_PAYEE,
+  PCT_CONTINUED,
+  DELETE_ON_SAVE,
+  ROLLOVER_IND)
+VALUES
+ (&A.EMPLID                  ,
+  &A.EMPL_RCD                ,
+  &A.BENEFIT_PLAN            ,
+  &A.PA_PMT_NBR              ,
+  $EFFDT                     ,
+  &A.PA_PMT_STAT             ,
+  &A.PA_PMT_RSN              ,
+  &A.CALC_NAME               ,
+  &A.PYMT_FREQ               ,
+  &A.FORM_LONG_NAME          ,
+  &A.FORM_CODE               ,
+  &A.GUARANTEED_PAYMENT      ,
+  &A.SETID                   ,
+  &A.VENDOR_ID               ,
+  &A.PA_PMT_CHOICE           ,
+  &A.PA_PMT_TYP1             ,
+  &A.PA_PMT_TYP2             ,
+  &A.PA_PMT_TYP3             ,
+  &A.PA_PMT_TYP4             ,
+  &A.PA_PMT_AMT1             ,
+  &A.PA_PMT_AMT2             ,
+  &A.PA_PMT_AMT3             ,
+  &A.PA_PMT_AMT4             ,
+  &A.PA_PMT_AMT1_NOTAX       ,
+  &A.PA_PMT_AMT2_NOTAX       ,
+  &A.PA_PMT_AMT3_NOTAX       ,
+  &A.PA_PMT_AMT4_NOTAX       ,
+  &A.PA_ALT_PAYEE            ,
+  &A.PCT_CONTINUED           ,
+  &A.DELETE_ON_SAVE          ,
+  &A.ROLLOVER_IND)
+end-SQL
+end-procedure
+
+
+!*******************************************
+begin-procedure Schedule-Rollover-Data
+!*******************************************
+
+begin-SELECT
+ROLLOVER.ACCOUNT_NAME,
+ROLLOVER.ACCOUNT_NUM,
+ROLLOVER.TAXPAYER_ID,
+ROLLOVER.DISTRIB_CODE,
+ROLLOVER.INSTITUTION_NAME,
+ROLLOVER.ADDRESS1,
+ROLLOVER.ADDRESS2,
+ROLLOVER.ADDRESS3,
+ROLLOVER.ADDRESS4,
+ROLLOVER.ADDR_FIELD1,
+ROLLOVER.ADDR_FIELD2,
+ROLLOVER.ADDR_FIELD3,
+ROLLOVER.CITY,
+ROLLOVER.COUNTRY,
+ROLLOVER.COUNTY,
+ROLLOVER.GEO_CODE,
+ROLLOVER.HOUSE_TYPE,
+ROLLOVER.IN_CITY_LIMIT,
+ROLLOVER.NUM1,
+ROLLOVER.NUM2,
+ROLLOVER.POSTAL,
+ROLLOVER.STATE
+
+  do Insert-Rollover-Row
+
+FROM  PS_PA_RT_ROLLOVER ROLLOVER
+WHERE ROLLOVER.EMPLID            = $EmplId
+  AND ROLLOVER.EMPL_RCD         = #EMPL_RCD
+  AND ROLLOVER.BENEFIT_PLAN      = $Benefit_Plan
+  AND ROLLOVER.PA_PMT_NBR        = #Pa_Pmt_Nbr
+  AND ROLLOVER.EFFDT             = $Orig_EffDt
+end-SELECT
+end-procedure
+
+
+!*******************************************
+begin-procedure Insert-Rollover-Row
+!*******************************************
+
+let $sql-statement = 'PASCOLA - Insert-Rollover-Row  1'
+begin-SQL on-error=SQL-Error
+INSERT INTO PS_PA_RT_ROLLOVER
+(
+EMPLID,
+EMPL_RCD,
+BENEFIT_PLAN,
+PA_PMT_NBR,
+EFFDT,
+ACCOUNT_NAME,
+ACCOUNT_NUM,
+TAXPAYER_ID,
+DISTRIB_CODE,
+INSTITUTION_NAME,
+ADDRESS1,
+ADDRESS2,
+ADDRESS3,
+ADDRESS4,
+ADDR_FIELD1,
+ADDR_FIELD2,
+ADDR_FIELD3,
+CITY,
+COUNTRY,
+COUNTY,
+GEO_CODE,
+HOUSE_TYPE,
+IN_CITY_LIMIT,
+NUM1,
+NUM2,
+POSTAL,
+STATE
+)
+VALUES
+ (
+  &A.EMPLID,
+  &A.EMPL_RCD,
+  &A.BENEFIT_PLAN,
+  &A.PA_PMT_NBR,
+  $EFFDT,
+  &ROLLOVER.ACCOUNT_NAME,
+  &ROLLOVER.ACCOUNT_NUM,
+  &ROLLOVER.TAXPAYER_ID,
+  &ROLLOVER.DISTRIB_CODE,
+  &ROLLOVER.INSTITUTION_NAME,
+  &ROLLOVER.ADDRESS1,
+  &ROLLOVER.ADDRESS2,
+  &ROLLOVER.ADDRESS3,
+  &ROLLOVER.ADDRESS4,
+  &ROLLOVER.ADDR_FIELD1,
+  &ROLLOVER.ADDR_FIELD2,
+  &ROLLOVER.ADDR_FIELD3,
+  &ROLLOVER.CITY,
+  &ROLLOVER.COUNTRY,
+  &ROLLOVER.COUNTY,
+  &ROLLOVER.GEO_CODE,
+  &ROLLOVER.HOUSE_TYPE,
+  &ROLLOVER.IN_CITY_LIMIT,
+  &ROLLOVER.NUM1,
+  &ROLLOVER.NUM2,
+  &ROLLOVER.POSTAL,
+  &ROLLOVER.STATE
+)
+end-SQL
+end-procedure
+
+
+!*******************************************
+begin-procedure Apply-Cola-Percent
+!*******************************************
+
+begin-SELECT
+C.EMPLID,
+C.EMPL_RCD,
+C.BENEFIT_PLAN,
+C.PA_PMT_NBR,
+C.EFFDT,
+C.PA_PMT_STAT,
+C.PA_PMT_RSN,
+C.CALC_NAME,
+C.PYMT_FREQ,
+C.FORM_LONG_NAME,
+C.FORM_CODE,
+C.GUARANTEED_PAYMENT,
+C.SETID,
+C.VENDOR_ID,
+C.PA_PMT_CHOICE,
+C.PA_PMT_TYP1,
+C.PA_PMT_TYP2,
+C.PA_PMT_TYP3,
+C.PA_PMT_TYP4,
+C.PA_PMT_AMT1,
+C.PA_PMT_AMT2,
+C.PA_PMT_AMT3,
+C.PA_PMT_AMT4,
+C.PA_PMT_AMT1_NOTAX,
+C.PA_PMT_AMT2_NOTAX,
+C.PA_PMT_AMT3_NOTAX,
+C.PA_PMT_AMT4_NOTAX,
+C.PA_ALT_PAYEE,
+C.PCT_CONTINUED,
+C.DELETE_ON_SAVE
+
+  move &C.EMPLID             To $EmplId
+  move &C.EMPL_RCD           To #EMPL_RCD
+  move &C.BENEFIT_PLAN       To $Benefit_Plan
+  move &C.PA_PMT_NBR         To #Pa_Pmt_Nbr
+  move &C.EFFDT              To $EffDt
+  move &C.PA_PMT_STAT        To $Pa_Pmt_Stat
+  move &C.PA_PMT_RSN         To $Pa_Pmt_Rsn
+  move &C.CALC_NAME          To $Calc_Name
+  move &C.PYMT_FREQ          To $Pymt_Freq
+  move &C.FORM_LONG_NAME     To $Form_Long_Name
+  move &C.FORM_CODE          To $Form_Code
+  move &C.GUARANTEED_PAYMENT To #Guaranteed_Payment
+  move &C.SETID              To $Setid
+  move &C.VENDOR_ID          To $Provider
+  move &C.PA_PMT_CHOICE      To $Pa_Pmt_Choice
+  move &C.PA_PMT_TYP1        To $Pa_Pmt_Typ1
+  move &C.PA_PMT_TYP2        To $Pa_Pmt_Typ2
+  move &C.PA_PMT_TYP3        To $Pa_Pmt_Typ3
+  move &C.PA_PMT_TYP4        To $Pa_Pmt_Typ4
+  move &C.PA_PMT_AMT1        To #Pa_Pmt_Amt1
+  move &C.PA_PMT_AMT2        To #Pa_Pmt_Amt2
+  move &C.PA_PMT_AMT3        To #Pa_Pmt_Amt3
+  move &C.PA_PMT_AMT4        To #Pa_Pmt_Amt4
+  move &C.PA_PMT_AMT1_NOTAX  To #Pa_Pmt_Amt1_Notax
+  move &C.PA_PMT_AMT2_NOTAX  To #Pa_Pmt_Amt2_Notax
+  move &C.PA_PMT_AMT3_NOTAX  To #Pa_Pmt_Amt3_Notax
+  move &C.PA_PMT_AMT4_NOTAX  To #Pa_Pmt_Amt4_Notax
+  move &C.PA_ALT_PAYEE       To $Pa_Alt_Payee
+  move &C.PCT_CONTINUED      To #Pct_Continued
+
+  if $Pa_Pmt_Stat = 'A' and $Form_Code <> 'LUMP'
+    do Compute-Cola-Amounts
+    do Update-Cola-Row
+  end-if
+
+FROM  PS_PA_RT_PAY_SCHED C
+WHERE C.BENEFIT_PLAN = $Cola_Benefit_Plan
+  AND C.EFFDT >= $Cola_Date
+ORDER BY
+C.EMPLID,
+C.EMPL_RCD,
+C.BENEFIT_PLAN,
+C.PA_PMT_NBR,
+C.EFFDT
+end-SELECT
+end-procedure
+
+
+!*******************************************
+begin-procedure Compute-Cola-Amounts
+!*******************************************
+
+    move 'C' to $Pa_Pmt_Rsn
+
+    let #Pa_Pmt_Amt1 = #Pa_Pmt_Amt1 * #Cola_Percent
+    let #Pa_Pmt_Amt2 = #Pa_Pmt_Amt2 * #Cola_Percent
+    let #Pa_Pmt_Amt3 = #Pa_Pmt_Amt3 * #Cola_Percent
+    let #Pa_Pmt_Amt4 = #Pa_Pmt_Amt4 * #Cola_Percent
+    let #Pa_Pmt_Amt1_Notax = #Pa_Pmt_Amt1_Notax * #Cola_Percent
+    let #Pa_Pmt_Amt2_Notax = #Pa_Pmt_Amt2_Notax * #Cola_Percent
+    let #Pa_Pmt_Amt3_Notax = #Pa_Pmt_Amt3_Notax * #Cola_Percent
+    let #Pa_Pmt_Amt4_Notax = #Pa_Pmt_Amt4_Notax * #Cola_Percent
+end-procedure
+
+
+!*******************************************
+begin-procedure Update-Cola-Row
+!*******************************************
+let $sql-statement = 'Update-Cola-Row'
+begin-SQL on-error=SQL-Error
+UPDATE PS_PA_RT_PAY_SCHED
+SET    PA_PMT_RSN        = $Pa_Pmt_Rsn,
+       PA_PMT_AMT1       = #Pa_Pmt_Amt1,
+       PA_PMT_AMT2       = #Pa_Pmt_Amt2,
+       PA_PMT_AMT3       = #Pa_Pmt_Amt3,
+       PA_PMT_AMT4       = #Pa_Pmt_Amt4,
+       PA_PMT_AMT1_NOTAX = #Pa_Pmt_Amt1_Notax,
+       PA_PMT_AMT2_NOTAX = #Pa_Pmt_Amt2_Notax,
+       PA_PMT_AMT3_NOTAX = #Pa_Pmt_Amt3_Notax,
+       PA_PMT_AMT4_NOTAX = #Pa_Pmt_Amt4_Notax
+WHERE  EMPLID            = $EmplId
+  AND  EMPL_RCD         = #EMPL_RCD
+  AND  BENEFIT_PLAN      = $Benefit_Plan
+  AND  PA_PMT_NBR        = #Pa_Pmt_Nbr
+  AND  EFFDT             = $EffDt
+end-SQL
+end-procedure
+
+
+begin-procedure End-Report
+  if $no-sql-errors = 'Y'
+  end-if
+end-procedure
+
+
+
+!*******************************************
+#include 'stdapi.sqc'    !Update Process Request API
+#include 'parnctl1.sqc'  !Get run control parameter values
+#include 'pagetval.sqc'  !Get values mask routines
+#Include 'reset.sqc'     !Reset printer procedure
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers

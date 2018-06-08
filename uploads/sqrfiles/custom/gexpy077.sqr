@@ -1,0 +1,292 @@
+!***********************************************************************
+!  GEXPY077:  Redirects checks/advices to specific printer
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module is the confidential and proprietary information of       *
+! Giant Eagle, Inc.; it is not to be copied, reproduced, or transmitted*
+! in any form, by any means, in whole or in part, nor is it to be used *
+! for any purpose other than that for which it is expressly provided   *
+! without the written permission of Giant Eagle.                       *
+!                                                                      *
+!***********************************************************************
+!
+!***********************************************************************
+!                         MODIFICATION HISTORY                         *
+!***********************************************************************
+!       ID#     INITIALS     DATE         DESCRIPTION OF THE CHANGE *
+!*******************************************************************************
+!GEXPY077       SXK          12/08/98     INITIAL CREATION                     *
+!                                                                              *
+!               GXD          12/16/98     Added Code to check in the           *
+!                                         $PS_HOME/outgoing directory          *
+!                                         for report files (l01 - l05)         *
+!                                         if an lis file does not exist        *
+!               CWB          07/21/1999   Added code to keep the printer       *
+!                                         'simplex' in lowercase.              * 
+!               CWB          02/23/2001   Changed the hard-coded path          *
+!                                         /opt/pshr/hr751/hrprd75  to $PS_HOME *
+!                                         so it will work in any database.     *
+!               CWB          02/24/2003   Changed lp_command to meet           *
+!                                         v 8.3 file-naming conventions.       *
+!               CJH          06/19/2003   Check for existence of .spf file for *
+!                                         a print request before issuing the   *
+!                                         lp command.  Allow the .spf to .lis  *
+!                                         conversion to complete before printing*
+!                                         the file.
+!*******************************************************************************
+
+#include 'setenv.sqc'    !Set environment
+!#include 'setup01.sqc' !Init printer and page size(Portrait)
+
+begin-report
+
+  do Init-DateTime
+  do Init-Number
+
+  do Get-Current-DateTime
+  show '$SysDateTime=' $SysDateTime 
+  show '$AsOfToday=' $AsOfToday    
+ 
+  do Init-Report
+
+  do Process-Main
+!  do Reset
+  do Stdapi-Term
+
+end-report
+
+
+begin-procedure Init-Report
+
+  move 'GEXPY077' to $ReportID
+
+  show '$ReportID=' $ReportID 
+  show '$ReportDate=' $ReportDate
+  show '$ReportTime=' $ReportTime
+
+  do Stdapi-Init
+  if $prcs_process_instance = ''
+     display 'Need to run this program thru process scheduler'
+     stop
+  else
+	Do GEXXX922-Select-Parameters
+     let $pgm_name = $GEX_RC_PAY.PRCSNAME
+     if RTRIM($GEX_RC_PAY.PRCSNAME,' ') = ''
+	display 'Process Name is blank; Cannot proceed further'
+	stop
+     else
+ !       let $pgm_name = LOWER($pgm_name)
+	display 'Process Name:' noline
+	display $pgm_name
+     end-if
+
+     let $printer = $GEX_RC_PAY.GEX_PRINTER
+     if RTRIM($GEX_RC_PAY.GEX_PRINTER,' ') = ''
+	display 'Printer Name is Required; Cannot proceed further'
+	stop
+     else
+! GXD 12/16/98
+	let $print_chk = substr($printer,1,5)
+	if $print_chk = 'CHECK'
+! CWB 07/21/99 Begin
+        or $print_chk = 'SIMPL'
+! CWB 07/21/99 End
+	   let $printer = LOWER($printer)
+	else
+	   let $printer = UPPER($printer)
+	end-if
+	display 'Printer Name:' noline
+	display $printer
+! GXD 12/16/98
+     end-if
+  end-if
+
+end-procedure
+
+begin-procedure Process-Main
+let $found = 'N'
+begin-SELECT 
+max(PRCSINSTANCE) &prcsinstance_A
+   move &prcsinstance_a to $prcsinstance
+   move 'Y' to $found
+  
+FROM    PSPRCSRQST
+WHERE PRCSNAME = $pgm_name
+and RUNSTATUS = '9'  ! GEX ISDVNPK 05/13/2008
+end-SELECT
+
+ if ($found = 'N') or 
+    RTRIM($PRCSINSTANCE,' ') = ''
+	display 'NO DATA SELECTED FOR THIS REPORT RUN'  
+ else                                             
+    display 'Process Instance:' noline
+    display $prcsinstance
+    #ifdef UNIX
+      let $cd_command = 'cd '||'$PS_HOME/outgoing/'
+      display 'CD command:' noline
+      display $cd_command
+      CALL SYSTEM USING $cd_command #sys_status
+      if #sys_status <> 0
+	 display 'Changing directory to $PS_HOME/outgoing/ did not work'
+	 display 'JOB failed'
+	 stop
+      end-if
+      let $pgm_name = LOWER($pgm_name)     
+
+! CJH - 06/19/2003 - check for the existence of an .spf file for the job before issuing the lp command.
+!                    Wait for the .spf to .lis conversion to complete before printing.
+      let $ls_command = 'ls -l '|| '$PS_HOME/outgoing/'||$pgm_name||'_'||$prcsinstance||'*.spf'    
+      display 'Checking for existence of spf file with: ' noline
+      display $ls_command
+      let $sleep_command = 'sleep 120'
+      Let #attempt = 0
+      CALL SYSTEM USING $ls_command #sys_status WAIT
+      While #sys_status <> 2    !if spf file is found, return code will be 0, not found will be 2  
+          display 'Found spf file - will wait for spf conversion to finish'
+          CALL SYSTEM USING $sleep_command #sys_status WAIT
+            if #sys_status <> 0
+               display 'Sleep command did not work'
+               display 'JOB failed'
+               stop
+            end-if
+            display 'Sleeping for 2 minutes - waiting for spf conversion to finish'
+          CALL SYSTEM USING $ls_command #sys_status WAIT
+          if #attempt > 5
+            display 'Waiting for spf to lis conversion for more than 10 minutes. Stopping SQR...'
+            STOP
+            break
+          end-if
+          let #attempt = #attempt + 1
+      end-while
+! CJH - 06/19/2003 - end
+
+
+! CWB  02/24/2003 Changed lp_command to meet v 8.3 file-naming conventions.
+!      let $lp_command = 'lp '||'-d '||$printer||' '||'$PS_HOME/outgoing/'||$pgm_name||'_'||$prcsinstance||'.lis'
+      let $lp_command = 'lp '||'-d '||$printer||' '||'$PS_HOME/outgoing/'||$pgm_name||'_'||$prcsinstance||'_1.LIS'
+      display 'Command:' noline
+      display $lp_command
+!      let $file_name = $pgm_name||'_'||$prcsinstance||'.lis'
+      let $file_name = $pgm_name||'_'||$prcsinstance||'_1.LIS'
+      display 'FileName:' noline
+      display $file_name
+      CALL SYSTEM USING $lp_command #sys_status
+      if #sys_status <> 0
+
+! GXD 12/16/98 Begin
+
+! CWB  02/24/2003 Changed lp_command to meet v 8.3 file-naming conventions.
+!	 let $lp_command = 'lp '||'-d '||$printer||' '||'$PS_HOME/outgoing/'||$pgm_name||'_'||$prcsinstance||'.l01'
+	 let $lp_command = 'lp '||'-d '||$printer||' '||'$PS_HOME/outgoing/'||$pgm_name||'_'||$prcsinstance||'_2.LIS'
+	 display 'Command:' noline
+	 display $lp_command
+!	 let $file_name = $pgm_name||'_'||$prcsinstance||'.l01'
+	 let $file_name = $pgm_name||'_'||$prcsinstance||'_2.LIS'
+	 display 'Filename:' noline
+	 display $file_name
+	 CALL SYSTEM USING $lp_command #sys_status
+	 if #sys_status <> 0
+! CWB  02/24/2003 Changed lp_command to meet v 8.3 file-naming conventions.
+!	    let $lp_command = 'lp '||'-d '||$printer||' '||'$PS_HOME/outgoing/'||$pgm_name||'_'||$prcsinstance||'.l02'
+	    let $lp_command = 'lp '||'-d '||$printer||' '||'$PS_HOME/outgoing/'||$pgm_name||'_'||$prcsinstance||'_3.LIS'
+	    display 'Command:' noline
+	    display $lp_command
+!	    let $file_name = $pgm_name||'_'||$prcsinstance||'.l02'
+	    let $file_name = $pgm_name||'_'||$prcsinstance||'_3.LIS'
+	    display 'Filename:' noline
+	    display $file_name
+	    CALL SYSTEM USING $lp_command #sys_status
+	    if #sys_status <> 0
+! CWB  02/24/2003 Changed lp_command to meet v 8.3 file-naming conventions.
+!	       let $lp_command = 'lp '||'-d '||$printer||' '||'$PS_HOME/outgoing/'||$pgm_name||'_'||$prcsinstance||'.l03'
+	       let $lp_command = 'lp '||'-d '||$printer||' '||'$PS_HOME/outgoing/'||$pgm_name||'_'||$prcsinstance||'_4.LIS'
+	       display 'Command:' noline
+	       display $lp_command
+!	       let $file_name = $pgm_name||'_'||$prcsinstance||'.l03'
+	       let $file_name = $pgm_name||'_'||$prcsinstance||'_4.LIS'
+	       display 'Filename:' noline
+	       display $file_name
+	       CALL SYSTEM USING $lp_command #sys_status
+	       if #sys_status <> 0
+! CWB  02/24/2003 Changed lp_command to meet v 8.3 file-naming conventions.
+!		  let $lp_command = 'lp '||'-d '||$printer||' '||'$PS_HOME/outgoing/'||$pgm_name||'_'||$prcsinstance||'.l04'
+		  let $lp_command = 'lp '||'-d '||$printer||' '||'$PS_HOME/outgoing/'||$pgm_name||'_'||$prcsinstance||'_5.LIS'
+		  display 'Command:' noline
+		  display $lp_command
+!		  let $file_name = $pgm_name||'_'||$prcsinstance||'.l04'
+		  let $file_name = $pgm_name||'_'||$prcsinstance||'_5.LIS'
+		  display 'Filename:' noline
+		  display $file_name
+		  CALL SYSTEM USING $lp_command #sys_status
+		  if #sys_status <> 0
+! CWB  02/24/2003 Changed lp_command to meet v 8.3 file-naming conventions.
+!		     let $lp_command = 'lp '||'-d '||$printer||' '||'$PS_HOME/outgoing/'||$pgm_name||'_'||$prcsinstance||'.l05'
+		     let $lp_command = 'lp '||'-d '||$printer||' '||'$PS_HOME/outgoing/'||$pgm_name||'_'||$prcsinstance||'_6.LIS'
+		     display 'Command:' noline
+		     display $lp_command
+!		     let $file_name = $pgm_name||'_'||$prcsinstance||'.l05'
+		     let $file_name = $pgm_name||'_'||$prcsinstance||'_6.LIS'
+		     display 'Filename:' noline
+		     display $file_name
+		     CALL SYSTEM USING $lp_command #sys_status
+		     if #sys_status <> 0
+			display 'Print Command Failed'
+			display 'Filename:' noline
+			display $file_name
+			display 'JOB failed'
+			stop
+		     else
+			display 'File:' noline
+			display $file_name noline
+			display ' directed to printer ' noline
+			display $printer
+		     end-if
+		  else
+		     display 'File:' noline
+		     display $file_name noline
+		     display ' directed to printer ' noline
+		     display $printer
+		  end-if
+	       else
+		  display 'File:' noline
+		  display $file_name noline
+		  display ' directed to printer ' noline
+		  display $printer
+	       end-if
+	    else
+	       display 'File:' noline
+	       display $file_name noline
+	       display ' directed to printer ' noline
+	       display $printer
+	    end-if
+	 else
+	    display 'File:' noline
+	    display $file_name noline
+	    display ' directed to printer ' noline
+	    display $printer
+	 end-if
+
+! GXD 12/16/98 End
+
+      else
+	 display 'File:' noline
+	 display $file_name noline
+	 display ' directed to printer ' noline
+	 display $printer
+      end-if
+    #endif
+ end-if
+	
+end-procedure
+
+
+
+#Include 'datemath.sqc'  !Routines for date arithmetic
+#Include 'reset.sqc'     !Reset printer procedure
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'stdapi.sqc'    !Routines to Update Run Status
+#Include 'gexxx922.sqc'

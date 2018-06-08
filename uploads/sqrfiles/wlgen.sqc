@@ -1,0 +1,781 @@
+! ***************************************************************!
+!  This software and related documentation are provided under a!
+!  license agreement containing restrictions on use and!
+!  disclosure and are protected by intellectual property!
+!  laws. Except as expressly permitted in your license agreement!
+!  or allowed by law, you may not use, copy, reproduce,!
+!  translate, broadcast, modify, license, transmit, distribute,!
+!  exhibit, perform, publish or display any part, in any form or!
+!  by any means. Reverse engineering, disassembly, or!
+!  decompilation of this software, unless required by law for!
+!  interoperability, is prohibited.!
+!  The information contained herein is subject to change without!
+!  notice and is not warranted to be error-free. If you find any!
+!  errors, please report them to us in writing.!
+!  !
+!  Copyright (C) 1988, 2011, Oracle and/or its affiliates.!
+!  All Rights Reserved.!
+! ***************************************************************!
+ 
+ 
+!                                                                    !
+!***********************************************************************
+!  WLGEN.SQC  Worklist Generator                                       *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!                                                                      *
+!***********************************************************************
+
+!----------------------------------------------------------------------!
+!  Worklist-Generator
+!
+!  This SQC is used to generate worklist entries.  It does the
+!  following processing:
+!
+!  1.)  Reads in the worklist definition that is defined in the
+!       Workflow Designer for the Business Process Name ($busprocname),
+!       Activity Name ($activityname), and Event Name ($eventname)
+!       passed to it.
+!  2.)  Builds the insert statement for the application worlist record.
+!  3.)  Inserts the worklist entries in the application record and
+!       PSWORKLIST.
+!  4.)  Deletes the application temporary worklist entry.
+!
+!  To call this subroutine, the calling application must:
+!
+!  1.)  Find the exception condition to be flagged.
+!  2.)  Insert the application worklist data into a tempory application
+!       worklist table.  This table must be an exact clone of the worklist
+!       table.  We need this temporary record because you
+!       cannot insert and select from the same table.
+!  3.)  Call procedure Worklist-Generator, passing it the Business Process,
+!       Activiy, and Event Names.  The name of the temporary worklist record
+!       must also be passed as well as the name of the calling application.
+!       Appname limit is 8 characters.  The following is a sample call:
+!
+! let $bpname  = 'Purchase Request'
+! let $actname = 'Create Purchase Request'
+! let $evtname = 'Manager Approval'
+! let $recname = 'WFEXPR_REQ_WC'
+! let $appname = 'WLGNTEST'
+!
+!begin-sql
+!
+!INSERT INTO PS_WFEXPR_REQ_WC
+!(
+!BUSPROCNAME,
+!ACTIVITYNAME,
+!EVENTNAME,
+!WORKLISTNAME,
+!INSTANCEID,
+!WFEXPR_REQUEST_ID,
+!BUSINESS_UNIT,
+!DEPTID,
+!)
+!VALUES
+!(
+!$bpname,
+!$actname,
+!$evtname,
+!'Manager Approval',
+!0,
+!100,
+!'NEWGN',
+!'0100',
+!)
+!
+!end-sql
+!
+! do Worklist-Generator($bpname,$actname,$evtname,$recname,$appname)
+!
+!
+!  4.)  Note that in the example above, INSTANCEID is 0.  This sqc will
+!       delete the entry that you insert.
+!
+!  NOTE1:  The Business Process, Acitivity, Eventname, and Worklist(s) must
+!          be fully defined in the Workflow Designer before using this
+!          sqc.
+!
+!  NOTE2:  ONLY USER LIST ROLES MAY BE USED FOR THE WORKLIST ROUTING.  QUERY
+!          ROLES MAY NOT BE USED.  For example, when creating the worklist
+!          routing, you may map rolename MANAGER to OPRID.  You may not map
+!          query role 'Manager by Deptid' to OPRID.
+!
+!  NOTE3:  If you want to completely control what operators the worklists are
+!          assigned to, then insert entries into table PS_BATCHWLOPR just prior
+!          to invoking Worklist-Generator.  PS_BATCHWLOPR has two columns, Process Instance
+!          and Oprid.  Use your process instance and the list of operators you want the
+!          worklists assigned to when using this approach to worklist assignment.
+!          The code in Worklist-Generator will then delete the entries from PS_BATCHWLOPR
+!          before returning control to the calling program.
+!
+! CHANGE HISTORY :
+! 08/26/96 - MLC - Changed typo on insert to PSWLINSTMAX.
+! 09/23/96 - MLC - Changed correlation table names so that they don't match
+! actual table names. This fix is for DB2 support. In most cases dropped
+! correlation usage.
+! 09/26/96 - MLC - Changed insert into PSWORKLIST to support the
+! {DateTimeIn-Suffix} stuff.
+! 12/22/97 - MJG - Changes required for Process Instance to be included in APP WL Table
+! 12/16/98 - RGM - Added support for PS_BATCHWLOPR
+! 01/15/02 - JRH - Added column WL_PRIORITY into the inserts into PSWORKLIST
+!
+!----------------------------------------------------------------------!
+begin-procedure Worklist-Generator($busprocname, $activityname, $eventname, $recname, $appname)
+
+! Set global variables to be used in this sqc
+
+   let $_WLGEN_BPName       = $busprocname
+   let $_WLGEN_ACTName      = $activityname
+   let $_WLGEN_EVTName      = $eventname
+   let $_WLGEN_Temp_Recname = $recname
+   let $_WLGEN_Temp_Appname = $appname
+
+   do Check-BatchWLOpr
+
+   if $_WLGEN_BPName <> $_WLGEN_BPName_Prev
+   or $_WLGEN_ACTName <> $_WLGEN_ACTName_Prev
+   or $_WLGEN_EVTName <> $_WLGEN_EVTName_Prev
+
+      let $_WLGEN_BPName_Prev  = $_WLGEN_BPName
+      let $_WLGEN_ACTName_Prev = $_WLGEN_ACTName
+      let $_WLGEN_EVTName_Prev = $_WLGEN_EVTName
+
+      do Retrieve-WL-Defn-Parms
+      do Build-App-WL-Insert-Statement
+
+   end-if
+
+   if $Found_BatchWLOpr = 'N'
+      do Jam-WL-Entries
+   else
+      do Jam-WL-Entries-BatchWLOpr
+   end-if
+
+   do Delete-App-WL-Temp-Entry
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+!  Retrieve-WL-Defn-Parms
+!
+!  Retrieve the worklist definition parms from table PSEVENTROUTE.
+!
+!----------------------------------------------------------------------!
+begin-procedure Retrieve-WL-Defn-Parms
+
+  let $Found_WL_Defn = 'N'
+
+begin-select
+
+ROUTENAME,
+ROUTETYPE,
+WLRECNAME,
+TIMEOUTACTIVE,
+TIMEOUTMAXDAYS,
+TIMEOUTMAXHRS,
+TIMEOUTMAXMINS,
+
+   let $Found_WL_Defn = 'Y'
+
+   let $App_WL_Recname = &WLRECNAME
+   let $Routename      = &ROUTENAME
+   let #timeoutactive  = &TIMEOUTACTIVE
+   let #timeoutmaxdays = &TIMEOUTMAXDAYS
+   let #timeoutmaxhrs  = &TIMEOUTMAXHRS
+   let #timeoutmaxmins = &TIMEOUTMAXMINS
+
+   do Get-RoleName
+
+FROM  PSEVENTROUTE
+WHERE ACTIVITYNAME  = $WLGEN_ACTName
+AND   EVENTNAME     = $WLGEN_EVTName
+AND   ROUTETYPE     = 3
+ORDER BY ROUTETYPE
+
+end-select
+
+   if $Found_WL_Defn = 'N'
+      display 'Error in WLGEN.SQC'
+      display 'Invalid Business Process and Worklist Name supplied.'
+      display '$WLGEN_BPName'
+      display $WLGEN_BPName
+      display '$WLGEN_WLName'
+      display $WLGEN_WLName
+      STOP
+   end-if
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+!  Get-RoleName
+!
+!  Retrieve the rolename that the entries are to be routed to.  Note that
+!  query roles are not permitted.
+!
+!----------------------------------------------------------------------!
+begin-procedure Get-RoleName
+
+   let $Found_RoleName_Defn = 'N'
+
+begin-select
+
+ROLENAME
+
+   let $Found_RoleName_Defn = 'Y'
+   let $RoleName = &ROLENAME
+
+FROM  PSMAPROLENAME
+WHERE ACTIVITYNAME  = $WLGEN_ACTName
+AND   EVENTNAME     = $WLGEN_EVTName
+AND   MAPTYPE       = 3
+AND   MAPNAME       = $RouteName
+
+end-select
+
+   if $Found_RoleName_Defn = 'N' and $Found_BatchWLOpr = 'N'
+      display 'Error in WLGEN.SQC'
+      display 'Rolename not found for worklist specified.'
+      display 'Note that query roles cannot be used.'
+      display '$RouteName'
+      display $RouteName
+      STOP
+   end-if
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+!  Check-BatchWLOpr
+!
+!  This checks to see if the app developer is using the PS_BATCHWLOPR table
+!  to control who the worklists are assigned to.
+!
+!----------------------------------------------------------------------!
+begin-procedure Check-BatchWLOpr
+
+   let $Found_BatchWLOpr = 'N'
+
+begin-select
+
+max(OPRID)
+
+   let $Found_BatchWLOpr = 'Y'
+
+FROM  PS_BATCHWLOPR
+WHERE PROCESS_INSTANCE  = #prcs_process_instance
+
+end-select
+
+
+end-procedure
+
+!----------------------------------------------------------------------!
+!  Build-App-WL-Insert-Statement
+!
+!  Build the insert statement for the insert from the tempory worklist
+!  table into the primary worklist table.
+!
+!----------------------------------------------------------------------!
+begin-procedure Build-App-WL-Insert-Statement
+
+begin-select
+
+WLGEN1.FIELDNAME
+
+   let $wl1_fieldname = rtrim(&WLGEN1.FIELDNAME,' ')
+
+   let $WLGEN_Insert_List = $WLGEN_Insert_List || $wl1_fieldname || ','
+
+FROM  PSRECFIELD WLGEN1
+WHERE WLGEN1.RECNAME  = $App_WL_Recname
+
+end-select
+
+   let $PI_Clause = ' '
+
+begin-select
+
+WLGEN12.FIELDNAME
+
+   let $wl12_fieldname = rtrim(&WLGEN12.FIELDNAME,' ')
+
+   evaluate $wl12_fieldname
+     when = 'INSTANCEID'
+        let $WLGEN_Select_List = $WLGEN_Select_List || '##INSTANCEID##' || ','
+     when = 'TRANSACTIONID'
+        let $WLGEN_Select_List = $WLGEN_Select_List || '##TRANSACTIONID##' || ','
+     when-other
+       let $WLGEN_Select_List  = $WLGEN_Select_List || &WLGEN12.FIELDNAME || ','
+   end-evaluate
+
+   if $wl12_fieldname = 'PROCESS_INSTANCE'
+
+      let $PI_Clause = ' AND PROCESS_INSTANCE = ' || to_char(#prcs_process_instance)
+
+   end-if
+
+FROM  PSRECFIELD WLGEN12
+WHERE WLGEN12.RECNAME  = $WLGEN_Temp_Recname
+
+end-select
+
+
+   let $WLGEN_Insert_List = rtrim($WLGEN_Insert_List,',')
+   let $WLGEN_Select_List = rtrim($WLGEN_Select_List,',')
+
+   let $WLGEN_App_WL_Insert =     'INSERT INTO PS_'
+                               || $App_WL_Recname
+                               || ' ( '
+                               || $WLGEN_Insert_List
+                               || ' ) SELECT '
+                               || $WLGEN_Select_List
+                               || ' FROM PS_'
+                               || $WLGEN_Temp_Recname
+                               || ' WHERE BUSPROCNAME = '
+                               || ''''
+                               || $WLGEN_BPName
+                               || ''''
+                               || ' AND ACTIVITYNAME = '
+                               || ''''
+                               || $WLGEN_ACTName
+                               || ''''
+                               || ' AND EVENTNAME = '
+                               || ''''
+                               || $WLGEN_EVTName
+                               || ''''
+                               || ' AND WORKLISTNAME = '
+                               || ''''
+                               || $Routename
+                               || ''''
+                               || ' AND INSTANCEID = 0 '
+
+   if $PI_Clause <> ' '
+
+      let $WLGEN_App_WL_Insert = $WLGEN_App_WL_Insert || $PI_Clause
+
+   end-if
+
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+!  Jam-WL-Entries
+!
+!  Insert the worklist entries.  Note that we musdt calculate the timeout
+!  datetime if timeout processing has been defined for this worklist defn.
+!
+!----------------------------------------------------------------------!
+begin-procedure Jam-WL-Entries
+
+   do Get-Current-DateTime
+
+   if #timeoutactive = 1
+      do Calc-TimeoutDttm
+   end-if
+
+   let $WLGEN_Datetime = &sysdatetime
+
+begin-select
+
+WLGEN2.OPRID
+
+   let $WLGEN_Oprid = rtrim(&WLGEN2.OPRID,' ')
+
+   if not(isnull($WLGEN_Oprid))
+      do Get-WL-InstanceID
+      do Insert-WL-Entries
+   end-if
+
+
+FROM  PS_ROLEXLATOPR WLGEN2
+WHERE ROLEUSER IN
+   (SELECT ROLEUSER FROM PSROLEUSER WHERE ROLENAME = $RoleName)
+
+end-select
+
+end-procedure
+
+!----------------------------------------------------------------------!
+!  Jam-WL-Entries-BatchWLOpr
+!
+!  Insert the worklist entries.  Note that we must calculate the timeout
+!  datetime if timeout processing has been defined for this worklist defn.
+!
+!----------------------------------------------------------------------!
+begin-procedure Jam-WL-Entries-BatchWLOpr
+
+   do Get-Current-DateTime
+
+   if #timeoutactive = 1
+      do Calc-TimeoutDttm
+   end-if
+
+   let $WLGEN_Datetime = &sysdatetime
+
+begin-select
+
+WLGEN22.OPRID
+
+   let $WLGEN_Oprid = rtrim(&WLGEN22.OPRID,' ')
+
+   if not(isnull($WLGEN_Oprid))
+      do Get-WL-InstanceID
+      do Insert-WL-Entries
+   end-if
+
+FROM  PS_BATCHWLOPR WLGEN22
+WHERE PROCESS_INSTANCE  = #prcs_process_instance
+
+end-select
+
+begin-sql
+DELETE FROM PS_BATCHWLOPR
+WHERE PROCESS_INSTANCE  = #prcs_process_instance
+end-sql
+
+end-procedure
+
+!----------------------------------------------------------------------!
+!  Calc-TimeoutDttm
+!
+!  Add the timeout days, hours, and minutes to the current datetime to
+!  calculate the timeout datetime.
+!
+!----------------------------------------------------------------------!
+begin-procedure Calc-TimeoutDttm
+
+   do Format-DateTime($SysDateTime, $datetime, {DEFCMP}, 'time', '')
+   let $year = substr($datetime,1,4)
+   let #year = to_number($year)
+   let $month = substr($datetime,5,2)
+   let #month = to_number($month)
+   let $day = substr($datetime,7,2)
+   let #day = to_number($day)
+   let $hour = substr($datetime,9,2)
+   let #hour = to_number($hour)
+   let $minute = substr($datetime,11,2)
+   let #minute = to_number($minute)
+   let $second = substr($datetime,13,2)
+   if (#timeoutmaxmins + #minute) > 60
+       let #timeoutmaxhrs = #timeoutmaxhrs + 1
+       let #minute = #minute + #timeoutmaxmins - 60
+   else
+       let #minute = #minute + #timeoutmaxmins
+   end-if
+   if (#timeoutmaxhrs + #hour) > 24
+       let #timeoutmaxdays = #timeoutmaxdays + 1
+       let #hour = #hour + #timeoutmaxhrs  - 24
+   else
+       let #hour = #hour + #timeoutmaxhrs
+   end-if
+   do dtu-ymd-to-ser(#year, #month, #day, #dtu_ser)
+   let #dtu_ser = #dtu_ser + #timeoutmaxdays
+   do dtu-ser-to-ymd(#dtu_ser, #year, #month, #day)
+   let $datetime = edit(#year, '0000') || edit(#month, '00')
+           || edit(#day, '00') || edit(#hour, '00') || edit(#minute, '00')
+           || $second
+   do Format-DateTime($datetime, $TimeoutDttm, {DEFCMP}, 'time', 'native')
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+!  Get-WL-InstanceID
+!
+!  Retrieve the next worklist instanceid available.
+!
+!----------------------------------------------------------------------!
+begin-procedure Get-WL-InstanceID
+
+   let #WLGEN_INSTANCEID = 0
+
+
+begin-sql
+   UPDATE PSWLINSTMAX
+   SET INSTMAX = INSTMAX + 1
+   WHERE BUSPROCNAME  = $WLGEN_BPName
+   AND   ACTIVITYNAME = $WLGEN_ACTName
+   AND   EVENTNAME    = $WLGEN_EVTName
+   AND   WORKLISTNAME = $RouteName
+end-sql
+
+
+begin-select
+
+WLGEN3.INSTMAX
+
+   let #WLGEN_INSTANCEID       = &WLGEN3.INSTMAX
+
+   if #WLGEN_INSTANCEID_FIRST = 0
+
+      let #WLGEN_INSTANCEID_FIRST = &WLGEN3.INSTMAX
+
+   end-if
+
+FROM  PSWLINSTMAX WLGEN3
+WHERE WLGEN3.BUSPROCNAME  = $WLGEN_BPName
+AND   WLGEN3.ACTIVITYNAME = $WLGEN_ACTName
+AND   WLGEN3.EVENTNAME    = $WLGEN_EVTName
+AND   WLGEN3.WORKLISTNAME = $Routename
+
+end-select
+
+  if #WLGEN_INSTANCEID = 0
+     do Insert-WLINSTMAX
+  end-if
+
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+!  Insert-WLINSTMAX
+!
+!  If this is the first time worklist entries of this type have been
+!  created, you must insert a new entry into PSWLINSTMAX.
+!
+!----------------------------------------------------------------------!
+begin-procedure Insert-WLINSTMAX
+
+   let #WLGEN_INSTANCEID       = 1
+   let #WLGEN_INSTANCEID_FIRST = 1
+
+begin-sql
+
+INSERT INTO PSWLINSTMAX
+(
+BUSPROCNAME,
+ACTIVITYNAME,
+EVENTNAME,
+WORKLISTNAME,
+INSTMAX
+)
+VALUES
+(
+$WLGEN_BPName,
+$WLGEN_ACTName,
+$WLGEN_EVTName,
+$Routename,
+#WLGEN_INSTANCEID
+)
+
+end-sql
+
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+!  Insert-WL-Entries
+!
+!  Substitute in the instanceid into the application select statement.
+!  Then insert the application worklist entry.
+!  Then insert into PSWORKLIST.
+!
+!----------------------------------------------------------------------!
+begin-procedure Insert-WL-Entries
+
+   let $WLGEN_INSTANCEID = to_char(#WLGEN_INSTANCEID)
+   let $WLGEN_INSTANCEID_FIRST = to_char(#WLGEN_INSTANCEID_FIRST)
+
+   let #wlgen_start  = instr($WLGEN_App_WL_Insert,'##INSTANCEID##',1)
+   let #wlgen_length = length($WLGEN_App_WL_Insert)
+
+   let $wlgen_left = substr($WLGEN_App_WL_Insert,1,(#wlgen_start - 1))
+   let $wlgen_right
+      = substr($WLGEN_App_WL_Insert,(#wlgen_start + 14),#wlgen_length)
+
+   let $WLGEN_Insert1 = $wlgen_left || $WLGEN_INSTANCEID || $wlgen_right
+
+   let #wlgen_start  = instr($WLGEN_Insert1,'##TRANSACTIONID##',1)
+   let #wlgen_length = length($WLGEN_Insert1)
+
+   let $wlgen_left = substr($WLGEN_Insert1,1,(#wlgen_start - 1))
+   let $wlgen_right
+      = substr($WLGEN_Insert1,(#wlgen_start + 17),#wlgen_length)
+
+   let $WLGEN_Insert = $wlgen_left || $WLGEN_INSTANCEID_FIRST || $wlgen_right
+
+begin-sql
+   [$WLGEN_Insert]
+end-sql
+
+   if #timeoutactive = 1
+      do Insert-Timeout-Entries
+   else
+      do Insert-NonTimeout-Entries
+   end-if
+
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+!  Insert-NonTimeout-Entries
+!
+!  Don't include column INSTTIMEOUTDTTM in this statement.  Don't want to
+!  deal with the porting of a null dttm ... easier to create two different
+!  SQL statements.
+!
+!----------------------------------------------------------------------!
+begin-procedure Insert-NonTimeout-Entries
+
+begin-sql
+
+INSERT INTO PSWORKLIST
+(
+BUSPROCNAME,
+ACTIVITYNAME,
+EVENTNAME,
+WORKLISTNAME,
+INSTANCEID,
+TRANSACTIONID,
+OPRID,
+ORIGINATORTYPE,
+ORIGINATORID,
+INSTSTATUS,
+INSTAVAILABLEDTTM,
+TIMEDOUT,
+PREVOPRID,
+COMMENTSHORT,
+WLDAYSTOSELECT,
+WLDAYSTOWORK,
+URL,
+DO_REPLICATE_FLAG,
+WL_PRIORITY
+)
+VALUES
+(
+$WLGEN_BPName,
+$WLGEN_ACTName,
+$WLGEN_EVTName,
+$RouteName,
+#WLGEN_INSTANCEID,
+#WLGEN_INSTANCEID_FIRST,
+$WLGEN_Oprid,
+0,
+$WLGEN_Temp_Appname,
+0,
+{DateTimeIn-Prefix}&Sysdatetime{DateTimeIn-Suffix},
+0,
+' ',
+' ',
+0,
+0,
+' ',
+' ',
+' '
+)
+
+end-sql
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+!  Insert-Timeout-Entries
+!----------------------------------------------------------------------!
+begin-procedure Insert-Timeout-Entries
+
+begin-sql
+
+INSERT INTO PSWORKLIST
+(
+BUSPROCNAME,
+ACTIVITYNAME,
+EVENTNAME,
+WORKLISTNAME,
+INSTANCEID,
+TRANSACTIONID,
+OPRID,
+ORIGINATORTYPE,
+ORIGINATORID,
+INSTSTATUS,
+INSTAVAILABLEDTTM,
+INSTTIMEOUTDTTM,
+TIMEDOUT,
+PREVOPRID,
+COMMENTSHORT,
+WLDAYSTOSELECT,
+WLDAYSTOWORK,
+URL,
+DO_REPLICATE_FLAG,
+WL_PRIORITY
+)
+VALUES
+(
+$WLGEN_BPName,
+$WLGEN_ACTName,
+$WLGEN_EVTName,
+$RouteName,
+#WLGEN_INSTANCEID,
+#WLGEN_INSTANCEID_FIRST,
+$WLGEN_Oprid,
+0,
+$WLGEN_Temp_Appname,
+0,
+{DateTimeIn-Prefix}&Sysdatetime{DateTimeIn-Suffix},
+{DateTimeIn-Prefix}$TimeoutDttm{DateTimeIn-Suffix},
+0,
+' ',
+' ',
+0,
+0,
+' ',
+' ',
+' '
+)
+
+end-sql
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+!  Update-PSWLINSTMAX
+!
+!  Increment the INSTMAX counter on PSWLINSTMAX.
+!
+!----------------------------------------------------------------------!
+begin-procedure Update-PSWLINSTMAX
+
+begin-sql
+   UPDATE PSWLINSTMAX
+   SET INSTMAX = #WLGEN_INSTANCEID - 1
+   WHERE BUSPROCNAME  = $WLGEN_BPName
+   AND   ACTIVITYNAME = $WLGEN_ACTName
+   AND   EVENTNAME    = $WLGEN_EVTName
+   AND   WORKLISTNAME = $RouteName
+end-sql
+
+end-procedure
+
+
+!----------------------------------------------------------------------!
+!  Delete-App-WL-Temp-Entry
+!
+!  Delete the application tempory worklist entry that was inserted by
+!  the calling application.  Note that INSTANCEID must be 0 in order
+!  for this to work.
+!
+!----------------------------------------------------------------------!
+begin-procedure Delete-App-WL-Temp-Entry
+
+   let $WLGEN_Delete_Rec = 'PS_' || $WLGEN_Temp_Recname
+
+begin-sql
+DELETE FROM [$WLGEN_Delete_Rec]
+WHERE BUSPROCNAME  = $WLGEN_BPName
+AND   ACTIVITYNAME  = $WLGEN_ACTName
+AND   EVENTNAME    = $WLGEN_EVTName
+AND   WORKLISTNAME = $Routename
+AND   INSTANCEID   = 0
+[$PI_Clause]
+end-sql
+
+end-procedure

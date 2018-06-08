@@ -1,0 +1,772 @@
+!********************************************************************** 
+! SQR Name:           adprecip.sqc  
+! SQR Descr:          ADP Tax Service Transporter 
+! Created by:         drmonroe 
+! Create date:        03/04/2010 
+! Last modified by:   drmonroe
+! Last modified date: 03/20/2014
+!*********************************************************************** 
+
+!---------------------------------------------------------------------------------------------
+! ADP - FACS PeopleSoft Transporter TAX extract
+! adprecip.sqc  (splits locality balances into RES and NON-RES totals)
+! Dan Monroe
+! May 21, 2007  included by pbzqtr.sqr if #define LOCAL_RECIPROCITY is enabled
+!               init-LOCAL_RECIPROCITY <--- hook from pbzqtr.sqr upon startup
+!               Split-locality-totals  <--- hook from pbzqtr.sqr out of update-taxbalances
+!               print-reciprocity      <--- hook from pbzqtr.sqr to print reciprocity warnings
+! July 10, 2007 add audit of taxable wages (not just taxes withheld)
+! Oct  11, 2007 if QTD and YTD tax and taxable wage sums (from checks) don't tie to balances..
+!               use the balances so we're always balancing to tax balance table
+! Oct  16, 2007 LOCAL_RECIPROCITY_PRINT_DETAILS added
+! May  23, 2008 reciprocity warnings for negative YTDs
+! Mar  16, 2010 for NXT1, only split Louisville
+! Mar  18, 2010 fix for NXT1
+! Mar  19, 2010 SPLIT_LOCALS_WITH_DIFFERENT_RATES only
+! Dec  06, 2010 LOCAL_RECIPROCITY xxxx (year) optional . .starting year
+! Jun  28, 2011 see: 6/28/2011 only split if nonzero rates for speed
+!               STRIPPED_PBZQTR_REPORT no detailed printing
+! Nov  05, 2011 1.  Use the update-tax-balances procedure in pbzqtr.sqr to save code
+!               2.  if the split fails.. go ahead and determine the Res Y/N flag here then update balances
+!                   important for the compid or fein rollup clients (GE01)
+! Mar 19, 2012  For 11-F, PAACT_32_11F_Logic
+! Jun 19, 2012  see 6/19/2012 in split-locality-totals to bypass this logic if not enabled
+! Jan  8, 2014  dont' split into res and non-res if YTD's go negative - 20140108 LOCAL_RECIPROCITY_NEGATIVE_CHECK
+! Mar 20, 2014  always split Yonkers / 84000
+!----------------------------------------------------------------------------------------------
+
+#ifdef ADP_TAX_QUARTERLY
+
+#define adprecip_Version    adprecip.Mar 20, 2014
+
+#if {SITE_ID} = 'NXT1'
+ #define SPLIT_LOCALS_WITH_DIFFERENT_RATES
+#endif
+
+#if {SITE_ID} = 'PWH1'
+ #define LOCAL_RECIPROCITY_NEGATIVE_CHECK
+#endif
+
+begin-procedure init-LOCAL_RECIPROCITY
+
+ create-array name=LocalBalance size=2   -
+    field=TaxBalance_Nlgrs_Qtd:number    -
+    field=TaxBalance_Txgrs_Qtd:number    -
+    field=TaxBalance_Tax_Qtd:number      -
+    field=TaxBalance_Nlgrs_Ytd:number    -
+    field=TaxBalance_Txgrs_Ytd:number    -
+    field=TaxBalance_Tax_Ytd:number   
+
+#ifndef STRIPPED_PBZQTR_REPORT
+  #define MAX_reciprocity 2500  !logs the situations where Tax Balances do not tie to Pay Tax totals for res and non-res
+  create-array name=reciprocity size={MAX_reciprocity}  -
+                 field=company:char       -
+                 field=emplid:char        -
+                 field=state:char         -
+                 field=locality:char      -
+                 field=QTD_R:number       -
+                 field=QTD_N:number       -
+                 field=QTD_T:number       -
+                 field=YTD_R:number       -
+                 field=YTD_N:number       -
+                 field=YTD_T:number       -   
+                 field=QTD_TXGRS_R:number       -
+                 field=QTD_TXGRS_N:number       -
+                 field=QTD_TXGRS_T:number       -
+                 field=YTD_TXGRS_R:number       -
+                 field=YTD_TXGRS_N:number       -
+                 field=YTD_TXGRS_T:number       -
+                 field=QTD_NLGRS_R:number       -
+                 field=QTD_NLGRS_N:number       -
+                 field=QTD_NLGRS_T:number       -
+                 field=YTD_NLGRS_R:number       -
+                 field=YTD_NLGRS_N:number       -
+                 field=YTD_NLGRS_T:number       -
+                 field=LOG_TYPE:Char
+
+#endif
+
+  Do Convert-From-DTU-Date($Qtr_Start_DTU,$Qtr_Start_Native)
+  let $First_day_of_year_DTU  = $RptYear || '-01-01'
+  Do Convert-From-DTU-Date($First_day_of_year_DTU,$First_day_of_year)
+  
+  SHOW ' '
+  show 'procedure init-LOCAL_RECIPROCITY, ADPRECIP.SQC Version : {adprecip_Version}'
+  show ' First_day_of_year : ' $First_day_of_year
+  show ' Qtr_Start_Native  : ' $Qtr_Start_Native
+  show ' Qtr_End_Native    : ' $Qtr_End_Native
+  #ifdef LOCAL_RECIPROCITY_PRINT_DETAILS
+  show ' LOCAL_RECIPROCITY_PRINT_DETAILS enabled'
+  #endif
+
+  #ifdef SPLIT_LOCALS_WITH_DIFFERENT_RATES
+  show ' SPLIT_LOCALS_WITH_DIFFERENT_RATES enabled'
+  #endif
+  
+  show 'LOCAL_RECIPROCITY  {LOCAL_RECIPROCITY}'
+  if rtrim('{LOCAL_RECIPROCITY}',' ') <> ''
+   if $RptYear < '{LOCAL_RECIPROCITY}'
+     show 'No split of Locals due to starting locality split in {LOCAL_RECIPROCITY}'
+     let $no_local_split = 't'
+   end-if
+  end-if
+  
+  SHOW 'init-LOCAL_RECIPROCITY complete.'
+  SHOW ' '
+  
+end-procedure
+
+#ifdef SPLIT_LOCALS_WITH_DIFFERENT_RATES
+begin-procedure Split-locality-totals              ! <--- hook from pbzqtr.sqr out of update-taxbalances
+
+ if $SelectEmplid <> ''
+     show 'Split-locality-totals : SPLIT_LOCALS_WITH_DIFFERENT_RATES, $no_local_split ' $no_local_split ' ' $Current_Company ' ' $Current_Emplid ' ' $Cur_State $Cur_Tax_Class $Cur_Locality 
+ end-if
+
+ if $no_local_split = 't'
+   let $log_type = 'error'
+ else
+   do get-local-info-recip
+   if $split_local = 'y'  or ($Cur_State = 'NY' and $Cur_Locality = '84000')  !'graduated tax'
+    if $SelectEmplid <> ''
+     show 'Split-locality-totals. res rate = ' #res_rate ', non-res rate = ' #nonres_rate
+    end-if
+    do Get-Res-and-non-Res-QTD-and-YTDs
+   else
+    let $log_type = 'error'
+   end-if
+ end-if
+ 
+end-procedure
+
+#else
+
+begin-procedure Split-locality-totals              ! <--- hook from pbzqtr.sqr out of update-taxbalances
+
+ if $SelectEmplid <> ''
+     show 'Split-locality-totals : $no_local_split ' $no_local_split ' ' $Current_Emplid ' ' $Cur_State $Cur_Tax_Class $Cur_Locality 
+ end-if
+ 
+ if $no_local_split = 't'     !6/19/2012 added this check
+   let $log_type = 'error'
+ else
+   do Get-Res-and-non-Res-QTD-and-YTDs
+ end-if
+ 
+end-procedure
+#endif
+
+!********************************************************************* !
+!----------------------------------------------------------------------!
+! Procedure: Get-Res-and-non-Res-QTD-and-YTDs                          !
+!----------------------------------------------------------------------!
+begin-procedure Get-Res-and-non-Res-QTD-and-YTDs
+
+  let $log_type = ''
+  clear-array name=LocalBalance                
+
+  #ifdef LOCAL_RECIPROCITY_SINGLE_STATE
+     if rtrim($Cur_state,' ') <> '{LOCAL_RECIPROCITY_SINGLE_STATE}'
+       let $log_type = 'error'
+       goto no_state_reciprocity
+     end-if
+  #endif
+
+  #ifdef PAACT_32_11F_Logic
+     if rtrim($Cur_state,' ') = 'PA' and rtrim($Cur_tax_class,' ') = 'H' and #RptYear >= 2012
+       let $log_type = 'error'
+       if $SelectEmplid  <> ''
+        show 'Local Reciprocity Message --> (PAACT_32_11F_Logic) No Split logic for PA Act 32 Data ' $Cur_state $Cur_tax_Class $Cur_Locality
+       end-if
+       goto no_state_reciprocity
+     end-if
+  #endif
+  
+  !called for all locals from quarterly to split out the balances between res and non-res
+  !--------------------------------------------------------------------------------------
+
+begin-SELECT
+PAYCALL2.PAY_BEGIN_DT
+PAYCALL2.PAY_END_DT
+PAYCALL2.CHECK_DT
+PSPCL1.COMPANY
+PSPCL1.PAYGROUP
+PSPCL1.PAY_END_DT
+PSPCL1.{pg}
+PSPCL1.{ln}
+PSPCL1.OFF_CYCLE
+PSPCL1.SEPCHK
+PSPCL1.EMPLID
+PSPCL1.CHECK_DT
+PSPCL1.PAYCHECK_OPTION
+PSPCL1.PAYCHECK_STATUS
+
+  move &PSPCL1.{pg}        to #PSPC_PAGE
+  move &PSPCL1.{ln}        to #PSPC_LINE
+  move &PSPCL1.SEPCHK      to #PSPC_SEPCHK
+
+  move &PSPCL1.COMPANY     to $PSPC.COMPANY
+  move &PSPCL1.PAYGROUP    to $PSPC.PAYGROUP
+  move &PSPCL1.PAY_END_DT  to $PSPC.PAY_END_DT
+  move &PSPCL1.OFF_CYCLE   to $PSPC.OFF_CYCLE
+  move &PSPCL1.EMPLID      to $PSPC.EMPLID
+
+  move &PAYCALL2.CHECK_DT  to $PSPC.CHECK_DT   ! To test... replace with: move &PSPCL1.CHECK_DT  to $PSPC.CHECK_DT
+  Do Convert-to-DTU-Date($PSPC.CHECK_DT, $CHECK_DT_DTU)
+  do init-local-balances                      
+  
+  FROM  PS_PAY_CHECK PSPCL1, PS_PAY_CALENDAR PAYCALL2, PS_PAY_CAL_BAL_ID BALL1
+
+     WHERE    PAYCALL2.COMPANY     = BALL1.COMPANY
+          AND PAYCALL2.PAYGROUP    = BALL1.PAYGROUP
+          AND PAYCALL2.PAY_END_DT  = BALL1.PAY_END_DT
+          AND BALL1.BALANCE_ID     = $Calendar_Year_Id
+          AND PAYCALL2.CHECK_DT   >= $First_day_of_year
+          AND PAYCALL2.CHECK_DT   <= $Qtr_End_Native 
+          AND PSPCL1.COMPANY       = $Current_Company
+          AND PSPCL1.EMPLID        = $Current_Emplid
+          AND PSPCL1.COMPANY       = PAYCALL2.COMPANY
+          AND PSPCL1.PAYGROUP      = PAYCALL2.PAYGROUP
+          AND PSPCL1.PAY_END_DT    = PAYCALL2.PAY_END_DT
+          AND PSPCL1.PAYCHECK_STATUS IN ('F','R','A')   !CONFIRMED AND REVERSALS AND ADJUSTMENTS
+
+   ORDER BY PAYCALL2.CHECK_DT
+
+  #ifdef SELECT_WITH_UR
+   with ur
+  #end-if
+end-select
+
+  !Resident totals are in array index 0
+  !------------------------------------
+  get #NLGRS_QTD_R     	  -
+      #TXGRS_QTD_R     	  -
+      #TAX_QTD_R       	  -
+      #NLGRS_YTD_R     	  -
+      #TXGRS_YTD_R     	  -
+      #TAX_YTD_R       	  -
+  from LocalBalance(0)    -
+    TaxBalance_Nlgrs_Qtd  -
+    TaxBalance_Txgrs_Qtd  -
+    TaxBalance_Tax_Qtd    -
+    TaxBalance_Nlgrs_Ytd  -
+    TaxBalance_Txgrs_Ytd  -
+    TaxBalance_Tax_Ytd    
+
+   
+  !Non-Resident totals are in array index 1
+  !----------------------------------------
+  get #NLGRS_QTD_N     	  -
+      #TXGRS_QTD_N     	  -
+      #TAX_QTD_N       	  -
+      #NLGRS_YTD_N     	  -
+      #TXGRS_YTD_N     	  -
+      #TAX_YTD_N       	  -
+  from LocalBalance(1)    -
+    TaxBalance_Nlgrs_Qtd  -
+    TaxBalance_Txgrs_Qtd  -
+    TaxBalance_Tax_Qtd    -
+    TaxBalance_Nlgrs_Ytd  -
+    TaxBalance_Txgrs_Ytd  -
+    TaxBalance_Tax_Ytd    
+
+
+  !Now we can double check that the sum of the RES and NON-RES amounts from PS_PAY_TAX
+  !Equal the PS_TAX_BALANCE totals
+  
+  let #NLGRS_YTD_D = #NLGRS_YTD_T - ( #NLGRS_YTD_N + #NLGRS_YTD_R )
+  let #TXGRS_YTD_D = #TXGRS_YTD_T - ( #TXGRS_YTD_N + #TXGRS_YTD_R )
+  let #TAX_YTD_D   = #TAX_YTD_T   - ( #TAX_YTD_N + #TAX_YTD_R )
+  let #NLGRS_QTD_D = #NLGRS_QTD_T - ( #NLGRS_QTD_N + #NLGRS_QTD_R )
+  let #TXGRS_QTD_D = #TXGRS_QTD_T - ( #TXGRS_QTD_N + #TXGRS_QTD_R )
+  let #TAX_QTD_D   = #TAX_QTD_T   - ( #TAX_QTD_N + #TAX_QTD_R )
+
+  ! 20140108 check for negative YTD's
+  let $locals_YTD_negative = 'f'
+  #ifdef LOCAL_RECIPROCITY_NEGATIVE_CHECK
+   if #NLGRS_YTD_N < 0 or #NLGRS_YTD_R < 0 or #TXGRS_YTD_N < 0 or #TXGRS_YTD_R or #TAX_YTD_N < 0 or #TAX_YTD_R < 0
+    let $locals_YTD_negative = 't'
+    if $SelectEmplid  <> ''
+      show 'Local Reciprocity Message --> Local YTD Res or Non-Res Taxes or wages are negative. Local ' $Cur_Locality
+    end-if
+   end-if
+  #endif
+  
+  !all of the above sums must tie out to the balances or we simply log it.. and always use the balances
+  !-----------------------------------------------------------------------------------------------------
+  if round(#TAX_QTD_D,2) = 0 AND round(#TXGRS_QTD_D,2) = 0 AND round(#NLGRS_QTD_D,2) = 0 AND
+     round(#TAX_YTD_D,2) = 0 AND round(#TXGRS_YTD_D,2) = 0 AND round(#NLGRS_YTD_D,2) = 0 AND $locals_YTD_negative = 'f'
+    
+    let $locals_balance = 't'
+    if $SelectEmplid  <> ''
+      show 'Local Reciprocity Message --> '
+      show ' Sum of Local Res and Non-Res Taxes or wages equal Tax Balances, Emplid ' $Current_Emplid ', Local ' $Cur_Locality
+      show '   QTD Tax Balances = ' #TAX_QTD_T ', QTD Res = ' #TAX_QTD_R ', QTD Non-Res = ' #TAX_QTD_N
+      show '   YTD Tax Balances = ' #TAX_YTD_T ', YTD Res = ' #TAX_YTD_R ', YTD Non-Res = ' #TAX_YTD_N
+    end-if     
+  else
+    let $locals_balance = 'f'
+    
+    !11/5/2011 reworked to handle the update right in this routine so we always write a Y/N into tax balances here. 
+    ! this takes care of the rollup situations where the split is ok in one company and not in another - GE01
+    ! we were writing a '' into the resident field in TaxBalance... this will write a Y/N
+    let $TaxBalance_State    = $cur_state
+    let $TaxBalance_Locality = $cur_locality
+    do Extract-Resident-Code  
+    let $Cur_resident = $resident
+    if $SelectEmplid  <> ''
+      show 'Local Reciprocity Message --> '
+      show ' Sum of Local Res and Non-Res Taxes or wages do NOT equal Tax Balances, Emplid ' $Current_Emplid ', Local ' $Cur_Locality ', Res ' $cur_resident
+      show '   QTD Tax Balances = ' #TAX_QTD_T ', QTD Res = ' #TAX_QTD_R ', QTD Non-Res = ' #TAX_QTD_N ', QTD Tax(Balance - (Res + NonRes)) = ' #TAX_QTD_D
+      show '   YTD Tax Balances = ' #TAX_YTD_T ', YTD Res = ' #TAX_YTD_R ', YTD Non-Res = ' #TAX_YTD_N ', YTD Tax(Balance - (Res + NonRes)) = ' #TAX_YTD_D
+    end-if     
+    do update-tax-balances
+    !let $log_type = 'error'
+    !----------------------------------
+#ifndef STRIPPED_PBZQTR_REPORT
+    do log-reciprocity
+#endif    
+  end-if
+  
+ 
+ if rtrim($locals_balance,' ') = 't'
+   
+  if  #NLGRS_QTD_R <> 0  OR #TXGRS_QTD_R <> 0 OR #TAX_QTD_R <> 0
+   OR #NLGRS_YTD_R <> 0  OR #TXGRS_YTD_R <> 0 OR #TAX_YTD_R <> 0
+
+      let #NLGRS_QTD_T = #NLGRS_QTD_R  
+      let #TXGRS_QTD_T = #TXGRS_QTD_R  
+      let #TAX_QTD_T   = #TAX_QTD_R    
+      let #NLGRS_YTD_T = #NLGRS_YTD_R  
+      let #TXGRS_YTD_T = #TXGRS_YTD_R  
+      let #TAX_YTD_T   = #TAX_YTD_R    
+
+    let $log_type = 'split'
+    let $Cur_Resident = 'Y'
+    do update-tax-balances
+
+  end-if
+
+  if  #NLGRS_QTD_N <> 0  OR #TXGRS_QTD_N <> 0 OR #TAX_QTD_N <> 0
+   OR #NLGRS_YTD_N <> 0  OR #TXGRS_YTD_N <> 0 OR #TAX_YTD_N <> 0
+
+      let #NLGRS_QTD_T = #NLGRS_QTD_N  
+      let #TXGRS_QTD_T = #TXGRS_QTD_N  
+      let #TAX_QTD_T   = #TAX_QTD_N    
+      let #NLGRS_YTD_T = #NLGRS_YTD_N  
+      let #TXGRS_YTD_T = #TXGRS_YTD_N  
+      let #TAX_YTD_T   = #TAX_YTD_N    
+
+      let $log_type = 'split'
+      let $Cur_Resident = 'N'
+      do update-tax-balances
+  end-if
+ 
+  #ifndef STRIPPED_PBZQTR_REPORT
+   if (#NLGRS_QTD_R <> 0  AND #NLGRS_QTD_N <> 0) OR   !log the situation when we split QTD numbers
+     (#TXGRS_QTD_R <> 0  AND #TXGRS_QTD_N <> 0) OR    !-------------------------------------------
+     (#TAX_QTD_R <> 0    AND #TAX_QTD_N <> 0) 
+          let $log_type = 'split'
+          do log-reciprocity
+   end-if
+  #endif
+
+  end-if
+
+no_state_reciprocity:
+
+  
+end-procedure
+
+begin-procedure init-local-balances
+
+begin-select
+EEC_LT.TAX_CUR
+EEC_LT.TXGRS_CUR
+EEC_LT.NLGRS_CUR
+EEC_LT.RESIDENT
+  
+  move &EEC_LT.RESIDENT to $Cur_resident
+
+  if $cur_resident = 'Y'
+   let #linx = 0
+  else
+   let $cur_resident = 'N'
+   let #linx = 1
+  end-if
+
+ if $CHECK_DT_DTU >= $Qtr_Start_DTU 
+  let #EEC_LT.NLGRS_CUR = &EEC_LT.NLGRS_CUR 
+  let #EEC_LT.TXGRS_CUR = &EEC_LT.TXGRS_CUR 
+  let #EEC_LT.TAX_CUR   = &EEC_LT.TAX_CUR 
+ else
+  let #EEC_LT.NLGRS_CUR = 0
+  let #EEC_LT.TXGRS_CUR = 0
+  let #EEC_LT.TAX_CUR   = 0
+ end-if
+ 
+      Array-Add #EEC_LT.NLGRS_CUR    -
+                #EEC_LT.TXGRS_CUR    -
+                #EEC_LT.TAX_CUR      -
+                &EEC_LT.NLGRS_CUR    -
+		&EEC_LT.TXGRS_CUR    -
+                &EEC_LT.TAX_CUR      -
+                TO LocalBalance(#linx) -
+                        TaxBalance_Nlgrs_Qtd  -
+                        TaxBalance_Txgrs_Qtd  -
+                        TaxBalance_Tax_Qtd    -
+                        TaxBalance_Nlgrs_Ytd  -
+                        TaxBalance_Txgrs_Ytd  -
+                        TaxBalance_Tax_Ytd    
+    
+ FROM PS_PAY_TAX EEC_LT
+ WHERE EEC_LT.COMPANY    = $PSPC.COMPANY
+   AND EEC_LT.PAYGROUP   = $PSPC.PAYGROUP
+   AND EEC_LT.PAY_END_DT = $PSPC.PAY_END_DT
+   AND EEC_LT.OFF_CYCLE  = $PSPC.OFF_CYCLE
+   AND EEC_LT.{pg}       = #PSPC_PAGE
+   AND EEC_LT.{ln}       = #PSPC_LINE
+   #if {PeopleSoft_Version} >= '8'   !10/12/07, changed from > to >=
+    AND EEC_LT.SEPCHK     = #PSPC_SEPCHK
+   #endif
+   AND EEC_LT.STATE     = $Cur_State
+   AND EEC_LT.TAX_CLASS = $Cur_Tax_Class
+   AND EEC_LT.LOCALITY  = $Cur_Locality
+   
+#ifdef SELECT_WITH_UR
+ with ur
+#end-if
+end-select
+ 
+end-procedure
+
+
+
+#ifndef STRIPPED_PBZQTR_REPORT
+begin-procedure log-reciprocity
+
+ #ifndef LOCAL_RECIPROCITY_PRINT_DETAILS
+       if $log_type = 'error'
+          add 1 to #reciprocity_error
+       end-if
+       if $log_type = 'split'
+          add 1 to #reciprocity_split
+       end-if
+ #else
+  if #reciprocity < {MAX_reciprocity}
+    put  $Current_company         -
+         $Current_Emplid          -
+         $Cur_State               -
+         $Cur_Locality            -
+         #TAX_QTD_R               -
+         #TAX_QTD_N               -
+         #TAX_QTD_T               -
+         #TAX_YTD_R               -
+         #TAX_YTD_N               -
+         #TAX_YTD_T               -
+         #TXGRS_QTD_R               -
+         #TXGRS_QTD_N               -
+         #TXGRS_QTD_T               -
+         #TXGRS_YTD_R               -
+         #TXGRS_YTD_N               -
+         #TXGRS_YTD_T               -         
+         #NLGRS_QTD_R               -
+         #NLGRS_QTD_N               -
+         #NLGRS_QTD_T               -
+         #NLGRS_YTD_R               -
+         #NLGRS_YTD_N               -
+         #NLGRS_YTD_T               -
+         $log_type                  -
+           into reciprocity(#reciprocity) -
+             company       -
+             emplid        -
+             state         -
+             locality      -
+             QTD_R         -
+             QTD_N         -
+             QTD_T         -
+             YTD_R         -
+             YTD_N         -
+             YTD_T         -
+             QTD_TXGRS_R         -
+             QTD_TXGRS_N         -
+             QTD_TXGRS_T         -
+             YTD_TXGRS_R         -
+             YTD_TXGRS_N         -
+             YTD_TXGRS_T         -
+             QTD_NLGRS_R         -
+             QTD_NLGRS_N         -
+             QTD_NLGRS_T         -
+             YTD_NLGRS_R         -
+             YTD_NLGRS_N         -
+             YTD_NLGRS_T         -
+             LOG_TYPE
+
+    add 1 to #reciprocity
+   else
+     if #zero_reciprocity < 1
+      show 'Warning: Maximum number of Reciprocity Locals logged, increase array, reciprocity ( {MAX_reciprocity} ) '
+      add 1 to #zero_reciprocity
+     end-if
+   end-if
+  #endif
+end-procedure
+
+begin-procedure print-reciprocity                  ! <-- hook from pbzqtr.sqr to print reciprocity warnings
+
+!Header format
+!-------------
+!Company Emplid       State Locality     TAX_BALANCE           PAY_TAX_(RES)   PAY_TAX_(NonRES)     Delta
+!---------------------------------------------------------------------------------------------------------
+
+    let #header_type = 9
+    let $ReportTitle  = 'ADP Tax & Financial Services Quarterly. Audit Local Reciprocity.'
+
+    if $no_local_split = 't'
+      print '  ***** Local Reciprocity suppressed due to LOCAL_RECIPROCITY starting in year: {LOCAL_RECIPROCITY}' (+2,1)
+    else
+   
+     show 'print-reciprocity, #reciprocity       = ' #reciprocity
+     show '                   #reciprocity_error = ' #reciprocity_error
+     show '                   #reciprocity_split = ' #reciprocity_split
+
+     if #reciprocity > 0
+
+      let #i = 0
+      while (#i < #reciprocity)
+
+        if #current-line > 56
+          New-Page
+        end-if
+
+        Get $C -
+            $E -
+            $S -
+            $L -
+            #QTD_R -
+            #QTD_N -
+            #QTD_T -
+            #YTD_R -
+            #YTD_N -
+            #YTD_T -
+            #QTD_TXGRS_R -
+            #QTD_TXGRS_N -
+            #QTD_TXGRS_T -
+            #YTD_TXGRS_R -
+            #YTD_TXGRS_N -
+            #YTD_TXGRS_T -
+            #QTD_NLGRS_R -
+            #QTD_NLGRS_N -
+            #QTD_NLGRS_T -
+            #YTD_NLGRS_R -
+            #YTD_NLGRS_N -
+            #YTD_NLGRS_T -
+            $log_type    -
+            from Reciprocity(#i) -
+             Company       -
+             Emplid        -
+             state         -
+             locality      -
+             QTD_R         -
+             QTD_N         -
+             QTD_T         -
+             YTD_R         -
+             YTD_N         -
+             YTD_T         -
+             QTD_TXGRS_R         -
+             QTD_TXGRS_N         -
+             QTD_TXGRS_T         -
+             YTD_TXGRS_R         -
+             YTD_TXGRS_N         -
+             YTD_TXGRS_T         -
+             QTD_NLGRS_R         -
+             QTD_NLGRS_N         -
+             QTD_NLGRS_T         -
+             YTD_NLGRS_R         -
+             YTD_NLGRS_N         -
+             YTD_NLGRS_T         -
+             LOG_TYPE       
+                          
+         if $log_type = 'error'
+
+           add 1 to #reciprocity_error
+
+           let #QTD_D       = #QTD_T - ( #QTD_R + #QTD_N )  
+           let #YTD_D       = #YTD_T - ( #YTD_R + #YTD_N )  
+           let #QTD_TXGRS_D = #QTD_TXGRS_T - ( #QTD_TXGRS_R + #QTD_TXGRS_N )  
+           let #YTD_TXGRS_D = #YTD_TXGRS_T - ( #YTD_TXGRS_R + #YTD_TXGRS_N )  
+           let #QTD_NLGRS_D = #QTD_NLGRS_T - ( #QTD_NLGRS_R + #QTD_NLGRS_N )  
+           let #YTD_NLGRS_D = #YTD_NLGRS_T - ( #YTD_NLGRS_R + #YTD_NLGRS_N )  
+
+           print $C           (+2,1)
+           print $E           (0,9)
+           print $S           (0,24)
+           print $L           (0,28)
+           print 'Sum of RES and Non-RES PAY_TAX records <> TAX_BALANCE.  TAX_BALANCE totals will be reported.' (0,39)
+           
+           if round(#QTD_D,2) <> 0      
+             print 'QTD Taxes' (+1,10)
+             print #QTD_T       (0,39)  edit $$$,$$$,$$$,$$9.99mi
+             print #QTD_R       (0,58)  edit $$$,$$$,$$$,$$9.99mi
+             print #QTD_N       (0,77)  edit $$$,$$$,$$$,$$9.99mi
+             print #QTD_D       (0,96)  edit $$$,$$$,$$$,$$9.99mi
+           end-if
+           if round(#QTD_TXGRS_D,2) <> 0      
+             print 'QTD Taxable Wages' (+1,10)
+             print #QTD_TXGRS_T       (0,39)  edit $$$,$$$,$$$,$$9.99mi
+             print #QTD_TXGRS_R       (0,58)  edit $$$,$$$,$$$,$$9.99mi
+             print #QTD_TXGRS_N       (0,77)  edit $$$,$$$,$$$,$$9.99mi
+             print #QTD_TXGRS_D       (0,96)  edit $$$,$$$,$$$,$$9.99mi
+           end-if
+           if round(#QTD_NLGRS_D,2) <> 0      
+             print 'QTD NLGRS Wages' (+1,10)
+             print #QTD_NLGRS_T       (0,39)  edit $$$,$$$,$$$,$$9.99mi
+             print #QTD_NLGRS_R       (0,58)  edit $$$,$$$,$$$,$$9.99mi
+             print #QTD_NLGRS_N       (0,77)  edit $$$,$$$,$$$,$$9.99mi
+             print #QTD_NLGRS_D       (0,96)  edit $$$,$$$,$$$,$$9.99mi
+           end-if
+
+           if round(#YTD_D,2) <> 0      
+             print 'YTD Taxes' (+1,10)
+             print #YTD_T       (0,39)  edit $$$,$$$,$$$,$$9.99mi
+             print #YTD_R       (0,58)  edit $$$,$$$,$$$,$$9.99mi
+             print #YTD_N       (0,77)  edit $$$,$$$,$$$,$$9.99mi
+             print #YTD_D       (0,96)  edit $$$,$$$,$$$,$$9.99mi
+           end-if
+           if round(#YTD_TXGRS_D,2) <> 0      
+             print 'YTD Taxable Wages' (+1,10)
+             print #YTD_TXGRS_T       (0,39)  edit $$$,$$$,$$$,$$9.99mi
+             print #YTD_TXGRS_R       (0,58)  edit $$$,$$$,$$$,$$9.99mi
+             print #YTD_TXGRS_N       (0,77)  edit $$$,$$$,$$$,$$9.99mi
+             print #YTD_TXGRS_D       (0,96)  edit $$$,$$$,$$$,$$9.99mi
+           end-if
+           if round(#YTD_NLGRS_D,2) <> 0      
+             print 'YTD NLGRS Wages' (+1,10)
+             print #YTD_NLGRS_T       (0,39)  edit $$$,$$$,$$$,$$9.99mi
+             print #YTD_NLGRS_R       (0,58)  edit $$$,$$$,$$$,$$9.99mi
+             print #YTD_NLGRS_N       (0,77)  edit $$$,$$$,$$$,$$9.99mi
+             print #YTD_NLGRS_D       (0,96)  edit $$$,$$$,$$$,$$9.99mi
+           end-if
+
+           if #YTD_T < 0 or #YTD_TXGRS_T < 0 or #YTD_NLGRS_T < 0
+             print ',  Warning: YTD negative amounts will fail in amendment process' () bold
+           end-if
+         end-if
+
+         if $log_type = 'split'
+           add 1 to #reciprocity_split
+           print $C           (+2,1)
+           print $E           (0,9)
+           print $S           (0,24)
+           print $L           (0,28)
+           print 'Split of RESIDENT and NON-RESIDENT matches TAX_BALANCE.  PAY_TAX split will be reported.' (0,39)
+           
+           print 'QTD Taxes' (+1,10)
+           print #QTD_T       (0,39)  edit $$$,$$$,$$$,$$9.99mi
+           print #QTD_R       (0,58)  edit $$$,$$$,$$$,$$9.99mi
+           print #QTD_N       (0,77)  edit $$$,$$$,$$$,$$9.99mi
+ 
+           print 'QTD Taxable Wages' (+1,10)
+           print #QTD_TXGRS_T       (0,39)  edit $$$,$$$,$$$,$$9.99mi
+           print #QTD_TXGRS_R       (0,58)  edit $$$,$$$,$$$,$$9.99mi
+           print #QTD_TXGRS_N       (0,77)  edit $$$,$$$,$$$,$$9.99mi
+
+           print 'QTD NLGRS Wages' (+1,10)
+           print #QTD_NLGRS_T       (0,39)  edit $$$,$$$,$$$,$$9.99mi
+           print #QTD_NLGRS_R       (0,58)  edit $$$,$$$,$$$,$$9.99mi
+           print #QTD_NLGRS_N       (0,77)  edit $$$,$$$,$$$,$$9.99mi
+ 
+           print 'YTD Taxes' (+1,10)
+           print #YTD_T       (0,39)  edit $$$,$$$,$$$,$$9.99mi
+           print #YTD_R       (0,58)  edit $$$,$$$,$$$,$$9.99mi
+           print #YTD_N       (0,77)  edit $$$,$$$,$$$,$$9.99mi
+ 
+           print 'YTD Taxable Wages' (+1,10)
+           print #YTD_TXGRS_T       (0,39)  edit $$$,$$$,$$$,$$9.99mi
+           print #YTD_TXGRS_R       (0,58)  edit $$$,$$$,$$$,$$9.99mi
+           print #YTD_TXGRS_N       (0,77)  edit $$$,$$$,$$$,$$9.99mi
+
+           print 'YTD NLGRS Wages' (+1,10)
+           print #YTD_NLGRS_T       (0,39)  edit $$$,$$$,$$$,$$9.99mi
+           print #YTD_NLGRS_R       (0,58)  edit $$$,$$$,$$$,$$9.99mi
+           print #YTD_NLGRS_N       (0,77)  edit $$$,$$$,$$$,$$9.99mi
+
+           if #YTD_R < 0       or #YTD_N < 0       or 
+              #YTD_NLGRS_R < 0 or #YTD_NLGRS_R < 0 or
+              #YTD_TXGRS_R < 0 or #YTD_TXGRS_R < 0 
+             print ',  Warning: YTD negative amounts will fail in amendment process' () bold
+           end-if
+
+         end-if
+
+         add 1 to #i
+
+      end-while
+  
+   end-if
+
+   if #reciprocity_error > 0
+      print 'Total Count of Reciprocity Warnings = ' (+2,1)
+      print #reciprocity_error  () edit 99999
+      print '  *** Note, These warnings for Locals are when the SUM of the Res and Non-Res detail records do not'   (+2,1)          
+      print '      equal the Balance records (likely due to Tax Balance Adjustments). TAX_BALANCE totals will be'   (+1,1)
+      print '      extracted with the current RESIDENT Status.'  (+1,1)
+   end-if
+
+   if #reciprocity_split > 0
+      print 'Total Count of Reciprocity Splits   = ' (+2,1)
+      print #reciprocity_split  () edit 99999
+      print '  *** Note, Splits are Locals where the SUM of the Res and Non-Res detail records DO equal the Balance records.' (+2,1)          
+      print '      The extract will use the RESIDENT and NON-RESIDENT Sums from PS_PAY_TAX' (+1,1)
+   end-if
+
+   #ifndef LOCAL_RECIPROCITY_PRINT_DETAILS
+      print '  ***** Details related to Local Reciprocity have been suppressed.  Enable definition ' (+2,1)
+      print '        #define LOCAL_RECIPROCITY_PRINT_DETAILS in your configuration file to enable the detailed Local tax processing.' (+1,1)
+   #endif 
+   
+ end-if
+ New-Page
+ 
+end-procedure
+#endif
+#endif
+
+#ifdef SPLIT_LOCALS_WITH_DIFFERENT_RATES
+
+begin-procedure get-local-info-recip
+
+ let #res_rate    = 0
+ let #nonres_rate = 0
+ 
+begin-select
+LCLP.RESIDENT_TAX_RT
+LCLP.NONRESIDENT_TAX_RT
+
+  let #res_rate    = &LCLP.RESIDENT_TAX_RT
+  let #nonres_rate = &LCLP.NONRESIDENT_TAX_RT
+
+ FROM  PS_LOCAL_TAX_TBL LCLP
+ WHERE LCLP.STATE      = $Cur_State
+  AND LCLP.LOCALITY    = $Cur_Locality
+  AND LCLP.EFFDT =
+      (SELECT MAX(EFFDT)
+       FROM   PS_LOCAL_TAX_TBL
+       WHERE  STATE    = LCLP.STATE
+         AND  LOCALITY = LCLP.LOCALITY
+         AND  EFFDT   <= $Qtr_End_Native)
+
+#ifdef SELECT_WITH_UR
+ {SELECT_WITH_UR} with ur
+#endif
+end-select
+
+  if #res_rate <> #nonres_rate and (#res_rate > 0 and #nonres_rate > 0)  !6/28/2011 only split if nonzero rates for speed
+     let $split_local = 'y'
+  else
+     let $split_local = 'n'
+  end-if
+  
+end-procedure
+
+#endif

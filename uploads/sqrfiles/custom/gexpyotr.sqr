@@ -1,0 +1,426 @@
+!******************************************************************************
+! GEXPYOTR: This program will load a one time refund to PAY_ONE_TIME.         *
+!           Data will be coming from a spreadsheet provided by Payroll        *
+!******************************************************************************
+!                                                                             *
+!               Confidentiality Information:                                  *
+!                                                                             *
+! This module is the confidential and proprietary information of              *
+! Giant Eagle, Inc.; it is not to be copied, reproduced, or transmitted       *
+! in any form, by any means, in whole or in part, nor is it to be used        *
+! for any purpose other than that for which it is expressly provided          *
+! without the written permission of Giant Eagle.                              *
+!                                                                             *
+!                                                                             *
+!******************************************************************************
+!******************************************************************************
+!                         MODIFICATION HISTORY                                *
+!******************************************************************************
+!  ID#     INITIALS    DATE           DESCRIPTION OF THE CHANGE               *
+!******************************************************************************
+! ISDVMZA    MVA       09/25/2012     INITIAL CREATION                        *
+!                                     Currently used to refund shoe deduction *
+! ISDVMZA    MVA       01/03/2013     Modify the program to handle one-time   *
+!                                     refund.  Changed input filename to      *
+!                                     payonetime.txt as comma-delimited file  *
+!                                     in S:\HR\Payroll\Private\UPLOADS\ folder*
+!                                     File format is:  Emplid,                *
+!                                                      Plan_Type,             *
+!                                                      Deduction_code,        *
+!                                                      Ded_class,             *
+!                                                      Ded_slstx_class,       *
+!                                                      One_Time_Cd,           *
+!                                                      Ded_calc,              *
+!                                                      Amt                    *
+! ISDVMZA    MVA       02/04/2013     Modify the program to update Pay Line   *
+!                                     status to 'U' for re-calculation.       *
+! ISDVMZA    MVA       11/01/2013     Modify the program to handle refund or  *
+!                                     additional deduction based on the       *
+!                                     one-time-code in the file.              *
+!                                     R - refund,   A - Additional deduction  *
+! 1289792    JN        06/15/2016     Modify the program  consider the one    *
+!                                     code to correctly update the refund     *
+!                                     and deductions                          *
+!******************************************************************************
+
+#include 'setenv.sqc' !Set environment
+
+!*********************************************************************
+!Initial processing, retrieving current dates and calls the main
+!procedure to do the processing.
+!*********************************************************************
+
+begin-report
+
+  do Init-DateTime
+  do Init-Number
+  do stdapi-init
+
+  do Get-Current-DateTime
+  do Report
+
+  do Commit-Transaction
+  close 1
+  do STDAPI-TERM
+
+end-report
+
+!*********************************************************************
+!If this Program is being executed through process scheduler,
+!the run control parameters and calls the main processing procedure.
+!Otherwise, interrogates the user for the run control parameters and
+!validates them. If the run control parameters are invalid, stops the
+!execution.
+!*********************************************************************
+begin-procedure Report
+#debug9  show 'Main-Process'
+   display $AsOfToday
+
+   do P100-Open-File
+   do P110-Get-Parms
+   do P150-Get-Pay-End
+!   let $pay_end_dt  = '29-SEP-2012'                       !***  Mel Testing
+   show 'Pay End Date: ' $pay_end_dt
+
+   do P200-Process-File
+
+   date-time () hh:mi:ss &timeProcess
+   display &timeProcess
+
+end-procedure Report
+
+!**********************************************************************
+! Open file for processing
+!**********************************************************************
+begin-procedure P100-Open-File
+#debug9  show 'P100-Open-File'
+
+#debug9 show 'Procedure = P100-Open-File'
+
+!  let $folder = '/apps/hr/hrms90/hrstg90/incoming/'         !***  Mel Testing
+   let $folder = '\\corp.gianteagle.com\common\HR\Payroll\Private\UPLOADS\'
+
+   let $file = $folder || 'payonetime.txt'
+
+   OPEN $file as 1 for-reading record=80 vary status = #file_status
+
+   if #file_status <> 0
+      let $Open-Msg = 'Error Opening '||$file || ' status = ' || to_char(#file_status)
+      display $Open-Msg
+      stop quiet
+   end-if
+
+end-procedure P100-Open-File
+
+
+!**********************************************************************
+! Get Run control parameters
+!**********************************************************************
+begin-procedure P110-Get-Parms
+#debug9  show 'P110-Get-Parms'
+
+  If $prcs_process_instance = ''
+    Do Get-SQRW-Run-Controls
+  Else
+    Do Get-Process-Scheduler-Run-Controls
+  End-If
+
+end-procedure P110-Get-Parms
+
+!**********************************************************************
+! Get Parameters when running through SQRW
+!**********************************************************************
+Begin-Procedure Get-SQRW-Run-Controls
+#debug9  show 'Get-SQRW-Run-Controls'
+
+!  While 1=1
+!    Input $Run_ID maxlen=3 type=char 'Enter the Pay Run ID'
+!    If $Run_ID <> ''
+!      Uppercase $Run_ID
+!      Show $Run_ID
+!      Break
+!    End-If
+!  End-While
+
+End-Procedure
+
+!**********************************************************************
+! Get parameters when running through PeopleSoft Process Scheduler
+!**********************************************************************
+Begin-Procedure Get-Process-Scheduler-Run-Controls
+#debug9  show 'Get-Process-Scheduler-Run-Controls'
+
+  Do GEXXX922-Select-Parameters
+
+  Let $Run_ID     = &GEX_RC_PAY.Run_ID
+
+  If $Run_ID = ''
+    Show 'Pay Run ID is required for this process'
+    Stop
+  End-If
+  Show 'Pay Run ID         :  ' $Run_ID
+End-Procedure
+
+!*********************************************************************
+!Gets the Pay End Date to process for
+!*********************************************************************
+begin-procedure P150-Get-Pay-End
+#debug9  show 'P150-Get-Pay-End'
+
+begin-select LOOPS=1
+Z1.PAY_END_DT
+
+   move &Z1.PAY_END_DT to $pay_end_dt
+   display 'Pay End Date: ' noline
+   display $pay_end_dt
+
+FROM PS_PAY_CALENDAR Z1
+where Z1.PAY_SHEETS_RUN = 'Y'
+  AND Z1.PAY_CONFIRM_RUN = 'N'
+  AND Z1.RUN_ID = $Run_ID
+end-select
+end-procedure P150-Get-Pay-End
+
+
+!************************************************************************
+!*  Read the input file for processing
+!************************************************************************
+begin-procedure P200-Process-File
+#debug9  show 'P200-Process-File'
+
+   move 'N' to $Found_cal
+   move 0 to #end-file
+
+   while 1
+      read 1 into $record1:80
+      if #end-file
+         break   ! End of file reached.
+      end-if
+
+      unstring $record1 by ',' into $emplid
+                                   $plan_type
+                                   $deduction_code
+                                   $ded_class
+                                   $ded_slstx_class
+                                   $one_time_cd
+                                   $ded_calc
+                                   $amt
+
+      show 'Emplid: ' $emplid ' - ' $amt
+
+      do P300-Get-Pay-Earnings
+
+      if $rec-found = 'Y'
+         move '00'    to $plan_type
+         move ' '     to $benefit_plan
+         move $deduction_code to $dedcd
+         move 'A'     to $ded_class
+         move 'B'     to $ded_slstx_class
+         move 'A'     to $ded_calc
+         !move 'R'     to $one_time_cd
+         move $amt    to #ded_addl_amt
+         if #ded_addl_amt < 0
+            let #ded_addl_amt = #ded_addl_amt * -1
+         end-if
+         move 0       to #ded_rate_pct
+
+         if $onetm = 'Y'
+            do P800-Update-One-Time
+         else
+            do P700-Insert-One-Time
+         end-if
+
+         do P810-Update-Pay-Line
+
+      else
+         show 'No paysheet found for emplid: ' $emplid
+      end-if
+
+   end-while
+
+end-procedure
+
+
+!************************************************************************
+Begin-Procedure P300-Get-Pay-Earnings
+#debug9  show 'P300-Get-Pay-Earnings'
+
+   move 'N' to $rec-found
+
+begin-select loops=1 on-error=sql-error-found('P300-Get-Pay-Earnings')
+PE.COMPANY
+PE.PAYGROUP
+PE.OFF_CYCLE
+PE.PAGE_NUM
+PE.LINE_NUM
+PE.ADDL_NBR
+PE.SEPCHK
+
+   move 'Y' to $rec-found
+   move &PE.COMPANY     to $company
+   move &PE.PAYGROUP    to $paygroup
+   move &PE.OFF_CYCLE   to $off_cycle
+   move &PE.PAGE_NUM    to #page_num
+   move &PE.LINE_NUM    to #line_num
+   move &PE.ADDL_NBR    to #addl_nbr
+   move &PE.SEPCHK      to #sepchk
+
+   do P350-Verify-One-Time
+
+from PS_PAY_EARNINGS PE
+where PE.PAY_END_DT = $pay_end_dt
+  and PE.OFF_CYCLE = 'N'
+  and PE.EMPLID     = $emplid
+end-SELECT
+
+end-procedure P300-Get-Pay-Earnings
+
+
+!************************************************************************
+Begin-Procedure P350-Verify-One-Time
+#debug9  show 'P350-Verify-One-Time'
+
+   move 'N' to $onetm
+
+begin-select loops=1 on-error=sql-error-found('P350-Verify-One-Time')
+PO.COMPANY
+PO.PAYGROUP
+PO.PAGE_NUM
+PO.LINE_NUM
+PO.ADDL_NBR
+PO.SEPCHK
+
+   move 'Y' to $onetm
+
+from PS_PAY_ONE_TIME PO
+where PO.COMPANY    = &PE.COMPANY
+  and PO.PAYGROUP   = &PE.PAYGROUP
+  and PO.PAY_END_DT = $pay_end_dt
+  and PO.OFF_CYCLE  = 'N'
+  and PO.PAGE_NUM   = &PE.PAGE_NUM
+  and PO.LINE_NUM   = &PE.LINE_NUM
+  and PO.ADDL_NBR   = &PE.ADDL_NBR
+  and PO.SEPCHK     = &PE.SEPCHK
+  and PO.ONE_TIME_CD = $one_time_cd		!1289792 JN - Added to correctly update refund/deductions
+end-SELECT
+
+end-procedure
+
+!************************************************************************
+! Insert Pay One Time record
+!************************************************************************
+Begin-Procedure P700-Insert-One-Time
+#debug9  show 'P700-Insert-One-Time'
+
+begin-SQL on-error=sql-error-found('P700-Insert-One-Time')
+
+INSERT INTO PS_PAY_ONE_TIME (COMPANY,
+                             PAYGROUP,
+                             PAY_END_DT,
+                             OFF_CYCLE,
+                             PAGE_NUM,
+                             LINE_NUM,
+                             ADDL_NBR,
+                             SEPCHK,
+                             PLAN_TYPE,
+                             BENEFIT_PLAN,
+                             DEDCD,
+                             DED_CLASS,
+                             DED_SLSTX_CLASS,
+                             ONE_TIME_CD,
+                             DED_CALC,
+                             DED_ADDL_AMT,
+                             DED_RATE_PCT)
+                    VALUES  ($company,
+                             $paygroup,
+                             $pay_end_dt,
+                             $off_cycle,
+                             #page_num,
+                             #line_num,
+                             #addl_nbr,
+                             #sepchk,
+                             $plan_type,
+                             $benefit_plan,
+                             $dedcd,
+                             $ded_class,
+                             $ded_slstx_class,
+                             $one_time_cd,
+                             $ded_calc,
+                             #ded_addl_amt,
+                             #ded_rate_pct)
+end-SQL
+
+end-procedure P700-Insert-One-Time
+
+
+Begin-Procedure P800-Update-One-Time
+#debug9  show 'P800-Update-One-Time'
+
+begin-SQL on-error=sql-error-found('P800-Update-One-Time')
+
+UPDATE PS_PAY_ONE_TIME ONE
+   SET ONE.DED_ADDL_AMT = ONE.DED_ADDL_AMT + #ded_addl_amt
+ WHERE ONE.COMPANY   = $company
+   AND ONE.PAYGROUP  = $paygroup
+   AND ONE.PAY_END_DT= $pay_end_dt
+   AND ONE.OFF_CYCLE = $off_cycle
+   AND ONE.PAGE_NUM  = #page_num
+   AND ONE.LINE_NUM  = #line_num
+   AND ONE.ADDL_NBR  = #addl_nbr
+   AND ONE.SEPCHK    = #sepchk
+   AND ONE.ONE_TIME_CD = $one_time_cd   	 !1289792 JN - Added to correctly update refund/deductions
+end-SQL
+
+end-procedure P800-Update-One-Time
+
+
+Begin-Procedure P810-Update-Pay-Line
+#debug9  show 'P810-Update-Pay-Line'
+
+begin-SQL on-error=sql-error-found('P810-Update-Pay-Line')
+
+UPDATE PS_PAY_EARNINGS PE1
+   SET PAY_LINE_STATUS = 'U'
+ WHERE PE1.COMPANY   = $company
+   AND PE1.PAYGROUP  = $paygroup
+   AND PE1.PAY_END_DT= $pay_end_dt
+   AND PE1.OFF_CYCLE = $off_cycle
+   AND PE1.PAGE_NUM  = #page_num
+   AND PE1.LINE_NUM  = #line_num
+   AND PE1.ADDL_NBR  = #addl_nbr
+   AND PE1.SEPCHK    = #sepchk
+end-SQL
+
+end-procedure P810-Update-Pay-Line
+
+
+!********************************************************************
+!This procedure displays in the error report if there are any sql erros
+!happened in the program
+!********************************************************************
+
+begin-procedure SQL-Error-Found($Proc_Name)
+
+  display 'SQL Error in ' noline
+  display $Proc_Name
+  display $_sql-error
+  display 'sql-status: '  noline
+  display #_sql-status  99990
+   show 'COMPANY   = ' $company
+   show 'PAYGROUP  = ' $paygroup
+   show 'PAGE_NUM  = ' #page_num
+   show 'LINE_NUM  = ' #line_num
+   show 'ADDL_NBR  = ' #addl_nbr
+  stop
+
+end-procedure
+
+#include 'gexxx922.sqc'  ! Process Scheduler run control procedure
+#Include 'tranctrl.sqc'  !Common Transaction Control Procedures
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'datemath.sqc'  !Date Arithmetic functions
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'payrnctl.sqc'  !Select-Parameters
+#Include 'payinit.sqc'   !Pay init
+#Include 'stdapi.sqc'    !Update Process API

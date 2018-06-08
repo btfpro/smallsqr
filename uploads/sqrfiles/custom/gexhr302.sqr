@@ -1,0 +1,2110 @@
+!***************************************************************************************
+! GEXHR302:              MOVEMENT OF EMPLOYEES ACROSS BUSINESS AREAS                   * 
+!                           CREATES SPREADSHEET FOR USE BY EVP                         *
+!***************************************************************************************
+!                                                                                      *
+!               Confidentiality Information:                                           *
+!                                                                                      *
+! This module is the confidential and proprietary information of                       *
+! Giant Eagle, Inc.; it is not to be copied, reproduced,or transmitted                 *
+! in any form, by any means, in whole or in part, nor is it to be used                 *
+! for any purpose other than that for which it is expressly provided                   *
+! without the written permission of Giant Eagle.                                       *
+!                                                                                      *
+! Copyright (c) 1997-1998 Giant Eagle,Inc. All Rights Reserved                         *
+!                                                                                      *
+!***************************************************************************************
+!                                                                                      *        
+! GEXHR302 :            EMPLOYEE MOVEMENT ACROSS BUSINESS AREAS                        *
+!                                                                                      *        
+! Narrative:                                                                           * 
+!                                                                                      *  
+! SQL Tables:           PS_GEX_DEPT_TBL				                       *
+!                       PS_JOB                                                         *
+!                       PS_NAMES                                                       *
+!                       PS_EMPLOYMENT				                       *   
+!			PS_GEX_EMPLID_MAPP                                             *
+!                                                                                      *
+! Written by:           Carl Buckrop                                                   *       
+!                                                                                      *
+! Normally Run:         Weekly                                                         *
+!                                                                                      *
+! Control Parms:        FOR WHERE CLAUSE:                                              *
+!                         Company Division Code                                        *
+!                         Deptid                                                       *
+!                         Employee Status                                              *
+!                         Account Code                                                 *
+!                         As Of Date                                                   *
+!                                                                                      *
+!***************************************************************************************
+!                         MODIFICATION HISTORY                                          *
+!****************************************************************************************
+! CSR    INITIALS     DATE         DESCRIPTION OF THE CHANGE                            *
+!****************************************************************************************
+!                                                                                       *
+!         CWB	      03/12/2007   New program                                          *
+!											*
+!        VENDAPP      11/05/2007   Change in logic for Hire/Rehire un-inclusion		*
+!				   Added 'FCC' company					*
+!				   Changes $asofdate to $thru_dt			*
+!				   Added STD_HOURS column in output file		*
+!				   Removed old Grade change logic and added new logic	*
+!				   Modifications to rename some columns and remove	*
+!					someothers in output file			*
+!				   IF condition changed to include DEMOTIONS		*
+!				   IF condition changed to include only non-union	*
+!					employees in the output file			*
+!				   IF condition changed to inclde only giant eagle	*
+!					employees in the output file			*
+!				   Logic incorporated to not to include new hire	*
+!				   Removed join on COMPANY field in procedures		*
+!					GET-JOB-ROWS, GET-MAX-ROS and GET-MIN-ROWS	*
+!				   Modifications to accommodate title on one line	*								    
+!				   Movement across position, account code and grade	*
+!					removed.					*
+!				   Modified SQL in GET-MIN-ROWS procedure to pick	*
+!					least dated row					*
+!	VENDAPP      11/05/2007	   Insertion into temp table PS_GEX_EVP_MVMNT for	*
+!					ITG 40110 calculations and analysis		*
+!       GEX-MXT      03/24/2008    Fixed for REHIRE DT issue in 9.0                     *
+!       GEX-TLL      03/25/2008   HCM 9.0 Upgrade                                       *
+!       GEX-TLL      04/08/2008   HCM 9.0 Upgrade                                       *
+!       ISDVASS      04/09/2008   Used $ASOFDATE instead of sysdate to pull rehire_dt from custom SQC *
+!	GEX-TLL	     05/02/2008   modified the sqr to pull action descrs from ps_action_tbl *
+!       GEX-SXP      05/12/2009   Update Sqr to retrieve JobTitle from Position_Data
+!       ISDVRKK      03/20/2011   Add company MGC for ITG 93405
+!       TCSXSSS      05/11/2015   Changes related to gex_emplid_mapp/7 digit emplid     *
+!****************************************************************************************
+                                                                                                 
+                                                                                                 
+#include 'setenv.sqc' !Set environment                                                           
+#include 'setup02.sqc'
+
+Begin-Heading 6
+#debug9 Show 'Begin-Heading'
+!#Include 'stdhdg01.sqc'  
+  Do GEXXX951-Select-Oracle-Instance        
+
+  print 'Oracle DB:'                (1,1)   
+  print $GEXXX951_Oracle_Instance   (1,13)  
+
+  print '            '    (1,1)
+  print 'PeopleSoft HRMS 8.3'      ()          center
+  
+  print 'Report ID:  '    (+1,1)
+  print $ReportID         (,13)
+  uppercase $ReportTitle
+  print $ReportTitle      ()          center
+  let #RptCol = {ColR} - 2
+  page-number             (0,#RptCol)  'Page No.  '
+  
+ 
+  
+  If $GEX_RC_PAY.YES_NO_FLAG ='Y' 
+    let $out1 = 'Employees with Action Dates ( of Hire/Rehire, Terminations ) from ' || $begin_dt_hdr || ' to ' || $end_dt_hdr
+   Else
+    let $out1 = 'Full Load Data File'   
+  End-If  
+  print $out1 () center
+  
+  print 'Run Date '       (+1,#RptCol)
+  print $ReportDate       ()
+  
+  print 'Run Time '       (+1,#RptCol)
+  print $ReportTime       ()
+
+  print 'SSN(last 4 digits)' (+2,5 )   !  10908 ISDVSRC    05/11/05     
+  print 'LastName          ' (0, 25)
+  print 'Region            ' (0, 42)
+  print 'Location          ' (0, 55)                            
+  print 'EMPLID            ' (0, 85)
+  
+End-heading
+
+!***********************************************************************************
+Begin-Report
+!***********************************************************************************
+#debug9 Show 'Begin-Report'
+  Do P100-Initialization
+  Do P200-Main-Process
+  Do P300-Finalization
+End-Report
+
+!***********************************************************************************
+Begin-Procedure P100-Initialization
+!***********************************************************************************
+#debug9 Show 'P100-Initialization'
+  let $First = 'Y'
+ 
+  Let $year4 = '1'
+  Do Init-DateTime           !datetime.sqc
+  Do Init-Number             !number.sqc
+  Do Get-Current-DateTime    !curdttim.sqc
+  Do Stdapi-Init             !stdapi.sqc
+
+  Let $ReportID      =   'gexhr302'
+ 
+  Let $ReportTitle   =   'EMPLOYEE PROMOTION DATA FOR EVP'
+!  
+  Show '$ReportID    = ' $ReportID
+  Show '$ReportTitle = ' $ReportTitle
+  Show '$ReportDate  = ' $ReportDate
+  Show '$ReportTime  = ' $ReportTime
+
+  encode '<009>' into $tab  
+  encode '<39>' into $Quote
+  Let $delim = $tab
+  Let $blank = ' '
+
+  Let $GEXXX900_Company_Alias  = 'j.company'
+!  Let $GEXXX900_Company_Aliasx  = 'JJ.company'
+  Let $GEXXX902_Deptid_Alias   = 'j.deptid'
+  Let $GEXXX903_Emp_Stat_Alias = 'j.empl_status'
+!  Let $GEXXX903_Emp_Stat_Aliasx = 'JJ.empl_status'
+!  Let $GEXXX907_Div_CD_Alias   = 'gdt.gex_company_div_cd'
+
+
+!-------------------------------------------------------------------------------------------------------
+!-------------------------------------------------------------------------------------------------------
+  If $prcs_process_instance = ''
+    Do Ask-As-Of-Date
+    
+	    Input $yes_no_flag Maxlen=1 'Date Range Y/N? If N, then a full load file will be run.'
+	    Uppercase $yes_no_flag
+	   
+	    
+	    If $yes_no_flag = 'Y' 
+	      Input $fromdate Maxlen=10 'MM/DD/YYYY, From date.' 
+	      
+	      If $fromdate = ''
+                let $from_dt = '01-JAN-1901'
+                let $thru_dt = $asofdate 
+	      Else    
+	        Input $thrudate Maxlen=10 'MM/DD/YYYY, Through date.'
+                do format-datetime($fromdate,$from_dt,{DEFMDY},'','NATIVE') 
+                do format-datetime($thrudate,$thru_dt,{DEFMDY},'','NATIVE') 
+	      End-If
+            else   
+                let $from_dt = '01-JAN-1901'
+                let $thru_dt = $asofdate 
+            end-if    
+            Do convert-to-dtu-date($from_dt,$from_dt_dtu)
+            Do convert-to-dtu-date($thru_dt,$thru_dt_dtu)
+
+	  While 1=1
+	    Input $Gex_Incl_Excl Maxlen=1 '(I)nclude Div_cd / (E)xclude Div_cd / (A)ll Div_cds'
+	    Uppercase $Gex_Incl_Excl
+	    
+	    If $Gex_Incl_Excl = 'I' 
+	       Do Ask-For-Incl-Div_cd
+	       Break
+	    Else
+	      If $Gex_Incl_Excl = 'E'
+	         Do Ask-For-Excl-Div_cd
+	         Break
+	      Else
+	        Let $GEXXX907_INCLUDE_DIV_CD_CRITERIA = '1=1'
+	        Let $GEXXX907_INCLUDE_DIV_CD_DISPLAY_CRITERIA = 'ALL'
+	        Let $GEXXX907_EXCLUDE_DIV_CD_CRITERIA = '1=1'
+	        Let $GEXXX907_EXCLUDE_DIV_CD_DISPLAY_CRITERIA = 'NONE'
+	        Break
+	      End-If
+	    End-If
+	    
+	  End-While
+
+
+	  !----------------------------------------------------
+	  Let $CompanyString = ''''
+	  Display 'Enter Company or leave blank to exit.'
+	  
+	  While 1=1
+	    Input $In-Company Maxlen=3 'Company'
+	    
+	    Uppercase $In-Company
+	    
+	    If Rtrim($In-Company, ' ') = ''
+	      Concat '''' With $CompanyString
+	      Break
+	    End-If
+	    
+	    If $CompanyString <> ''''
+	      Concat ''',''' With $CompanyString
+	    End-If
+	    Concat $In-Company With $CompanyString
+	  End-While
+	
+	  If $CompanyString = ''''''
+	    Let $GEXXX900_INCLUDE_COMPANY_CRITERIA = '1=1'
+	    Let $GEXXX900_INCLUDE_COMPANY_DISPLAY_CRITERIA = 'ALL'
+	    
+	    Let $GEXXX900_INCLUDE_COMPANY_CRITERIAx = '1=1'			!ISDVSRC 03/29/05
+	    Let $GEXXX900_INCLUDE_COMPANY_DISPLAY_CRITERIAx = 'ALL'		!ISDVSRC 03/29/05
+	    
+	    
+	  Else
+	    Let $GEXXX900_INCLUDE_COMPANY_CRITERIA = $GEXXX900_Company_Alias || ' In (' || $CompanyString || ')'
+	    Let $GEXXX900_INCLUDE_COMPANY_DISPLAY_CRITERIA = $GEXXX900_INCLUDE_COMPANY_CRITERIA
+	    
+	    Let $GEXXX900_INCLUDE_COMPANY_CRITERIAx = $GEXXX900_Company_Aliasx || ' In (' || $CompanyString || ')'	!ISDVSRC 03/29/05
+	    Let $GEXXX900_INCLUDE_COMPANY_DISPLAY_CRITERIAx = $GEXXX900_INCLUDE_COMPANY_CRITERIAx			!ISDVSRC 03/29/05
+
+	  End-If
+
+	!----------------------------------------------------  	 
+  	 Let $DeptIDString = ''''
+  	 Display 'Enter DeptID or leave blank to exit.'
+	  While 1=1
+	    Input $In-DeptID Maxlen=10 'DeptID'
+	    Uppercase $In-DeptID
+	    If Rtrim($In-DeptID, ' ') = ''
+	      Concat '''' With $DeptIDString
+	      Break
+	    End-If
+	    If $DeptIDString <> ''''
+	      Concat ''',''' With $DeptIDString
+	    End-If
+	    Concat $In-DeptID With $DeptIDString
+	  End-While
+	
+	  If $DeptIDString = ''''''
+	    Let $GEXXX902_INCLUDE_DEPTID_CRITERIA = '1=1'
+	    Let $GEXXX902_INCLUDE_DEPTID_DISPLAY_CRITERIA = 'ALL'
+	  Else
+	    Let $GEXXX902_INCLUDE_DEPTID_CRITERIA = $GEXXX902_Deptid_Alias || ' In (' || $DeptIDString || ')'
+	    Let $GEXXX902_INCLUDE_DEPTID_DISPLAY_CRITERIA = $GEXXX902_INCLUDE_DEPTID_CRITERIA
+	  End-If
+
+	!----------------------------------------------------
+
+	  Let $EmplStatusString = ''''
+
+	  Display 'Enter Employee Status or leave blank to exit.'
+	  While 1=1
+	    Input $In-EmplStatus Maxlen=1 'Employee Status'
+	    Uppercase $In-EmplStatus
+	    If Rtrim($In-EmplStatus, ' ') = ''
+	      Concat '''' With $EmplStatusString
+	      Break
+	    End-If
+	    If $EmplStatusString <> ''''
+	      Concat ''',''' With $EmplStatusString
+	    End-If
+	    Concat $In-EmplStatus With $EmplStatusString
+	  End-While
+	
+	  If $EmplStatusString = ''''''
+	    Let $GEXXX903_INCLUDE_EMP_STAT_CRITERIA = '1=1'
+	    Let $GEXXX903_INCLUDE_EMP_STAT_DISPLAY_CRITERIA = 'ALL'
+	    
+	    Let $GEXXX903_INCLUDE_EMP_STAT_CRITERIAx = '1=1'		!ISDVSRC 03/29/05
+	    Let $GEXXX903_INCLUDE_EMP_STAT_DISPLAY_CRITERIAx = 'ALL'	!ISDVSRC 03/29/05
+	    
+	  Else
+	    Let $GEXXX903_INCLUDE_EMP_STAT_CRITERIA = $GEXXX903_Emp_Stat_Alias || ' In (' || $EmplStatusString || ')'
+	    Let $GEXXX903_INCLUDE_EMP_STAT_DISPLAY_CRITERIA = $GEXXX903_INCLUDE_EMP_STAT_CRITERIA
+	    
+	    Let $GEXXX903_INCLUDE_EMP_STAT_CRITERIAx = $GEXXX903_Emp_Stat_Aliasx || ' In (' || $EmplStatusString || ')'		!ISDVSRC 03/29/05
+	    Let $GEXXX903_INCLUDE_EMP_STAT_DISPLAY_CRITERIAx = $GEXXX903_INCLUDE_EMP_STAT_CRITERIAx				!ISDVSRC 03/29/05
+
+	  End-If
+	!----------------------------------------------------
+	
+
+    show '$HIRE_DT_CRITERIA: ' $HIRE_DT_CRITERIA
+    
+    
+  Else
+  
+     Do Process-Scheduler-Run-Controls
+
+     move $FromDate to $from_dt		!VENDAPP
+     move $ThruDate to $thru_dt		!VENDAPP
+     !GEX-TLL 04/08/2008 HCM 9.0 Upgrade Begin
+     if Ltrim(Rtrim ($from_dt, ' '),' ') = '' or Ltrim(Rtrim ($thru_dt, ' '),' ') = ''
+        Let $from_dt = dateadd(strtodate($AsOfDate),'YEAR',-1)
+        Let $thru_dt = dateadd(strtodate($AsOfDate),'DAY',-1)
+         End-If
+      !GEX-TLL 04/08/2008 HCM 9.0 Upgrade End
+     
+  End-If
+!-------------------------------------------------------------------------------------------------------
+!-------------------------------------------------------------------------------------------------------
+
+  Show '$GEXXX907_Exclude_Div_Cd_Display_Criteria           = ' $GEXXX907_Exclude_Div_Cd_Display_Criteria
+  Show '$GEXXX907_INCLUDE_DIV_CD_DISPLAY_CRITERIA           = ' $GEXXX907_INCLUDE_DIV_CD_DISPLAY_CRITERIA
+  
+  Show '$GEXXX900_Include_Company_Display_Criteria          = ' $GEXXX900_Include_Company_Display_Criteria
+  Show '$GEXXX900_Include_Company_Display_Criteriax          = ' $GEXXX900_Include_Company_Display_Criteriax	!ISDVSRC 03/29/05
+  
+  Show '$GEXXX902_Include_Deptid_Display_Criteria           = ' $GEXXX902_Include_Deptid_Display_Criteria
+  Show '$GEXXX903_Include_Emp_Stat_Display_Criteria         = ' $GEXXX903_Include_Emp_Stat_Display_Criteria
+  Show '$GEXXX903_Include_Emp_Stat_Display_Criteriax         = ' $GEXXX903_Include_Emp_Stat_Display_Criteriax	!ISDVSRC 03/29/05
+  Show '$AsOfDate                                           = ' $AsOfDate
+
+  let $year4 = '1'
+  do Format-DateTime($AsOfDate, $activation_date, {DEFMDY}, '', '')
+  let $year4 = '1'
+  do Format-DateTime($AsOfDate, $rpt_asofdate, {DEFMDY}, '', '')
+  let $year4 = '1'
+  do Format-DateTime($AsOfDate, $temp_dt, {DEFCMP}, '', '')   
+  let $year4 = '1'
+  do Format-DateTime($from_dt, $from_temp_dt, {DEFCMP}, '', '')   
+  let $year4 = '1'
+  do Format-DateTime($thru_Dt, $thru_temp_dt, {DEFCMP}, '', '')   
+  let $file_dt = $from_temp_dt||'_'||$thru_temp_dt
+  
+
+
+   Let $ORDER_BY = 'ORDER BY J.COMPANY,J.PAYGROUP,J.DEPTID,J.EMPLID'
+
+  show '##################################'  
+  show '$rpt_asofdate: ' $rpt_asofdate
+  show '$file_dt:      ' $file_dt   
+  show '$from_dt: ' $from_dt
+  show '$thru_dt: ' $thru_dt
+  show '##################################'  
+  
+
+  Do P130-Print-Cover-Page
+  Do P140-Open-File
+  Do P141-write-file-header
+
+  !VENDAPP, ITG40110, Delete all rows from temp table PS_GEX_EVP_MVMNT
+  Begin-Sql
+  DELETE FROM PS_GEX_EVP_MVMNT
+  End-Sql
+  show 'ALL ROWS IN PS_GEX_EVP_MVMNT DELETED'
+  !VENDAPP, ITG40110, Delete all rows from temp table PS_GEX_EVP_MVMNT
+End-Procedure
+
+
+
+!***********************************************************************
+Begin-Procedure Ask-For-Incl-Div_cd
+!***********************************************************************
+#debug9 show 'Ask-For-Incl-Div_cd'
+
+  Let $Div_Cdstring = ''''
+  Display 'Enter Company Div Cds to INCLUDE or leave blank to exit.'
+  
+  While 1=1
+    Input $In-Div_Cd Maxlen=6 'Div_Cd'
+    Uppercase $In-Div_Cd
+    
+    If Rtrim($In-Div_Cd, ' ') = ''
+      Concat '''' With $Div_CdString
+      Break
+    End-If
+    
+    If $Div_CdString <> ''''
+      Concat ''',''' With $Div_CdString
+    End-If
+
+    Concat $In-Div_Cd With $Div_CdString
+  End-While
+  
+
+  If $Div_CdString = ''''''
+    Let $GEXXX907_INCLUDE_DIV_CD_CRITERIA = '1=1'
+    Let $GEXXX907_INCLUDE_DIV_CD_DISPLAY_CRITERIA = 'ALL'
+  Else
+    Let $GEXXX907_INCLUDE_DIV_CD_CRITERIA = $GEXXX907_div_cd_Alias || ' In (' || $Div_CdString || ')'
+    Let $GEXXX907_INCLUDE_DIV_CD_DISPLAY_CRITERIA = $GEXXX907_INCLUDE_DIV_CD_CRITERIA
+  End-If
+  
+  Let $GEXXX907_EXCLUDE_DIV_CD_CRITERIA = '1=1'
+  Let $GEXXX907_EXCLUDE_DIV_CD_DISPLAY_CRITERIA = 'NONE'
+  
+End-Procedure
+
+!***********************************************************************
+Begin-Procedure Ask-For-Excl-Div_cd
+!***********************************************************************
+#debug9 show 'Ask-For-Excl-Div_cd'
+
+  Let $Div_CdString = ''''
+  Display 'Enter Company Div Cds to EXCLUDE or leave blank to exit.'
+  While 1=1
+    Input $In-Div_Cd Maxlen=6 'Div_Cd'
+    Uppercase $In-Div_Cd
+    If Rtrim($In-Div_Cd, ' ') = ''
+      Concat '''' With $Div_CdString
+      Break
+    End-If
+    If $Div_CdString <> ''''
+      Concat ''',''' With $Div_CdString
+    End-If
+    Concat $In-Div_Cd With $Div_CdString
+  End-While
+
+  show '$Div_CdString = ' $Div_CdString 
+  If $Div_CdString = ''''''
+    Let $GEXXX907_EXCLUDE_Div_Cd_CRITERIA = '1=1'
+    Let $GEXXX907_EXCLUDE_Div_Cd_DISPLAY_CRITERIA = 'NONE'
+  Else
+    Let $GEXXX907_EXCLUDE_Div_Cd_CRITERIA = $GEXXX907_Div_Cd_Alias || ' Not In (' || $Div_CdString || ')'
+    Let $GEXXX907_EXCLUDE_Div_Cd_DISPLAY_CRITERIA = $GEXXX907_EXCLUDE_Div_Cd_CRITERIA
+  End-If
+  
+  Let $GEXXX907_INCLUDE_Div_Cd_CRITERIA = '1=1'
+  Let $GEXXX907_INCLUDE_Div_Cd_DISPLAY_CRITERIA = 'ALL'
+
+End-Procedure
+
+!***********************************************************************************
+Begin-Procedure Process-Scheduler-Run-Controls
+!***********************************************************************************
+#debug9 Show 'Process-Scheduler-Run-Controls'
+  Show 'Process-Scheduler-Run-Controls'
+  
+  Do GEXXX922-Select-Parameters
+
+	  Let $AsOfDate = $GEX_RC_PAY.AsOfDate
+	  If Rtrim ($GEX_RC_PAY.AsOfDate, ' ') = ''
+	    Let $AsOfDate = $AsOfToday
+	  End-If
+	
+	
+	  let  $FromDate = $GEX_RC_PAY.FromDate
+	  let  $ThruDate = $GEX_RC_PAY.ThruDate
+	
+	   show '$FromDate- :' $FromDate
+	   show '$ThruDate- :' $ThruDate 
+   
+  Do set-weekly-dates
+ 
+	  if $GEX_RC_PAY.YES_NO_FLAG = 'Y'
+	  
+	    let $temp1 = '(E.HIRE_DT between ''' || $week_begin_dt || ''' and '''|| $week_end_dt || ''''
+	    let $temp2 = ' OR E.REHIRE_DT between ''' || $week_begin_dt || ''' and '''|| $week_end_dt || ''''
+	    let $temp3 = ' OR E.TERMINATION_DT between ''' || $week_begin_dt || ''' and '''|| $week_end_dt || ''')'   !ISDVSRC 03/29/05
+	      
+ 	    !let $HIRE_DT_CRITERIA = $temp1 || $temp2  
+	    let $HIRE_DT_CRITERIA = $temp1 || $temp2 || $temp3  	!ISDVSRC 03/29/05
+	    
+!	    let $temp11 = '(JJ.ACTION_DT between ''' || $week_begin_dt || ''' and '''|| $week_end_dt || ''')'
+!            let $temp22 = '(J.ACTION_DT between ''' || $week_begin_dt || ''' and '''|| $week_end_dt || ''')'  ! ITG33009/CSR10924 ISDVSRC 06/20/05
+            
+!	    Let $ACTION_DT_CRITERIA     = $temp11    
+!            show '$ACTION_DT_CRITERIA:'  $temp11 
+            
+!            Let $ACTION_DT_CRITERIA_2     = $temp22    
+!            show '$ACTION_DT_CRITERIA_2:'  $temp22 
+            
+            
+	  Else
+	    let $HIRE_DT_CRITERIA = '1=1' 
+	    Let $ACTION_DT_CRITERIA = '1=1' 
+	    Let $ACTION_DT_CRITERIA_2 = '1=1' 
+	  End-If
+	  
+	  
+    
+	  Evaluate &GEX_RC_PAY.Gex_Incl_Excl
+	     When = 'I'
+	        Do GEXXX907-Select-Div-CD-Parameters 
+	        Let $GEXXX907_EXCLUDE_DIV_CD_CRITERIA = '1=1'
+	        Let $GEXXX907_EXCLUDE_DIV_CD_DISPLAY_CRITERIA = 'NONE'
+	        Break
+	     When = 'E'
+	        Do GEXXX907-Select-Div-CD-Parameters 
+	        Let $GEXXX907_INCLUDE_DIV_CD_CRITERIA = '1=1'
+	        Let $GEXXX907_INCLUDE_DIV_CD_DISPLAY_CRITERIA = 'NONE'
+	        Break
+	     When-Other
+	        Let $GEXXX907_INCLUDE_DIV_CD_CRITERIA   = '1=1'
+	        Let $GEXXX907_EXCLUDE_DIV_CD_CRITERIA = '1=1'
+	        Let $GEXXX907_INCLUDE_DIV_CD_DISPLAY_CRITERIA = 'ALL'
+	        Let $GEXXX907_EXCLUDE_DIV_CD_DISPLAY_CRITERIA = 'NONE'
+	  End-Evaluate
+
+
+
+
+!  Do GEXXX900-Select-Company-Parameters
+!  Do GEXXX900-Select-Company-Parametersx		!ISDVSRC 03/29/05
+  Do GEXXX902-Select-Deptid-Parameters
+  Do GEXXX903-Select-Emp-Stat-Parameters
+  Do GEXXX903-Select-Emp-Stat-Parametersx		!ISDVSRC 03/29/05
+End-Procedure
+
+
+
+!***********************************************************************************
+Begin-Procedure set-weekly-dates
+!***********************************************************************************
+#debug9 Show 'set-weekly-dates'
+! ->    determine day of week that $asofdate is, then do math to find last
+! ->    week's Sunday and Saturday dates.
+
+
+  !-----------------------------------------------------------------
+  If ((rtrim($fromdate,' ') <> '') and (rtrim($thrudate,' ') <> ''))
+	    show ' '
+	    show '$fromdate: ' $fromdate
+	    show '$thrudate: ' $thrudate
+	    
+	    If $prcs_process_instance = ''
+	      Do Format-DateTime($FromDate,$week_begin_dt,{DEFMDY},'','native')
+	      Do Format-DateTime($thruDate,$week_end_dt,{DEFMDY},'','native')
+	    Else
+	      let $week_begin_dt = $fromDate
+	      let $week_end_dt   = $thruDate
+	    End-If
+	    
+	    show '$week_begin_dt: ' $week_begin_dt
+	    show '$week_end_dt:   ' $week_end_dt
+  Else
+    
+    Do convert-to-dtu-date($asofdate,$asof_dtu)
+    Do dtu-dayofweek#($asof_dtu,#dayofweek)
+    Do dtu-dayofweek$($asof_dtu,$dayofweek)
+	    show ' '
+	    show '$asofdate :' $asofdate
+	    show '$asof_dtu :' $asof_dtu
+	    show '#dayofweek:' #dayofweek   
+	    show '$dayofweek:' $dayofweek   
+	    
+     
+	      Evaluate $dayofweek
+		 when = 'Sunday'
+		   !do dtu-subtract-days($asof_dtu,7,$week_begin_dtu)
+		   !ISDVSRC -01/26/04
+ 	           !If we do the above,
+		   !we are getting all of the users from Sunday's load in Wednesday's load as well.  
+		   !We should only get new users/deactivations after Sunday's load on Wed's load  
+		   !and then only new ones after wed's load on the next Sunday load.
+		   !-- so subtract 3 days instead of 4 - week begin dt
+		   !   and add 3 days to week begin dt
+		   !ISDVSRC -01/26/04
+ 	           do dtu-subtract-days($asof_dtu,4,$week_begin_dtu)
+ 	           Do dtu-add-days($week_begin_dtu,3,$week_end_dtu)
+	 	   break
+		 when = 'Monday'
+		   do dtu-subtract-days($asof_dtu,8,$week_begin_dtu)
+	 	   break
+		 when = 'Tuesday'
+		   do dtu-subtract-days($asof_dtu,9,$week_begin_dtu)
+	 	   break
+		 when = 'Wednesday'
+		   !ISDVSRC -01/26/04
+		   !do dtu-subtract-days($asof_dtu,10,$week_begin_dtu)
+		   !If we do the above,
+		   !we are getting all of the users from Sunday's load in Wednesday's load as well.  
+		   !We should only get new users/deactivations after Sunday's load on Wed's load  
+		   !and then only new ones after wed's load on the next Sunday load.
+		   !-- so subtract 3 days instead of 10 - week begin dt
+		   !   and add 2 days to week begin dt
+		   !ISDVSRC -01/26/04
+		   do dtu-subtract-days($asof_dtu,3,$week_begin_dtu)
+ 		    Do dtu-add-days($week_begin_dtu,2,$week_end_dtu)
+
+
+	 	   break
+		 when = 'Thursday'
+		   do dtu-subtract-days($asof_dtu,11,$week_begin_dtu)
+	 	   break
+		 when = 'Friday'
+		   do dtu-subtract-days($asof_dtu,12,$week_begin_dtu)
+	 	   break
+		 when = 'Saturday'
+		   do dtu-subtract-days($asof_dtu,13,$week_begin_dtu)
+	     End-Evaluate      
+     
+      !Do dtu-add-days($week_begin_dtu,6,$week_end_dtu)
+      
+      Do convert-from-dtu-date($week_begin_dtu,$week_begin_dt) 
+      Do convert-from-dtu-date($week_end_dtu,$week_end_dt) 
+  End-If
+  !-----------------------------------------------------------------
+  
+    let $year4 = '1'
+    do Format-DateTime($week_begin_dt,$begin_dt_hdr, {DEFMDY}, '', '')
+    let $year4 = '1'
+    do Format-DateTime($week_end_dt,$end_dt_hdr, {DEFMDY}, '', '')
+    
+    show ' '
+    show '$week_begin_dt: ' $week_begin_dt
+    show '$week_end_dt:  ' $week_end_dt
+    show '$begin_dt_hdr: ' $begin_dt_hdr
+    show '$end_dt_hdr:   ' $end_dt_hdr
+
+End-Procedure
+
+
+!***********************************************************************************
+Begin-Procedure P130-Print-Cover-Page
+!***********************************************************************************
+ SHOW ' Entered into P130-Print-Cover-Page'
+#debug9 Show 'P130-Print-Cover-Page'
+  Print 'RUN CONTROL INFORMATION FOR THIS REPORT RUN:'            (+2,1)
+  Print '$Prcs_OprID          ='                                  (+2,5)
+  Print $Prcs_OprID                                               (0,+2)
+  Print '$Prcs_Run_Cntl_ID    ='                                  (+1,5)
+  Print $Prcs_Run_Cntl_ID                                         (0,+2)
+
+  Print 'Report As Of Date : '                                    (+2,5)
+  Print $Rpt_AsOfDate                                             (0,+2)
+
+  !Print '$Hire_dt_criteria                                   = '  (+2,5)
+  !Print $Hire_dt_criteria                                         (0,+2)  
+  
+  Print '$Action_dt_criteria                                 = '  (+2,5)
+  Print $ACTION_DT_CRITERIA                                       (0,+2)  
+
+  Print '$Action_dt_criteria_2                                 = '  (+2,5)
+  Print $ACTION_DT_CRITERIA_2                                       (0,+2)  
+        
+  Print '$GEXXX907_Include_Div_Cd_Display_Criteria           = '  (+1,5)
+  Print $GEXXX907_Include_Div_Cd_Display_Criteria                 (0,+2) 
+  Print '$GEXXX907_Exclude_Div_Cd_Display_Criteria           = '  (+1,5)
+  Print $GEXXX907_Exclude_Div_Cd_Display_Criteria                 (0,+2) 
+  Print '$GEXXX900_Include_Company_Display_Criteria          = '  (+1,5)
+  print $GEXXX900_Include_Company_Display_Criteria                (0,+2)
+  Print '$GEXXX902_Include_Deptid_Display_Criteria           = '  (+1,5)
+  Print $GEXXX902_Include_Deptid_Display_Criteria                 (0,+2)
+  Print '$GEXXX903_Include_Emp_Stat_Display_Criteria         = '  (+1,5)
+  Print $GEXXX903_Include_Emp_Stat_Display_Criteria               (0,+2)
+  Print 'SORT ORDER FOR THIS REPORT RUN: '                        (+2,2)
+  Print $Order_By                                                 (0,+2)
+  Let #PAGE-COUNT = 0
+  NEW-PAGE
+End-Procedure
+
+!***********************************************************************************
+begin-procedure P140-Open-File
+!***********************************************************************************
+#debug9 Show 'P140-Open-File'
+
+!-----------------open file1 -----------------------------
+!VENDAPP, date time stamp concatination to file name
+move $current-date to $currdt 'MMDDYYYYHHMMSS'
+show '$currdt:' $currdt
+
+   Let $File_Name = 'evp_move'
+   !this is prod -> Let $file1 = 'S:\HR\Metrics\EVP\Secure\Mobility - All Bus Areas\' || Lower($File_Name) || $currdt || '.xls'	!GEX_MXT commented
+   !Let $file1 =  '\\Ruchi\psprod\Temp\' || Lower($File_Name) || $currdt || '.xls'				!GEX-MXT added
+   !Let $file1 = '\\apps\hr\hrms90\hrdev90\outgoing\'|| Lower($File_Name) || $currdt || '.xls' !GEX-TLL Testing
+   !Let $file1 = '\apps\hr\hrms90\hrdev90\outgoing\gexhr302_44.xls'
+   Let $output_destination = '\\corp.gianteagle.com\common\HR\Metrics\EVP\Secure\Mobility - All Bus Areas\'
+   !Let $output_destination = '\\riva\hrdev\psoft\working\'  ! For Testing
+  
+
+   Let $file1 = $output_destination || lower($File_Name) || '_' || $file_dt || '.xls'
+!VENDAPP, date time stamp concatination to file name
+   show '$filename:' $filename
+   show '$file1:' $file1
+  
+  Open $file1
+       As 1
+       For-Writing
+       Record=1000:Vary
+       Status=#filestat
+
+  If #filestat != 0
+     Show 'Error opening output file.  Program terminating.'
+     Stop
+  End-If
+
+End-Procedure
+ 
+
+!***********************************************************************************
+Begin-Procedure P200-main-process 
+!***********************************************************************************
+#debug9 Show 'P2000-main-process'
+
+Begin-Select
+E.HIRE_DT                       
+!E.REHIRE_DT					!GEX-MXT COMMENTED FOR REHIRE DATE LOGIC
+E.CMPNY_SENIORITY_DT
+E.SERVICE_DT
+E.GEX_VCN_SENIOR_DT
+E.TERMINATION_DT
+!GEX-AXG Modified for Upgrade 9.0 - Begin
+!E.APPOINT_END_DT
+HP.APPOINT_END_DT
+!GEX-AXG Modified for Upgrade 9.0 - End
+K.EMPLID
+K.SSN                           
+J.EMPLID                        
+J.EMPL_RCD
+J.COMPANY
+J.PAYGROUP
+J.DEPTID                        
+N.FIRST_NAME                    
+N.MIDDLE_NAME
+N.LAST_NAME                     
+SYSDATE        		&GEXJOB_REH_ASOFDATE 	!GEX-MXT ADDED FOR REHIRE DATE LOGIC IN 9.0
+  
+  let $Data-Found-Flag = 'Y'
+  Add 1 to #rpt_count
+  Add 1 to #P300-Get-Details
+  
+  let $firstname      = &N.FIRST_NAME
+    If length($firstname) > 15
+       let $firstname = substr($firstname,1,15)
+     End-If
+
+  let $midname      = &N.MIDDLE_NAME
+    If length($midname) > 15
+       let $midname = substr($midname,1,15)
+     End-If
+     
+  let $lastname       = &n.last_name
+     If length($lastname) > 30
+       let $lastname = substr($lastname,1,30)
+     End-If
+
+  let $name           = $lastname ||', '||$firstname||' '||$midname 
+  
+
+  let $emplid         = &j.emplid
+  let $empl_rcd       = &j.empl_rcd
+  let $hire_dt        = &e.hire_dt  
+  Do convert-to-dtu-date($hire_dt,$hire_dt_dtu)
+  let $prev_change    = ' ' 
+
+ !VENDAPP, Uncommented for Hire/Rehire un-inclusion
+  if  $hire_dt_dtu >= $from_dt_dtu 
+  and $hire_dt_dtu <= $thru_dt_dtu
+    let $new_hire = 'Y'
+    #debug9 show $emplid ', ' $name ', ' $hire_dt
+  else
+    let $new_hire = 'N'
+  end-if
+ !VENDAPP, Uncommented for Hire/Rehire un-inclusion 
+
+  let $year4 = '1'
+  let $hire_date      = datetostr(&e.hire_dt, 'MM/DD/YYYY')
+  
+
+  ! GEX-MXT 03/24/2008 Fixed for REHIRE DT-BEGIN
+   let $GEXJOB_REH_EMPLID = $emplid
+   let #GEXJOB_REH_EMPLRCD = $EMPL_RCD
+!   let $GEXJOB_REH_ASOFDATE = &GEXJOB_REH_ASOFDATE   ! ISDVASS used $ASOFDATE instead of sysdate
+   Let $GEXJOB_REH_ASOFDATE = $ASOFDATE								! ISDVASS used $ASOFDATE instead of sysdate
+   do Get-Job-Rehire-Dt
+   if $GEXJOB_REH_REHIRE_DT <> ''
+     let $rehire_date = datetostr(strtodate($GEXJOB_REH_REHIRE_DT,'DD-MON-YYYY'),'MM/DD/YYYY') 
+   else
+     let $rehire_date = ''
+   end-if
+   !show 'Emplid :' $emplid ',Reh date:' $rehire_date
+  ! GEX-MXT 03/24/2008 Fixed for REHIRE DT-END
+  
+  !let $rehire_dt        = &e.rehire_dt 			! GEX-MXT 03/24/2008 Fixed for REHIRE DT 
+   
+  let $year4 = '1' 
+  !let $rehire_date      = datetostr(&e.rehire_dt, 'MM/DD/YYYY')	! GEX-MXT 03/24/2008 Fixed for REHIRE DT
+  
+  let $term_dt        = &e.termination_dt  
+  let $year4 = '1'
+  let $term_date      = datetostr(&e.termination_dt, 'MM/DD/YYYY')
+
+  let $co_senior_dt   = &e.cmpny_seniority_dt
+  let $co_senior_date = datetostr(&e.cmpny_seniority_dt, 'MM/DD/YYYY')
+
+  let $vcn_senior_dt   = &e.gex_vcn_senior_dt
+  let $vcn_senior_date = datetostr(&e.gex_vcn_senior_dt, 'MM/DD/YYYY')
+
+  let $service_dt      = &e.cmpny_seniority_dt
+  let $service_date    = datetostr(&e.service_dt, 'MM/DD/YYYY')
+!GEX-AXG Modified for Upgrade 9.0 - Begin
+ ! let $pay_elig_date   = datetostr(&e.appoint_end_dt, 'MM/DD/YYYY')
+  let $pay_elig_date   = datetostr(&hp.appoint_end_dt, 'MM/DD/YYYY')
+!GEX-AXG Modified for Upgrade 9.0 - End
+   
+   !GEX_SEC_REENG 2015-05-11 Surya Sobha Begins
+   !Let $National_Id   = &K.SSN
+   do Get-Emp-Ssn (&J.EMPLID, $National_Id)
+   !GEX_SEC_REENG 2015-05-11 Surya Sobha Ends
+
+!########################################################
+  do get-max-row
+  do get-min-row
+  let $prior_effdt = dateadd(strtodate($from_dt),'DAY',-1)
+  let $curr_effdt_dtu = '' 
+  while $curr_effdt_dtu < $max_effdt_dtu
+  #debug9 show $emplid ' $curr_effdt_dtu: ' $curr_effdt_dtu ', $max_effdt_dtu: ' $max_effdt_dtu
+    do get-job-rows
+    let $prior_effdt = $curr_effdt
+  end-while
+!########################################################
+  
+  
+FROM   PS_NAMES          N, 
+       PS_EMPLOYMENT     E,
+       PS_JOB            J,
+       PS_GEX_EMPLID_MAPP K,
+       PS_PER_ORG_ASG_HP HP   !GEX-AXG Added for Upgrade 9.0
+       	  
+WHERE  E.EMPLID            = J.EMPLID
+AND    E.EMPL_RCD          = J.EMPL_RCD
+!GEX-AXG Added for Upgrade 9.0 - Begin
+AND    HP.EMPLID 					 = J.EMPLID
+AND    HP.EMPL_RCD 					 = J.EMPL_RCD
+!GEX-AXG Added for Upgrade 9.0 - End
+AND    N.EMPLID            = J.EMPLID	
+!AND   J.EMPLID		   = K.SSN		!GEX_SEC_REENG TCSXSSS 05/11/2015   	
+AND    J.EMPLID		   = K.EMPLID		!GEX_SEC_REENG TCSXSSS 05/11/2015    
+AND    J.EMPL_RCD          = K.EMPL_RCD   
+AND    N.NAME_TYPE         = 'PRI'
+!#########################################################
+and    j.company           in ('GEI', 'MCC', 'RFI', 'TMK','FCC','MGC')	!RKK ADDED COMPANY MGC for ITG 93405
+!and    j.company           = 'GEI'   
+and    j.company          > '999'
+and    j.union_cd          in ('NON', 'COL', 'TOL', 'GGO')
+!#########################################################
+and    j.gex_seasonal_emp  <> 'Y'
+AND    N.EFFDT             = (SELECT MAX(NN.EFFDT) FROM   PS_NAMES NN WHERE  
+       				NN.EMPLID     = N.EMPLID    AND    
+       				NN.NAME_TYPE  = N.NAME_TYPE AND    
+       				NN.EFFDT       <= $ASOFDATE)
+and    j.effdt             between $from_dt and $thru_dt
+AND    J.EFFDT             = (SELECT MAX(EFFDT) FROM   PS_JOB WHERE  
+				EMPLID  = J.EMPLID  AND    
+				EMPL_RCD    = J.EMPL_RCD AND    
+				!EFFDT       <= $ASOFDATE)		!VENDAPP COMMENTED
+				EFFDT       <= $thru_dt)		!VENDAPP
+
+AND    J.EFFSEQ            = (SELECT MAX(EFFSEQ) FROM   PS_JOB WHERE  
+				EMPLID       = J.EMPLID AND    
+				EMPL_RCD    = J.EMPL_RCD AND    
+				EFFDT        = J.EFFDT)
+
+!AND   [$ACTION_DT_CRITERIA_2]     ! ITG33009/CSR10924 ISDVSRC 06/20/05
+!AND   [$GEXXX900_Include_Company_Criteria]   
+AND   [$GEXXX902_Include_Deptid_Criteria]
+!AND   [$GEXXX907_Include_Div_Cd_Criteria]
+!AND   [$GEXXX907_Exclude_Div_Cd_Criteria]
+AND   [$GEXXX903_Include_Emp_Stat_Criteria]
+ORDER BY J.COMPANY,J.PAYGROUP,J.DEPTID,J.EMPLID
+End-Select
+End-Procedure
+
+!$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
+
+begin-procedure get-job-rows
+#debug9 show 'get-job-rows'
+
+  let $movement_flag = 'N' 
+    
+begin-select
+jcurr.emplid
+jcurr.empl_status
+jcurr.company
+jcurr.paygroup
+jcurr.deptid
+jcurr.jobcode
+jcurr.acct_cd
+jcurr.empl_type
+jcurr.effdt
+jcurr.union_cd
+jcurr.action
+jcurr.action_reason
+jcurr.position_nbr
+jcurr.full_part_time
+jcurr.grade
+jcurr.grade_entry_dt
+jcurr.std_hours			!VENDAPP, Addition of STD HRS column in output
+
+  #debug9 show 'in job rows'
+  add 1 to #job_rows_cntr
+  let $curr_company     = &jcurr.company 
+  let $curr_paygroup    = &jcurr.paygroup
+  let $curr_deptid      = &jcurr.deptid
+  let $lkup_deptid      = $curr_deptid 
+  do get-deptid-descr
+  let $curr_Dept_descr  = &DT1.DESCR
+  do get-rgn-cd
+  let $curr_region      = &gdt1.gex_rgn_cd
+  let $curr_div_cd      = &gdt1.gex_company_div_cd
+  let $div_cd           = $curr_div_cd
+  let $curr_gl_dept     = &gdt1.department
+  do get-operating-division
+  let $curr_division    = $division
+  let $curr_status      = &jcurr.empl_status
+  let $curr_acct_cd     = &jcurr.acct_cd 
+  let $lkup_acct_cd     = $curr_acct_cd
+  do get-acct-cd-descr
+  let $curr_acct_descr  = &AT1.DESCRSHORT
+  let $curr_jobcode     = &jcurr.jobcode
+  let $lkup_jobcode     = $curr_jobcode 
+  let $Position_Nbr = &jcurr.POSITION_NBR 
+  Let $PosName = ''
+  Do Get-Position-Title
+  Let $curr_job_descr = $PosName
+  If $PosName = ''
+  do get-jobcode-descr 
+  let $curr_job_descr   = &JT1.DESCR
+  end-if 
+ 
+  let $curr_mgr_level   = &jt1.manager_level
+  let $mgr_level        = $curr_mgr_level 
+  do get-mgr-level-descr 
+  let $curr_level_descr = &xlat1.xlatshortname 
+  let $curr_eeo1code    = &jt1.eeo1code
+  let $eeo1code         = $curr_eeo1code
+  do get-eeo1-descr
+  let $curr_eeo1_descr  = $eeo1_descr 
+  let $curr_effdt       = &jcurr.effdt 
+  let $curr_effdate     = datetostr(&jcurr.effdt, 'MM/DD/YYYY') 
+  do convert-to-dtu-date ($curr_effdt,$curr_effdt_dtu) 
+  let $curr_union_cd    = &jcurr.union_cd
+  let $curr_pos_nbr     = &jcurr.position_nbr 
+  let $curr_f_p_t       = &jcurr.full_part_time
+  let $curr_action      = &jcurr.action
+  let $curr_act_reas    = &jcurr.action_reason
+  let $action = $curr_action
+  do get-action-descr
+  let $curr_action_descr = &xlat.action_descr   !GEX-TLL 05/02/2008
+  let $actn_reason = $curr_act_reas
+  do get-actn-reason-descr 
+  let $curr_actn_rsn_descr = &ar.descr
+  let $curr_empl_type   = &jcurr.empl_type
+  let $curr_grade       = &jcurr.grade      
+  let $curr_old_grade   = &jcurr.grade 
+
+  let $curr_std_hours = &jcurr.std_hours	!VENDAPP, Addition od STD HRS column in output	
+
+  If $curr_old_grade <> ' '
+    If ($curr_old_grade = 'A10' OR $curr_old_grade = 'A11' OR $curr_old_grade = 'C10' OR $curr_old_grade = 'C11' OR
+       $curr_old_grade = 'P10' OR $curr_old_grade = 'P11' OR $curr_old_grade = 'M10' OR $curr_old_grade = 'M11')
+       !Pharmacy Grades
+       let $curr_new_grade = '>= 13'
+    Else
+      !Non-Pharmacy Grades
+      let #curr_old_grade = to_number($curr_old_grade)
+      if (#curr_old_grade   >= 13 and #curr_old_grade <= 50)
+      or (#curr_old_grade   >= 82 and #curr_old_grade <= 100)
+        let $curr_new_grade = '>= 13'
+      else
+        let $curr_new_grade = '< 13'  
+      end-if
+    End-If
+  Else
+    If $curr_empl_type = 'H'
+      let $curr_new_grade = '< 13'
+    Else
+      let $curr_new_grade = '>= 13'
+    End-If
+  End-If
+
+  let $curr_entry_date  = datetostr(&jcurr.grade_entry_dt, 'MM/DD/YYYY')
+  let $curr_change = ' '
+  do get-evp-values 
+  let $curr_BUS_UNIT  = &evp.BUSINESS_UNIT
+  let $curr_GEX_CEO   = &evp.gex_ceo      
+  let $curr_GEX_EVP   = &evp.gex_evp      
+  let $curr_evp_name  = $evp_name
+  let $curr_GEX_SVPVP = &evp.gex_svpvp     
+  let $curr_GEX_DIR   = &evp.gex_dir      
+  let $curr_GEX_MGR   = &evp.gex_mgr     
+  let $curr_GEX_SUP   = &evp.gex_sup
+
+  if substr(&jcurr.paygroup,1,2) = 'PH'
+  or &jcurr.deptid = 'C017' 
+  or &jcurr.deptid = 'C098'
+  or &jcurr.acct_cd = '008'
+    let $curr_bus_area = 'Pharmacy'
+  else
+  if &jcurr.acct_cd = '041'
+  or &jcurr.acct_cd = '044'
+    let $curr_bus_area = 'GetGo'
+  else
+    let $curr_bus_area = &evp.gex_bus_area
+  end-if
+  end-if
+
+  let $movement_flag = 'N'
+
+  do field-comparison  
+ 
+   if ($movement_flag <> 'N' or &jcurr.action='DEM')   !VENDAPP if condition changed to handle movement change and demotions
+      if $is_new_hire<>'Y'     	!VENDAPP, to handle new Hire un-inclusion
+         if (&jcurr.action<>'REH' and &jcurr.action<>'HIR')	!VENDAPP, to handle Hire/Rehire un-inclusion
+	    if (&jcurr.union_cd = 'CBT' or &jcurr.union_cd = 'COL' or &jcurr.union_cd = 'DVR'
+	     or &jcurr.union_cd = 'GGO' or &jcurr.union_cd = 'HGN' or &jcurr.union_cd = 'MAS'
+	     or &jcurr.union_cd = 'MDL' or &jcurr.union_cd = 'MOD' or &jcurr.union_cd = 'MUR'
+	     or &jcurr.union_cd = 'NON' or &jcurr.union_cd = 'SEC' or &jcurr.union_cd = 'SFT'
+	     or &jcurr.union_cd = 'TOL' or &jcurr.union_cd = 'XPR')	!VENDAPP, only non-union employees are included in the output file
+	        if (&jcurr.company = 'GEI' or &jcurr.company = 'MCC' or	&jcurr.company = 'RFI'
+		 or &jcurr.company = 'TMK' or &jcurr.company = 'FCC' or &jcurr.company = 'MGC')	!VENDAPP, Independents are not icluded in output file
+		                                                                                !RKK ADDED COMPANY MGC for ITG 93405
+	        	
+      string $NAME $curr_effdate $curr_COMPANY $curr_paygroup $curr_deptid $curr_DEPT_descr 
+      $curr_div_cd $curr_DIVISION $curr_bus_area $curr_BUS_UNIT $curr_gl_dept $curr_acct_cd 
+      $curr_REGION $curr_STATUS $curr_action $curr_action_descr 
+      $curr_act_reas $curr_actn_rsn_descr $curr_union_cd $curr_f_p_t  
+      $curr_jobcode $curr_JOB_DESCR $cur_std_hours $curr_level_descr $curr_eeo1_descr
+      $curr_empl_type $curr_old_grade $curr_new_grade $curr_entry_date $hire_date 
+      $rehire_date $term_date $service_date $curr_evp_name $curr_change
+      by $delim into $curr_cols
+
+      move $curr_bus_area to $ic_new_bus_area		!ITG 40110
+      move $curr_new_grade to $ic_new_new_grade		
+      move $curr_f_p_t to $ic_new_f_p_t			
+      move $curr_empl_type to $ic_new_empl_type		
+      move $curr_DIVISION to $ic_new_division		
+      move $curr_jobcode to $ic_new_jobcode		
+      move $curr_GEX_EVP to $ic_new_gex_evp		
+      move $curr_deptid to $ic_new_deptid
+      move $curr_old_grade to $ic_new_sg
+      move $curr_level_descr to $ic_new_mgr_lvl		!ITG 40110
+      move $curr_effdate to $ic_new_effdt		
+      move $curr_action to $ic_new_action
+      move $curr_act_reas to $ic_new_actn_rsn	
+
+      move '' to $prt_cols
+      string $prev_cols ' | ' $curr_cols by $delim into $prt_cols
+      Do P240-Write-Record
+      Do Insert-Movement-Record		!VENDAPP, ITG 40110, Insert into temp table
+      let $movement_flag = 'N'
+		end-if
+	    end-if
+	 end-if
+      end-if
+   else
+
+   end-if
+
+  if $curr_change = ' '
+    if $new_hire = 'Y'
+      let $curr_change = 'NEW HIRE'
+      let $new_hire = 'N'
+     end-if
+  end-if
+
+
+      string $NAME $curr_effdate $curr_COMPANY $curr_paygroup $curr_deptid $curr_DEPT_descr 
+      $curr_div_cd $curr_DIVISION $curr_bus_area $curr_BUS_UNIT $curr_gl_dept $curr_acct_cd 
+      $curr_REGION $curr_STATUS $curr_action $curr_action_descr 
+      $curr_act_reas $curr_actn_rsn_descr $curr_union_cd $curr_f_p_t  
+      $curr_jobcode $curr_JOB_DESCR $cur_std_hours $curr_level_descr $curr_eeo1_descr
+      $curr_empl_type $curr_old_grade $curr_new_grade $curr_entry_date $hire_date 
+      $rehire_date $term_date $service_date $curr_evp_name $curr_change
+      by $delim into $prev_cols
+
+  move $curr_bus_area to $prev_bus_area
+  move $curr_division to $prev_division
+  move $curr_pos_nbr to $prev_pos_nbr
+  move $curr_empl_type to $prev_empl_type
+  move $curr_f_p_t to $prev_f_p_t
+  move $curr_grade to $prev_grade
+  move $curr_deptid to $prev_deptid
+  move $curr_jobcode to $prev_jobcode
+  move $curr_acct_cd  to $prev_acct_cd
+  move $curr_GEX_EVP to $prev_GEX_EVP			!ITG 40110
+
+  move $curr_bus_area to $ic_old_bus_area		!ITG 40110
+  move $curr_new_grade to $ic_old_new_grade		
+  move $curr_f_p_t to $ic_old_f_p_t			
+  move $curr_empl_type to $ic_old_empl_type		
+  move $curr_DIVISION to $ic_old_division		
+  move $curr_GEX_EVP to $ic_old_gex_evp			
+  move $curr_old_grade to $ic_old_sg
+  move $curr_jobcode to $ic_old_jobcode
+  move $curr_level_descr to $ic_old_mgr_lvl		!ITG 40110
+!GEX-TLL 03/25/2008 HCM 9.0 Upgrade Begin  
+  move $curr_deptid to $ic_old_deptid			!ITG 44431
+  move $curr_effdate to $ic_old_effdt
+  move $curr_action to $ic_old_action
+  move $curr_act_reas to $ic_old_actn_rsn
+!GEX-TLL 03/25/2008 HCM 9.0 Upgrade End  
+  
+from ps_job jcurr
+  
+WHERE jcurr.emplid = $emplid
+and jcurr.empl_rcd = $empl_rcd
+!and jcurr.company = &j.company			VENDAPP, Not Needed
+and jcurr.effdt = (select min(effdt)
+from ps_job
+where emplid = jcurr.emplid
+  and empl_rcd = jcurr.empl_rcd
+  !and company  = jcurr.company			VENDAPP, Not Needed
+  and effdt > $prior_effdt)
+
+and jcurr.effseq = (select max(effseq)
+from ps_job
+where emplid = jcurr.emplid
+  and empl_rcd = jcurr.empl_rcd
+  !and company  = jcurr.company			VENDAPP, Not Needed
+  and effdt = jcurr.effdt)
+
+end-select
+end-procedure
+
+!**********************************************************************************
+!**********************************************************************************
+begin-procedure field-comparison
+#debug9 show 'field-comparison'
+
+  #debug9 show 'Business Area:' $prev_bus_area '-' $curr_bus_area
+  if $prev_bus_area <> $curr_bus_area
+    let $movement_flag = 'Y'
+  end-if
+
+  #debug9 show 'Division:' $prev_division '-' $curr_division
+  if $prev_division <> $curr_division
+    let $movement_flag = 'Y'
+  end-if
+
+  #debug9 show 'Deptid:' $prev_deptid '-' $curr_deptid
+  if $prev_deptid <> $curr_deptid
+    let $movement_flag = 'Y'
+  end-if
+
+  #debug9 show 'Jobcode:' $prev_jobcode '-' $curr_jobcode
+  if $prev_jobcode <> $curr_jobcode
+    let $movement_flag = 'Y'
+  end-if
+
+  !VENDAPP, movement across position, account code removed.
+  !#debug9 show 'Account code:' $prev_acct_cd '-' $curr_acct_cd
+  !if $prev_acct_cd <> $curr_acct_cd
+  !  let $movement_flag = 'Y'
+  !end-if
+
+  !#debug9 show 'Position No:' $prev_pos_nbr '-' $curr_pos_nbr
+  !if $prev_pos_nbr <> $curr_pos_nbr  
+  !  let $movement_flag = 'Y'
+  !end-if					
+  !VENDAPP, movement across position, account code removed.
+
+  #debug9 show 'FT/PT:' $prev_f_p_t '-' $curr_f_p_t
+  if  $prev_f_p_t <> $curr_f_p_t 
+    let $movement_flag = 'Y'
+  end-if
+
+  !VENDAPP, movement across grade removed.
+  !#debug9 show 'Grade:' $prev_grade '-' $curr_grade
+  !if $prev_grade <> $curr_grade
+  !  let $movement_flag = 'Y'
+  !end-if
+  !VENDAPP, movement across grade removed.
+
+end-procedure
+
+!**********************************************************************************
+!***********************************************************************************
+begin-procedure get-max-row
+#debug9 show 'get-max-row'
+
+begin-select
+jj.effdt
+jj.emplid 
+
+  let $max_effdt = &jj.effdt
+  #debug9 show '$max_effdt:' $max_effdt
+  do convert-to-dtu-date($max_effdt,$max_effdt_dtu)
+from ps_job jj
+
+where jj.emplid = $emplid
+and jj.empl_rcd = $empl_rcd
+!and jj.company = &j.company		VENDAPP, Not Needed
+and jj.effdt = (select max(effdt)
+from ps_job
+where emplid = jj.emplid
+  and empl_rcd = jj.empl_rcd
+  !and company = jj.company		VENDAPP, Not Needed
+  and effdt <= $thru_dt)
+
+and jj.effseq = (select max(effseq)
+from ps_job
+where emplid = jj.emplid
+  and empl_rcd = jj.empl_rcd
+  !and company = jj.company		VENDAPP, Not Needed
+  and effdt = jj.effdt)
+
+end-select
+end-procedure
+
+!***********************************************************************************
+
+!**********************************************************************************
+begin-procedure get-min-row
+#debug9 show 'get-min-row'
+#debug9 show $emplid ', $new_hire ' $new_hire
+
+!VENDAPP, Added for Hire/Rehire un-inclusion
+let $is_new_hire=' '
+if $new_hire='Y'
+   let $is_new_hire='Y'
+end-if
+!VENDAPP, Added for Hire/Rehire un-inclusion
+
+begin-select
+jprev.emplid
+jprev.empl_type
+jprev.company
+jprev.paygroup
+jprev.deptid
+jprev.empl_status
+jprev.acct_cd
+jprev.jobcode
+jprev.effdt
+jprev.union_cd
+jprev.action
+jprev.action_reason
+jprev.position_nbr
+jprev.full_part_time
+jprev.grade
+jprev.grade_entry_dt
+jprev.std_hours			!VENDAPP, Addition of STD HRS column in output
+
+
+  let $is_new_hire='N'		!VENDAPP, Added for Hire/Rehire un-inclusion
+
+  if &jprev.action='TER'
+     let $is_new_hire='Y'
+  end-if			!VENDAPP, Added for Hire/Rehire un-inclusion
+
+  #debug9 show 'In min row dt:' &jprev.effdt
+  let $prev_company     = &jprev.company 
+  let $prev_paygroup    = &jprev.paygroup
+  let $prev_deptid      = &jprev.deptid
+  let $lkup_deptid      = $prev_deptid 
+  do get-deptid-descr
+  let $prev_Dept_descr  = &DT1.DESCR
+  do get-rgn-cd
+  let $prev_region      = &GDT1.GEX_RGN_CD
+  let $prev_div_cd      = &gdt1.gex_company_div_cd
+  let $div_cd           = $prev_div_cd
+  let $prev_gl_dept     = &gdt1.department
+  do get-operating-division
+  let $prev_division   = $division
+  let $prev_status      = &jprev.empl_status
+  let $prev_acct_cd     = &jprev.acct_cd 
+  let $lkup_acct_cd     = $prev_acct_cd
+  do get-acct-cd-descr
+  let $prev_acct_descr  = &AT1.DESCRSHORT
+  let $prev_jobcode     = &jprev.jobcode
+  let $lkup_jobcode     = $prev_jobcode 
+   !ISDVSXP ITG 60304 05/12/2009 -- START
+   !do get-jobcode-descr 
+   !let $prev_job_descr   = &JT1.DESCR
+  let $Position_Nbr = &jprev.POSITION_NBR 
+  Let $PosName = ''
+  Do Get-Position-Title
+  Let $prev_job_descr = $PosName
+  If $PosName = ''
+  do get-jobcode-descr 
+  let $prev_job_descr   = &JT1.DESCR
+  end-if
+   !ISDVSXP ITG 60304 05/12/2009 -- END
+ 
+  let $prev_mgr_level   = &jt1.manager_level
+  let $mgr_level        = $prev_mgr_level 
+  do get-mgr-level-descr 
+  let $prev_level_descr = &xlat1.xlatshortname 
+  let $prev_eeo1code    = &jt1.eeo1code
+  let $eeo1code         = $prev_eeo1code
+  do get-eeo1-descr
+  let $prev_eeo1_descr  = $eeo1_descr 
+  let $prev_effdt       = &jprev.effdt 
+  let $prev_effdate     = datetostr(&jprev.effdt, 'MM/DD/YYYY') 
+  let $prev_union_cd    = &jprev.union_cd
+  let $prev_action      = &jprev.action
+  let $prev_act_reas    = &jprev.action_reason  
+  let $action = $prev_action
+  do get-action-descr
+  !let $prev_action_descr = &xlat.xlatlongname !GEX-TLL 05/02/2008
+  let $prev_action_descr =&xlat.action_descr   !GEX-TLL 05/02/2008
+  let $actn_reason = $prev_act_reas
+  do get-actn-reason-descr 
+  let $prev_actn_rsn_descr = &ar.descr
+  let $prev_pos_nbr     = &jprev.position_nbr
+  let $prev_f_p_t       = &jprev.full_part_time
+  let $prev_empl_type   = &jprev.empl_type
+  let $prev_grade       = &jprev.grade     
+  let $prev_old_grade   = &jprev.grade
+  
+  let $prev_std_hours= &jprev.std_hours		!VENDAPP, Addition od STD HRS column in output
+
+  !VENDAPP, Removal of old grade calculation
+!  let #prev_old_grade = to_number($prev_old_grade)
+!  if (#prev_old_grade   >= 13 and #prev_old_grade <= 50)
+!  or (#prev_old_grade   >= 82 and #prev_old_grade <= 100)
+!    let $prev_new_grade = '>= 13'
+!  else
+!    let $prev_new_grade = '< 13'  
+!  end-if 
+  !VENDAPP, Removal of old grade calculation
+
+  !VENDAPP, Addition of new grade calculation
+  If $prev_old_grade <> ' '
+    If ($prev_old_grade = 'A10' OR $prev_old_grade = 'A11' OR $prev_old_grade = 'C10' OR $prev_old_grade = 'C11' OR
+       $prev_old_grade = 'P10' OR $prev_old_grade = 'P11' OR $prev_old_grade = 'M10' OR $prev_old_grade = 'M11')
+       !Pharmacy Grades
+       let $prev_new_grade = '>= 13'
+    Else
+      !Non-Pharmacy Grades
+      let #prev_old_grade = to_number($prev_old_grade)
+      if (#prev_old_grade   >= 13 and #prev_old_grade <= 50)
+      or (#prev_old_grade   >= 82 and #prev_old_grade <= 100)
+        let $prev_new_grade = '>= 13'
+      else
+        let $prev_new_grade = '< 13'  
+      end-if
+    End-If
+  Else
+    If $prev_empl_type = 'H'
+      let $prev_new_grade = '< 13'
+    Else
+      let $prev_new_grade = '>= 13'
+    End-If
+  End-If
+  !VENDAPP, Addition of new grade calculation
+
+  let $prev_entry_date  = datetostr(&jprev.grade_entry_dt, 'MM/DD/YYYY')
+  do get-evp-values 
+  let $prev_BUS_UNIT  = &evp.BUSINESS_UNIT
+  let $prev_GEX_CEO   = &evp.gex_ceo      
+  let $prev_GEX_EVP   = &evp.gex_evp      
+  let $prev_evp_name  = $evp_name 
+  let $prev_GEX_SVPVP = &evp.gex_svpvp     
+  let $prev_GEX_DIR   = &evp.gex_dir      
+  let $prev_GEX_MGR   = &evp.gex_mgr     
+  let $prev_GEX_SUP   = &evp.gex_sup
+
+  if substr(&jprev.paygroup,1,2) = 'PH'
+  or &jprev.deptid = 'C017' 
+  or &jprev.deptid = 'C098'
+  or &jprev.acct_cd = '008'
+    let $prev_bus_area = 'Pharmacy'
+  else
+  if &jprev.acct_cd = '041'
+  or &jprev.acct_cd = '044'
+    let $prev_bus_area = 'GetGo'
+  else
+     let $prev_bus_area = &evp.gex_bus_area
+  end-if
+  end-if
+
+  if $new_hire = 'Y'
+    let $prev_change = 'NEW HIRE'
+  else
+    let $prev_change = ' '
+  end-if
+
+  !VENDAPP, Modified to rename some columns and rename others
+  !GEX-TLL 04/08/2008 HCM 9.0 Upgrade Begin
+  !string $EMPLID $NAME $prev_effdate $prev_COMPANY $prev_paygroup $prev_deptid $prev_DEPT_descr 
+  string $NAME $prev_effdate $prev_COMPANY $prev_paygroup $prev_deptid $prev_DEPT_descr 
+  !GEX-TLL 04/08/2008 HCM 9.0 Upgrade End
+  $prev_div_cd $prev_DIVISION $prev_bus_area $prev_BUS_UNIT $prev_gl_dept $prev_acct_cd 
+  $prev_REGION $prev_STATUS $prev_action $prev_action_descr $prev_act_reas 
+  $prev_actn_rsn_descr $prev_union_cd $prev_f_p_t $prev_jobcode 
+  $prev_JOB_DESCR $prev_std_hours $prev_level_descr $prev_eeo1_descr  
+  $prev_empl_type $prev_old_grade $prev_new_grade $prev_entry_date $hire_date $rehire_date  
+  $term_date $service_date $prev_evp_name
+  $prev_change by $delim into $prev_cols
+
+!  string $EMPLID $NAME $prev_effdate $prev_COMPANY $prev_paygroup $prev_deptid $prev_DEPT_descr 
+!  $prev_div_cd $prev_DIVISION $prev_bus_area $prev_BUS_UNIT $prev_gl_dept $prev_acct_cd 
+!  $prev_ACCT_DESCR $prev_REGION $prev_STATUS $prev_action $prev_action_descr $prev_act_reas 
+!  $prev_actn_rsn_descr $prev_union_cd $prev_f_p_t $prev_jobcode 
+!  $prev_JOB_DESCR $prev_mgr_level $prev_level_descr $prev_eeo1code $prev_eeo1_descr $prev_pos_nbr 
+!  $prev_empl_type $prev_old_grade $prev_new_grade $prev_entry_date $hire_date $rehire_date  
+!  $term_date $co_senior_date $service_date $vcn_senior_date $pay_elig_date  $prev_GEX_CEO 
+!  $prev_GEX_EVP $prev_evp_name $prev_GEX_SVPVP $prev_GEX_DIR $prev_GEX_MGR $prev_GEX_SUP 
+!  $prev_change by $delim into $prev_cols
+  !VENDAPP, Modified to rename some columns and rename others
+
+  move $prev_bus_area to $ic_old_bus_area		!ITG 40110
+  move $prev_new_grade to $ic_old_new_grade		
+  move $prev_f_p_t to $ic_old_f_p_t			
+  move $prev_empl_type to $ic_old_empl_type		
+  move $prev_DIVISION to $ic_old_division		
+  move $prev_GEX_EVP to $ic_old_gex_evp			
+  move $prev_old_grade to $ic_old_sg
+  move $prev_level_descr to $ic_old_mgr_lvl		
+  move $prev_jobcode to $ic_old_jobcode			!ITG 40110
+!GEX-TLL 03/25/2008 HCM 9.0 Upgrade Begin  
+  move $prev_deptid to $ic_old_deptid			!ITG 44431
+  move $prev_effdate to $ic_old_effdt
+  move $prev_action to $ic_old_action
+  move $prev_act_reas to $ic_old_actn_rsn	
+!GEX-TLL 03/25/2008 HCM 9.0 Upgrade End  
+
+from ps_job jprev
+where jprev.emplid = $emplid
+and jprev.empl_rcd = $empl_rcd
+!and jprev.company = &j.company		VENDAPP, Not Needed
+!and jprev.effdt = (select min(effdt)	VENDAPP COMMENTED
+and jprev.effdt = (select max(effdt)	!VENDAPP ADDED
+from ps_job
+where emplid = jprev.emplid
+  !and company  = jprev.company		VENDAPP, Not Needed
+  and empl_rcd = jprev.empl_rcd
+  !and effdt >= $from_dt)		VENDAPP, COMMENTED
+  and effdt < $from_dt)			!VENDAPP, ADDED
+and jprev.effseq = (select max(effseq)
+from ps_job
+where emplid = jprev.emplid
+  and empl_rcd = jprev.empl_rcd
+  !and company  = jprev.company		VENDAPP, Not Needed
+  and effdt = jprev.effdt)
+
+end-select
+end-procedure
+!**********************************************************************************
+!$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
+!**********************************************************************************
+begin-procedure get-action-descr
+begin-select
+
+!xlat.xlatlongname	!GEX-TLL 05/02/2008
+xlat.action_descr	!GEX-TLL 05/02/2008
+
+!GEX-AXG Modified for Upgrade 9.0 - Begin
+!from xlattable xlat
+!from psxlatitem xlat   !GEX-TLL 05/02/2008
+from PS_ACTION_TBL xlat !GEX-TLL 05/02/2008
+!GEX-AXG Modified for Upgrade 9.0 - End
+!where xlat.fieldname = 'ACTION'  !GEX-TLL 05/02/2008
+!and xlat.fieldvalue = $action	  !GEX-TLL 05/02/2008
+where xlat.action=$action	  !GEX-TLL 05/02/2008
+and xlat.eff_status = 'A' 
+!GEX-TLL 05/02/2008 - Begin
+and xlat.effdt=
+		(select MAX(EFFDT) FROM PS_ACTION_TBL
+		WHERE xlat.ACTION = ACTION           
+         	AND xlat.EFF_STATUS = EFF_STATUS)
+!GEX-TLL 05/02/2008 - End    
+
+end-select
+end-procedure
+!**********************************************************************************
+
+!**********************************************************************************
+begin-procedure get-actn-reason-descr
+begin-select
+
+ar.descr
+
+from ps_actn_reason_tbl ar
+
+where ar.action = $action
+and ar.action_reason = $actn_reason
+and ar.eff_status = 'A'
+end-select
+end-procedure
+!**********************************************************************************
+!**********************************************************************************
+begin-procedure get-deptid-descr
+#debug9 show 'get-deptid-descr'
+begin-select
+
+dt1.descr
+
+from ps_dept_tbl dt1
+where    DT1.SETID            = 'COMMN'
+AND    DT1.DEPTID           = $lkup_DEPTID
+AND    DT1.EFF_STATUS       = 'A'
+AND    DT1.EFFDT            = (SELECT MAX(EFFDT) FROM   PS_DEPT_TBL WHERE  
+				DEPTID       = DT1.DEPTID AND    
+				SETID        = DT1.SETID AND    
+				EFFDT       <= $ASOFDATE)
+end-select
+end-procedure
+!**********************************************************************************
+!**********************************************************************************
+begin-procedure get-acct-cd-descr
+#debug9 show 'get-acc-cd-descr'
+begin-select
+
+at1.descrshort
+
+!GEX-AXG Modified for 9.0 Upgrade - Begin
+!from ps_acct_cd_tbl at1
+from ps_gex_acct_cd_tbl at1
+!GEX-AXG Modified for 9.0 Upgrade - End
+
+where    at1.SETID          = 'COMMN'
+AND    at1.acct_cd          = $lkup_acct_cd
+AND    at1.EFF_STATUS       = 'A'
+AND    at1.EFFDT            = (SELECT MAX(EFFDT) FROM   PS_acct_cd_tbl WHERE  
+				acct_cd      = at1.acct_cd AND    
+				SETID        = at1.SETID AND    
+				EFFDT       <= $ASOFDATE)
+end-select
+end-procedure
+!**********************************************************************************
+
+!**********************************************************************************
+begin-procedure get-jobcode-descr
+#debug9 show 'get-jobcode-descr'
+begin-select
+
+jt1.descr
+jt1.manager_level
+jt1.eeo1code
+
+from ps_jobcode_tbl jt1
+where    jt1.SETID          = 'COMMN'
+AND    jt1.jobcode          = $lkup_jobcode
+AND    jt1.EFF_STATUS       = 'A'
+AND    jt1.EFFDT            = (SELECT MAX(EFFDT) FROM   PS_jobcode_tbl WHERE  
+				jobcode      = jt1.jobcode AND    
+				SETID        = jt1.SETID AND    
+				EFFDT       <= $ASOFDATE)
+end-select
+end-procedure
+!**********************************************************************************
+!**********************************************************************************
+begin-procedure get-rgn-cd
+#debug9 show 'get-rgn-cd'
+begin-select
+
+gdt1.gex_company_div_cd
+gdt1.department
+gdt1.gex_rgn_cd
+
+from ps_gex_dept_tbl gdt1
+where  gdt1.DEPTID          = $lkup_deptid
+AND    GDT1.EFFDT           = (SELECT MAX(EFFDT) FROM   PS_GEX_DEPT_TBL WHERE  
+				DEPTID       = GDT1.DEPTID AND    
+				EFFDT       <= $ASOFDATE)
+AND    GDT1.SEQUENCE_NUMBER = (SELECT MAX(SEQUENCE_NUMBER) FROM   PS_GEX_DEPT_TBL WHERE  
+				DEPTID       = GDT1.DEPTID AND    
+				EFFDT        = GDT1.EFFDT)
+
+end-select
+end-procedure
+!**********************************************************************************
+!**********************************************************************************
+begin-procedure get-mgr-level-descr
+begin-select
+
+xlat1.xlatshortname
+
+
+!GEX-AXG Modified for Upgrade 9.0 - Begin
+!from xlattable xlat1
+from psxlatitem xlat1
+!GEX-AXG Modified for Upgrade 9.0 - End
+
+where xlat1.fieldname = 'MANAGER_LEVEL'
+and xlat1.fieldvalue = $mgr_level
+and xlat1.eff_status = 'A' 
+
+end-select
+end-procedure
+!**********************************************************************************
+!**********************************************************************************
+begin-procedure get-eeo1-descr
+  evaluate $eeo1code
+    when = '1' 
+      let $eeo1_descr = 'Officials/Mgrs'
+    break
+    when = '2'
+      let $eeo1_descr = 'Professionals'
+    break
+    when = '3'
+      let $eeo1_descr = 'Technicians'
+    break
+    when = '4'
+      let $eeo1_descr =  'Sales'
+    break
+    when = '5' 
+      let $eeo1_descr = 'Office/Clerical'
+    break
+    when = '6'
+      let $eeo1_descr = 'Skilled'
+    break
+    when = '7'
+      let $eeo1_descr = 'Semi-skilled'
+    break
+    when = '8'
+      let $eeo1_descr = 'Unskilled'
+    break
+    when = '9' 
+      let $eeo1_descr = 'Service'
+    break  
+    when = 'N' 
+      let $eeo1_descr = 'No EEO'
+    break
+    end-evaluate
+
+end-procedure
+!**********************************************************************************
+
+!***********************************************************************************
+begin-procedure get-operating-division
+!***********************************************************************************
+  
+  Evaluate $div_cd
+	when = 'COR'
+  	when = 'GEM'
+	when = 'GPH'
+	when = 'RMC'
+	when = 'RPH'
+	when = 'WHS'
+	
+  	  !show '$div_cd:' $div_cd
+          let $division = 'POD'
+          Add 1 to  #division_POD  
+	break
+	
+	when = 'CLC'
+	when = 'CLE'
+	when = 'CP3'
+	when = 'CLW'
+
+	  !show '$div_cd:' $div_cd
+          let $division = 'COD'
+          Add 1 to  #division_COD 
+	break
+        when = 'RTL'
+        when = 'GGO'
+        when = 'VDO' 
+          evaluate &J.company
+            when = 'GEI'
+            when = 'RTP'
+            when = 'TMK' 
+	    when = 'FCC'		!VENDAPP, ITG 40110
+	    when = 'MGC'	        !RKK ADDED COMPANY MGC for ITG 93405
+              let $division = 'POD'
+            break 
+            when = 'RFI'
+              let $division = 'COD'
+            break
+            when = 'MCC'
+              !let $division = 'MOD'
+	      let $division = 'POD'	!VENDAPP, ITG 40110
+            break
+          end-evaluate
+        break	
+	when = 'MDR'
+	  !show '$div_cd:' $div_cd
+          !let $division = 'MOD'
+	  let $division = 'POD'		!VENDAPP, ITG 40110
+          !Add 1 to  #division_MOD
+          Add 1 to  #division_POD	!VENDAPP, ITG 40110
+	break
+	
+	when = 'COC'
+        when = 'COL'
+          !show '$div_cd:' $div_cd
+          let $division = 'COL'
+          Add 1 to  #division_COL
+       when-other
+          Add 1 to  #division_other          
+  End-evaluate
+
+End-Procedure
+
+!***********************************************************************************
+Begin-procedure Get-evp-values
+#debug9 show 'Get-evp-values'
+!***********************************************************************************
+let $EVP_NAME = ' '		!VENDAPP
+begin-select
+evp.gex_bus_area 
+evp.BUSINESS_UNIT
+evp.GEX_CEO        
+evp.GEX_EVP        
+evp.GEX_SVPVP      
+evp.GEX_DIR        
+evp.GEX_MGR        
+evp.GEX_SUP        
+     
+  evaluate &evp.GEX_EVP
+    when = '192505706'
+      let $EVP_NAME = 'Minnaugh, M'
+    break
+    when = '181464707'
+      let $EVP_NAME = 'Lucot, J'
+    break
+    when = '178509093'
+      let $EVP_NAME = 'Karet, L'
+    break
+    when-other
+      let $EVP_NAME = ' '
+  end-evaluate
+    
+from ps_gex_evp_tbl evp
+where evp.deptid = $lkup_deptid
+end-select
+
+end-procedure
+
+!***********************************************************************************
+Begin-Procedure P141-Write-file-header
+!***********************************************************************************
+#debug9 Show 'P141-Write-File-Header'
+
+    Move '' To $prt_cols                                                   
+
+    !VENDAPP, Modified to accomdate title in one line
+    let $year4 = '1'
+    do format-datetime($from_dt,$hdr_from_dt,{DEFMDY},'','') 
+    do format-datetime($thru_dt,$hdr_thru_dt,{DEFMDY},'','') 
+
+    string  ' ' ' ' ' ' 'EMPLOYEE' 'MOVEMENT' 'DATA' 'FOR' 'EVP' 'FROM ' $hdr_from_dt ' THROUGH ' $hdr_thru_dt
+    by $delim into $prt_cols
+    write 1 from $prt_cols Status=#filestat	
+
+!   string ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' 'BEGIN' ' END' 'BEGIN' ' END' 
+!   'BEGIN' ' END' 'BEGIN' ' END' by $delim into $prt_cols
+!   write 1 from $prt_cols Status=#filestat
+    !VENDAPP, Modified to accomdate title in one line
+
+
+    !VENDAPP, Modified to rename some columns and rename others
+    !GEX-TLL 04/08/2008 HCM 9.0 Upgrade Begin
+    !string 'EMPLID' 'NAME' 'EFFDT' 'CO' 'PAYGRP' 'DEPT' 'DESCR' 'DIV CD' 'OPR DIV' 
+    string 'NAME' 'EFFDT' 'CO' 'PAYGRP' 'DEPT' 'DESCR' 'DIV CD' 'OPR DIV' 
+    !GEX-TLL 04/08/2008 HCM 9.0 Upgrade End
+    'BUS AREA' 'BUS UNIT' 'GL DEPT' 'ACCT CD' 'REGION' 'STATUS' 
+    'ACTION' 'DESCR' 'REASON' 'DESCR' 'UNION' 'FT/PT' 'JOBCODE' 'DESCR' 
+    'STD HOURS' 'MGR LEVEL' 'EEO CD' 'TYPE'
+    'OLD SG' 'NEW SG' 'GRADE DT' 'HIRE DT' 'REHIRE DT' 'TERM DT' 'SERVICE DT'
+    'EVP NAME' 'CHANGE'  by $delim into $left_hdr_cols
+    !GEX-TLL 04/08/2008 HCM 9.0 Upgrade Begin
+    !string 'EMPLID' 'NAME' 'EFFDT' 'CO' 'PAYGRP' 'DEPT' 'DESCR' 'DIV CD' 'OPR DIV' 
+    string 'NAME' 'EFFDT' 'CO' 'PAYGRP' 'DEPT' 'DESCR' 'DIV CD' 'OPR DIV' 
+    !GEX-TLL 04/08/2008 HCM 9.0 Upgrade End
+    'BUS AREA' 'BUS UNIT' 'GL DEPT' 'ACCT CD' 'REGION' 'STATUS' 
+    'ACTION' 'DESCR' 'REASON' 'DESCR' 'UNION' 'FT/PT' 'JOBCODE' 'DESCR' 
+    'STD HOURS' 'MGR LEVEL' 'EEO CD' 'TYPE'
+    'OLD SG' 'NEW SG' 'GRADE DT' 'HIRE DT' 'REHIRE DT' 'TERM DT' 'SERVICE DT'
+    'EVP NAME' 'CHANGE' by $delim into $right_hdr_cols
+    !VENDAPP, Modified to rename some columns and rename others
+
+
+
+    !VENDAPP, Modified to rename some columns and rename others
+!    string 'EMPLID' 'NAME' 'EFFDT' 'CO' 'PAYGRP' 'DEPT' 'DESCR' 'DIV CD' 'OPR DIV' 
+!    'BUS AREA' 'BUS UNIT' 'GL DEPT' 'ACCT CD' 'DESCR' 'REGION' 'STATUS' 
+!    'ACTION' 'DESCR' 'REASON' 'DESCR' 'UNION' 'FT/PT' 'JOBCODE' 'DESCR' 
+!    'MGR LEVEL' 'DESCR' 'EEO CD' 'DESCR' 'POSITION' 'TYPE'
+!    'OLD SG' 'NEW SG' 'GRADE DT' 'HIRE DT' 'REHIRE DT' 'TERM DT' 'CO SENIOR DT' 'SERVICE DT'
+!    'VAC SENIOR DT' 'PAY ELIG DT' '  CEO  ' '  EVP  ' '   EVP NAME   ' ' SVPVP ' '  DIR  ' 
+!    '  MGR  ' '  SUPR  ' 'CHANGE'  by $delim into $left_hdr_cols
+!
+!    string 'EMPLID' 'NAME' 'EFFDT' 'CO' 'PAYGRP' 'DEPT' 'DESCR' 'DIV CD' 'OPR DIV' 
+!    'BUS AREA' 'BUS UNIT' 'GL DEPT' 'ACCT CD' 'DESCR' 'REGION' 'STATUS' 
+!    'ACTION' 'DESCR' 'REASON' 'DESCR' 'UNION' 'FT/PT' 'JOBCODE' 'DESCR' 
+!    'MGR LEVEL' 'DESCR' 'EEO CD' 'DESCR' 'POSITION' 'TYPE'
+!    'OLD SG' 'NEW SG' 'GRADE DT' 'HIRE DT' 'REHIRE DT' 'TERM DT' 'CO SENIOR DT' 'SERVICE DT'
+!    'VAC SENIOR DT' 'PAY ELIG DT' '  CEO  ' '  EVP  ' '   EVP NAME   ' ' SVPVP ' '  DIR  ' 
+!    '  MGR  ' '  SUPR  ' 'CHANGE' by $delim into $right_hdr_cols
+!
+    !VENDAPP, Modified to rename some columns and rename others
+
+    string $left_hdr_cols ' | ' $right_hdr_cols by $delim into $prt_cols 
+    write 1 from $prt_cols Status=#filestat	
+
+
+  If #filestat <> 0
+     Show 'Error writing file header.  Program terminating.'
+     Stop
+  End-If
+
+End-Procedure
+
+!***********************************************************************************
+Begin-Procedure P240-Write-Record
+!***********************************************************************************
+#debug9 Show 'P240-Write-Record'
+
+!   Move '' To $prt_cols
+
+   write 1 from $prt_cols Status=#filestat
+   Add 1 To #recs-written 
+
+  If #filestat <> 0
+     Show 'Error writing output file1.  Program terminating.'
+     Stop
+  End-If
+   
+End-Procedure
+
+!VENDAPP, ITG40110, Insertion into temp table PS_GEX_EVP_MVMNT
+!***********************************************************************************
+Begin-Procedure Insert-Movement-Record
+!***********************************************************************************
+
+Begin-sql on-error=SQL-Error-Insert-Movement-table
+Insert into PS_GEX_EVP_MVMNT
+VALUES($EMPLID,
+!GEX-TLL 03/25/2008 HCM 9.0 Upgrade Begin	
+	to_date($service_date,'MM-DD-YYYY'),
+	$ic_old_deptid,
+!GEX-TLL 03/25/2008 HCM 9.0 Upgrade End	
+	$ic_new_deptid,
+!GEX-TLL 03/25/2008 HCM 9.0 Upgrade Begin	
+	$ic_old_action,
+	$ic_new_action,
+	$ic_old_actn_rsn,
+	$ic_new_actn_rsn,
+	to_date($ic_old_effdt,'MM-DD-YYYY'),
+	to_date($ic_new_effdt,'MM-DD-YYYY'),
+!GEX-TLL 03/25/2008 HCM 9.0 Upgrade End		
+	$ic_old_jobcode,
+	$ic_new_jobcode,
+	nvl($ic_old_bus_area,' '),
+	nvl($ic_new_bus_area,' '),
+	$ic_old_new_grade,
+	$ic_new_new_grade,
+	$ic_old_f_p_t,
+	$ic_new_f_p_t,
+	$ic_old_empl_type,
+	$ic_new_empl_type,
+	$ic_old_division,
+	$ic_new_division,
+	nvl($ic_old_gex_evp,' '),
+	nvl($ic_new_gex_evp,' '),
+	nvl($ic_old_sg,' '),
+	nvl($ic_new_sg,' '),
+	nvl($ic_old_mgr_lvl,' '),
+	nvl($ic_new_mgr_lvl,' '))
+End-Sql
+
+end-procedure 
+
+!***********************************************************************************
+Begin-Procedure SQL-Error-Insert-Movement-table
+!***********************************************************************************
+    Show 'Error inserting row into PS_GEX_EVP_MVMNT table'
+    Show 'Emplid:' $EMPLID
+    Show 'Jobcode:' $ic_new_jobcode
+    Show 'Old Business Area:' $ic_old_bus_area
+    Show 'New Business Area:' $ic_new_bus_area
+    Show 'Old Grade:' $ic_old_new_grade
+    Show 'New Grade:' $ic_new_new_grade
+    Show 'Old Full/Part Time:' $ic_old_f_p_t
+    Show 'New Full/Part Time:' $ic_new_f_p_t
+    Show 'Old Employee Type:' $ic_old_empl_type
+    Show 'New Employee Type:' $ic_new_empl_type
+    Show 'Old Division:' $ic_old_division
+    Show 'New Division:' $ic_new_division
+    !GEX-TLL TESTING
+    
+show '$service_date: ' $service_date
+show '$ic_old_deptid: '	$ic_old_deptid
+show '$ic_new_deptid: '	$ic_new_deptid
+show '$ic_old_action: '	$ic_old_action
+show '$ic_new_action: '	$ic_new_action
+show '$ic_old_actn_rsn: ' $ic_old_actn_rsn
+show '$ic_new_actn_rsn: ' $ic_new_actn_rsn
+show '$ic_old_effdt: '	$ic_old_effdt
+show '$ic_new_effdt: '$ic_new_effdt
+show '$ic_old_jobcode: ' 	$ic_old_jobcode
+show '$ic_old_gex_evp: ' $ic_old_gex_evp
+show '$ic_new_gex_evp: '	$ic_new_gex_evp
+show '$ic_old_sg: '	$ic_old_sg
+show '$ic_new_sg: ' 	$ic_new_sg
+show '$ic_old_mgr_lvl: ' $ic_old_mgr_lvl
+show ' $ic_new_mgr_lvl: ' $ic_new_mgr_lvl
+    !GEX-TLL TESTING
+End-Procedure 
+!VENDAPP, ITG40110, Insertion into temp table PS_GEX_EVP_MVMNT
+
+!***********************************************************************************
+Begin-procedure P245-print-rpt-line
+!***********************************************************************************
+! SHOW ' Entered into P245-print-rpt-line'
+#debug9 Show 'P245-print-rpt-line'
+
+print $LastSSN  (+1,5 )
+print $LastName (0, 25)
+print $Region   (0, 42)
+print $DepartmentID   (0, 55)                            
+print $logon_id (0, 85)
+
+
+end-procedure
+
+!***********************************************************************************
+Begin-Procedure P300-Finalization
+!***********************************************************************************
+ #debug9 SHOW ' Entered into P300-Finalization'
+#debug9 Show 'P300-Finalization'
+  
+  If $Data-Found-Flag_1 <> 'Y'
+    Print 'NO DATA SELECTED FOR THIS REPORT RUN'        (5) center
+  Else  
+     If $Data-Found-Flag <> 'Y'
+      Print 'NO DATA SELECTED FOR THIS REPORT RUN'        (5) center
+     End-If
+  End-If
+   
+  Do Format-Number(#recs-written,$recs-written,'888,888,888')
+  Do Format-Number(#recs-written-division,$recs-written-division,'888,888,888')
+  
+  Do Format-Number(#region_empty,$region_empty,'888,888,888')
+  Do Format-Number(#region_NOT_empty,$region_NOT_empty,'888,888,888')
+  Do Format-Number(#region_Other,$region_Other,'888,888,888')
+  
+  
+  Do Format-Number(#division_POD, $division_POD,'888,888,888')     
+  Do Format-Number(#division_COL, $division_COL,'888,888,888')       
+  Do Format-Number(#division_COD, $division_COD,'888,888,888')       
+  Do Format-Number(#division_MOD, $division_MOD,'888,888,888')       
+  Do Format-Number(#division_other, $division_other,'888,888,888')      
+  
+   	  Show ''
+	  Show $recs-written ' records written to ' $file1
+	  Show ''
+	  Show 'Region Empty    :' $region_empty
+	  Show 'Region NOT Empty:' $region_NOT_empty
+	  show 'region_Other    :' $region_Other
+  	  Show ''
+          show 'Records read from P200-Main-Process    :' #P200-Main-Process
+          show 'Records read from P300-Get-Details    :' #P300-Get-Details
+          show 'job_rows_cntr: ' #job_rows_cntr   
+          show ''
+          show 'Terminated_Employees Read	       :' #Terminated_Employees
+          Show 'Active_Employees  Read   	       :' #Active_Employees
+          show ''
+          show 'Total Active Employees  written        :' #P300-Get-Details_Y
+          show 'Total Terminated Employees written     :' #P300-Get-Details_N
+  
+
+
+   
+  SHOW '$division_POD:' $division_POD
+  SHOW '$division_COL:' $division_COL
+  SHOW '$division_COD:' $division_COD
+  SHOW '$division_MOD:' $division_MOD
+  show '$division_other:' $division_other
+  
+    Do P310-Close-File
+  
+  Do Reset                   !reset.sqc
+  Do Stdapi-Term             !stdapi.sqc
+  Show 'Successful end of report'
+End-Procedure
+
+!***********************************************************************************
+Begin-Procedure P310-Close-File
+!***********************************************************************************
+#debug9 Show 'P310-Close-File'
+  Close 1
+  If #filestat != 0
+     Show 'Error closing output file.  Program terminating.'
+     Stop
+  End-If
+End-Procedure
+
+!***********************************************************************
+!clone of gexxx900.sqc  for the proceudre  P200-Main-Process 
+Begin-Procedure GEXXX900-Select-Company-Parametersx
+!***********************************************************************
+ show 'entered into GEXXX900-Select-Company-Parameters_x'
+  Let $OprID               = '''' || $Prcs_OprID       || ''''
+  Let $Run_Cntl_ID         = '''' || $Prcs_Run_Cntl_ID || ''''
+  Let #GEX_RC_COMPANY_ROWS = 0
+  Let $GEXXX900_INCLUDE_COMPANY_CRITERIAx = ''
+  Let $GEXXX900_EXCLUDE_COMPANY_CRITERIAx = ''
+  Let $GEXXX900_INCLUDE_COMPANY_DISPLAY_CRITERIAx = 'ALL'
+  Let $GEXXX900_EXCLUDE_COMPANY_DISPLAY_CRITERIAx = 'NONE'
+
+Begin-Select
+
+GEX_RC_COMPANY2.COMPANY
+
+  Add 1 To #GEX_RC_COMPANY_ROWS
+
+  If #GEX_RC_COMPANY_ROWS = 1
+    Let $GEXXX900_INCLUDE_COMPANY_CRITERIAx = '(' || $GEXXX900_Company_Aliasx || ' In ('''     || &GEX_RC_COMPANY2.COMPANY || ''''
+    Let $GEXXX900_EXCLUDE_COMPANY_CRITERIAx = '(' || $GEXXX900_Company_Aliasx || ' Not In (''' || &GEX_RC_COMPANY2.COMPANY || ''''
+  Else
+    Let $GEXXX900_INCLUDE_COMPANY_CRITERIAx = $GEXXX900_INCLUDE_COMPANY_CRITERIAx || ',''' || &GEX_RC_COMPANY2.COMPANY  || ''''
+    Let $GEXXX900_EXCLUDE_COMPANY_CRITERIAx = $GEXXX900_EXCLUDE_COMPANY_CRITERIAx || ',''' || &GEX_RC_COMPANY2.COMPANY  || ''''
+  End-If
+
+From  PS_GEX_RC_COMPANY GEX_RC_COMPANY2
+
+Where GEX_RC_COMPANY2.OPRID                = [$OprID]
+And   GEX_RC_COMPANY2.RUN_CNTL_ID          = [$Run_Cntl_ID]
+And   Rtrim(GEX_RC_COMPANY2.COMPANY, ' ') != ' '
+
+End-Select
+
+  If #GEX_RC_COMPANY_ROWS = 0
+    Let $GEXXX900_INCLUDE_COMPANY_CRITERIAx = $GEXXX900_Company_Aliasx || ' = ' || $GEXXX900_Company_Aliasx
+    Let $GEXXX900_EXCLUDE_COMPANY_CRITERIAx = $GEXXX900_Company_Aliasx || ' = ' || $GEXXX900_Company_Aliasx
+  Else
+    Let $GEXXX900_INCLUDE_COMPANY_CRITERIAx = $GEXXX900_INCLUDE_COMPANY_CRITERIAx || '))'
+    Let $GEXXX900_EXCLUDE_COMPANY_CRITERIAx = $GEXXX900_EXCLUDE_COMPANY_CRITERIAx || '))'
+    Let $GEXXX900_INCLUDE_COMPANY_DISPLAY_CRITERIAx = $GEXXX900_INCLUDE_COMPANY_CRITERIAx
+    Let $GEXXX900_EXCLUDE_COMPANY_DISPLAY_CRITERIAx = $GEXXX900_EXCLUDE_COMPANY_CRITERIAx
+  End-If
+
+End-Procedure
+!*****************************************************************************
+!clone of  for the proceudre gexxx903.sqc P200-Main-Process 
+Begin-Procedure GEXXX903-Select-Emp-Stat-Parametersx
+!*****************************************************************************
+
+  Let $OprID                = '''' || $Prcs_OprID       || ''''
+  Let $Run_Cntl_ID          = '''' || $Prcs_Run_Cntl_ID || ''''
+  Let #GEX_RC_EMP_STAT_ROWS = 0
+  Let $GEXXX903_INCLUDE_EMP_STAT_CRITERIAx = ''
+  Let $GEXXX903_EXCLUDE_EMP_STAT_CRITERIAx = ''
+  Let $GEXXX903_INCLUDE_EMP_STAT_DISPLAY_CRITERIAx = 'ALL'
+  Let $GEXXX903_EXCLUDE_EMP_STAT_DISPLAY_CRITERIAx = 'NONE'
+
+Begin-Select
+
+GEX_RC_EMP_STAT2.EMPL_STATUS
+
+  Add 1 To #GEX_RC_EMP_STAT_ROWS
+
+  If #GEX_RC_EMP_STAT_ROWS = 1
+    Let $GEXXX903_INCLUDE_EMP_STAT_CRITERIAx = '(' || $GEXXX903_Emp_Stat_Aliasx || ' In ('''     || &GEX_RC_EMP_STAT2.EMPL_STATUS || ''''
+    Let $GEXXX903_EXCLUDE_EMP_STAT_CRITERIAx= '(' || $GEXXX903_Emp_Stat_Aliasx || ' Not In (''' || &GEX_RC_EMP_STAT2.EMPL_STATUS || ''''
+  Else
+    Let $GEXXX903_INCLUDE_EMP_STAT_CRITERIAx = $GEXXX903_INCLUDE_EMP_STAT_CRITERIAx || ',''' || &GEX_RC_EMP_STAT2.EMPL_STATUS || ''''
+    Let $GEXXX903_EXCLUDE_EMP_STAT_CRITERIAx = $GEXXX903_EXCLUDE_EMP_STAT_CRITERIAx || ',''' || &GEX_RC_EMP_STAT2.EMPL_STATUS || ''''
+  End-If
+
+From  PS_GEX_RC_EMP_STAT GEX_RC_EMP_STAT2
+
+Where GEX_RC_EMP_STAT2.OPRID                    = [$OprID]
+And   GEX_RC_EMP_STAT2.RUN_CNTL_ID              = [$Run_Cntl_ID]
+And   Rtrim(GEX_RC_EMP_STAT2.EMPL_STATUS, ' ') != ' '
+
+End-Select
+
+  If #GEX_RC_EMP_STAT_ROWS = 0
+    Let $GEXXX903_INCLUDE_EMP_STAT_CRITERIAx = $GEXXX903_Emp_Stat_Aliasx || ' = ' || $GEXXX903_Emp_Stat_Aliasx
+    Let $GEXXX903_EXCLUDE_EMP_STAT_CRITERIAx = $GEXXX903_Emp_Stat_Aliasx || ' = ' || $GEXXX903_Emp_Stat_Aliasx
+  Else
+    Let $GEXXX903_INCLUDE_EMP_STAT_CRITERIAx = $GEXXX903_INCLUDE_EMP_STAT_CRITERIAx || '))'
+    Let $GEXXX903_EXCLUDE_EMP_STAT_CRITERIAx = $GEXXX903_EXCLUDE_EMP_STAT_CRITERIAx || '))'
+    Let $GEXXX903_INCLUDE_EMP_STAT_DISPLAY_CRITERIAx = $GEXXX903_INCLUDE_EMP_STAT_CRITERIAx
+    Let $GEXXX903_EXCLUDE_EMP_STAT_DISPLAY_CRITERIAx = $GEXXX903_EXCLUDE_EMP_STAT_CRITERIAx
+  End-If
+End-Procedure
+!*****************************************************************************
+
+!***********************************************************************
+#include 'gexxx951.sqc'
+#include 'gexxx950.sqc'  !Get SQRW run controls
+#include 'gexxx900.sqc'  !Get company multiple row table
+#include 'gexxx901.sqc'  !Get company/paygroup multiple row table
+#include 'gexxx902.sqc'  !Get deptid multiple row table
+#include 'gexxx903.sqc'  !Get employee status multiple row table
+#include 'gexxx907.sqc'  !Get company/division code multiple row table
+#include 'gexxx909.sqc'  !Get acct_cd code multiple row table
+#include 'gexxx922.sqc'  !Get pay single row run control
+!#include 'gexxx9xx.sqc'  !Get pay single row run control        jnb 09/15/99
+#Include 'reset.sqc'     !Reset printer procedure
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'stdapi.sqc'    !Update Process API
+#Include 'datemath.sqc'  !Does the date-math functions
+#Include 'getbalid.sqc'  !Get-Calendar-Year-Id
+#Include 'askaod.sqc'    !Ask-As-Of-Date procedure
+#include 'getdptnm.sqc'  !Get Department Name
+#include 'gexrehdt.sqc'	 !GEX-MXT 03/24/2008 Fixed for REHIRE DT
+#Include 'getposnm.sqc'   !get position title !ISDVSXP ITG 60304 05/12/2009
+#Include 'getgeid.sqc'   !Get 7 digit Emplid	!TCSXSSS ADDED GEX_SEC_REENG

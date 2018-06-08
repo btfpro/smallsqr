@@ -1,0 +1,855 @@
+!***********************************************
+!  FGHR029:   Load Plan/Grade/Step Tables      *
+!***********************************************
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+!                                                                      *
+! This module contains confidential and proprietary information        *
+! of Oracle; it is not to be copied, reproduced, or transmitted        *
+! in any form, by any means, in whole or in part, nor is it to         *
+! be used for any purpose other than that for which it is              *
+! expressly provided under the applicable license agreement.           *
+!                                                                      *
+! Copyright (C) 2007 Oracle. All Rights Reserved.                      *
+!                                                                      *
+!***********************************************************************
+!----------------------------------------------------------------------
+!
+!          $Date:  2007/03/26:23:07:24                                 !
+!       $Release:  HR9                                                 !
+!    $Resolution:  689716                                              !
+!                                                                      *
+!***********************************************************************
+#include 'setenv.sqc'    !Set environment
+#Include 'setup32.sqc'   !Printer and page-size initialization
+!***********************************************************************
+!                                                                      *
+!  Pending Items:                                                      *
+!   1) Look at effdt for control tables like earnings_program          *
+!   2) Look at preventing alpha grades from entering the load process  *
+!   3) Finalize step_name(currently on in the insert procedure         *
+!   4)                                                                 *
+!***********************************************************************
+
+begin-report
+  do Init-DateTime
+  do Init-Number
+  move 'FGHR029' to $ReportID
+  move 'Load Plan/Grade/Step Tables' to $ReportTitle
+  display $ReportTitle
+  do Init
+  do Report
+  do Reset
+  do Stdapi-Term
+end-report
+
+begin-heading 7
+  #Include 'stdhdg01.sqc'
+  print '                            '                       (+2,1)
+  print 'Pay   Pay  '                                        (0,50)
+  print 'Plan  Table  Grade  Step  Amount    Problem'        (+1,50)
+end-heading
+
+begin-procedure Init
+
+  Do Stdapi-Init
+
+  if $prcs_process_instance = ''
+    Do Ask-Salary-Defaults
+  else
+
+    do select-parameters
+    do Get-FGHR029-Parameters
+
+  end-if
+
+  do Get-Current-DateTime
+
+  if $gvtwageflag = 'Y'
+    move 'H' to $gvt-sal-basis
+  else
+    move 'A' to $gvt-sal-basis
+  end-if
+
+  !-------------------------  Start Set Up EIP -----------------------------------------
+
+  do Get-Process-Name (#prcs_process_instance, $prcsname)
+  do Get-Active-In-BatchPub ($prcsname, #cntmsg)
+  if #cntmsg > 0
+      do Get-Job-Instance
+      do Insert-Param-In-BatchPub (#prcs_process_instance, #prcs_job_instance, $prcsname, $SysDateTime, 'D')
+  end-if
+
+  !--------------------------  End Set Up EIP -------------------------------------------
+
+end-procedure
+
+begin-procedure Report
+
+  !-------------------------  Process EIP -----------------------------------------
+  do DELETE-PLAN-GRADE-STEP
+  do COMMIT-TRANSACTION
+  !-------------------------  Process EIP -----------------------------------------
+
+open $GvtHRFileName as 1 for-reading record=24:fixed status = #open1
+
+if #open1 = -1
+  display 'OPEN ERROR on: ' noline
+  display $GvtHRFileName
+  stop
+end-if
+
+move 'Y' to $first-step-of-grade
+
+while 1=1
+
+  Do Read-File
+  if #end-file = 1
+    close 1
+    break
+  end-if
+
+  let $mmdd = substr($input,17,6)
+  let $yy   = substr($input,23,2)
+  let #yy-n = to_number(substr($input,23,2))
+  if #yy-n > 20
+    let $date = $mmdd||'19'||$yy
+  else
+    let $date = $mmdd||'20'||$yy
+  end-if
+  let $insert-date = strtodate($date,'MM/DD/YYYY')
+
+ show '$insert-date ' $insert-date
+
+  if $pay-plan <> $save-pay-plan or $pay-table <> $save-pay-table
+      if $pay-plan <> $save-pay-plan
+        Do Get-Pay-Plan-Descr
+      end-if
+      if $Plan-Found = 'Y'
+          if $first-step-of-grade = 'N'
+              if $save-descr = ' '
+                let $save-descr = $descr
+              end-if
+              Do Calc-Grade-Range
+              Do Insert-Sal-Grade-Record
+              Do Insert-Sal-Admin-Plan
+          end-if
+      else
+        move 0 to #sql-status
+        move 'Grade' to $error
+        Do Write-Report
+        move 'Plan' to $error
+        Do Write-Report
+      end-if
+      move $pay-table to $save-pay-table
+      move $pay-plan to $save-pay-plan
+      move $grade to $save-grade
+      move $descr to $save-descr
+      move $insert-date to $save-date
+      move 'Y' to $first-step-of-grade
+    else
+      if $grade <> $save-grade
+        if $Plan-Found = 'Y'
+          Do Calc-Grade-Range
+          Do Insert-Sal-Grade-Record
+        else
+          move 0 to #sql-status
+          move 'Grade' to $error
+          Do Write-Report
+        end-if
+        move 'Y' to $first-step-of-grade
+        move $grade to $save-grade
+      end-if
+    end-if
+
+    if #amount > 0 and #step <> 0
+      if $first-step-of-grade = 'Y'
+        move #amount to #save-step-amt
+        move 'N' to $first-step-of-grade
+      end-if
+      if $Plan-Found = 'Y'
+        Do Get-Step-Increment
+        Do Calc-Step-Amounts
+        Do Insert-Sal-Step-Record
+      else
+        move 0 to #sql-status
+        move 'Step' to $error
+        Do Write-Report
+      end-if
+    end-if
+
+end-while
+
+Do Calc-Grade-Range
+Do Insert-Sal-Grade-Record
+Do Insert-Sal-Admin-Plan
+
+end-procedure
+
+begin-procedure Read-File
+
+read 1 into $input:24
+
+let $pay-table = substr($input,1,4)
+let $pay-plan  = substr($input,5,2)
+let $wgi-plan  = substr($input,5,1)
+let $grade     = substr($input,7,2)
+if substr($grade,1,1) = ' '
+  let $grade = '0'||ltrim($grade,' ')
+end-if
+let #step = to_number(substr($input,9,2))
+let $step = substr($input,9,2)
+if $gvtwageflag = 'Y'
+  let #amount = to_number(substr($input,11,6))/100
+else
+  let #amount = to_number(substr($input,11,6))
+end-if
+
+end-procedure
+
+begin-procedure Get-Pay-Plan-Descr
+
+move 'N' to $Plan-Found
+
+begin-select
+E.DESCR
+
+  move 'Y' to $Plan-Found
+  evaluate $wgi-plan
+    when = 'G'
+      if $pay-table = '0000'
+        move &e.descr to $descr
+      else
+        move 'Genl Sched Special Sal Rate' to $descr
+      end-if
+    when-other
+      move &e.descr to $descr
+  end-evaluate
+
+from PS_GVT_PAY_PLAN E
+where E.GVT_PAY_PLAN      = $pay-plan
+and   E.EFF_STATUS        = 'A'
+and   E.EFFDT             = (SELECT MAX(EE.EFFDT)
+                             from  PS_GVT_PAY_PLAN EE
+                             where EE.GVT_PAY_PLAN  = E.GVT_PAY_PLAN
+                             and   EE.EFF_STATUS   = 'A'
+                             and   EE.EFFDT       <= $insert-date)
+end-select
+
+begin-select
+
+CONV.GVT_HRLY_CNV_FCTR
+
+    let #conv_factor = &CONV.GVT_HRLY_CNV_FCTR
+
+FROM PS_GVT_HRLY_CONV CONV
+
+WHERE CONV.GVT_PAY_PLAN    = $pay-plan
+AND   #StdHrsDefault      <= GVT_TO_STDHRS
+AND   #StdHrsDefault      >= GVT_FROM_STDHRS
+AND   CONV.EFFDT           = (SELECT MAX(CONV1.EFFDT)
+                              FROM  PS_GVT_HRLY_CONV CONV1
+                              WHERE CONV1.GVT_PAY_PLAN = $pay-plan
+                              AND #StdHrsDefault      <= CONV1.GVT_TO_STDHRS
+                              AND #StdHrsDefault      >= CONV1.GVT_FROM_STDHRS
+                              AND CONV1.EFFDT         <= $insert-date)
+
+end-select
+
+end-procedure
+
+begin-procedure Get-Step-Increment
+
+move 0 to #increm_weeks
+evaluate $wgi-plan
+  when = 'G'
+    if #step <= 3
+      move 52 to #increm_weeks
+      move 260 to #increm_days
+    else
+      if #step <= 6
+        move 104 to #increm_weeks
+        move 520 to #increm_days
+      else
+        if #step <= 9
+          move 156 to #increm_weeks
+          move 780 to #increm_days
+        end-if
+      end-if
+    end-if
+    break
+  when = 'W'
+    if #step = 1
+      move 26 to #increm_weeks
+      move 130 to #increm_days
+    else
+      if #step = 2
+        move 78 to #increm_weeks
+        move 390 to #increm_days
+      else
+        if #step <= 4
+          move 104 to #increm_weeks
+          move 520 to #increm_days
+        end-if
+      end-if
+    end-if
+end-evaluate
+
+end-procedure
+
+begin-procedure Calc-Grade-Range
+
+if $gvtwageflag = 'Y'
+  let #min_rt_hourly = #save-step-amt
+  let #mid_rt_hourly = round((#save-step-amt + #save-amount) / 2,2)
+  let #max_rt_hourly = #save-amount
+  let #min_rt_annual = round((#min_rt_hourly * (#StdHrsDefault * 52)),2)
+  let #mid_rt_annual = round((#mid_rt_hourly * (#StdHrsDefault * 52)),2)
+  let #max_rt_annual = round((#max_rt_hourly * (#StdHrsDefault * 52)),2)
+else
+  let #min_rt_annual = #save-step-amt
+  let #mid_rt_annual = round((#save-step-amt + #save-amount) / 2,2)
+  let #max_rt_annual = #save-amount
+  let #min_rt_hourly = round((#save-step-amt / (#conv_factor)),2)
+  let #mid_rt_hourly = round((#mid_rt_annual / (#conv_factor)),2)
+  let #max_rt_hourly = round((#save-amount   / (#conv_factor)),2)
+end-if
+
+let #min_rt_biweekly = round((#min_rt_hourly * (#StdHrsDefault * 2)),2)
+let #mid_rt_biweekly = round((#mid_rt_hourly * (#StdHrsDefault * 2)),2)
+let #max_rt_biweekly = round((#max_rt_hourly * (#StdHrsDefault * 2)),2)
+
+let #min_rt_monthly  = round((#min_rt_hourly * (#StdHrsDefault * 52)) / 12,2)
+let #mid_rt_monthly  = round((#mid_rt_hourly * (#StdHrsDefault * 52)) / 12,2)
+let #max_rt_monthly  = round((#max_rt_hourly * (#StdHrsDefault * 52)) / 12,2)
+
+end-procedure
+
+begin-procedure Calc-Step-Amounts
+
+if $gvtwageflag = 'Y'
+  let #hourly_rt = #amount
+  let #biweekly_rt = round(#amount * (#StdHrsDefault * 2),2)
+  let #annual_rt   = round(#amount * (#StdHrsDefault * 52),2)
+  let #monthly_rt  = round((#hourly_rt * (#StdHrsDefault * 52)) / 12,2)
+else
+  let #annual_rt   = #amount
+  let #hourly_rt   = round((#amount / (#conv_factor)),2)
+  let #biweekly_rt = round(#hourly_rt * (#StdHrsDefault * 2),2)
+  let #monthly_rt  = round((#hourly_rt * (#StdHrsDefault * 52)) / 12,2)
+end-if
+
+move #amount to #save-amount
+
+end-procedure
+
+begin-procedure Insert-Sal-Admin-Plan
+
+let $descrshort = substr($save-descr,1,10)
+
+move 'Plan' to $error
+begin-sql on-error=Continue
+INSERT INTO PS_SAL_PLAN_TBL
+(SETID,
+ SAL_ADMIN_PLAN,
+ EFFDT,
+ EFF_STATUS,
+ DESCR,
+ DESCRSHORT,
+ STD_HOURS,
+ STD_HRS_FREQUENCY,
+ CURRENCY_CD,
+ SALARY_MATRIX_CD,
+ COMPANY,
+ FREQ_ID_MONTHLY,
+ FREQ_ID_DAILY,
+ FREQ_ID_HOURLY,
+ AUTO_CALC_PREM_SW,
+ CMP_RTCD_PREM_ABS,
+ CMP_RTCD_PREM_NONA,
+ GVT_SAL_BASIS,
+ GVT_GEOG_SCOPE,
+ GVT_NEXT_PAY_ADJ,
+ TARIFF_GER,
+ TARIFF_AREA_GER,
+ ATTACHSYSFILENAME,
+ ATTACHUSERFILE,
+ URL_ID,
+ DESCR254,
+ ADDED_BY,
+ ADDED_DT,
+ WAGE_PROG_FLAG
+ )
+Values
+($save-pay-plan,
+ $save-pay-table,
+ $save-date,
+ 'A',
+ $save-descr,
+ $descrshort,
+ #StdHrsDefault,
+ #StdHrsFrequency,
+ $ExchngtoCurrency,
+ $SalaryMatrixCode,
+ $Agency,
+ 'M',
+ 'D',
+ 'H',
+ 'N',
+ ' ',
+ ' ',
+ $gvt-sal-basis,
+ 'L',
+ &RUN_CNTL_FG.GVT_NEXT_PAY_ADJ,
+ ' ',
+ ' ',
+ ' ',
+ ' ',
+ ' ',
+ ' ',
+ ' ',
+  $save-date,
+ 'N'
+ );
+INSERT INTO PS_SAL_PLAN_PUB
+(SETID,
+ SAL_ADMIN_PLAN,
+ EFFDT,
+ EFF_STATUS,
+ DESCR,
+ DESCRSHORT,
+ STD_HOURS,
+ STD_HRS_FREQUENCY,
+ CURRENCY_CD,
+ SALARY_MATRIX_CD,
+ COMPANY,
+ FREQ_ID_MONTHLY,
+ FREQ_ID_DAILY,
+ FREQ_ID_HOURLY,
+ GVT_SAL_BASIS,
+ GVT_GEOG_SCOPE,
+ GVT_NEXT_PAY_ADJ,
+ TARIFF_GER,
+ TARIFF_AREA_GER,
+ AUDIT_ACTN,
+ PROCESS_INSTANCE
+ )
+Values
+($save-pay-plan,
+ $save-pay-table,
+ $save-date,
+ 'A',
+ $save-descr,
+ $descrshort,
+ #StdHrsDefault,
+ #StdHrsFrequency,
+ $ExchngtoCurrency,
+ $SalaryMatrixCode,
+ $Agency,
+ ' ',
+ ' ',
+ ' ',
+ $gvt-sal-basis,
+ 'L',
+ &RUN_CNTL_FG.GVT_NEXT_PAY_ADJ,
+ ' ',
+ ' ',
+ 'A',
+ #PROCESS_INSTANCE
+ )
+end-sql
+end-procedure
+
+begin-procedure Insert-Sal-Grade-Record
+
+let $descrshort = substr($save-descr,1,10)
+
+move 'Grade' to $error
+
+begin-sql on-error=Continue
+INSERT INTO PS_SAL_GRADE_TBL
+(SETID,
+ SAL_ADMIN_PLAN,
+ GRADE,
+ EFFDT,
+ EFF_STATUS,
+ DESCR,
+ DESCRSHORT,
+ SALARY_MATRIX_CD,
+ CURRENCY_CD,
+ MIN_RT_HOURLY,
+ MID_RT_HOURLY,
+ MAX_RT_HOURLY,
+ MIN_RT_MONTHLY,
+ MID_RT_MONTHLY,
+ MAX_RT_MONTHLY,
+ MIN_RT_ANNUAL,
+ MID_RT_ANNUAL,
+ MAX_RT_ANNUAL,
+ STEP_INCREM_TYPE,
+ STEP_INCREM_ACCUM,
+ MIN_RT_DAILY,
+ MID_RT_DAILY,
+ MAX_RT_DAILY,
+ LABOR_AGREEMENT,
+ EMPL_CTG,
+ EMPL_CTG_L1,
+ EMPL_CTG_L2,
+ GVT_MAX_RT_BIWK,
+ GVT_MID_RT_BIWK,
+ GVT_MIN_RT_BIWK,
+ GRADE_TITLE_JPN,
+ MIN_YRS_GRADE,
+ MAX_YRS_GRADE,
+ MIN_GRD_AGE,
+ REVIEW_COUNT,
+ ELIGIBILITY_POINTS,
+ REG_REGION
+ )
+Values
+($save-pay-plan,
+ $save-pay-table,
+ $save-grade,
+ $save-date,
+ 'A',
+ $save-descr,
+ $descrshort,
+ $SalaryMatrixCode,
+ $ExchngtoCurrency,
+ #min_rt_hourly,
+ #mid_rt_hourly,
+ #max_rt_hourly,
+ #min_rt_monthly,
+ #mid_rt_monthly,
+ #max_rt_monthly,
+ #min_rt_annual,
+ #mid_rt_annual,
+ #max_rt_annual,
+ ' ',
+ ' ',
+ 0,
+ 0,
+ 0,
+ ' ',
+ ' ',
+ ' ',
+ ' ',
+ #max_rt_biweekly,
+ #mid_rt_biweekly,
+ #min_rt_biweekly,
+ ' ',
+ 0,
+ 0,
+ 0,
+ 0,
+ 0,
+ ' '
+ );
+INSERT INTO PS_SAL_GRADE_PUB
+(SETID,
+ SAL_ADMIN_PLAN,
+ GRADE,
+ EFFDT,
+ EFF_STATUS,
+ DESCR,
+ DESCRSHORT,
+ SALARY_MATRIX_CD,
+ CURRENCY_CD,
+ MIN_RT_HOURLY,
+ MID_RT_HOURLY,
+ MAX_RT_HOURLY,
+ MIN_RT_MONTHLY,
+ MID_RT_MONTHLY,
+ MAX_RT_MONTHLY,
+ MIN_RT_ANNUAL,
+ MID_RT_ANNUAL,
+ MAX_RT_ANNUAL,
+ STEP_INCREM_TYPE,
+ STEP_INCREM_ACCUM,
+ MIN_RT_DAILY,
+ MID_RT_DAILY,
+ MAX_RT_DAILY,
+ LABOR_AGREEMENT,
+ EMPL_CTG,
+ EMPL_CTG_L1,
+ EMPL_CTG_L2,
+ GVT_MAX_RT_BIWK,
+ GVT_MID_RT_BIWK,
+ GVT_MIN_RT_BIWK,
+ AUDIT_ACTN,
+ PROCESS_INSTANCE
+ )
+Values
+($save-pay-plan,
+ $save-pay-table,
+ $save-grade,
+ $save-date,
+ 'A',
+ $save-descr,
+ $descrshort,
+ $SalaryMatrixCode,
+ $ExchngtoCurrency,
+ #min_rt_hourly,
+ #mid_rt_hourly,
+ #max_rt_hourly,
+ #min_rt_monthly,
+ #mid_rt_monthly,
+ #max_rt_monthly,
+ #min_rt_annual,
+ #mid_rt_annual,
+ #max_rt_annual,
+ ' ',
+ ' ',
+ 0,
+ 0,
+ 0,
+ ' ',
+ ' ',
+ ' ',
+ ' ',
+ #max_rt_biweekly,
+ #mid_rt_biweekly,
+ #min_rt_biweekly,
+ 'A',
+ #PROCESS_INSTANCE
+ )
+end-sql
+
+add 1 to #cnt
+if #cnt > 300
+ do Commit-Transaction
+ move 0 to #cnt
+end-if
+
+end-procedure
+
+begin-procedure Insert-Sal-Step-Record
+
+move 'Step' to $error
+if #step < 10
+  let $Step = '0'||to_char(trunc(#step,0))
+else
+  move 0 to #increm_days
+  let $Step = to_char(trunc(#step,0))
+end-if
+
+begin-sql on-error=Continue
+INSERT INTO PS_SAL_STEP_TBL
+(SETID,
+ SAL_ADMIN_PLAN,
+ GRADE,
+ EFFDT,
+ STEP,
+ CURRENCY_CD,
+ HOURLY_RT,
+ MONTHLY_RT,
+ ANNUAL_RT,
+ INCREM_MONTHS,
+ INCREM_HOURS,
+ DAILY_RT,
+ GVT_BIWEEKLY_RT,
+ GVT_INCREM_DAYS,
+ GVT_INCREM_WEEKS,
+ GVT_STEP,
+ GVT_WGI_ADJ,
+ CLASSN_CURRENT_AUS,
+ APS_MIN_CLS_AUS,
+ APS_MAX_CLS_AUS,
+ STEP_DESCR
+ )
+Values
+($pay-plan,
+ $pay-table,
+ $grade,
+ $insert-date,
+ #step,
+ $ExchngtoCurrency,
+ #hourly_rt,
+ #monthly_rt,
+ #annual_rt,
+ 0,
+ 0,
+ 0,
+ #biweekly_rt,
+ #increm_days,
+ #increm_weeks,
+ $step,
+ 80,
+ 0,
+ ' ',
+ ' ',
+ ' '
+);
+INSERT INTO PS_SAL_STEP_PUB
+(SETID,
+ SAL_ADMIN_PLAN,
+ GRADE,
+ EFFDT,
+ STEP,
+ CURRENCY_CD,
+ HOURLY_RT,
+ MONTHLY_RT,
+ ANNUAL_RT,
+ INCREM_MONTHS,
+ INCREM_HOURS,
+ DAILY_RT,
+ GVT_BIWEEKLY_RT,
+ GVT_INCREM_DAYS,
+ GVT_INCREM_WEEKS,
+ GVT_STEP,
+ GVT_WGI_ADJ,
+ AUDIT_ACTN,
+ PROCESS_INSTANCE
+ )
+Values
+($pay-plan,
+ $pay-table,
+ $grade,
+ $insert-date,
+ #step,
+ $ExchngtoCurrency,
+ #hourly_rt,
+ #monthly_rt,
+ #annual_rt,
+ 0,
+ 0,
+ 0,
+ #biweekly_rt,
+ #increm_days,
+ #increm_weeks,
+ $step,
+ 80,
+ 'A',
+ #PROCESS_INSTANCE
+ )
+end-sql
+
+let $save-date = $insert-date
+
+end-procedure
+
+begin-procedure Continue
+
+Do Write-Report
+
+end-procedure
+
+begin-procedure Write-Report
+
+if #sql-status = 0
+  move 'No Pay Plan Found for this Pay Plan/Table Entry' to $Problem
+else
+  if #sql-status = 805
+    move 'Duplicate Record' to $Problem
+  else
+   ! let $Problem = 'Error Code: '||to_char(trunc(#sql-status,0))
+    let $Problem = 'Error Code: '||to_char(#sql-status)
+  end-if
+end-if
+
+let $Print-Step = to_char(trunc(#step,0))
+
+evaluate $error
+ when = 'Plan'
+  print $save-pay-plan                  (+1,51)
+  print $save-pay-table                 (0,56)
+  print '   '                           (0,64)
+  print '               '               (0,71)
+  print '.'                             (0,86,10) fill
+  print $Error                          (0,86)
+  print $Problem                        (0,97)
+  break
+ when = 'Plan PUB'
+  print $save-pay-plan                  (+1,51)
+  print $save-pay-table                 (0,56)
+  print '   '                           (0,64)
+  print '               '               (0,71)
+  print '.'                             (0,86,10) fill
+  print $Error                          (0,86)
+  print $Problem                        (0,97)
+  break
+when = 'Grade'
+  print $save-pay-plan                  (+1,51)
+  print $save-pay-table                 (0,56)
+  print $save-grade                     (0,64)
+  print '               '               (0,71)
+  print '.'                             (0,86,10) fill
+  print $Error                          (0,86)
+  print $Problem                        (0,97)
+  break
+when = 'Grade PUB'
+  print $save-pay-plan                  (+1,51)
+  print $save-pay-table                 (0,56)
+  print $save-grade                     (0,64)
+  print '               '               (0,71)
+  print '.'                             (0,86,10) fill
+  print $Error                          (0,86)
+  print $Problem                        (0,97)
+  break
+when = 'Step'
+  print $pay-plan                       (+1,51)
+  print $pay-table                      (0,56)
+  print $grade                          (0,64)
+  print $Print-Step                     (0,71)
+  print #amount                         (0,76)
+  print '.'                             (0,86,10) fill
+  print $Error                          (0,86)
+  print $Problem                        (0,97)
+when = 'Step PUB'
+  print $pay-plan                       (+1,51)
+  print $pay-table                      (0,56)
+  print $grade                          (0,64)
+  print $Print-Step                     (0,71)
+  print #amount                         (0,76)
+  print '.'                             (0,86,10) fill
+  print $Error                          (0,86)
+  print $Problem                        (0,97)
+end-evaluate
+
+end-procedure
+
+
+  !-------------------------  Process EIP -----------------------------------------
+
+!******************************************************************************
+! DELETE-PLAN-GRADE-STEP                                                      *
+! Descr:     Deletes SAL_PLAN_PUB, SAL_GRADE_PUB, SAL_STEP_PUB record         *
+!                                                                             *
+!******************************************************************************
+begin-procedure DELETE-PLAN-GRADE-STEP
+
+  let $err-statement1 = 'FGHR029, Delete Error - DELETE-PLAN-GRADE-STEP'
+  let $err-statement2 = 'Record SAL_PLAN_PUB'
+begin-SQL on-error=Continue
+DELETE FROM  PS_SAL_PLAN_PUB
+end-SQL
+
+  let $err-statement1 = 'FGHR029, Delete Error - DELETE-PLAN-GRADE-STEP'
+  let $err-statement2 = 'Record SAL_GRADE_PUB'
+begin-SQL on-error=Continue
+DELETE FROM  PS_SAL_GRADE_PUB
+end-SQL
+
+  let $err-statement1 = 'FGHR029, Delete Error - DELETE-PLAN-GRADE-STEP'
+  let $err-statement2 = 'Record SAL_STEP_PUB'
+begin-SQL on-error=Continue
+DELETE FROM  PS_SAL_STEP_PUB
+end-SQL
+
+end-procedure
+
+#Include 'fgrunctl.sqc'  !Get run control parameter values
+#include 'fggetval.sqc'  !Get values mask routines
+#Include 'fgsaldf.sqc'   !Ask Salary Defaults
+#Include 'reset.sqc'     !Reset printer
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'curdttim.sqc'  !Routines to get current date/time
+#Include 'stdapi.sqc'    !Routines to Update Run Status
+#Include 'tranctrl.sqc'  !Commit-Transaction
+
+#Include 'eoprcsnm.sqc'  !Determine Process Name
+#Include 'eoactive.sqc'  !Determine Active Publish Definition
+#Include 'eoparam.sqc'   !Insert values into Parameter Table for Batch Publish

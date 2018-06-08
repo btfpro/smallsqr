@@ -1,0 +1,1433 @@
+!***********************************************************************
+! GEXBN609:  401K Loan Starts, Stops, and Deferral Changes             *
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module is the confidential and proprietary information of       *
+! Giant Eagle, Inc.; it is not to be copied, reproduced,or transmitted *
+! in any form, by any means, in whole or in part, nor is it to be used *
+! for any purpose other than that for which it is expressly provided   *
+! without the written permission of Giant Eagle.                       *
+!                                                                      *
+! Copyright (c) 1997-1998 Giant Eagle,Inc. All Rights Reserved         *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+! GEXBN609 :            401K Loan Starts, Stops, and Deferral Changes  *
+!                                                                      *
+! Narrative:            This SQR is designed to read an interface file *
+!                         from Dreyfus to setup new 401K loans, stop   *
+!                         existing 401K loans, and change deferral     *
+!                         percentages.                                 *
+!                                                                      *
+! #Debugx Used:         #debug9 paragraph trace                        *
+!                       #debug8 key variable values                    *
+!                       #debug7 data returned from sql calls           *
+!                                                                      *
+! SQL Tables:           gex_dreyfus_tbl                                *
+!                       gex_dreyfus_map                                *
+!                       genl_deduction                                 *
+!                       savings_plan                                   *
+!                                                                      *
+! Written by:           Jim Hutchison                                  *
+!                                                                      *
+! Normally Run:         Weekly                                         *
+!                                                                      *
+! Control Parms:        AsOfDate                                       *
+!                                                                      *
+!***********************************************************************
+!                         MODIFICATION HISTORY                         *
+!***********************************************************************
+! INITIALS  DATE        DESCRIPTION OF THE CHANGE                      *
+!***********************************************************************
+! JDH       09/14/99    Initial Creation                               *
+!                                                                      *
+! JDH       12/20/99    Modified deferral change logic to handle use   *
+!                       of multiple benefit plans per dreyfus plan.    *
+!                                                                      *
+! AXL       01/10/2000  Modified deferral change logic to suppress     *
+!                       error msg from showing up in log when comparing*
+!                       Benefit Plans 4GE01A & 4GE02A.                 *
+!                                                                      *
+! AXL       01/18/2000  Modified insert & update to PS_GENL_DEDUCTION  *
+!                       to satisfy new 7.5 structure                   *
+! PSR       09/12/02    ps_genl_Deduction table key fields change      *  
+!                       - Upgrade 8.3. Added logic to get company from *
+!                       PS_JOB                                         *  
+!                                                                      *
+! CWB       03/13/2003  In order to accomodate 100% deferrals, Mellon  *
+!                       has changed the format on the input file.      *
+!                       Commented out the 'divide by 10' code.         *
+!                                                                      *
+! SCM       01/05/2004  Added PAY_OFF_CYCLE_CAL = 'N' to pay_calendar  *
+!                       to ignore off-cycle calendar entries.          *
+!                                                                      *
+! AXL       03/03/2004  V8.3 Upgrade - Add Yes (Y) to Genl Deduction   *
+!                       table insert for PROCESS_DEDN.                 *
+! GEX_ITG_113537 ISDVNPK    02/10/2012	 Modified to insert into 
+!                       PS_SAVINGS_BENEF and process 4V changes        *
+! GEX_ITG_122551 ISDVMZA    03/21/2012	 Add logic to suppress the msg *
+!                       'No plan elections found' if plan exists.      *
+! GEXBN_848_E145515_01 2013-03-21 Vahini Katta                         *
+! a) Call the procedure P360-Check-For-Term-Row out of                 *
+! P340-Get-Max-Election as the terms rows never get selected with the  *
+! the current logic                                                    *
+! b) Correct the empl_rcd variable                                     *
+! 1289792 10/19/2016 Correct  the saving Plan Inserts                  *
+!***********************************************************************
+
+#include 'setenv.sqc'    !Set environment
+#Include 'setup32.sqc'   !Printer and Page-Size Initialization (Landscape)
+
+
+#define #column1     1
+#define #column2    13
+#define #column3    27
+#define #column4    46
+#define #column5    57
+#define #column6    66
+#define #column7    85
+#define #column8   100
+#define #column9   118
+
+
+Begin-Setup
+  Declare-Report Exception-Report
+Printer-Type=HPLASERJET
+    Layout=Default
+  End-Declare
+
+  Declare-Report Load-Report
+Printer-Type=HPLASERJET
+    Layout=Default
+  End-Declare
+End-Setup
+
+
+Begin-Report
+#debug9 Show 'Begin-Report'
+  Do P100-Initialization
+  Do P200-Main-Process
+  Do P400-Finalization
+End-Report
+
+
+Begin-Heading 8 For-Reports=(Exception-Report)
+#debug9 Show 'Begin-Heading (Exception-Report)'
+  Let $ReportID      =   'BN609E'
+  Let $ReportTitle   =   '401K Loan Starts, Stops, and Deferral Changes'
+  Let $ReportTitle2  =   'Exception Report'
+
+  #Include 'stdhdg01.sqc'
+  Print $ReportTitle2      (3,) Center
+
+  Print 'DREYFUS'          (+3,{#column1})
+  Print '         LIMIT'   (+0,{#column3})
+  Print 'LOAN'             (+0,{#column4})
+  Print 'LOAN'             (+0,{#column5})
+  Print '  LOAN BALANCE'   (+0,{#column6})
+  Print 'LAST LOAN'        (+0,{#column7})
+  Print 'LOAN'             (+0,{#column8})
+  Print 'ERROR'            (+0,{#column9})
+
+  Print 'PLAN'             (+1,{#column1})
+  Print 'EMPLID'           (+0,{#column2})
+  Print '        AMOUNT'   (+0,{#column3})
+  Print 'NUMBER'           (+0,{#column4})
+  Print 'TYPE'             (+0,{#column5})
+  Print '       CURRENT'   (+0,{#column6})
+  Print 'REPAY DATE'       (+0,{#column7})
+  Print 'INACTIVE DATE'    (+0,{#column8})
+  Print 'MESSAGE'          (+0,{#column9})
+
+  Print '-'                (+1,{#column1},7)  Fill
+  Print '-'                (+0,{#column2},9)  Fill
+  Print '-'                (+0,{#column3},14) Fill
+  Print '-'                (+0,{#column4},6)  Fill
+  Print '-'                (+0,{#column5},4)  Fill
+  Print '-'                (+0,{#column6},14) Fill
+  Print '-'                (+0,{#column7},10) Fill
+  Print '-'                (+0,{#column8},13) Fill
+  Print '-'                (+0,{#column9},57) Fill
+End-Heading
+
+
+Begin-Heading 8 For-Reports=(Load-Report)
+#debug9 Show 'Begin-Heading (Load-Report)'
+  Let $ReportID      =   'BN609L'
+  Let $ReportTitle   =   '401K Loan Starts, Stops, and Deferral Changes'
+  Let $ReportTitle2  =   'Load Report'
+
+  #Include 'stdhdg01.sqc'
+  Print $ReportTitle2      (3,) Center
+
+  Print 'DREYFUS'          (+3,{#column1})
+  Print '         LIMIT'   (+0,{#column3})
+  Print 'LOAN'             (+0,{#column4})
+  Print 'LOAN'             (+0,{#column5})
+  Print '  LOAN BALANCE'   (+0,{#column6})
+  Print 'LAST LOAN'        (+0,{#column7})
+  Print 'LOAN'             (+0,{#column8})
+
+  Print 'PLAN'             (+1,{#column1})
+  Print 'EMPLID'           (+0,{#column2})
+  Print '        AMOUNT'   (+0,{#column3})
+  Print 'NUMBER'           (+0,{#column4})
+  Print 'TYPE'             (+0,{#column5})
+  Print '       CURRENT'   (+0,{#column6})
+  Print 'REPAY DATE'       (+0,{#column7})
+  Print 'INACTIVE DATE'    (+0,{#column8})
+  Print 'MESSAGE'          (+0,{#column9})
+
+  Print '-'                (+1,{#column1},7)  Fill
+  Print '-'                (+0,{#column2},9)  Fill
+  Print '-'                (+0,{#column3},14) Fill
+  Print '-'                (+0,{#column4},6)  Fill
+  Print '-'                (+0,{#column5},4)  Fill
+  Print '-'                (+0,{#column6},14) Fill
+  Print '-'                (+0,{#column7},10) Fill
+  Print '-'                (+0,{#column8},13) Fill
+  Print '-'                (+0,{#column9},57) Fill
+End-Heading
+
+
+Begin-Procedure P100-Initialization
+#debug9 Show 'P100-Initialization'
+  Do Init-DateTime           !datetime.sqc
+  Do Init-Number             !number.sqc
+  Do Get-Current-DateTime    !curdttim.sqc
+  Do Stdapi-Init             !stdapi.sqc
+
+  Let $ReportID      =   'GEXBN609'
+  Let $ReportTitle   =   '401K Loan Starts, Stops, and Deferral Changes'
+
+  Show '$ReportID    = ' $ReportID
+  Show '$ReportTitle = ' $ReportTitle
+
+  If $prcs_process_instance = ''
+    Do Ask-As-Of-Date
+  Else
+    Do GEXRCBN1-SELECT-PARAMETERS
+    Let $AsOfDate = &GEX_RC_BEN.ASOFDATE
+    If Rtrim($AsOfDate, ' ') = ''
+      Let $AsOfDate = $AsOfToday
+    End-If
+  End-If
+
+  date-time () HH:MI:SS &timeBegan
+  date-time () MM/DD/YYYY &dateBegan
+  show 'Report Began at ' &timeBegan ' on ' &dateBegan
+  show ' '
+
+  Do P140-Open-File
+  Do P150-Get-Pay-Begin-Dt
+  Do P160-Create-Job-Array
+End-Procedure
+
+
+Begin-Procedure P140-Open-File
+#debug9 Show 'P140-Open-File'
+  Let $file1 = '{INFILE}' || Lower($ReportID) || '.dat'
+
+  Open $file1
+       As 1
+       For-Reading
+       Record=80:Vary
+       Status=#filestat
+
+  If #filestat != 0
+     Show 'Error opening input file.  Program terminating.'
+     Stop
+  End-If
+End-Procedure
+
+
+Begin-Procedure P150-Get-Pay-Begin-Dt
+#debug9 Show 'P150-Get-Pay-Begin-Dt'
+Begin-Select distinct
+pay_begin_dt
+pay_begin_dt-1 &prior_pay_end_dt
+To_Char(pay_begin_dt,'YYYYMMDD') &pay_begin_date
+  Let $pay_begin_dt     = &pay_begin_dt
+  Let $pay_begin_date   = &pay_begin_date
+  Let $prior_pay_end_dt = &prior_pay_end_dt
+From   ps_pay_calendar
+Where  pay_begin_dt =
+      (Select Max(pay_begin_dt)
+       From   ps_pay_calendar
+       Where  pay_begin_dt <= $AsOfDate
+       and PAY_OFF_CYCLE_CAL = 'N')                            !SCM  01/05/2004
+AND PAY_OFF_CYCLE_CAL = 'N'                                    !SCM  01/05/2004
+End-Select
+End-Procedure
+
+
+Begin-Procedure P160-Create-Job-Array
+#debug9 Show 'P160-Create-Job-Array'
+  Create-Array Name=Job-Array Size=9
+    Field=empl_rcd:Number
+    Field=empl_status:Char:1
+!PSR 09/12/2002
+    Field =company:Char:3
+!PSR 09/12/2002
+End-Procedure
+
+
+Begin-Procedure P200-Main-Process
+#debug9 Show 'P200-Main-Process'
+  While 1=1
+    Do P210-Read-Record
+
+    If #end-file 
+      Break
+    Else
+      Add 1 To #recs-read
+      Add 1 To #trans-read
+    End-If
+
+    If #recs-read = 1
+      Subtract 1 From #trans-read
+      !GEX_SEC_REENG 2015-04-29 Vahini Katta Begins
+      !If Substr($plan_number||$emplid,1,13) = 'PFG401KHEADER'
+      If Substr($plan_number||$ssn,1,13) = 'PFG401KHEADER'
+      !GEX_SEC_REENG 2015-04-29 Vahini Katta Ends
+  !GEX_SEC_REENG 2016-09-28 Jyotsna Negi Begins
+	!Let $trailer-date = Substr($plan_number||$emplid||
+  Let $trailer-date = Substr($plan_number||$ssn||
+  !GEX_SEC_REENG 2016-09-28 Jyotsna Negi Ends
+				   $pre_tax_deferral_pct||
+				   $after_tax_deferral_pct||
+				   $filler1,15,8)
+	Do Format-DateTime($trailer-date, $trailer_dt, {DEFCMP},'','native')
+	Uppercase $trailer_dt
+	Uppercase $AsOfDate
+	If $trailer_dt = $AsOfDate
+          Goto skip-record
+        Else
+	  Show 'Date on header record does not equal processing date'
+	  Show '  Date from header record: ' $trailer_dt
+	  Show '  Processing date: ' $AsOfDate
+	  Stop
+	End-If
+      Else
+	Show 'Header record not found'
+	Stop
+      End-If
+    End-If
+     !GEX_SEC_REENG 2015-04-29 Vahini Katta Begins
+    !If Substr($plan_number||$emplid,1,14) = 'PFG401KTRAILER'
+    If Substr($plan_number||$ssn,1,14) = 'PFG401KTRAILER'
+    !GEX_SEC_REENG 2015-04-29 Vahini Katta Ends
+      Subtract 1 From #trans-read
+      Let $trailer-record-found = 'Y'
+      !GEX_SEC_REENG 2016-09-28 Jyotsna Negi Begins
+      !Let #number-of-transactions = Substr($plan_number||$emplid||
+      Let #number-of-transactions = Substr($plan_number||$ssn||
+      !GEX_SEC_REENG 2016-09-28 Jyotsna Negi Begins
+				    $pre_tax_deferral_pct||
+				    $after_tax_deferral_pct||$filler1||
+				    $repay_amt,27,6)
+      If #number-of-transactions = #trans-read
+         Goto skip-record
+      Else
+	Show 'Number of transactions field on trailer record'
+	Show ' does not equal number of records read'
+	Move #number-of-transactions To $out 888,888,888
+	Show '   Number of transactions from trailer record: ' $out
+	Move #trans-read To $out 888,888,888
+	Show '   Actual transactions read: ' $out
+	Stop
+      End-If
+    End-If
+
+    Let $message = 'No transactions to process'
+    Let $message2 = ''
+    Let $report_type = 'E'
+
+    Do P220-Edit-Record
+    Do P225-Validate-Dreyfus
+
+!***** 03/21/2012 -- GEX_ITG_122551 ISDVMZA  --  Begin   *****!
+    If $dreyfus-found = 'N'
+	Let $message = 'Invalid Dreyfus Plan ID -- transaction not processed.'
+  do Get-Emplid                   !Jyotsna - Ptools Upgrade - 12/09/2016 - Fetch EMPLID from SSN
+	Do P250-Print-Record
+        Goto skip-record
+    End-if
+!***** 03/21/2012 -- GEX_ITG_122551 ISDVMZA  --  End     *****!
+
+    Do P230-Get-Loan-Dedcd
+    Do P240-Load-Job-Array
+    
+    If #active-records > 1
+      Let $active-on-multiple-jobs = 'Y'
+    Else
+      Let $active-on-multiple-jobs = 'N'
+    End-If
+    
+    Let $loan-start = 'N'
+    Let $loan-stop  = 'N'
+    Let $defer-chg  = 'N'
+    
+    If #limit_amt <> 0
+      Let $loan-start = 'Y'
+      If $dedcd-found <> 'Y'
+	Let $message = 'Dedcd not found for dreyfus plan - loan not loaded'
+	Do P250-Print-Record
+      Else
+	Evaluate #i
+	  When = 0
+	    Let $message = 'Employee not found on system - loan not loaded'
+	    Do P250-Print-Record
+	  When = 1
+	    Get #empl_rcd $empl_status $company From Job-Array(1)
+	    
+	    Evaluate $empl_status
+	      When = 'T'
+		Let $message = 'Terminated employee - loan not loaded'
+		Do P250-Print-Record
+	      When = 'L'
+	      When = 'P'
+		Let $message = 'Employee on leave - loan loaded'
+		Do P260-Loan-Start
+	      When-Other
+		Do P260-Loan-Start
+	    End-Evaluate
+	  When > 1
+	    If $termed-on-all-jobs = 'Y'
+	      Let $message = 'Terminated employee - loan not loaded'
+	      Do P250-Print-Record
+	    Else
+	      If $active-on-multiple-jobs = 'Y'
+                Do P280-Multijob
+              Else
+                Let #j = 0
+                While #j < #i
+                  Add 1 To #j
+                  Get #j_empl_rcd $j_empl_status $j_company From Job-Array(#j)
+                  If $j_empl_status = 'A'
+                    Let #empl_rcd = #j_empl_rcd
+                    Let $Company  = $j_company
+                    Do P260-Loan-Start
+                    Let #j = #i
+                  End-If
+                End-While
+  	      End-If
+            End-If
+	End-Evaluate
+      End-If
+      Let $loan-start = 'N'
+    !GEXBN_848_E145515_01 2013-03-21 Vahini Katta Begins      
+    else 
+     Evaluate #i
+     When = 0
+	    Let $message = 'Employee not found on system - loan not loaded'
+	    Do P250-Print-Record
+     When = 1
+            Get #empl_rcd $empl_status $company From Job-Array(#i)
+     When > 1  
+           If $active-on-multiple-jobs = 'Y'
+               Do P280-Multijob
+           Else
+              Let #j = 0
+              While #j < #i
+              Add 1 To #j
+              Get #j_empl_rcd $j_empl_status $j_company From Job-Array(#j)
+              If $j_empl_status = 'A'
+                 Let #empl_rcd = #j_empl_rcd
+                 Let $Company  = $j_company
+                 Let #j = #i
+              End-If
+              End-While
+           End-If
+     End-Evaluate
+    !GEXBN_848_E145515_01 2013-03-21 Vahini Katta Ends 
+    End-If
+
+    Let $message  = ''
+    Let $message2 = ''
+    Let $report_type = 'E'
+
+    If (Rtrim($last_loan_repay_date,' ') <> ''  And
+        Rtrim($last_loan_repay_date,'0') <> '') Or
+       (Rtrim($loan_inactive_date,' ')   <> ''  And
+        Rtrim($loan_inactive_date,' ')   <> '') Or
+        #loan_balance_current            <> 0
+      Let $loan-stop  = 'Y'
+      If $dedcd-found <> 'Y'
+	Let $message = 'Dedcd not found for dreyfus plan - loan not stopped'
+	Do P250-Print-Record
+      Else
+	Evaluate #i
+	  When = 0
+	    Let $message = 'Employee not found on system - loan not stopped'
+	    Do P250-Print-Record
+	  When = 1
+	    Get #empl_rcd $j_empls $company From Job-Array(1)
+	    Do P300-Loan-Stop
+	  When > 1
+            Do P280-Multijob
+	End-Evaluate
+      End-If
+      Let $loan-stop = 'N'
+    End-If
+
+    Let $message  = ''
+    Let $message2 = ''
+    Let $report_type = 'E'
+
+    If Rtrim($pre_tax_deferral_pct,' ')   <> '' Or
+       Rtrim($after_tax_deferral_pct,' ') <> ''
+      Let $defer-chg  = 'Y'
+      Do P320-Deferral-Change
+      Let $defer-chg = 'N'
+    End-If
+
+    If $message = 'No transactions to process'
+      Do P250-Print-Record
+    End-If
+
+    skip-record:
+
+  End-While
+End-Procedure
+
+
+Begin-Procedure P210-Read-Record
+#debug9 Show 'P210-Read-Record'
+  Read 1 Into $plan_number:6
+	      !$emplid:9 !GEX_SEC_REENG 2015-04-29 Vahini Katta
+        $ssn:9 !GEX_SEC_REENG 2015-04-29 Vahini Katta
+	      $pre_tax_deferral_pct:3
+	      $after_tax_deferral_pct:3
+	      $filler1:6
+	      $repay_amt:9
+	      $limit_amt:11
+	      $loan_number:3
+	      $loan_type:1
+	      $filler2:4
+	      $loan_balance_current:11
+	      $last_loan_repay_date:6
+	      $loan_inactive_date:6
+	      $filler3:2
+    Status=#filestat
+
+  If #filestat != 0
+     Show 'Error reading input file.  Program terminating.'
+     Stop
+  End-If
+End-Procedure
+
+
+Begin-Procedure P220-Edit-Record
+#debug9 Show 'P220-Edit-Record'
+  Let #pre_tax_deferral_pct = To_Number($pre_tax_deferral_pct)
+  Let #after_tax_deferral_pct = To_Number($after_tax_deferral_pct)
+    
+  If Rtrim($repay_amt, ' ') = ''
+    Let #repay_amt = 0
+  Else
+    Let #repay_amt = To_Number($repay_amt)
+  End-If
+
+  If Rtrim($limit_amt, ' ') = ''
+    Let #limit_amt = 0
+  Else
+    Let #limit_amt = To_Number($limit_amt)
+  End-If
+
+  If Rtrim($loan_balance_current, ' ') = ''
+    Let #loan_balance_current = 0
+  Else
+    Let #loan_balance_current = To_Number($loan_balance_current)
+  End-If
+
+! CWB 03/13/2003 BEGIN
+! New record format from Mellon makes these lines unneccessary  
+
+!  Let #pre_tax_deferral_pct   = #pre_tax_deferral_pct / 10
+!  Let #after_tax_deferral_pct = #after_tax_deferral_pct / 10
+
+! CWB 03/13/2003 END
+
+  Let #repay_amt              = #repay_amt / 100
+
+  Let #limit_amt              = #limit_amt / 100
+  Let #loan_balance_current   = #loan_balance_current / 100
+End-Procedure
+
+
+!***** 03/21/2012 -- GEX_ITG_122551 ISDVMZA  --  Begin   *****!
+Begin-Procedure P225-Validate-Dreyfus
+#debug9 Show 'P225-Validate-Dreyfus'
+
+   Let $dreyfus-found = 'N'
+
+Begin-Select
+'1'
+   Let $dreyfus-found = 'Y'
+
+From  ps_gex_dreyfus_tbl
+Where gex_dreyfus_plan = $plan_number
+End-Select
+
+End-Procedure P225-Validate-Dreyfus
+!***** 03/21/2012 -- GEX_ITG_122551 ISDVMZA  --  End     *****!
+
+
+Begin-Procedure P230-Get-Loan-Dedcd
+#debug9 Show 'P230-Get-Loan-Dedcd'
+  Let $dedcd-found = 'N'
+Begin-Select
+dedcd
+  Let $dedcd-found = 'Y'
+  Let $dedcd = &dedcd
+From   ps_gex_dreyfus_tbl
+Where  gex_dreyfus_plan = $plan_number
+End-Select
+End-Procedure
+
+
+Begin-Procedure P240-Load-Job-Array
+#debug9 Show 'P240-Load-Job-Array'
+  Let $termed-on-all-jobs = 'Y'
+  Let #active-records = 0
+  Let #i = 0
+
+  Clear-Array Name=Job-Array
+
+Begin-Select
+j.emplid
+j.empl_rcd
+j.empl_status
+!PSR 09/12/2002 Begin
+j.company
+!PSR 09/12/2002 End
+  Add 1 To #i
+  
+  move &j.emplid to $emplid
+  Put &j.empl_rcd &j.empl_status &j.company Into Job-Array(#i)
+  
+  If &j.empl_status <> 'T'
+    Add 1 To #active-records
+    Let $termed-on-all-jobs = 'N'
+  End-If
+
+From   ps_job j
+      ,ps_pers_nid n 
+!GEX_SEC_REENG 2015-04-29 Vahini Katta Begins      
+!Where  j.emplid          = $emplid
+Where  n.national_id  = $ssn
+AND j.emplid = n.emplid
+AND n.COUNTRY='USA'
+AND n.NATIONAL_ID_TYPE='PR'
+!GEX_SEC_REENG 2015-04-29 Vahini Katta Ends
+And    j.effdt           =
+      (Select Max(effdt)
+       From   ps_job
+       Where  emplid     = j.emplid
+       And    empl_rcd  = j.empl_rcd
+       And    effdt     <= $AsOfDate)
+
+And    j.effseq          =
+      (Select Max(effseq)
+       From   ps_job
+       Where  emplid     = j.emplid
+       And    empl_rcd  = j.empl_rcd
+       And    effdt      = j.effdt)
+End-Select
+End-Procedure
+
+
+Begin-Procedure P250-Print-Record
+#debug9 Show 'P250-Print-Record'
+  Evaluate $report_type
+    When = 'E'
+      Use-Report Exception-Report
+      Let $E-Data-Found-Flag = 'Y'
+      Add 1 To #e-recs-printed
+    When = 'L'
+      Use-Report Load-Report
+      Let $L-Data-Found-Flag = 'Y'
+      Add 1 To #l-recs-printed
+  End-Evaluate
+
+  Print $plan_number              (+1,{#column1})
+  Print $emplid                   (+0,{#column2})
+  Print #limit_amt                (+0,{#column3})  Edit 999,999,999.99
+  Print $loan_number              (+0,{#column4})
+  Print $loan_type                (+0,{#column5})
+
+  If $loan-stop = 'Y'
+    Print #loan_balance_current   (+0,{#column6})  Edit 999,999,999.99
+    Print $last_loan_repay_date   (+0,{#column7})  Edit xx/xx/xx
+    Print $loan_inactive_date     (+0,{#column8})  Edit xx/xx/xx
+  End-If
+
+  Print $message                  (+0,{#column9})
+
+  If Rtrim($message2,' ') <> ''
+    Print $message2               (+1,{#column9})
+  End-If
+End-Procedure
+
+
+Begin-Procedure P260-Loan-Start
+#debug9 Show 'P260-Loan-Start'
+  Let $deduction-exists = 'N'
+  Let $deduction-active = 'N'
+Begin-Select
+goal_amt
+goal_bal
+To_Char(deduction_end_dt,'YYYYMMDD') &deduction_end_dt
+
+  Let $deduction-exists = 'Y'
+
+  If &goal_bal         >= &goal_amt       Or
+    (&deduction_end_dt  < $pay_begin_date And
+    Rtrim(&deduction_end_dt,' ') <> '')
+  Else
+    Let $deduction-active = 'Y'
+  End-If
+ 
+From   ps_genl_deduction
+
+Where  emplid    = $emplid
+!PSR - Upgrade 8.3 09/12/2002 Begin
+!And    empl_rcd = #empl_rcd
+And    company  = $company
+!PSR - Upgrade 8.3 09/12/2002 End
+And    dedcd     = $dedcd
+End-Select
+
+  If $deduction-active = 'Y'
+    Let $message = 'Employee has active loan in this plan - loan not loaded'
+  Else
+    If $message = 'Employee on leave - loan loaded'
+      Do P250-Print-Record
+      Let $report_type = 'L'
+    Else
+      Let $message = 'Loan loaded'
+      Let $report_type = 'L'
+    End-If
+    If $deduction-exists = 'N'
+      Do P265-Genl-Ded-Cd-Insert
+    End-If
+    Do P270-Genl-Deduction-Insert
+  End-If
+  Do P250-Print-Record
+End-Procedure
+
+
+Begin-Procedure P265-Genl-Ded-Cd-Insert
+#debug9 Show 'P265-Genl-Ded-Cd-Insert'
+  Begin-SQL On-Error=P290-SQL-Error('Insert into ps_genl_ded_cd')
+    Insert Into ps_genl_ded_cd
+	Values ($emplid,
+               !PSR 09/12/2002
+		!#empl_rcd,
+               !PSR 09/12/2002
+		$dedcd,
+                $company)
+  End-SQL
+
+  Add 1 To #gdc-rows-inserted
+End-Procedure
+
+
+Begin-Procedure P270-Genl-Deduction-Insert
+#debug9 Show 'P270-Genl-Deduction-Insert'
+
+  Begin-SQL On-Error=P290-SQL-Error('Insert into ps_genl_deduction')
+    Insert Into ps_genl_deduction
+!PSR 09/12/2002
+	(EMPLID,                 
+	 DEDCD,                  
+	 EFFDT,                  
+	 DED_CALC,               
+	 DEDUCTION_END_DT,       
+	 DED_ADDL_AMT,           
+	 DED_RATE_PCT,           
+	 GOAL_AMT,               
+	 GOAL_BAL,               
+	 LOAN_INT_PCT,           
+	 BAS_TAXABLE_BEN,        
+	 DED_STOPPED,            
+	 LAST_ACTION,            
+	 LAST_UPDATE_DATE,       
+	 COMPANY,                
+	 PROCESS_DEDN,           
+	 GVT_DED_DIST_CD,        
+	 GVT_PYMNT_METHOD,       
+	 GVT_CHK_NAME,           
+	 GVT_ADDRESS1,           
+	 GVT_ADDRESS2,           
+	 GVT_ADDRESS_CITY,       
+	 GVT_ADDRESS_STATE,
+	 GVT_ADDRESS_ZIP,        
+	 GVT_ADDRESS_CNTRY,
+	 BANK_CD,                
+	 ACCOUNT_NUM,            
+	 ACCOUNT_TYPE,           
+	 GVT_PAYEE_ID_NO,        
+	 GVT_PAYEE_NAME,         
+         GVT_ALLOT_PB)
+         values
+	($emplid,
+	$dedcd,
+	$pay_begin_dt,
+	'A',
+	null,
+	#repay_amt,
+	0,
+	#limit_amt,
+	0,
+	0,
+	' ',
+	' ',
+	'C',
+	$AsOfDate,
+	$company,
+	'Y',		!AXL 03/03/2004 New for V8.3
+	' ',
+	' ',
+	' ',
+	' ',
+	' ',
+	' ',
+	' ',
+	' ',
+	' ',
+	' ',
+	' ',
+	' ',
+	' ',	
+	' ',
+	' ')
+
+!	Values ($emplid,
+!		#empl_rcd,
+!		$dedcd,
+!		$pay_begin_dt,
+!		'A',
+!		null,
+!		#repay_amt,
+!		0,
+!		#limit_amt,
+!		0,
+!		0,
+!		' ',
+!                ' ',
+!                'C',
+!                $AsOfDate)
+!PSR 09/12/2002
+  End-SQL
+
+  Add 1 To #gd-rows-inserted
+End-Procedure
+
+
+Begin-Procedure P280-Multijob
+#debug9 Show 'P280-Multijob'
+Begin-Select
+Distinct sp.empl_rcd &sp.empl_rcd
+  Add 1 To #plans
+  Let #empl_rcd = &sp.empl_rcd
+From   ps_savings_plan    sp,
+       ps_gex_dreyfus_map gdm2
+Where  sp.emplid             = $emplid
+And    gdm2.gex_dreyfus_plan = $plan_number
+And    gdm2.plan_type        = sp.plan_type
+And    gdm2.benefit_plan     = sp.benefit_plan
+End-Select
+  If $loan-start = 'Y'
+    If #plans = 0
+      Let $message  = 'Multiple job employee, not enrolled in a'
+      Let $message2 = 'savings plan - loan not loaded'
+      Do P250-Print-Record
+    Else
+      If #plans > 1
+        Let $message  = 'Multiple job employee, unable to determine'
+        Let $message2 = 'correct job - loan not loaded'
+        Do P250-Print-Record
+      Else
+        Do P285-Check-Empl-Status
+        Do P260-Loan-Start
+      End-If
+    End-If
+  End-If
+  If $loan-stop = 'Y'
+    If #plans <> 1
+      Let $message = 'Unable to convert plan - loan not stopped'
+      Do P250-Print-Record
+    Else
+      Do P300-Loan-Stop
+    End-If
+  End-If
+End-Procedure
+
+
+Begin-Procedure P285-Check-Empl-Status
+#debug9 Show 'P285-Check-Empl-Status'
+  Let #j = 0
+  While #j < #i
+    Add 1 To #j
+    Get #j_empl_rcd $j_empl_status From Job-Array(#j)
+    If #j_empl_rcd = #empl_rcd
+      Let #j = #i
+      If $j_empl_status = 'L' Or
+	 $j_empl_status = 'P'
+	Let $message = 'Employee on leave - loan loaded'
+      End-If
+    End-If
+  End-While
+End-Procedure
+
+
+Begin-Procedure P290-SQL-Error($Action)
+#debug9 Show 'P290-SQL-Error'
+  Show $Action ' failed'
+  Show 'SQL Error:  '  $_sql-error
+  Stop
+End-Procedure
+
+
+Begin-Procedure P300-Loan-Stop
+#debug9 Show 'P300-Loan-Stop'
+  If Rtrim($last_loan_repay_date,' ') <> '' And
+     Rtrim($last_loan_repay_date,'0') <> ''
+    Let $Set = 'Set deduction_end_dt = ''' || $prior_pay_end_dt || ''',' ||
+                    '    goal_bal         = goal_amt'
+    ! AXL 1/18/2000 New 7.5 fields Begin
+    Let $set = $set || ',' || 'last_action = ''' || 'C' || ''''
+    let $set = $set || ',' || 'last_update_date =  ''' || $asofdate || ''''
+    ! AXL 1/18/2000 New 7.5 fields End
+    Do P310-Update-Genl-Deduction
+    If #sql-count = 1
+      Add 1 To #gd-rows-updated
+      Let $message = 'Early loan payoff'
+      Let $report_type = 'L'
+    Else
+      Let $message = 'Unable to convert plan - loan not stopped'
+    End-If
+    Do P250-Print-Record
+  End-If
+
+  If Rtrim($loan_inactive_date,' ') <> '' And
+     Rtrim($loan_inactive_date,'0') <> ''
+    Let $set = 'Set deduction_end_dt = ''' || $prior_pay_end_dt || ''''
+    ! AXL 1/18/2000 New 7.5 fields Begin
+    Let $set = $set || ',' || 'last_action = ''' || 'C' || ''''
+    let $set = $set || ',' || 'last_update_date =  ''' || $asofdate || ''''
+    ! AXL 1/18/2000 New 7.5 fields End
+    Do P310-Update-Genl-Deduction
+    If #sql-count = 1
+      Add 1 To #gd-rows-updated
+      Let $message = 'Loan defaulted'
+      Let $report_type = 'L'
+    Else
+      Let $message = 'Unable to convert plan - loan not stopped'
+    End-If
+    Do P250-Print-Record
+  End-If
+End-Procedure
+
+
+Begin-Procedure P310-Update-Genl-Deduction
+#debug9 Show 'P310-Update-Genl-Deduction'
+#debug8 display 'emplid: ' noline
+#debug8 display $emplid
+#debug8 display 'set clause: ' noline
+#debug8 display $set
+  Begin-SQL
+    Update ps_genl_deduction gd
+   [$Set]
+    Where  emplid            = $emplid
+!PSR 09/12/2002
+!    And    empl_rcd         = #empl_rcd
+    And    COMPANY        = $COMPANY
+!PSR 09/12/2002
+    And    dedcd             = $dedcd
+    And    effdt             =
+	  (Select Max(effdt)
+	   From   ps_genl_deduction
+	   Where  emplid     = gd.emplid
+!PSR 09/12/2002
+	   !And    empl_rcd  = gd.empl_rcd
+            and    company   = gd.company
+!PSR 09/12/2002
+	   And    dedcd      = gd.dedcd
+	   And    effdt     <= $AsOfDate)
+  End-SQL
+End-Procedure
+
+
+Begin-Procedure P320-Deferral-Change
+#debug9 Show 'P320-Deferral-Change'
+   Let $plan-election-40-found = 'N' ! GEX_ITG_113537 ISDVNPK    02/10/2012
+ 
+Begin-Select Distinct
+benefit_plan
+
+   Let $benefit_plan = &benefit_plan
+
+   Let $plan-election-40-found = 'Y' ! GEX_ITG_113537 ISDVNPK    02/10/2012
+
+   Let $gex_plan_type = '40'         ! GEX_ITG_113537 ISDVNPK    02/10/2012 
+   
+   Do P340-Get-Max-Election
+   
+!***** 03/21/2012 -- GEX_ITG_122551 ISDVMZA  --  Begin   *****!
+   If $plan-election-found = 'Y'                               
+      Exit-select
+   End-if
+!***** 03/21/2012 -- GEX_ITG_122551 ISDVMZA  --  End     *****!
+   
+From   ps_gex_dreyfus_map
+Where  gex_dreyfus_plan = $plan_number
+And    plan_type In ('40','4W')
+And    gex_prof_shr = 'N'
+End-Select
+
+! GEX_ITG_113537 ISDVNPK    02/10/2012 BEGIN
+   If $plan-election-40-found = 'N'
+
+      Do PA320-Deferral-Change
+
+      If $plan-election-found = 'N'                               !***** 03/21/2012 -- GEX_ITG_122551 ISDVMZA  *****!
+         show 'Emplid = ' $emplid  ' Plan Type = ' $gex_plan_type ' Benefit Plan = ' $benefit_plan
+         Let $message = 'No plan elections found - deferral % change not applied'
+         Do P250-Print-Record
+      End-If
+   !GEXBN_848_E145515_01 2013-03-21 Vahini Katta Begins 
+   else
+       Do P360-Check-For-Term-Row   !The above procedure has plan types 40 and 4W and calling term procedure would end up printing 2 termination messages.
+   !GEXBN_848_E145515_01 2013-03-21 Vahini Katta Ends      
+   End-If
+! GEX_ITG_113537 ISDVNPK    02/10/2012 END
+
+End-Procedure
+ 
+ 
+! GEX_ITG_113537 ISDVNPK    02/10/2012 BEGIN
+
+
+Begin-Procedure PA320-Deferral-Change
+#debug9 Show 'PA320-Deferral-Change'
+ 
+Begin-Select Distinct
+DF.benefit_plan
+
+   Let $benefit_plan = &DF.benefit_plan
+   Let $gex_plan_type = '4V'
+   
+   Do P360-Check-For-Term-Row !GEXBN_848_E145515_01 2013-03-21 Vahini Katta
+   Do P340-Get-Max-Election
+
+!***** 03/21/2012 -- GEX_ITG_122551 ISDVMZA  --  Begin   *****!
+   If $plan-election-found = 'Y'                               
+      Exit-select
+   End-if
+!***** 03/21/2012 -- GEX_ITG_122551 ISDVMZA  --  End     *****!
+
+From   ps_gex_dreyfus_map DF
+Where  DF.gex_dreyfus_plan = $plan_number
+And    DF.plan_type = '4V'
+And    DF.gex_prof_shr = 'N'
+End-Select
+
+End-Procedure
+
+
+! GEX_ITG_113537 ISDVNPK    02/10/2012 END
+
+
+Begin-Procedure P340-Get-Max-Election
+#debug9 Show 'P340-Get-Max-Election'
+ Let $plan-election-found = 'N'  ! GEX_ITG_113537 ISDVNPK    02/10/2012
+ Show 'P340-Get-Max-Election'
+ show '$emplid        :' $emplid
+ show '#empl_rcd      :' #empl_rcd
+ show '$gex_plan_type :' $gex_plan_type
+ show '$benefit_plan  :' $benefit_plan
+Begin-Select
+effdt
+To_Char(effdt,'YYYYMMDD') &eff_dt
+
+  Let $plan-election-found = 'Y'
+
+  Let $effdt = &eff_dt
+
+  Move #pre_tax_deferral_pct   to $pretax   999.999
+  Move #after_tax_deferral_pct to $aftertax 999.999
+   
+  If $pay_begin_date <= $effdt
+     Do P350-Update-Savings-Plan
+  Else
+    !GEXBN_848_E145515_01 2013-03-21 Vahini Katta Begins
+    !Do P360-Check-For-Term-Row
+    !If $term-row-exists = 'N'
+    !GEXBN_848_E145515_01 2013-03-21 Vahini Katta Ends
+      Do P365-Check-For-Plan-Change
+      If $plan-change-row-exists = 'Y'
+        Do Double-Check		! AXL 1/11/2000 New Procedure
+      Else
+        Do P370-Insert-Savings-Plan
+        Do P375-Insert-Savings-Benef ! GEX_ITG_113537 ISDVNPK    02/10/2012 
+      End-If
+    !GEXBN_848_E145515_01 2013-03-21 Vahini Katta Begins
+    !End-If
+    !GEXBN_848_E145515_01 2013-03-21 Vahini Katta Ends
+  End-If
+  
+From   ps_savings_plan sp
+Where  emplid         = $emplid
+And    empl_rcd      = #empl_rcd
+! GEX_ITG_113537 ISDVNPK    02/10/2012 BEGIN
+!And    plan_type      = '40'
+And    plan_type      = $gex_plan_type 
+! GEX_ITG_113537 ISDVNPK    02/10/2012 END
+And    benefit_plan   = $benefit_plan
+And    coverage_elect = 'E'
+And    effdt =
+      (Select Max(effdt)
+         From  ps_savings_plan sp1
+        Where  emplid         = $emplid
+          And  empl_rcd      = #empl_rcd
+! GEX_ITG_113537 ISDVNPK    02/10/2012 BEGIN
+	 !And    plan_type      = '40'
+	  And  plan_type      = $gex_plan_type
+! GEX_ITG_113537 ISDVNPK    02/10/2012 END
+!***** 04/02/2012 -- GEX_ITG_122551 ISDVMZA  --  Begin   *****!
+          And  sp1.benefit_nbr   = sp.benefit_nbr)
+!       And    benefit_plan   = $benefit_plan)
+!       And    coverage_elect = 'E')
+!***** 04/02/2012 -- GEX_ITG_122551 ISDVMZA  --  End   *****!
+End-Select
+
+End-Procedure
+
+
+Begin-Procedure P350-Update-Savings-Plan
+#debug9 Show 'P350-Update-Savings-Plan'
+  Begin-SQL
+    Update ps_savings_plan
+       Set savings_covrg      = '2',
+           pct_gross          = $pretax,
+           savings_covrg_atax = '2',
+           pct_gross_atax     = $aftertax,
+           coverage_elect_dt  = '01-JAN-1900'
+    Where  emplid       = $emplid
+    And    empl_rcd    = #empl_rcd
+    And    benefit_plan = $benefit_plan
+    And    effdt        = &effdt
+  End-SQL
+
+  Add #sql-count To #sp-rows-updated
+End-Procedure
+
+
+Begin-Procedure P360-Check-For-Term-Row
+#debug9 Show 'P360-Check-For-Term-Row'
+  Let $term-row-exists = 'N'
+Begin-Select
+'x'
+
+  Let $term-row-exists = 'Y'
+  
+  Let $message  = 'Attempting to update a terminated plan'
+  Let $message2 = 'deferral % change not applied'
+  Do P250-Print-Record
+
+From   ps_savings_plan st
+
+Where  st.emplid          = $emplid
+And    st.empl_rcd       = #empl_rcd
+! GEX_ITG_113537 ISDVNPK    02/10/2012 BEGIN
+!And    plan_type      = '40'
+And    st.plan_type      = $gex_plan_type
+! GEX_ITG_113537 ISDVNPK    02/10/2012 END
+And    st.coverage_elect  = 'T'
+!GEXBN_848_E145515_01 2013-03-21 Vahini Katta Begins
+!And    effdt     Between &effdt And $pay_begin_dt
+And    st.effdt = (Select Max(spt.effdt)  
+                   From  ps_savings_plan spt
+                   Where  spt.emplid        = $emplid
+                     And  spt.empl_rcd      = #empl_rcd
+	             And  spt.plan_type     = $gex_plan_type
+                     And  spt.benefit_nbr   = st.benefit_nbr)
+!GEXBN_848_E145515_01 2013-03-21 Vahini Katta Ends      
+End-Select
+End-Procedure
+
+
+Begin-Procedure P365-Check-For-Plan-Change
+#debug9 Show 'P365-Check-For-Plan-Change'
+  Let $plan-change-row-exists = 'N'
+
+Begin-Select
+'y'
+
+  Let $plan-change-row-exists = 'Y'
+
+From   ps_savings_plan
+Where  emplid          = $emplid
+And    empl_rcd       = #empl_rcd
+! GEX_ITG_113537 ISDVNPK    02/10/2012 BEGIN
+!And    plan_type      = '40'
+And    plan_type      = $gex_plan_type
+! GEX_ITG_113537 ISDVNPK    02/10/2012 END
+And    benefit_plan   <> $benefit_plan
+And    effdt     Between &effdt And $pay_begin_dt
+End-Select
+End-Procedure
+
+!***********************************************************************
+Begin-Procedure Double-Check
+!***********************************************************************
+! New procedure to address a problem with false errors written to LIS
+! rpt. AXL 1/11/2000
+
+  Let $warning = 'N'
+  #debug9 display 'In Double Check' 
+
+Begin-Select
+SAV.BENEFIT_PLAN
+
+  Let $warning = 'Y'
+
+  If &SAV.BENEFIT_PLAN = '4GE02A' and $benefit_plan = '4GE01A'
+     Let $warning = 'N'
+  End-if
+
+  If &SAV.BENEFIT_PLAN = '4GE01A' and $benefit_plan = '4GE02A'
+     Let $warning = 'N'
+  End-if
+
+  #debug8 display '&sav.ben_plan: ' noline
+  #debug8 display &SAV.BENEFIT_PLAN
+  #debug8 display '$benefit_plan: ' noline
+  #debug8 display $benefit_plan
+  #debug8 display '$warning: ' noline
+  #debug8 display $warning
+
+  If $warning = 'Y'
+     Let $message  = 'Attempting to update incorrect plan'
+     Let $message2 = 'deferral % change not applied'
+     Do P250-Print-Record
+  End-if
+
+From   ps_savings_plan SAV
+
+Where  sav.emplid          = $emplid
+And    sav.empl_rcd       = #empl_rcd
+! GEX_ITG_113537 ISDVNPK    02/10/2012 BEGIN
+!And   sav.plan_type      = '40'
+And    sav.plan_type      = $gex_plan_type
+! GEX_ITG_113537 ISDVNPK    02/10/2012 END
+And    sav.benefit_plan   <> $benefit_plan
+And    sav.effdt     Between &effdt And $pay_begin_dt
+End-Select
+End-Procedure
+
+Begin-Procedure P370-Insert-Savings-Plan
+#debug9 Show 'P370-Insert-Savings-Plan'
+  
+  Begin-SQL
+    Insert Into ps_savings_plan
+	(SELECT EMPLID,
+		EMPL_RCD,
+		PLAN_TYPE,
+		BENEFIT_NBR,
+		$pay_begin_dt,
+		DEDUCTION_END_DT,
+		$pay_begin_dt,
+		COVERAGE_END_DT,
+		COVERAGE_ELECT,
+		'01-JAN-1900',
+		BENEFIT_PLAN,
+		'2',
+		FLAT_DED_AMT,
+		#pre_tax_deferral_pct,
+		'2',
+		FLAT_DED_AMT_ATAX,
+		#after_tax_deferral_pct,
+		ANN_EX_CREDITS,
+		PLAN_TYPE_RB,
+		BENEFIT_PLAN_RB,
+		DEDCD_RB,
+		DED_CLASS_RB,
+		PLAN_TYPE_RA,
+		BENEFIT_PLAN_RA,
+		DEDCD_RA,
+		DED_CLASS_RA,
+                !PSR 09/12/2002
+                GVT_INV_CHG_FLAG,       
+                GVT_STAT_CHG_FLAG      
+                !PSR 09/12/2002
+	 FROM   PS_SAVINGS_PLAN
+	 WHERE  EMPLID       = $emplid
+	 AND    EMPL_RCD    = #empl_rcd
+	 AND    BENEFIT_PLAN = $benefit_plan
+         AND    EFFDT        = &effdt
+!Jyotsna - 14-Oct-16 - Correct the insertion of invalid PlanType - Begin
+AND EXISTS(SELECT '1' FROM PS_GEX_DREYFUS_MAP DRMP 
+WHERE DRMP.GEX_DREYFUS_PLAN=$plan_number
+AND DRMP.BENEFIT_PLAN=PS_SAVINGS_PLAN.BENEFIT_PLAN 
+AND DRMP.PLAN_TYPE=PS_SAVINGS_PLAN.PLAN_TYPE)
+!Jyotsna - 14-Oct-16 - Correct the insertion of invalid PlanType - End
+)
+  End-SQL
+
+  Add #sql-count To #sp-rows-inserted
+End-Procedure
+
+! GEX_ITG_113537 ISDVNPK    02/10/2012 BEGIN
+
+Begin-Procedure P375-Insert-Savings-Benef
+#debug9 Show 'P375-Insert-Savings-Benef'
+  Begin-SQL
+   INSERT INTO PS_SAVINGS_BENEFIC 
+   (SELECT 
+   AAB.EMPLID, 
+   AAB.EMPL_RCD, 
+   AAB.PLAN_TYPE, 
+   AAB.BENEFIT_NBR, 
+   $pay_begin_dt,  
+   AAB.DEPENDENT_BENEF,  
+   AAB.BENEF_PCT,  
+   AAB.EXCESS,  
+   AAB.CONTINGENt, 
+   AAB.FLAT_AMOUNt
+  FROM PS_SAVINGS_BENEFIC AAB, 
+  PS_SAVINGS_PLAN AA
+	WHERE AA.EMPLID       = $emplid
+	AND AA.EMPL_RCD    = #empl_rcd
+	AND AA.BENEFIT_PLAN = $benefit_plan
+	AND AA.EFFDT        = &effdt
+	AND AAB.EMPLID = AA.EMPLID
+	AND AAB.EMPL_RCD = AA.EMPL_RCD
+	AND AAB.PLAN_TYPE =AA.PLAN_TYPE
+	AND AAB.BENEFIT_NBR = AA.BENEFIT_NBR
+	AND AAB.EFFDT = AA.EFFDT
+!Jyotsna - 14-Oct-16 - Correct the insertion of invalid PlanType - Begin
+AND EXISTS(SELECT '1' FROM PS_GEX_DREYFUS_MAP DRMP 
+WHERE DRMP.GEX_DREYFUS_PLAN=$plan_number
+AND DRMP.BENEFIT_PLAN=AA.BENEFIT_PLAN 
+AND DRMP.PLAN_TYPE=AA.PLAN_TYPE)
+!Jyotsna - 14-Oct-16 - Correct the insertion of invalid PlanType - End
+)
+  End-SQL
+
+  Add #sql-count To #sb-rows-inserted
+End-Procedure
+! GEX_ITG_113537 ISDVNPK    02/10/2012 END
+
+!GEX_SEC_REENG 2015-04-29 Vahini Katta Begins
+!****************************************
+Begin-Procedure Get-Emplid
+!****************************************
+Begin-Select 
+PNID.EMPLID 
+	
+	Let $emplid = &PNID.EMPLID 
+	
+FROM PS_PERS_NID PNID 
+WHERE PNID.NATIONAL_ID = $ssn
+AND PNID.COUNTRY='USA'
+AND PNID.NATIONAL_ID_TYPE='PR'
+End-Select
+!****************************************
+End-Procedure Get-Emplid
+!****************************************
+!GEX_SEC_REENG 2015-04-29 Vahini Katta Ends
+
+Begin-Procedure P400-Finalization
+#debug9 Show 'P400-Finalization'
+  If $trailer-record-found <> 'Y'
+    Show 'Trailer record not found'
+    Stop
+  End-If
+
+  Do P410-Close-File
+
+  If $E-Data-Found-Flag <> 'Y'
+    Use-Report Exception-Report
+    Print 'NO DATA SELECTED FOR THIS REPORT RUN'        (25,) Center
+  End-If
+
+  If $L-Data-Found-Flag <> 'Y'
+    Use-Report Load-Report
+    Print 'NO DATA SELECTED FOR THIS REPORT RUN'        (25,) Center
+  End-If
+
+  Move #trans-read To $trans-read 888,888,888
+  Show $trans-read ' transaction records read from input file'
+
+  Move #e-recs-printed To $e-recs-printed 888,888,888
+  Show $e-recs-printed ' records written to exception report'
+
+  Move #l-recs-printed To $l-recs-printed 888,888,888
+  Show $l-recs-printed ' records written to load report'
+
+  Show ' '
+
+  Move #gdc-rows-inserted To $gdc-rows-inserted 888,888,888
+  Show $gdc-rows-inserted ' rows inserted into ps_genl_ded_cd table'
+
+  Show ' '
+
+  Move #gd-rows-inserted To $gd-rows-inserted 888,888,888
+  Show $gd-rows-inserted ' rows inserted into ps_genl_deduction table'
+
+  Move #gd-rows-updated To $gd-rows-updated 888,888,888
+  Show $gd-rows-updated ' rows updated in ps_genl_deduction table'
+
+  Show ' '
+
+  Move #sp-rows-inserted To $sp-rows-inserted 888,888,888
+  Show $sp-rows-inserted ' rows inserted into ps_savings_plan table'
+! GEX_ITG_113537 ISDVNPK    02/10/2012
+  
+  Move #sb-rows-inserted To $sb-rows-inserted 888,888,888
+  Show $sb-rows-inserted ' rows inserted into ps_savings_benef table'
+! GEX_ITG_113537 ISDVNPK    02/10/2012
+
+
+  Move #sp-rows-updated To $sp-rows-updated 888,888,888
+  Show $sp-rows-updated ' rows updated in ps_savings_plan table'
+
+!  Rollback
+
+  Do Reset                   !reset.sqc
+  Do Stdapi-Term             !stdapi.sqc
+
+  date-time () HH:MI:SS &timeEnded
+  date-time () MM/DD/YYYY &dateEnded
+  show ' '
+  show 'Report Ended at ' &timeEnded ' on ' &dateEnded
+
+  Show 'Successful end of report'
+End-Procedure
+
+
+Begin-Procedure P410-Close-File
+#debug9 Show 'P410-Close-File'
+  Close 1
+
+  If #filestat != 0
+     Show 'Error closing input file.  Program terminating.'
+     Stop
+  End-If
+End-Procedure
+
+
+#Include 'gexxx920.sqc'  !Run Control parameters from GEX_RC_BEN record
+#include 'askaod.sqc'    !Ask-As-Of-Date procedure
+#Include 'stdapi.sqc'    !Process Scheduler Interface
+#Include 'reset.sqc'     !Reset Printer Procedure
+#Include 'curdttim.sqc'  !Get-Current-DateTime Procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'datemath.sqc'  !Routines for date math

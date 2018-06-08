@@ -6,6 +6,9 @@ var fs = require('fs');
 var rimraf = require('rimraf');
 const sqrparser = require('./server/sqrparser');
 const uuidv1 = require('uuid/v1');
+const slone = require('./server/solutionone');
+
+ slone();
 
 var PORT = process.env.PORT || 5000;
 
@@ -36,6 +39,10 @@ app.get('/v1/allfiles', function(req, res) {
         res.status(200).send({ files: JSON.stringify(filesList) });
     });
 });
+
+app.get('/slone', function (req, res) {
+    slone();
+})
 
 app.post('/upload', function(req, res) {
     let uploadedFileName = "";

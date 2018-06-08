@@ -1,0 +1,1467 @@
+!***********************************************************************
+!  FPJOB.SQC  :  loads MCOP and updates compensation elements in JOB   *
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+!                                                                      *
+! This module contains confidential and proprietary information        *
+! of Oracle; it is not to be copied, reproduced, or transmitted        *
+! in any form, by any means, in whole or in part, nor is it to         *
+! be used for any purpose other than that for which it is              *
+! expressly provided under the applicable license agreement.           *
+!                                                                      *
+! Copyright (C) 2006 Oracle. All Rights Reserved.                      *
+!                                                                      *
+!***********************************************************************
+!----------------------------------------------------------------------*
+!                                                                      *
+!          $Date:  2006/10/05:23:59:18                                 *
+!       $Release:  HR9                                                 *
+!      $Revision:  103                                                 *
+!                                                                      *
+!***********************************************************************
+
+! Functions used by Merge Process
+!
+!
+!***********************************************************************
+
+#include 'setenv.sqc'
+#include 'frquency.sqc'        !  Amount conversions
+
+!****************************************************************
+! Init-MCOP
+!****************************************************************
+
+BEGIN-PROCEDURE Init-MCOP
+
+! delete working table
+Let $TruncateCommand = '{PTTRUNCATE}'
+
+begin-sql
+[$TruncateCommand] PS_FP_COMPENSATION
+end-sql
+
+! retrieving previous JOB row
+! the select may return 2 rows, the only last will be kept with newest effective date
+
+!Let $prev_COMP_FREQUENCY    =   ''
+!Let $prev_CURRENCY_CD  =   ''
+!Let #prev_COMPRATE     =   0
+
+!begin-select
+
+!PREV.EFFDT                 &PREV_EFFDT
+!PREV.COMP_FREQUENCY        &PREV_COMP_FREQUENCY
+!PREV.CURRENCY_CD           &PREV_CURRENCY_CD
+!PREV.COMPRATE              &PREV_COMPRATE
+
+!  Let $prev_EFFDT           = &PREV_EFFDT
+!  Let $prev_COMP_FREQUENCY  = &PREV_COMP_FREQUENCY
+!  Let $prev_CURRENCY_CD     = &PREV_CURRENCY_CD
+!  Let #prev_COMPRATE        = &PREV_COMPRATE
+
+!from PS_JOB  PREV
+
+!where      PREV.EMPLID   = $emplid
+!and        PREV.EMPL_RCD = #empl_rcd
+!and     (  PREV.EFFDT    = {DATEIN-PREFIX}$effdt_abs1{DATEIN-SUFFIX}  and PREV.EFFSEQ =
+!                                       (select max(PRV1.EFFSEQ) from PS_JOB PRV1
+!                                        where    PRV1.EMPLID   = PREV.EMPLID
+!                                        and      PRV1.EMPL_RCD = PREV.EMPL_RCD
+!                                        and      PRV1.EFFDT    = PREV.EFFDT
+!                                        and      PRV1.EFFSEQ   < #effseq_abs1)
+!    or    (PREV.EFFDT    =             (select max(PRV1.EFFDT)  from PS_JOB PRV1
+!                                        where    PRV1.EMPLID   = PREV.EMPLID
+!                                        and      PRV1.EMPL_RCD = PREV.EMPL_RCD
+!                                        and      PRV1.EFFDT    < {DATEIN-PREFIX}$effdt_abs1{DATEIN-SUFFIX} )
+!    and    PREV.EFFSEQ   =             (select max(PRV1.EFFSEQ) from PS_JOB PRV1
+!                                        where    PRV1.EMPLID   = PREV.EMPLID
+!                                        and      PRV1.EMPL_RCD = PREV.EMPL_RCD
+!                                        and      PRV1.EFFDT    = PREV.EFFDT) ) )
+!order by PREV.EFFDT ASC
+!end-select
+
+End-PROCEDURE Init-MCOP
+
+!************************************************************************
+! user-pre-chg :  calculate comprate and update compensation
+!************************************************************************
+!BEGIN-PROCEDURE  user-pre-chg($emplid, #empl_rcd, $effdt, #effseq, $action)
+!       IN                      Grade
+!                               Jobcode
+!                               Step
+!                               Forced Compensation
+!                               Forced Index
+!
+!
+!       OUT     $Pointyp_cd     Type of point
+!               $Gross_Ind      Gross Index
+!               $Incs_Ind       Increased Index
+!               #Comprate       Compensation Rate
+!               #Annual_rt      Annual Rate
+!               #Monthly_rt     Monthly Rate
+!               #Hourly_rt      Hourly Rate
+!
+!************************************************************************
+
+
+BEGIN-PROCEDURE user-pre-chg($emplid, #empl_rcd, $effdt, #effseq, $action)
+
+move '' to  $rank_cd
+move '' to  $step_post
+
+let $setid_rank = rtrim($_fusi_buffer_FP_SETID_RANK, ' ')
+let $rank_cd = rtrim($_fusi_buffer_FP_RANK_CD, ' ')
+let $step_career = rtrim($_fusi_buffer_FP_STEP_CD, ' ')
+
+
+let $step_post =  rtrim($_fusi_buffer_FP_STEP_CD2,' ')
+let $setid_jobcd = rtrim($_fusi_buffer_SETID_JOBCODE, ' ')
+let $jobcode =  $_fusi_buffer_JOBCODE
+let #comprate = #_fusi_buffer_FP_COMPRATE
+let #annual_rt = #_fusi_buffer_ANNUAL_RT
+let #monthly_rt = #_fusi_buffer_MONTHLY_RT
+let #hourly_rt = #_fusi_buffer_HOURLY_RT
+let $pointyp_cd = $_fusi_buffer_FP_POINTYP_CD
+let #gross_ind = #_fusi_buffer_FP_GROSS_IND
+let #incs_ind = #_fusi_buffer_FP_INCS_IND
+let $chg_ind = $_fusi_buffer_FP_CHG_IND
+let $chg_sal = $_fusi_buffer_FP_CHG_SAL
+let #_fusi_buffer_STRM_NUM = 1
+
+
+#ifdef debugi
+    display '$emplid = ' noline
+    display $emplid
+    display 'rank_cd    = ' noline
+    display $rank_cd
+    display 'effdt    = ' noline
+    display $effdt
+    display $chg_ind
+    display $chg_sal
+#endif
+
+do Get-Proration-Factor ($_fusi_buffer_FP_LEGALSTAT_CD,$_fusi_buffer_FP_PT_PCT,
+                             $Effdt,#proration_factor1,#proration_factor2)
+               let #_proration_factor1_abs1 = #proration_factor1
+               let #_proration_factor2_abs1 = #proration_factor2
+
+
+!  *************************************************************************************
+!  ********                       9 cases                             ******************
+!  *************************************************************************************
+
+if $rank_cd <> ''
+
+!The employee has a grade and career data
+
+        do Get-Matrix-Scale($setid_rank,$rank_cd,$effdt,$matrix_typ,$matrix_cd,$scale_cd)
+
+        do Get-Pointyp($matrix_typ,$matrix_cd,$scale_cd,$effdt,$pointyp_cd)
+
+
+
+        do Get-PointVal ($matrix_typ,$matrix_cd,$scale_cd,$effdt,$Pointyp_cd,
+                          $Pointrtcd,#Pointval,$row_freq,$row_curr,#std_hours)
+
+    if $chg_ind = 'N' or #incs_ind = 0
+    !the index is not forced
+
+        do Get-Indexes($matrix_typ,$matrix_cd,$scale_cd,$effdt,$step_career,#gross_ind,#incs_ind,$step_chv,#annl_amt)
+
+!#ifdef debugi
+
+
+!#endif
+
+        if $step_chv = 'S'
+        !when a step is assigned to the employee, comp rate = index*point value
+
+       !1   Civil servant with career (rank) .  Regular step                                                    !&
+#ifdef debugi
+        display   'before calling case_1      ---------------------------'                                      !&
+#endif
+
+            Let #mcop_comprate = #incs_ind * #Pointval
+            Let #_fusi_buffer_FP_INCS_IND  = #incs_ind
+            Let #_fusi_buffer_FP_GROSS_IND = #gross_ind
+
+            Let $row_type = 'PTS'
+
+        else
+        !when a sub-step is assigned to the employee, comp rate = annual compensation value
+
+       !2   Civil servant with career (rank) .  Substep                                                         !&
+#ifdef debugi
+        display   'before calling case_2      ---------------------------'                                      !&
+#endif
+            if  #point_val <> 0
+            let #INCS_IND = round(#annl_amt/#point_val,0)
+            else
+            let  #INCS_IND = 0
+            end-if
+            Let #mcop_comprate            = #annl_amt
+            Let #_fusi_buffer_FP_INCS_IND = #incs_ind
+
+            Let $row_type = 'AMT'
+
+        end-if
+
+    else
+    !Index is forced
+
+       !3   Civil servant with career (rank) .  Forced index                                                    !&
+#ifdef debugi
+        display   'before calling case_3     ---------------------------'                                       !&
+#endif
+            Let #mcop_comprate = #_fusi_buffer_FP_INCS_IND * #Pointval
+            Let $row_type = 'PTS'
+    end-if
+else
+!The employee has no rank and no career data
+    #ifdef debugi
+    #endif
+    if $step_post <> ''
+    !a step is assigned to the employee, he is compensated on a salary grade table
+
+
+            do Get-Matrix($setid_jobcd,$jobcode,$effdt,$matrix_typ,$matrix_cd)
+        do Get-PointVal ($matrix_typ,$matrix_cd,$scale_cd,$effdt,$Pointyp_cd,
+                         $Pointrtcd,#Pointval,$row_freq,$row_curr,#std_hours)
+
+       Let $Is_reference = substr($Pointyp_cd,1,1)
+         if $Is_reference <> 'X'
+         !Indexical compensation
+            if $chg_sal = 'N' or (#incs_ind = 0 and #comprate = 0)
+            !The index is not forced
+
+       !4   Contract worker with matrix . Index matrix . Regular index                                          !&
+#ifdef debugi
+        display   'before calling case_4     ---------------------------'                                       !&
+#endif
+       !    Point value is called before
+
+
+        do Get-Indexes($matrix_typ,$matrix_cd,$scale_cd,$effdt,$step_post,#gross_ind,#incs_ind,$step_chv,#annl_amt)
+
+
+            let #_fusi_buffer_FP_GROSS_IND = #gross_ind
+            let #_fusi_buffer_FP_INCS_IND = #incs_ind
+            Let #mcop_comprate = #incs_ind * #Pointval
+
+            Let $row_type = 'PTS'
+
+            else
+
+            !The index is forced
+
+       !5   Contract worker with matrix . Index matrix . Forced index                                           !&
+#ifdef debugi
+        display   'before calling case_5     ---------------------------'                                       !&
+#endif
+       !    Point value is called before
+
+            Let #mcop_comprate = #_fusi_buffer_FP_INCS_IND2 * #Pointval
+
+            Let $row_type = 'PTS'
+
+            end-if
+         else
+         !Reference compensation (point type begins with X)
+
+            if $chg_sal = 'N' or (#_fusi_buffer_FP_INCS_IND2 = 0 and #comprate = 0)
+
+
+            !Reference is not forced
+       !6   Contract worker with matrix . Reference matrix (point type begins with X). Regular reference        !&
+#ifdef debugi
+        display   'before calling case_6     ---------------------------'                                       !&
+#endif
+!-------------------------------------------------------------------------------------------------
+!-------------------------------------------------------------------------------------------------
+
+               do Get-Indexes($matrix_typ,$matrix_cd,$scale_cd,$effdt,$step_post,#gross_ind,#incs_ind,$step_chv,#annl_amt)
+!-------------------------------------------------------------------------------------------------
+!-------------------------------------------------------------------------------------------------
+            do Get-PoinTypValRtcd ($matrix_typ,$matrix_cd,$scale_cd,$effdt,#incs_ind,$Pointyp_cd,$Pointrtcd, #Pointval,#Ann_ref_amt,#Month_ref_amt,#Hour_ref_amt,  $freq_type,$row_freq,$row_curr,#std_hours )
+
+!-------------------------------------------------------------------------------------------------
+!-------------------------------------------------------------------------------------------------
+            let #_fusi_buffer_FP_GROSS_IND = #gross_ind
+            let #_fusi_buffer_FP_INCS_IND2 = #incs_ind
+
+                  evaluate $freq_type
+                         when = 'A'
+                             Let #mcop_comprate = #Ann_ref_amt
+                         when = 'M'
+                             Let #mcop_comprate = #Month_ref_amt
+                         when = 'H'
+                             Let #mcop_comprate = #Hour_ref_amt
+                  end-evaluate
+
+            Let $row_type = 'AMT'
+
+            end-if
+
+            if $chg_sal = 'Y' and #_fusi_buffer_FP_INCS_IND2 <> 0
+            !Reference is forced
+       !7   Contract worker with matrix . Reference matrix (point type begins with X). Forced index             !&
+#ifdef debugi
+        display   'before calling case_7     ---------------------------'                                       !&
+#endif
+
+            do Get-PoinTypValRtcd ($matrix_typ,$matrix_cd,$scale_cd,$effdt,#_fusi_buffer_FP_INCS_IND2,$Pointyp_cd,$Pointrtcd,#Pointval,#Ann_ref_amt,#Month_ref_amt,#Hour_ref_amt,$freq_type,$row_freq,$row_curr,#std_hours )
+            let #_fusi_buffer_FP_GROSS_IND = #gross_ind
+
+                  evaluate $freq_type
+                         when = 'A'
+                             Let #mcop_comprate = #Ann_ref_amt
+                         when = 'M'
+                             Let #mcop_comprate = #Month_ref_amt
+                         when = 'H'
+                             Let #mcop_comprate = #Hour_ref_amt
+                  end-evaluate
+
+            Let $row_type = 'AMT'
+
+            end-if
+
+            if $chg_sal = 'Y' and #comprate <> 0
+            !Salary is forced
+       !8   Contract worker with matrix . Reference matrix (point type begins with X). Forced comprate          !&
+#ifdef debugi
+        display   'before calling case_8     ---------------------------'                                       !&
+#endif
+!-------------------------------------------------------------------------------------------------
+
+
+
+!-------------------------------------------------------------------------------------------------
+            let $row_ratecode  = $_fusi_buffer_COMP_RATECD
+            let $pointrtcd     = $_fusi_buffer_COMP_RATECD
+            Let #mcop_comprate = #_fusi_buffer_FP_COMPRATE
+            Let $row_freq      = $_fusi_buffer_COMP_FREQUENCY
+            Let $row_curr      = $_fusi_buffer_CURRENCY_CD
+            Let #std_hours     = #_fusi_buffer_STD_HOURS
+            
+
+            Let $row_type      = 'AMT'
+            end-if
+         end-if
+    else
+    !the employee is not compensated on a salary grade table
+       !9   Contract worker without matrix . Free comprate                                                      !&
+#ifdef debugi
+        display   'before calling case_9     ---------------------------'                                       !&
+#endif
+     let $row_ratecode  = $_fusi_buffer_COMP_RATECD
+     let $pointrtcd     = $_fusi_buffer_COMP_RATECD
+     Let #mcop_comprate = #_fusi_buffer_FP_COMPRATE
+     Let $row_freq      = $_fusi_buffer_COMP_FREQUENCY
+     Let $row_curr      = $_fusi_buffer_CURRENCY_CD
+     Let #std_hours     = #_fusi_buffer_STD_HOURS
+     
+
+     Let $row_type      = 'AMT'
+    end-if
+end-if
+
+        let $_setid_jobcd_abs1    = $setid_jobcd
+        let $_jobcode_abs1        = $jobcode
+        let $_setid_rank_abs1     = $setid_rank
+        let $_rank_cd_abs1        = $rank_cd
+        let $_matrix_typ_abs1     = $matrix_typ
+        let $_matrix_cd_abs1      = $matrix_cd
+        let $_scale_cd_abs1       = $scale_cd
+        let $_pointyp_cd_abs1     = $pointyp_cd
+        let $_pointrtcd_abs1      = $pointrtcd
+        let #_pointval_abs1       = #pointval
+        let #_gross_ind_abs1      = #gross_ind
+        let #_incs_ind_abs1       = #incs_ind
+        let #_mcop_comprate_abs1  = #mcop_comprate
+        if $row_freq = ''
+              let $row_freq = 'A'
+        else
+              let $_mcop_freq_abs1 = $row_freq
+        end-if
+        let $_mcop_curr_abs1 = $row_curr
+        let $_row_type_abs1  = $row_type
+        let $_effdt_abs1     = $effdt
+        let #_effseq_abs1    = #effseq
+        let #_std_hours_abs1 = #std_hours
+
+        let $_COMP_RATECD                 = $pointrtcd
+        let $_COMP_SOURCE                 = 'M'
+        Let $_COMP_FREQUENCY              = $row_freq
+        Let $_CURRENCY_CD                 = $row_curr
+
+
+!   do Build-MCOP
+
+END-PROCEDURE user-pre-chg
+
+!************************************************************************************
+! Insert-Fpaeeupdrow : Insert into FPAEEUPDROW when a process updates employee record
+!************************************************************************************
+!       IN      Emplid
+!               Empl_Rcd
+!               Effdt
+!               Update date
+!
+!************************************************************************************
+
+BEGIN-PROCEDURE Insert-Fpaeeupdrow ($emplid,#empl_rcd,$effdt,$audit_stamp)
+
+let $sql-statement = 'fpjob.sqc, Insert-Fpaeeupdrow,Insert,PS_FPAEEUPDROW'
+BEGIN-SQL  On-Error=SQL-Error
+
+        Insert into PS_FPAEEUPDROW (EMPLID, EMPL_RCD, EFFDT, LAST_UPDATE_DATE)
+        values ($emplid, #empl_rcd,
+        {DATEIN-PREFIX}$effdt{DATEIN-SUFFIX},
+        {DATEIN-PREFIX}$audit_stamp{DATEIN-SUFFIX})
+
+END-SQL
+
+END-PROCEDURE Insert-Fpaeeupdrow
+
+!*********************************************************************
+! Insert-Fpaeedelrow : Insert into FPAEEDELROW delete rows
+!*********************************************************************
+!       IN      Emplid
+!               Empl_Rcd
+!
+!*********************************************************************
+
+BEGIN-PROCEDURE Insert-Fpaeedelrow ($emplid,#empl_rcd)
+
+let #total=0
+
+let $sql-statement = 'fpjob.sqc,Insert-Fpaeedelrow,select,PS_FPAEEDELROW'
+
+BEGIN-SELECT    On-Error=SQL-Error
+EMPLID
+        let #total = #total + 1
+From PS_FPAEEDELROW
+Where EMPLID = $emplid
+and EMPL_RCD = #empl_rcd
+
+END-SELECT
+
+if #total = 0
+        let $sql-statement = 'fpjob.sqc, Insert-Fpaeedelrow,Insert,PS_FPAEEDELROW'
+        BEGIN-SQL  On-Error=SQL-Error
+
+            Insert into PS_FPAEEDELROW (EMPLID,EMPL_RCD) values ($emplid, #empl_rcd)
+
+        END-SQL
+end-if
+
+END-PROCEDURE Insert-Fpaeedelrow
+
+!__________________________________________________________________________________________
+
+!***********************************************************************
+!  Build-MCOP
+!***********************************************************************
+BEGIN-PROCEDURE Build-MCOP
+
+ Do Init-MCOP
+ Do Fetch-main
+ Do Fetch-secondary
+ Do Fetch-RCG
+ do Final-run
+ !do fpjob-additive-insert
+
+END-PROCEDURE Build-MCOP
+!__________________________________________________________________________________________
+
+!*********************************************************************
+!  Fetch-main
+!*********************************************************************
+
+BEGIN-PROCEDURE Fetch-main
+
+If $row_type_abs1  = 'PTS'
+    Let #trans_COMP_RATE_POINTS = #incs_ind_abs1
+Else
+    Let #trans_COMP_RATE_POINTS = 0
+End-if
+
+Let #trans_COMPRATE = #mcop_comprate_abs1
+Let $FP_PCT_TYPE = 'M'
+Let $Is-it-main-salary = 'Y'
+
+Do Insert-MCOP-Row
+
+END-PROCEDURE Fetch-main
+
+!__________________________________________________________________________________________
+
+!***********************************************************************
+! Fetch-secondary
+!***********************************************************************
+
+BEGIN-PROCEDURE Fetch-secondary
+
+Do Fetch-job-premiums
+
+If ( $rank_cd_abs1 <> '' and   $rank_cd_abs1 <> ' ')
+Do Fetch-rank-premiums
+End-If
+
+Do Fetch-individual-premium
+
+END-PROCEDURE Fetch-secondary
+
+!__________________________________________________________________________________________
+
+!*********************************
+BEGIN-PROCEDURE Fetch-job-premiums
+!*********************************
+
+let $sql-statement = 'ins_mcop,Fetch-job-premiums,select'
+
+#ifdef debugi
+display $sql-statement
+#endif
+
+begin-select    On-Error=SQL-Error
+
+A.COMP_RATECD           &A.COMP_RATECD
+A.COMPRATE              &A.COMPRATE
+A.COMP_PCT              &A.COMP_PCT
+A.COMP_RATE_POINTS      &A.COMP_RATE_POINTS
+A.COMP_FREQUENCY        &A.COMP_FREQUENCY
+A.CURRENCY_CD           &A.CURRENCY_CD
+A.RATE_CODE_GROUP       &A.RATE_CODE_GROUP
+A.FP_PCT_TYPE           &A.FP_PCT_TYPE
+
+       Let $COMP_RATECD            = &A.COMP_RATECD
+       Let #COMPRATE               = &A.COMPRATE
+       Let #COMP_PCT               = &A.COMP_PCT
+       Let #trans_COMP_RATE_POINTS = &A.COMP_RATE_POINTS
+       Let $COMP_FREQUENCY         = &A.COMP_FREQUENCY
+       Let $CURRENCY_CD            = &A.CURRENCY_CD
+       Let $RATE_CODE_GROUP        = &A.RATE_CODE_GROUP
+       Let $FP_PCT_TYPE            = &A.FP_PCT_TYPE
+
+       Let    $Is-it-main-salary = 'N'
+
+!      This item is a Job  premium
+        Let $COMP_SOURCE      = 'J'
+
+       Do Insert-MCOP-row
+
+from
+
+ PS_FPMJB_RATECODE       A
+
+where
+         A.SETID       = $setid_jobcd_abs1
+     and A.JOBCODE     = $jobcode_abs1
+     and A.EFFDT      = (select max(AZ.EFFDT) from PS_FPMJB_RATECODE AZ
+                         where  A.SETID     = AZ.SETID
+                         and    A.JOBCODE   = AZ.JOBCODE
+                         and    AZ.EFFDT   <= {DATEIN-PREFIX}$effdt_abs1{DATEIN-SUFFIX}  )
+
+End-select
+
+!*********************************
+END-PROCEDURE Fetch-job-premiums
+!*********************************
+
+!*********************************
+BEGIN-PROCEDURE Fetch-rank-premiums
+!*********************************
+
+let $sql-statement = 'ins_mcop,Fetch-rank-premiums,select'
+#ifdef debugi
+display $sql-statement
+#endif
+begin-select    On-Error=SQL-Error
+
+A2.COMP_RATECD           &A2.COMP_RATECD
+A2.COMPRATE              &A2.COMPRATE
+A2.COMP_PCT              &A2.COMP_PCT
+A2.COMP_RATE_POINTS      &A2.COMP_RATE_POINTS
+A2.COMP_FREQUENCY        &A2.COMP_FREQUENCY
+A2.CURRENCY_CD           &A2.CURRENCY_CD
+A2.RATE_CODE_GROUP       &A2.RATE_CODE_GROUP
+A2.FP_PCT_TYPE           &A2.FP_PCT_TYPE
+
+       Let $COMP_RATECD            = &A2.COMP_RATECD
+       Let #COMPRATE               = &A2.COMPRATE
+       Let #COMP_PCT               = &A2.COMP_PCT
+
+       Let #trans_COMP_RATE_POINTS = &A2.COMP_RATE_POINTS
+       Let $COMP_FREQUENCY         = &A2.COMP_FREQUENCY
+       Let $CURRENCY_CD            = &A2.CURRENCY_CD
+       Let $RATE_CODE_GROUP        = &A2.RATE_CODE_GROUP
+       Let $FP_PCT_TYPE            = &A2.FP_PCT_TYPE
+
+       Let    $Is-it-main-salary = 'N'
+
+!      This item is a Rank premium
+        Let $COMP_SOURCE      = 'R'
+
+        Do Insert-MCOP-row
+
+from
+
+ PS_FPMRK_RATECODE       A2
+
+where
+         A2.SETID      = $setid_rank_abs1
+     and A2.FP_RANK_CD = $rank_cd_abs1
+     and A2.EFFDT      = (select max(BZ.EFFDT) from PS_FPMRK_RATECODE  BZ
+                         where  A2.SETID         = BZ.SETID
+                         and    A2.FP_RANK_CD    = BZ.FP_RANK_CD
+                         and    BZ.EFFDT   <= {DATEIN-PREFIX}$effdt_abs1{DATEIN-SUFFIX}  )
+End-select
+
+!*********************************
+END-PROCEDURE Fetch-rank-premiums
+!*********************************
+
+!__________________________________________________________________________________________
+
+!*********************************
+BEGIN-PROCEDURE Fetch-individual-premium
+!*********************************
+
+let $sql-statement = 'ins_mcop,Fetch-individual-premium ,select'
+
+#ifdef debugi
+display $sql-statement
+#endif
+
+begin-select    On-Error=SQL-Error
+
+X1.COMP_RATECD           &X1.COMP_RATECD
+X1.COMPRATE              &X1.COMPRATE
+X1.COMP_PCT              &X1.COMP_PCT
+X1.COMP_RATE_POINTS      &X1.COMP_RATE_POINTS
+X1.COMP_FREQUENCY        &X1.COMP_FREQUENCY
+X1.CURRENCY_CD           &X1.CURRENCY_CD
+X1.RATE_CODE_GROUP       &X1.RATE_CODE_GROUP
+X1.FP_PCT_TYPE           &X1.FP_PCT_TYPE
+
+       Let $COMP_RATECD            = &X1.COMP_RATECD
+       Let #COMPRATE               = &X1.COMPRATE
+       Let #COMP_PCT               = &X1.COMP_PCT
+       Let #trans_COMP_RATE_POINTS = &X1.COMP_RATE_POINTS
+       Let $COMP_FREQUENCY         = &X1.COMP_FREQUENCY
+       Let $CURRENCY_CD            = &X1.CURRENCY_CD
+       Let $RATE_CODE_GROUP        = &X1.RATE_CODE_GROUP
+       Let $FP_PCT_TYPE            = &X1.FP_PCT_TYPE
+
+       Let    $Is-it-main-salary = 'N'
+
+!      This item is an individual premium
+        Let $COMP_SOURCE      = 'I'
+
+       Do Insert-MCOP-row
+
+from
+
+ PS_FPAEE_PREMIUM    X1
+
+where
+          X1.EMPLID           = $fusi_emplid
+     and  X1.EMPL_RCD         = #fusi_empl_rcd
+     and (X1.FP_IN_ABEYANCE   = 'B'  or
+          X1.FP_IN_ABEYANCE   = 'R' )
+
+     and X1.EFFDT      = (select max(X2.EFFDT) from PS_FPAEE_PREMIUM X2
+                         where  X2.EMPLID       = X1.EMPLID
+                            and X2.EMPL_RCD     = X1.EMPL_RCD
+                            and X2.EFFDT       <= {DATEIN-PREFIX}$effdt_abs1{DATEIN-SUFFIX}  )
+     and X1.EFFSEQ     = (select max(X3.EFFSEQ) from PS_FPAEE_PREMIUM X3
+                         where  X3.EMPLID       = X1.EMPLID
+                            and X3.EMPL_RCD     = X1.EMPL_RCD
+                            and X3.EFFDT        = X1.EFFDT
+                            and X3.EFFSEQ       <= #effseq_abs1  )
+
+End-select
+
+END-PROCEDURE Fetch-individual-premium
+!__________________________________________________________________________________________
+!*********************************
+BEGIN-PROCEDURE Insert-MCOP-row
+!*********************************
+
+      If  $FP_PCT_TYPE <> 'M'
+
+              Let #proration_factor = #proration_factor2_abs1
+      else
+              Let #proration_factor = #proration_factor1_abs1
+      End-if
+
+      Let #trans_COMP_EFFSEQ = 1
+      Let $trans_COMP_RATECD    = $COMP_RATECD
+      if $trans_COMP_RATECD = ''
+      let $trans_COMP_RATECD = 'A'
+      end-if
+
+
+      Let $trans_COMP_SOURCE    = $COMP_SOURCE
+
+
+      Let $trans_COMP_FREQUENCY = $COMP_FREQUENCY
+      Let $trans_CURRENCY_CD    = $CURRENCY_CD
+
+      Let $trans_MANUAL_SW     = 'N'
+      Let #trans_CHANGE_AMT    = 0
+      Let #trans_CHANGE_PCT    = 0
+      Let #trans_CHANGE_PTS    = 0
+      Let $trans_FTE_INDICATOR = 'Y'
+      Let #trans_FP_SHR_TM_RT  = #proration_factor
+
+      If $Is-it-main-salary = 'Y'
+           Do Prepare-Salary
+      Else
+           Do Prepare-Other
+      End-if
+
+let $sql-statement = 'ins_mcop,temporary table,insert'
+
+#ifdef debugi
+display $sql-statement
+#endif
+
+BEGIN-SQL    On-Error=SQL-Error
+Insert into PS_FP_COMPENSATION (COMP_EFFSEQ, COMP_RATECD, FP_COMP_SOURCE,
+COMP_RATE_POINTS, COMPRATE,COMP_PCT, COMP_FREQUENCY, CURRENCY_CD, MANUAL_SW, CONVERT_COMPRT,
+RATE_CODE_GROUP, CHANGE_AMT, CHANGE_PCT, CHANGE_PTS, FTE_INDICATOR, FP_SHR_TM_RT)
+Values (
+#trans_COMP_EFFSEQ,
+$trans_COMP_RATECD,
+$trans_COMP_SOURCE,
+#trans_COMP_RATE_POINTS,
+#trans_COMPRATE,
+#trans_COMP_PCT,
+$trans_COMP_FREQUENCY,
+$trans_CURRENCY_CD,
+$trans_MANUAL_SW,
+#trans_CONVERT_COMPRT,
+$trans_RATE_CODE_GROUP,
+#trans_CHANGE_AMT,
+#trans_CHANGE_PCT,
+#trans_CHANGE_PTS,
+$trans_FTE_INDICATOR,
+#trans_FP_SHR_TM_RT)
+
+END-SQL
+
+END-PROCEDURE Insert-MCOP-row
+
+!__________________________________________________________________________________________
+!***********************************************************************
+! Prepare-Salary
+!***********************************************************************
+
+BEGIN-PROCEDURE Prepare-Salary
+
+
+Let #trans_COMP_PCT = 0
+
+do convertCurrency(#trans_COMPRATE,$mcop_curr_abs1 ,$mcop_curr_abs1,$BaseRtType,$effdt_abs1  ,#CURR_COMPRATE,'W')
+do Convert-Frequency($effdt_abs1  ,#CURR_COMPRATE,$mcop_freq_abs1 ,$mcop_freq_abs1 ,#std_hours_abs1,'M',#FREQ_COMPRATE)
+
+
+Let #trans_CONVERT_COMPRT = #FREQ_COMPRATE * #proration_factor
+
+Let $trans_RATE_CODE_GROUP = ' '
+Let $trans_FP_PCT_TYPE = 'M'
+
+END-PROCEDURE Prepare-Salary
+
+!__________________________________________________________________________________________
+!***********************************************************************
+! Prepare-Other
+!***********************************************************************
+
+BEGIN-PROCEDURE Prepare-Other
+
+Let #trans_COMPRATE = #COMPRATE
+Let #trans_COMP_PCT = #COMP_PCT
+
+If #trans_COMP_PCT = 0
+If #trans_COMP_RATE_POINTS <> 0
+let #trans_COMPRATE = #trans_COMP_RATE_POINTS * #pointval_abs1
+End-if
+
+do ConvertCurrency(#trans_COMPRATE,$CURRENCY_CD,$mcop_curr_abs1,$BaseRtType,$effdt_abs1,#CURR_COMPRATE,'W')
+
+do Convert-Frequency($effdt_abs1,#CURR_COMPRATE,$COMP_FREQUENCY,$mcop_freq_abs1,#std_hours_abs1,'M',#FREQ_COMPRATE)
+
+Let #trans_CONVERT_COMPRT = #FREQ_COMPRATE * #proration_factor
+Else
+Let #trans_CONVERT_COMPRT = 0
+End-if
+
+Let $trans_RATE_CODE_GROUP = $RATE_CODE_GROUP
+
+END-PROCEDURE Prepare-Other
+
+!***********************************************************************
+! Fetch-RCG
+!***********************************************************************
+
+BEGIN-PROCEDURE Fetch-RCG
+
+!JP ******************
+Begin-Select  distinct  On-Error=SQL-Error
+RATE_CODE_GROUP   &nb_RCG_vide
+
+                  Do Sum-RCG0
+
+from PS_FP_COMPENSATION
+Where
+COMP_PCT <> 0 and ( RATE_CODE_GROUP = '' or  RATE_CODE_GROUP = ' ' )
+
+End-Select
+
+!******************
+Begin-Select distinct  On-Error=SQL-Error
+A3. RATE_CODE_GROUP         &A3.RATE_CODE_GROUP
+
+        Let $RCG =&A3.RATE_CODE_GROUP
+                  Do Sum-RCG
+
+from
+PS_FP_COMPENSATION A3
+Where
+A3.RATE_CODE_GROUP <> ' '
+
+End-Select
+
+END-PROCEDURE Fetch-RCG
+
+!__________________________________________________________________________________________
+
+!***********************************************************************
+! Sum-RCG0
+!***********************************************************************
+
+BEGIN-PROCEDURE Sum-RCG0
+
+#ifdef debugi
+        display ' ===============  Sum-RCG0   ==================   '
+#endif
+
+Begin-Select   On-Error=SQL-Error
+
+SUM(CONVERT_COMPRT)      &SUM_CONVERT_RCG
+
+                  Let #SUM_CONVERT_RCG = &SUM_CONVERT_RCG
+
+
+                  Do Second-fetch-run0
+
+from   PS_FP_COMPENSATION
+          Where      COMP_PCT = 0
+
+End-Select
+
+END-PROCEDURE Sum-RCG0
+
+!__________________________________________________________________________________________
+
+!***********************************************************************
+! Sum-RCG
+!***********************************************************************
+BEGIN-PROCEDURE Sum-RCG
+
+
+#ifdef debugi
+        display ' ===============  Sum-RCG   ==================   '
+#endif
+
+Begin-Select   On-Error=SQL-Error
+
+SUM(A4.CONVERT_COMPRT)  &RCG_SUM_CONVERT_RCG
+
+                  Let #RCG_SUM_CONVERT_RCG = &RCG_SUM_CONVERT_RCG
+
+
+                  Do Second-fetch-run
+
+from
+
+PS_FP_COMPENSATION A4 ,
+PS_COMPRT_GRP_TBL2 B4
+
+ where B4.RATE_CODE_GROUP = $RCG
+ and   B4.EFFDT           = (SELECT MAX(BZ1.EFFDT) FROM PS_COMPRT_GRP_TBL2 BZ1
+                            WHERE B4.RATE_CODE_GROUP = BZ1.RATE_CODE_GROUP
+                            AND B4.EFFDT <= {DATEIN-PREFIX}$effdt_abs1{DATEIN-SUFFIX})
+ and   B4.COMP_RATECD     = A4.COMP_RATECD
+                                    group by B4.RATE_CODE_GROUP
+End-Select
+END-PROCEDURE Sum-RCG
+
+!__________________________________________________________________________________________
+
+!***********************************************************************
+! Second-fetch-run0
+!***********************************************************************
+
+BEGIN-PROCEDURE Second-fetch-run0
+
+Begin-Select   On-Error=SQL-Error
+
+T20.COMP_EFFSEQ               &T20update_COMP_EFFSEQ
+T20.COMP_RATECD               &T20update_COMP_RATECD
+T20.COMP_PCT                  &T20COMP_PCT
+T20.FP_COMP_SOURCE            &T20update_FP_COMP_SOURCE
+
+       Let #update_COMP_EFFSEQ      = &T20update_COMP_EFFSEQ
+       Let $update_COMP_RATECD      = &T20update_COMP_RATECD
+       Let $update_FP_COMP_SOURCE   = &T20update_FP_COMP_SOURCE
+       Let #COMP_PCT                = &T20COMP_PCT
+       Let #trans_COMPRATE          = #SUM_CONVERT_RCG * #COMP_PCT /100
+       Let #trans_CONVERT_COMPRT    = #trans_COMPRATE
+
+
+                  Do Update-percentage
+
+From
+
+PS_FP_COMPENSATION   T20
+Where T20.COMP_PCT <> 0
+and   ( T20.RATE_CODE_GROUP = ''  or  T20.RATE_CODE_GROUP = ' ' )
+End-Select
+
+END-PROCEDURE Second-fetch-run0
+
+!__________________________________________________________________________________________
+
+!***********************************************************************
+! Second-fetch-run
+!***********************************************************************
+
+BEGIN-PROCEDURE Second-fetch-run
+
+Begin-Select   On-Error=SQL-Error
+
+T10.COMP_EFFSEQ       &T10update_COMP_EFFSEQ
+T10.COMP_RATECD       &T10update_COMP_RATECD
+T10.COMP_PCT          &T10COMP_PCT
+T10.FP_COMP_SOURCE    &T10update_FP_COMP_SOURCE
+
+       Let #update_COMP_EFFSEQ    = &T10update_COMP_EFFSEQ
+       Let $update_COMP_RATECD    = &T10update_COMP_RATECD
+       Let $update_FP_COMP_SOURCE = &T10update_FP_COMP_SOURCE
+       Let #COMP_PCT              = &T10COMP_PCT
+       Let #trans_COMPRATE        = #RCG_SUM_CONVERT_RCG * #COMP_PCT / 100
+       Let #trans_CONVERT_COMPRT  = #trans_COMPRATE
+
+                  Do Update-percentage
+
+From
+
+PS_FP_COMPENSATION   T10
+Where T10.COMP_PCT <> 0
+And   T10.RATE_CODE_GROUP = $RCG
+
+End-Select
+
+END-PROCEDURE Second-fetch-run
+
+!__________________________________________________________________________________________
+
+!***********************************************************************
+! Update-percentage
+!***********************************************************************
+
+BEGIN-PROCEDURE Update-percentage
+
+
+
+
+
+
+Begin-SQL    On-Error=SQL-Error
+
+
+
+Update
+      PS_FP_COMPENSATION
+
+Set COMPRATE          = #trans_COMPRATE,
+    CONVERT_COMPRT    = #trans_CONVERT_COMPRT
+
+
+                  where COMP_EFFSEQ      = #update_COMP_EFFSEQ
+                  and   COMP_RATECD      = $update_COMP_RATECD
+                  and   FP_COMP_SOURCE   = $update_FP_COMP_SOURCE
+
+
+End-SQL
+
+END-PROCEDURE Update-percentage
+
+!__________________________________________________________________________________________
+
+!***********************************************************************
+! Final-run
+!***********************************************************************
+
+BEGIN-PROCEDURE Final-run
+
+             Let #seqw = -1
+             Let #rows_total = 0
+
+begin-select   On-Error=SQL-Error
+
+COMP_EFFSEQ        &COMP_EFFSEQ
+COMP_RATECD        &COMP_RATECD (,1,1)  ON-BREAK PRINT=Never LEVEL=1 AFTER=seq-reset
+FP_COMP_SOURCE     &FP_COMP_SOURCE
+COMP_RATE_POINTS   &COMP_RATE_POINTS
+COMPRATE           &COMPRATE
+COMP_PCT           &COMP_PCT
+COMP_FREQUENCY     &COMP_FREQUENCY
+CURRENCY_CD        &CURRENCY_CD
+MANUAL_SW          &MANUAL_SW
+CONVERT_COMPRT     &CONVERT_COMPRT
+RATE_CODE_GROUP    &RATE_CODE_GROUP
+CHANGE_AMT         &CHANGE_AMT
+CHANGE_PCT         &CHANGE_PCT
+CHANGE_PTS         &CHANGE_PTS
+FTE_INDICATOR      &FTE_INDICATOR
+FP_SHR_TM_RT       &FP_SHR_TM_RT
+
+               Let #seqw                       = #seqw + 1
+
+               Let #To_insert_COMP_EFFSEQ      = #seqw
+               Let $To_insert_COMP_RATECD      = &COMP_RATECD
+               Let $To_insert_FP_COMP_SOURCE   = &FP_COMP_SOURCE
+               Let #To_insert_COMP_RATE_POINTS = &COMP_RATE_POINTS
+               Let #To_insert_COMPRATE         = &COMPRATE
+               Let #To_insert_COMP_PCT         = &COMP_PCT
+               Let $To_insert_COMP_FREQUENCY   = &COMP_FREQUENCY
+               Let $To_insert_CURRENCY_CD      = &CURRENCY_CD
+               Let $To_insert_MANUAL_SW        = &MANUAL_SW
+               Let #To_insert_CONVERT_COMPRT   = &CONVERT_COMPRT
+               Let $To_insert_RATE_CODE_GROUP  = &RATE_CODE_GROUP
+               Let #To_insert_CHANGE_AMT       = &CHANGE_AMT
+               Let #To_insert_CHANGE_PCT       = &CHANGE_PCT
+               Let #To_insert_CHANGE_PTS       = &CHANGE_PTS
+               Let $To_insert_FTE_INDICATOR    = &FTE_INDICATOR
+               Let #To_insert_FP_SHR_TM_RT     = &FP_SHR_TM_RT
+
+               Let #rows_total                 = #rows_total + #To_insert_CONVERT_COMPRT
+
+
+               Do Insert-final-MCOP
+
+from
+PS_FP_COMPENSATION
+Order by
+
+COMP_RATECD,COMP_EFFSEQ
+
+
+End-select
+
+
+END-PROCEDURE Final-run
+
+!__________________________________________________________________________________________
+
+!***********************************************************************
+! Insert-final-MCOP
+!***********************************************************************
+
+BEGIN-PROCEDURE Insert-final-MCOP
+
+let $sql-statement = 'ins_mcop,Final-compensation,insert'
+
+#ifdef debugi
+
+display $sql-statement
+
+display $fusi_emplid
+display #fusi_empl_rcd
+display $effdt_abs1
+display #effseq_abs1
+display #To_insert_COMP_EFFSEQ
+display $To_insert_COMP_RATECD
+display #To_insert_COMP_RATE_POINTS
+display #To_insert_COMPRATE
+display #To_insert_COMP_PCT
+display $To_insert_COMP_FREQUENCY
+display $To_insert_CURRENCY_CD
+display #To_insert_CONVERT_COMPRT
+display $To_insert_RATE_CODE_GROUP
+display #To_insert_CHANGE_AMT
+display #To_insert_CHANGE_PCT
+display #To_insert_CHANGE_PTS
+display $To_insert_FTE_INDICATOR
+
+#endif
+
+BEGIN-SQL  On-Error=SQL-Error
+
+Insert into PS_FPA_CI_COMP (EMPLID, EMPL_RCD, EFFDT, EFFSEQ, COMP_EFFSEQ, COMP_RATECD,
+COMP_RATE_POINTS, COMPRATE, COMP_PCT, COMP_FREQUENCY, CURRENCY_CD, CONVERT_COMPRT, RATE_CODE_GROUP,
+CHANGE_AMT, CHANGE_PCT, CHANGE_PTS, FTE_INDICATOR) 
+
+Values (
+$fusi_emplid,
+#fusi_empl_rcd,
+$effdt_abs1,
+#effseq_abs1,
+#To_insert_COMP_EFFSEQ,
+$To_insert_COMP_RATECD,
+#To_insert_COMP_RATE_POINTS,
+#To_insert_COMPRATE,
+#To_insert_COMP_PCT,
+$To_insert_COMP_FREQUENCY,
+$To_insert_CURRENCY_CD,
+#To_insert_CONVERT_COMPRT,
+$To_insert_RATE_CODE_GROUP,
+#To_insert_CHANGE_AMT,
+#To_insert_CHANGE_PCT,
+#To_insert_CHANGE_PTS,
+$To_insert_FTE_INDICATOR)
+
+END-SQL
+
+END-PROCEDURE Insert-final-MCOP
+
+!__________________________________________________________________________________________
+!***********************************************************************
+! Seq-reset
+!***********************************************************************
+
+BEGIN-PROCEDURE Seq-reset
+  Let #seqw = -1
+END-PROCEDURE Seq-reset
+
+
+!__________________________________________________________________________________________
+
+!****************************************************************
+!      Get-PointVal
+!This function get Point-Type, RateCode and Point value + frequency + currency
+!****************************************************************
+
+BEGIN-PROCEDURE Get-PointVal ($matrix_typ,$matrix_cd,$scale_cd,
+                             $effdt,:$Pointyp_cd,:$Pointrtcd,:#Pointval,:$row_freq,:$row_curr,:#std_hours)
+
+            if rtrim($scale_cd, ' ')    = ''
+                      let $scale_cd = ' '
+            end-if
+
+
+let $sql-statement = 'fpaparam.sqc, Get-PoinValelect,PS_FPMSALMATRX_TBL'
+
+BEGIN-SELECT   On-Error=SQL-Error
+
+AR.FP_POINTYP_CD           &FP_POINTYP_CD
+BR.COMP_RATECD             &COMP_RATECD
+BR.FP_POINT_VAL            &FP_POINT_VAL
+BR.COMP_FREQUENCY          &COMP_FREQUENCY
+BR.CURRENCY_CD             &CURRENCY_CD
+BR.STD_HOURS               &STD_HOURS
+
+        Let $Pointyp_cd    = &FP_POINTYP_CD
+        Let $Pointrtcd     = &COMP_RATECD
+        Let #Pointval      = &FP_POINT_VAL
+        Let $row_freq      = &COMP_FREQUENCY
+        Let $row_curr      = &CURRENCY_CD
+        Let #std_hours     = &STD_HOURS
+
+from PS_FPMSALMATRX_TBL AR, PS_FPMPOINTYP_TBL BR , PS_COMP_RATECD_TBL DR
+
+                 where AR.FP_MATRIX_TYP = $matrix_typ
+                 and   AR.FP_MATRIX_CD  = $matrix_cd
+                 and   AR.FP_SCALE_CD   = $scale_cd
+                 and   AR.EFF_STATUS    = 'A'
+                 and   BR.EFF_STATUS    = 'A'
+                 and   BR.FP_POINTYP_CD = AR.FP_POINTYP_CD
+                 and   BR.COMP_RATECD   = DR.COMP_RATECD
+                 and   AR.EFFDT   =
+                           (SELECT max(BQ.EFFDT) from PS_FPMSALMATRX_TBL BQ
+                                where BQ.FP_MATRIX_TYP =  AR.FP_MATRIX_TYP
+                                and   BQ.FP_MATRIX_CD  =  AR.FP_MATRIX_CD
+                                and   BQ.FP_SCALE_CD   =  AR.FP_SCALE_CD
+                                and   BQ.EFFDT        <=  {DATEIN-PREFIX}$effdt{DATEIN-SUFFIX})
+                 and   BR.EFFDT =
+                      (SELECT MAX(B_ED.EFFDT) FROM PS_FPMPOINTYP_TBL B_ED
+                       WHERE BR.FP_POINTYP_CD = B_ED.FP_POINTYP_CD
+                         AND B_ED.EFFDT     <= {DATEIN-PREFIX}$effdt{DATEIN-SUFFIX})
+                 and   DR.EFFDT =
+                          (SELECT MAX(D_ED.EFFDT) FROM PS_COMP_RATECD_TBL D_ED
+                           WHERE DR.COMP_RATECD = D_ED.COMP_RATECD
+                           AND     D_ED.EFFDT <= {DATEIN-PREFIX}$effdt{DATEIN-SUFFIX})
+
+END-SELECT
+
+END-PROCEDURE Get-PointVal
+!__________________________________________________________________________________________
+
+!****************************************************************
+! Get-PoinTypValRtcd : Retrieve Point type, Ratecode and Point value
+!
+!       IN      $matrix_typ     Grades table type
+!               $matrix_cd      Grades table code
+!               $scale_cd       Scale
+!               $effdt          Effective date
+!               #Refer_in       Reference for corresponding amount
+!
+!       OUT     $Pointyp_cd     Type de point
+!               $Pointrtcd      Attached ratecode
+!               #Pointval       Point value
+!               #Ann_ref_amt    Annually amount
+!               #Month_ref_amt  Monthly amount
+!               #Hour_ref_amt   Hourly amount
+!
+!
+!This function get Point-Type RateCode Point value  + References amount (monthly
+!hourly or annually ) with frequence type  , frequency and currency
+!as far as Reference (#refer_in) is passed to the function
+!****************************************************************
+BEGIN-PROCEDURE Get-PoinTypValRtcd ($matrix_typ,$matrix_cd,$scale_cd, $effdt,#refer_in,:$Pointyp_cd,:$Pointrtcd, :#Pointval,:#Ann_ref_amt,:#Month_ref_amt,:#Hour_ref_amt,:$freq_type,:$row_freq,:$row_curr,:#std_hours)
+
+let $sql-statement = 'Get-PoinTypValRtcd ,Select,PS_FPMSALMATRX_TBL'
+
+        let $scale_cd = rtrim($scale_cd,' ')
+        if $scale_cd = ''
+               let $scale_cd = ' '
+        end-if
+
+BEGIN-SELECT   On-Error=SQL-Error
+
+AV1.FP_POINTYP_CD           &FP_POINTYP_CD
+BV1.COMP_RATECD             &COMP_RATECD
+BV1.FP_POINT_VAL            &FP_POINT_VAL
+BV1.STD_HOURS               &STD_HOURS
+CV1.FP_ANNL_AMT             &FP_ANNL_AMT
+CV1.FP_MONTH_AMT            &FP_MONTH_AMT
+CV1.FP_HOUR_AMT             &FP_HOUR_AMT
+EV1.FREQUENCY_TYPE          &FREQUENCY_TYPE
+DV1.COMP_FREQUENCY          &COMP_FREQUENCY
+DV1.CURRENCY_CD             &CURRENCY_CD
+
+        Let $Pointyp_cd    = &FP_POINTYP_CD
+        Let $Pointrtcd     = &COMP_RATECD
+        Let #Pointval      = &FP_POINT_VAL
+        Let #std_hours     = &STD_HOURS
+        Let #Ann_ref_amt   = &FP_ANNL_AMT
+        Let #Ann_ref_amt   = &FP_ANNL_AMT
+        Let #Month_ref_amt = &FP_MONTH_AMT
+        Let #Hour_ref_amt  = &FP_HOUR_AMT
+        Let $freq_type     = &FREQUENCY_TYPE
+        Let $row_freq      = &COMP_FREQUENCY
+        Let $row_curr      = &CURRENCY_CD
+
+!-------------------------------------------------------------------------------------------------
+!-------------------------------------------------------------------------------------------------
+
+from PS_FPMSALMATRX_TBL AV1, PS_FPMPOINTYP_TBL BV1, PS_FPMINDEXAMT_TBL CV1, PS_COMP_RATECD_TBL DV1, PS_FREQUENCY_TBL EV1
+
+where AV1.FP_MATRIX_TYP = $matrix_typ
+and   AV1.FP_MATRIX_CD  = $matrix_cd
+and   AV1.FP_SCALE_CD   = $scale_cd
+and   AV1.EFF_STATUS    = 'A'
+and   BV1.EFF_STATUS    = 'A'
+and   DV1.EFF_STATUS    = 'A'
+and   BV1.FP_POINTYP_CD = AV1.FP_POINTYP_CD
+and   BV1.FP_POINTYP_CD = CV1.FP_POINTYP_CD
+and   CV1.FP_INCS_IND   = #refer_in
+and   BV1.COMP_RATECD   = DV1.COMP_RATECD
+and   EV1.FREQUENCY_ID  = DV1.COMP_FREQUENCY
+and   EV1.EFF_STATUS    = 'A'
+and   AV1.EFFDT         =
+        (SELECT max(BV2.EFFDT) from PS_FPMSALMATRX_TBL BV2
+        where BV2.FP_MATRIX_TYP =  AV1.FP_MATRIX_TYP
+        and   BV2.FP_MATRIX_CD  =  AV1.FP_MATRIX_CD
+        and   BV2.FP_SCALE_CD   =  AV1.FP_SCALE_CD
+        and   BV2.EFFDT         <= {DATEIN-PREFIX}$effdt{DATEIN-SUFFIX})
+and   BV1.EFFDT =
+        (SELECT MAX(B_ED.EFFDT) FROM PS_FPMPOINTYP_TBL B_ED
+        WHERE BV1.FP_POINTYP_CD = B_ED.FP_POINTYP_CD
+          AND B_ED.EFFDT <= {DATEIN-PREFIX}$effdt{DATEIN-SUFFIX})
+and   CV1.EFFDT = BV1.EFFDT
+and   DV1.EFFDT =
+        (SELECT MAX(D_ED.EFFDT) FROM PS_COMP_RATECD_TBL D_ED
+        WHERE DV1.COMP_RATECD = D_ED.COMP_RATECD
+          AND D_ED.EFFDT <= {DATEIN-PREFIX}$effdt{DATEIN-SUFFIX})
+and   EV1.EFFDT =
+        (SELECT MAX(E_ED.EFFDT) FROM PS_FREQUENCY_TBL E_ED
+        WHERE EV1.FREQUENCY_ID = E_ED.FREQUENCY_ID
+        AND   E_ED.EFFDT      <= {DATEIN-PREFIX}$effdt{DATEIN-SUFFIX})
+
+END-SELECT
+
+END-PROCEDURE Get-PoinTypValRtcd
+
+!__________________________________________________________________________________________
+!****************************************************************
+! Get-Proration-Factor : Retrieve   the  proration factors from status and part time data
+!
+!       IN   $_fusi_buffer_FP_LEGALSTAT_CD        Employee status
+!            $part_time                           Employee Part time
+!
+!       OUT     #proration_factor1     Main-salary proration factor
+!               #proration_factor2     Other items proration factor
+!
+!****************************************************************
+
+BEGIN-PROCEDURE Get-Proration-Factor ($_fusi_buffer_FP_LEGALSTAT_CD,$part_time,
+                             $effdt,:#proration_factor1,:#proration_factor2)
+
+let $sql-statement = 'Get-Proration-Factor ,Select,PS_FPMFRACPYMT_TBL'
+BEGIN-SELECT   On-Error=SQL-Error
+
+P.FP_FRACPYMT_NOM1      &FP_FRACPYMT_NOM1
+P.FP_FRACPYMT_DEN1      &FP_FRACPYMT_DEN1
+P.FP_FRACPYMT_NOM2      &FP_FRACPYMT_NOM2
+P.FP_FRACPYMT_DEN2      &FP_FRACPYMT_DEN2
+
+      Let #FP_FRACPYMT_NOM1  =    &FP_FRACPYMT_NOM1
+      Let #FP_FRACPYMT_DEN1  =    &FP_FRACPYMT_DEN1
+      Let #FP_FRACPYMT_NOM2  =    &FP_FRACPYMT_NOM2
+      Let #FP_FRACPYMT_DEN2  =    &FP_FRACPYMT_DEN2
+
+       If #FP_FRACPYMT_DEN1 <>0
+       Let #proration_factor1 = #FP_FRACPYMT_NOM1/#FP_FRACPYMT_DEN1
+       Else
+       Let #proration_factor1=0
+       end-if
+
+       If #FP_FRACPYMT_DEN2 <>0
+       Let #proration_factor2 = #FP_FRACPYMT_NOM2/#FP_FRACPYMT_DEN2
+       Else
+       Let #proration_factor2 =0
+       end-if
+
+from PS_FPMFRACPYMT_TBL P
+
+Where
+              P.FP_LEGALSTAT_CD = $_fusi_buffer_FP_LEGALSTAT_CD
+              and P.FP_PT_PCT = $part_time
+              and P.EFFDT =
+                   (SELECT MAX(P1.EFFDT) FROM PS_FPMFRACPYMT_TBL P1
+                    WHERE P1.FP_LEGALSTAT_CD = $_fusi_buffer_FP_LEGALSTAT_CD
+                    and  P1.FP_PT_PCT = $part_time
+                    AND P1.EFFDT <= {DATEIN-PREFIX}$effdt{DATEIN-SUFFIX})
+
+END-SELECT
+
+END-PROCEDURE Get-Proration-Factor
+
+!___________________________________________________________________________________________________
+!****************************************************************
+! fpjob-additive-insert    : Compensation amounts  to insert in JOB
+!****************************************************************
+BEGIN-PROCEDURE fpjob-additive-insert
+
+   Let #fusi_buffer_comprate = #rows_total
+
+   do Convert-Frequency($effdt_abs1,#rows_total ,$mcop_freq_abs1,'A',#std_hours_abs1,'M',#fusi_buffer_annual_rt)
+   do Convert-Frequency($effdt_abs1,#rows_total ,$mcop_freq_abs1,'M',#std_hours_abs1,'M',#fusi_buffer_monthly_rt)
+   do Convert-Frequency($effdt_abs1,#rows_total ,$mcop_freq_abs1,'D',#std_hours_abs1,'M',#fusi_buffer_daily_rt)
+   do Convert-Frequency($effdt_abs1,#rows_total ,$mcop_freq_abs1,'H',#std_hours_abs1,'M',#fusi_buffer_hourly_rt)
+
+!              if   $prev_COMP_FREQUENCY = '' or $prev_CURRENCY_CD = ''  or #prev_COMPRATE =0
+!                 let #previous_comprate  = 0
+!              else
+!
+!                 do ConvertCurrency(#prev_COMPRATE,$prev_CURRENCY_CD,$mcop_curr_abs1,$BaseRtType,$effdt_abs1,#inter_rate,'W')
+!
+!                 do Convert-Frequency($effdt_abs1,#inter_rate,$prev_COMP_FREQUENCY,$mcop_freq_abs1,#std_hours_abs1,'M',#previous_comprate)
+!
+!              end-if
+
+   Let #fusi_buffer_CHANGE_AMT               =   #rows_total - #previous_comprate
+
+   if  #previous_comprate <> 0
+             let #fusi_buffer_CHANGE_PCT     =   100 * #fusi_buffer_CHANGE_AMT / #previous_comprate
+   End-if
+
+        Let $fusi_buffer_CURRENCY_CD      = $mcop_curr_abs1
+        Let $fusi_buffer_COMP_FREQUENCY   = $mcop_freq_abs1
+        Let $fusi_buffer_FP_POINTYP_CD    = $pointyp_cd_abs1
+
+print $fusi_emplid (,1)
+print #fusi_empl_rcd (,15)
+print $effdt_abs1 (,19)
+print $setid_jobcd_abs1 (,32)
+print $jobcode_abs1 (,41)
+print $setid_rank_abs1 (,50)
+print $rank_cd_abs1 (,59)
+print $fusi_buffer_COMP_FREQUENCY (,68)
+print $fusi_buffer_CURRENCY_CD (,72)
+print #incs_ind_abs1 (+1,1)
+print #std_hours_abs1 (+1,8)
+print #fusi_buffer_comprate (+1,15)
+print #fusi_buffer_annual_rt (+1,30)
+print #fusi_buffer_monthly_rt (+1,45)
+print #fusi_buffer_daily_rt (+1,60)
+print #fusi_buffer_hourly_rt (+1,75)
+print #fusi_buffer_CHANGE_AMT (+1,90)
+print #fusi_buffer_CHANGE_PCT (+1,105)
+
+END-PROCEDURE fpjob-additive-insert
+
+!----------------------------------------------------------------------!
+! Procedure:    Update_CI                                              !
+! Description:  Updates FPA_CI_OG with the stream numbers              !
+!----------------------------------------------------------------------!
+
+
+begin-procedure Update_CI
+
+SHOW 'ENTRO '
+
+begin-select On-Error=SQL-Error 
+
+count(*) &Chunk
+
+   let #UPD = round(&Chunk/#str,0)
+   
+    
+FROM PS_FPA_CI_JOB
+end-select
+
+do Format-Number(#UPD, $UPDent, '999999')
+
+
+#ifdef ORACLE
+let $Where = ' ROWNUM <= '||$UPDent||' AND STRM_NUM=1'
+#else
+let $Where = 'EMPLID IN (SELECT TOP '||$UPDent||' EMPLID From PS_FPA_CI_JOB where STRM_NUM=1)'
+#end-if
+
+
+Let #indice=2
+
+
+While #indice <= #str
+
+begin-sql On-Error=SQL-Error
+update PS_FPA_CI_JOB
+set STRM_NUM = #indice
+WHERE [$Where]
+
+end-sql
+
+
+
+!begin-sql On-Error=SQL-Error
+!update PS_FPA_CI_JOB
+!set STRM_NUM = #indice
+!WHERE EMPLID IN (SELECT EMPLID From PS_FPA_CI_JOB where STRM_NUM= #indice) AND STRM_NUM=1
+!end-sql
+
+
+add 1 to #indice
+end-while
+
+end-procedure
