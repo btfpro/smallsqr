@@ -11,70 +11,38 @@ var findInFiles = require('find-in-files');
 var excludeFiles = ['setenv.sqc','setup02.sqc','number.sqc','datetime.sqc','curdttim.sqc','stdapi.sqc','datemath.sqc'];
 
 
-const traverseProcedure = (parentprocName,fileName,isInclude, procList) => {  //TODO:Needs to be changed to accept list of procudures and chang method accordingly.
-    console.log(procList);
-    console.log(isInclude);
-    console.log(fileName);
-    if(!procList || procList.length == 0) {
-        return;
-    }
-    var procAppendTerm = '(';
-    procList.forEach(function(procName){
-        procName = procName.replace("do","");
-        procAppendTerm = procAppendTerm +procName.trim()+'|';
-    });
-    procAppendTerm = procAppendTerm.replace(/\|$/,')');
-
-    console.log('All Procedure Names for Regex :'+procAppendTerm);
-    var procTerm = '^Begin-Procedure\\s+'+procAppendTerm+'[^]*?End-Procedure$';  //TODO change this to handel multi space and file Includes
-    //var term = '^Begin-Procedure\\s+'+procAppendTerm+'[^]*?End-Procedure$';
-    var incTerm = 'Include.*sqc';
-    var term = '('+procTerm+'|'+incTerm+')';
+const traverseProcedure = (parentprocName,fileName,isInclude, procName) => {  //TODO:Needs to be changed to accept list of procudures and chang method accordingly.
+    //console.log(procName);
+    //console.log(isInclude);
+    //console.log(fileName);
+    procName = procName.replace("do","");
+    console.log('Begin-Procedure :'+procName.trim());
+    var term = '^Begin-Procedure\\s'+procName.trim()+'[^]*?End-Procedure$';
     //console.log(term);
     var reGex = {'term': term, 'flags': 'igm'};  //"^Begin-Program[^]*?End-Program$"
     findInFiles.find(reGex,"/Users/voddes/Extras/UD/SQR_Project/SQR_Unix_PRD",fileName)
         .then(function(results) {
-            //console.log(results);
-            //var res = results[0];
+
             for (var result in results) {
                 var res = results[result];
-                var procList = [];
-                for (var itr in res.matches) {
-                    var matchText = res.matches[itr];
-
-                    //TODO:findout and seperate file includes.
-                    //console.log(matchText);
-                    var procedures = new Set(matchText.match(/do\s(\w+)(-?(\w+)?)*/igm)); //
-                    console.log(procedures);
-                    var procName = matchText.match(/^Begin-Procedure\s(\w+)(-?(\w+)?)*/ig)[0].replace('Begin-Procedure ',''); //find proc
-                    procList.delete(procName);  //Delete found proc
-                    if (procedures.size > 0)
-                        traverseProcedure(parentprocName,fileName,false,procedures);
-                }
+                var matchText = res.matches[0];
+                //console.log(matchText);
+                var procedures = matchText.match(/do\s(\w+)(-?(\w+)?)*/igm);
+                console.log(procedures);
+                //procedures.forEach(traverseProcedure.bind(null,procName,fileName,false));
+                procedures.forEach(function(proc){
+                    if (proc !== parentprocName)
+                        traverseProcedure.bind(null,parentprocName,fileName,false,proc);
+                });
+                /*console.log(results);
+                 console.log(result);
+                 console.log(res);
+                 console.log(
+                 'found "' + res.matches[0] + '" ' + res.count
+                 + ' times in "' + result + '"'
+                 );*/
             }
-
-            /*if (procList && procList!= 0) {
-                if (!isInclude) {
-                    var reGex = {'term': "Include.*sqc", 'flags': 'igm'};
-                    findInFiles.find(reGex, "/Users/voddes/Extras/UD/SQR_Project/SQR_Unix_PRD", fileName)//TODO:This can be merged with above find
-                        .then(function (results) {
-                            //console.log(results);
-                            for (var result in results) {
-                                var res = results[result];
-                                res.matches.forEach(function (sqrFileStr) {
-                                    sqrFileStr = sqrFileStr.replace(/Include|\\s|\'/gi, "");
-                                    console.log(procList + ' Searching in File: ' + sqrFileStr);
-                                    traverseProcedure(parentprocName,sqrFileStr.trim(), true, procList);
-                                });
-                                //var matchText = res.matches[0];
-                                //console.log(matchText);
-                            }
-                        });
-                } else {
-
-                }
-            }*/
-            /*if(!isInclude && Object.keys(results).length === 0) {
+            if(!isInclude && Object.keys(results).length === 0) {
                 console.log(procName + ': Not found in :' + fileName);
                 if (!isInclude) {
                     //console.log(procName + ': Not found in :' + fileName);
@@ -99,7 +67,7 @@ const traverseProcedure = (parentprocName,fileName,isInclude, procList) => {  //
                 } else {
                     //console.log(procName + ': Not found in :' + fileName);
                 }
-            }*/
+            }
         });
     //1.find in file
     //2.if not found find in all includes
@@ -123,10 +91,10 @@ const slone = (fileName,dirPath) => {
                 var res = results[result];
                 var matchText = res.matches[0];
                 console.log(matchText);
-                var procedures = new Set(matchText.match(/do\s(\w+)(-?(\w+)?)*/igm));  //Set will remove duplicates
+                var procedures = matchText.match(/do\s(\w+)(-?(\w+)?)*/igm);
                 //console.log(procedures);
                 //procedures.forEach(traverseProcedure.bind(null,null,fileName,false));
-                traverseProcedure(null,fileName,false, procedures);
+                procedures.forEach(traverseProcedure.bind(null,null,fileName,false));
                 /*console.log(results);
                 console.log(result);
                 console.log(res);
