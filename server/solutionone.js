@@ -11,7 +11,7 @@ var findInFiles = require('find-in-files');
 var excludeFiles = ['setenv.sqc','setup02.sqc','number.sqc','datetime.sqc','curdttim.sqc','stdapi.sqc','datemath.sqc'];
 let SQR_FOLDER_PATH = __dirname+'/../uploads/sqrfiles'; // "/Users/voddes/Extras/UD/SQR_Project/SQR_Unix_PRD";
 console.log(SQR_FOLDER_PATH);
-let FILE_NAME = 'ravi2.sqr'; // '1.sqr'; // "bas003.sqr";
+let FILE_NAME = 'bas003.sqr'; // '1.sqr'; // "bas003.sqr";
 
 const traverseProcedure = (parentprocName,fileName,isInclude, procList) => {  //TODO:Needs to be changed to accept list of procudures and chang method accordingly.
     // console.log(isInclude);
@@ -57,7 +57,7 @@ const traverseProcedure = (parentprocName,fileName,isInclude, procList) => {  //
                         let beginProcMatch = matchText.match(/^Begin-Procedure\s(\w+)(-?(\w+)?)*/ig);
                         var procName = beginProcMatch && beginProcMatch[0].replace('Begin-Procedure ', ''); //find proc
                         procName && procList.delete('do '+procName); // Delete found proc
-                        console.log("\x1b[36m%s\x1b[0m", "found proc name: ", procName + " in " + fileName, "child procs: ", procedures);
+                        console.log("\x1b[42m%s\x1b[0m", "found proc name: ", procName + " in " + fileName, "child procs: ", procedures);
                         if (procedures.size > 0) {
                             traverseProcedure(parentprocName, fileName, false, procedures);
                         }
