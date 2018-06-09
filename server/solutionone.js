@@ -11,15 +11,15 @@ var findInFiles = require('find-in-files');
 var excludeFiles = ['setenv.sqc','setup02.sqc','number.sqc','datetime.sqc','curdttim.sqc','stdapi.sqc','datemath.sqc'];
 let SQR_FOLDER_PATH = __dirname+'/../uploads/sqrfiles'; // "/Users/voddes/Extras/UD/SQR_Project/SQR_Unix_PRD";
 console.log(SQR_FOLDER_PATH);
-let FILE_NAME = 'bas003.sqr'; // '1.sqr'; // "bas003.sqr";
+let FILE_NAME = 'ravi2.sqr'; // '1.sqr'; // "bas003.sqr";
 
 const traverseProcedure = (parentprocName,fileName,isInclude, procList) => {  //TODO:Needs to be changed to accept list of procudures and chang method accordingly.
-    console.log("traverse these procedures: ", procList);
-    console.log(isInclude);
-    console.log(fileName);
-    if(!procList || procList.length == 0) {
+    // console.log(isInclude);
+    // console.log(fileName);
+    if(!procList || procList.size == 0) {
         return;
     }
+    console.log("traverse these", procList, " procedures in : " + fileName);
     var procAppendTerm = '(';
     procList.forEach(function(procName){
         procName = procName.replace(/do/ig,"");
@@ -27,14 +27,14 @@ const traverseProcedure = (parentprocName,fileName,isInclude, procList) => {  //
     });
     procAppendTerm = procAppendTerm.replace(/\|$/,')');
 
-    console.log('All Procedure Names for Regex :'+procAppendTerm);
+    // console.log('All Procedure Names for Regex :'+procAppendTerm);
     var procTerm = '^Begin-Procedure\\s+'+procAppendTerm+'[^]*?End-Procedure$';  //TODO change this to handel multi space and file Includes
     //var term = '^Begin-Procedure\\s+'+procAppendTerm+'[^]*?End-Procedure$';
     var incTerm = 'Include.*sqc';
     var term = '('+procTerm+'|'+incTerm+')';
     //console.log(term);
     var reGex = {'term': term, 'flags': 'igm'};  //"^Begin-Program[^]*?End-Program$"
-    findInFiles.find(reGex,SQR_FOLDER_PATH,fileName)
+    findInFiles.findSync(reGex,SQR_FOLDER_PATH,fileName)
         .then(function(results) {
             let includes = [];
             let begins = [];
@@ -44,36 +44,34 @@ const traverseProcedure = (parentprocName,fileName,isInclude, procList) => {  //
                 var res = results[result];
                 // var procList = [];
                 
-                let fileName;
+                let fileName1;
                 res.matches.forEach((matchText) => {
                     if (matchText.match(/include\s/igm)) {
-                        fileName = matchText.replace(/include\s/igm, '');
-                        fileName = fileName.replace("'", '');
-                        includes.push(fileName);
+                        fileName1 = matchText.replace(/include\s/igm, '');
+                        fileName1 = fileName1.replace("'", '');
+                        includes.push(fileName1);
                     }
                     if (matchText.match(/Begin-Procedure\s(\w+)(-?(\w+)?)*/igm)) {
                         begins.push(matchText);
                         var procedures = new Set(matchText.match(/do\s(\w+)(-?(\w+)?)*/igm)); //
                         let beginProcMatch = matchText.match(/^Begin-Procedure\s(\w+)(-?(\w+)?)*/ig);
                         var procName = beginProcMatch && beginProcMatch[0].replace('Begin-Procedure ', ''); //find proc
-                        procName && procList.delete(procName); // Delete found proc
-                        console.log("proc name: ",procName, "procs: ", procedures);
+                        procName && procList.delete('do '+procName); // Delete found proc
+                        console.log("\x1b[36m%s\x1b[0m", "found proc name: ", procName + " in " + fileName, "child procs: ", procedures);
                         if (procedures.size > 0) {
                             traverseProcedure(parentprocName, fileName, false, procedures);
                         }
+                        
                     }
                 });
+                console.log("remaing procs: ", procList);
                 includes = includes.filter((el) => !excludeFiles.includes(el));
-                if (procList && procList.length !== 0) {
-                    // procList.forEach((procItem) => {
-                        includes.forEach((includeFile) => {
-                            // traverseProcedure(null, includeFile, false, [procItem]);
-                            traverseProcedure(null, includeFile, false, procList);
-                        });
-                    // });
-                }
-                
                 console.log("include files:", includes);
+                if (procList && procList.length !== 0) {
+                        includes.forEach((includeFile) => {
+                            traverseProcedure(null, '^'+includeFile, false, procList);
+                        });
+                }
             }
 
             
@@ -141,8 +139,8 @@ const slone = (fileName,dirPath) => {
     var reGex = {'term': "^Begin-Program[^]*?End-Program$", 'flags': 'igm'};
     //var reGex = {'term': "^Begin-Procedure\\sInit-Report[^]*?End-Procedure$", 'flags': 'igm'};
     //findInFiles.find(reGex,dirPath,fileName)
-    fileName = fileName || FILE_NAME;
-    findInFiles.find(reGex, SQR_FOLDER_PATH, FILE_NAME)
+    fileName = fileName || '^'+FILE_NAME;
+    findInFiles.find(reGex, SQR_FOLDER_PATH, fileName)
         .then(function(results) {
 
             for (var result in results) {
@@ -162,7 +160,6 @@ const slone = (fileName,dirPath) => {
                 );*/
             }
         });
-
 }
 // slone();
 
