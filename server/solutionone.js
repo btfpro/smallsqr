@@ -64,13 +64,14 @@ const traverseProcedure = (parentprocName,fileName,isInclude, procList) => {  //
                         
                     }
                 });
-                console.log("remaing procs: ", procList);
+                console.log("remaining procs: ", procList);
                 includes = includes.filter((el) => !excludeFiles.includes(el));
                 console.log("include files:", includes);
+                // TODO: search remaining procs in include files one by one, if we find in first file, do not search in other sqc files
                 if (procList && procList.length !== 0) {
-                        includes.forEach((includeFile) => {
-                            traverseProcedure(null, '^'+includeFile, false, procList);
-                        });
+                    includes.forEach((includeFile) => {
+                        traverseProcedure(null, '^'+includeFile, false, procList);
+                    });
                 }
             }
 
@@ -134,7 +135,7 @@ const traverseProcedure = (parentprocName,fileName,isInclude, procList) => {  //
 
 }
 
-const slone = (fileName,dirPath) => {
+const slone = (fileName, dirPath) => {
 
     var reGex = {'term': "^Begin-Program[^]*?End-Program$", 'flags': 'igm'};
     //var reGex = {'term': "^Begin-Procedure\\sInit-Report[^]*?End-Procedure$", 'flags': 'igm'};
