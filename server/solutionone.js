@@ -7,12 +7,13 @@ const Promise = require('bluebird');
 const express = require('express');
 //const readline = require('readline');
 const fs = require('fs');
-var findInFiles = require('find-in-files');
-var excludeFiles = ['setenv.sqc','setup02.sqc','number.sqc','datetime.sqc','curdttim.sqc','stdapi.sqc','datemath.sqc'];
+let findInFiles = require('find-in-files');
+let excludeFiles = ['setenv.sqc','setup02.sqc','number.sqc','datetime.sqc','curdttim.sqc','stdapi.sqc','datemath.sqc'];
 let SQR_FOLDER_PATH = __dirname+'/../uploads/sqrfiles'; // "/Users/voddes/Extras/UD/SQR_Project/SQR_Unix_PRD";
 let FILE_NAME = 'bas003.sqr'; // 'ravi2.sqr'; // "bas003.sqr";
 let OUTPUT_FILE = fs.createWriteStream(__dirname+'/../uploads/solone_output.txt', {});
-var isInclude = false;
+let isInclude = false;
+
 
 
 const traverseProcedure = (fileName,isInclude, procList) => {  //TODO:Needs to be changed to accept list of procudures and chang method accordingly.
@@ -79,7 +80,7 @@ const traverseProcedure = (fileName,isInclude, procList) => {  //TODO:Needs to b
                         if (procList && procList.length !== 0 && !isInclude) {
                             //includes.forEach((includeFile) => {
                             Promise.each(includes, (includeFile) => {
-                                traverseProcedure( '^'+includeFile, true, procList );
+                                traverseProcedure( '^'+includeFile+'$', true, procList );
 
                         });
                     }
@@ -154,7 +155,7 @@ const slone = (fileName, dirPath) => {
     var reGex = {'term': "^Begin-Program[^]*?End-Program$", 'flags': 'igm'};
     //var reGex = {'term': "^Begin-Procedure\\sInit-Report[^]*?End-Procedure$", 'flags': 'igm'};
     //findInFiles.find(reGex,dirPath,fileName)
-    fileName = fileName || '^'+FILE_NAME;
+    fileName = fileName || '^'+FILE_NAME+'$';
     findInFiles.find(reGex, SQR_FOLDER_PATH, fileName)
         .then(function(results) {
 
