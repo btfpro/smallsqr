@@ -51,6 +51,7 @@ app.get('/slone', function (req, res) {
 
 app.post('/upload', function (req, res) {
     let uploadedFileName = "";
+    const baseSQRFile = req.query.base || 'bas003.sqr';
     // create an incoming form object
     var form = new formidable.IncomingForm();
 
@@ -83,7 +84,7 @@ app.post('/upload', function (req, res) {
             extract(form.uploadDir + '/' + uploadedFileName, {
                 dir: form.uploadDir
             }, function (err) {
-                slone('bas003.sqr', form.uploadDir, form.uploadDir + '/output.txt').then((success) => {
+                slone(baseSQRFile, form.uploadDir, form.uploadDir + '/output.txt').then((success) => {
                     res
                         .status(200)
                         .send('/v1/ab7820028322' + form.uploadDir.replace(__dirname, "") + '/output.txt');
