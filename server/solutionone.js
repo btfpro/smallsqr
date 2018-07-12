@@ -7,9 +7,8 @@ const express = require('express');
 //const readline = require('readline');
 const fs = require('fs');
 const findInFiles = require('find-in-files');
-const { table } = require('table');
-// const {table} = require('table');
-// import {createStream} from 'table';
+const {table} = require('table');
+// const {table} = require('table'); import {createStream} from 'table';
 
 let excludeFiles = [
     'setenv.sqc',
@@ -23,6 +22,7 @@ let excludeFiles = [
 let SQR_FOLDER_PATH = __dirname + '/../uploads/sqrfiles'; // "/Users/voddes/Extras/UD/SQR_Project/SQR_Unix_PRD";
 let FILE_NAME = 'bas003.sqr'; // 'ravi2.sqr'; // "bas003.sqr";
 let OUTPUT_FILE = fs.createWriteStream(__dirname + '/../uploads/solone_output.txt', {});
+let OUTPUT_FILE_PATH = __dirname + '/../uploads/solone_output.txt';
 let isInclude = false;
 let config,
     data,
@@ -31,7 +31,7 @@ let config,
 let tableData;
 
 let tableConfig = {
-    
+
     columns: {
         0: {
             width: 10,
@@ -39,9 +39,9 @@ let tableConfig = {
         },
         1: {
             alignment: 'center',
-            width : 10
+            width: 10
         },
-        2 : {
+        2: {
             alignment: 'left'
         }
     }
@@ -49,7 +49,7 @@ let tableConfig = {
 
 // const stream = createStream(tableConfig);
 
-const traverseProcedure = (fileName, isInclude, procList) => { //TODO:Needs to be changed to accept list of procudures and chang method accordingly.
+const traverseProcedure = (fileName, isInclude, procList, dirPath, outputFile) => { //TODO:Needs to be changed to accept list of procudures and chang method accordingly.
     // console.log(isInclude); console.log(fileName);
 
     if (!procList || procList.size == 0) {
@@ -74,7 +74,7 @@ const traverseProcedure = (fileName, isInclude, procList) => { //TODO:Needs to b
         'flags': 'igm'
     }; //"^Begin-Program[^]*?End-Program$"
     return findInFiles
-        .findSync(reGex, SQR_FOLDER_PATH, fileName)
+        .findSync(reGex, dirPath, fileName)
         .then(function (results) {
             let includes = [];
             let begins = [];
@@ -99,7 +99,7 @@ const traverseProcedure = (fileName, isInclude, procList) => { //TODO:Needs to b
                         let beginProcMatch = matchText.match(/^Begin-Procedure\s(\w+)(-?(\w+)?)*/ig);
                         var procName = beginProcMatch && beginProcMatch[0].replace(/Begin-Procedure\s/ig, ''); //find proc
                         procName && procList.delete('do ' + procName); // Delete found proc
-                        
+
                         let xyz = [
                             procName,
                             fileName,
@@ -107,13 +107,13 @@ const traverseProcedure = (fileName, isInclude, procList) => { //TODO:Needs to b
                         ];
 
                         tableData.push(xyz);
-                        
-                        // stream.write(xyz);
-                        // console.log("\x1b[42m%s\x1b[0m", "found proc name: ", procName + " in " + fileName, "child procs: ", procedures);
-                        OUTPUT_FILE.write('\r\n Procedure Name  : ' + procName + ' fileName :' + fileName);
-                        OUTPUT_FILE.write('\r\n child Process : ' + matchText.match(/do\s(\w+)(-?(\w+)?)*/igm));
+
+                        // stream.write(xyz); console.log("\x1b[42m%s\x1b[0m", "found proc name: ",
+                        // procName + " in " + fileName, "child procs: ", procedures);
+                        outputFile.write('\r\n Procedure Name  : ' + procName + ' fileName :' + fileName);
+                        outputFile.write('\r\n child Process : ' + matchText.match(/do\s(\w+)(-?(\w+)?)*/igm));
                         if (procedures.size > 0) {
-                            traverseProcedure(fileName, false, procedures);
+                            traverseProcedure(fileName, false, procedures, dirPath, outputFile);
                         }
 
                     }
@@ -126,10 +126,10 @@ const traverseProcedure = (fileName, isInclude, procList) => { //TODO:Needs to b
                     if (procList && procList.length !== 0 && !isInclude) {
                         //includes.forEach((includeFile) => {
                         Promise.each(includes, (includeFile) => {
-                            traverseProcedure('^' + includeFile + '$', true, procList);
+                            traverseProcedure('^' + includeFile + '$', true, procList, dirPath, outputFile);
                         }).then(() => {
-                            // console.log('ravi *******************');
-                            // console.log(table(tableData, tableConfig));
+                            // console.log('ravi *******************'); console.log(table(tableData,
+                            // tableConfig));
                         });
                     }
                 });
@@ -192,10 +192,10 @@ const traverseProcedure = (fileName, isInclude, procList) => { //TODO:Needs to b
 
 }
 
-const slone = (fileName, dirPath) => {
+const slone = (fileName, dirPath, outputFilePath) => {
 
     tableData = [
-['Proc Name', 'Where??', 'Child Procs']
+        ['Proc Name', 'Where??', 'Child Procs']
     ];
 
     var reGex = {
@@ -204,21 +204,25 @@ const slone = (fileName, dirPath) => {
     };
     // var reGex = {'term': "^Begin-Procedure\\sInit-Report[^]*?End-Procedure$",
     // 'flags': 'igm'}; findInFiles.find(reGex,dirPath,fileName)
-    fileName = fileName || '^' + FILE_NAME + '$';
-    findInFiles
-        .find(reGex, SQR_FOLDER_PATH, fileName)
-        .then(function (results) {
+    fileName = fileName || FILE_NAME;
+    fileName = '^' + fileName + '$';
 
+    dirPath = dirPath || SQR_FOLDER_PATH;
+    let outputFile = outputFilePath || OUTPUT_FILE_PATH;
+    outputFile = fs.createWriteStream(outputFile);
+    findInFiles
+        .find(reGex, dirPath, fileName)
+        .then(function (results) {
             for (var result in results) {
                 var res = results[result];
                 var matchText = res.matches[0];
                 var procedures = new Set(matchText.match(/do\s(\w+)(-?(\w+)?)*/igm)); //Set will remove duplicates
                 // console.log(procedures);
                 // procedures.forEach(traverseProcedure.bind(null,null,fileName,false));
-                OUTPUT_FILE.write('Found Begin Program in File : ' + fileName);
-                OUTPUT_FILE.write('\n' + matchText.match(/do\s(\w+)(-?(\w+)?)*/igm));
+                outputFile.write('Found Begin Program in File : ' + fileName);
+                outputFile.write('\n' + matchText.match(/do\s(\w+)(-?(\w+)?)*/igm));
                 //console.log(matchText);
-                traverseProcedure(fileName, false, procedures);
+                traverseProcedure(fileName, false, procedures, dirPath, outputFile);
                 /*console.log(results);
                 console.log(result);
                 console.log(res);
@@ -228,10 +232,22 @@ const slone = (fileName, dirPath) => {
                 );*/
             }
         });
-    // TODO: listen for done event and print
-    setTimeout(() => {
-        console.log(table(tableData, tableConfig));
-    }, 4000);
+
+    return new Promise((resolve, reject) => {
+        // TODO: listen for done event and print
+        setTimeout(() => {
+            let output = table(tableData, tableConfig);
+            console.log(output);
+            fs.writeFile(outputFilePath, output, "utf8", function (err) {
+                if (err) {
+                    return reject('error');
+                }
+                resolve('success');
+            });
+
+        }, 5000);
+
+    });
 }
 
 async function asyncForEach(array, callback) {
@@ -240,7 +256,6 @@ async function asyncForEach(array, callback) {
     }
 }
 
-slone();
 //OUTPUT_FILE.end(); module.exports = slone;
 
 /*const slone = (inputfile,opfile) => new Promise((resolve, reject) => {
@@ -275,4 +290,5 @@ resolve();
 
 }*/
 
-//module.exports = slone;
+module.exports = slone;
+// slone();
