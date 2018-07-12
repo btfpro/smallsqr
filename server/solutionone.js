@@ -228,7 +228,7 @@ const slone = (fileName, dirPath) => {
                 );*/
             }
         });
-
+    // TODO: listen for done event and print
     setTimeout(() => {
         console.log(table(tableData, tableConfig));
     }, 4000);
