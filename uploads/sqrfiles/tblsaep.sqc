@@ -1,0 +1,506 @@
+!***********************************************************************
+! TBLSAEP: Analysis of Table Access by Application Engine Programs
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module contains confidential and proprietary information        *
+! of Oracle; it is not to be copied, reproduced, or transmitted        *
+! in any form, by any means, in whole or in part, nor is it to         *
+! be used for any purpose other than that for which it is              *
+! expressly provided under the applicable license agreement.           *
+!                                                                      *
+! Copyright (C) 2006 Oracle. All Rights Reserved.                      *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+!          $Date:  2006/07/19:15:34:36                                 !
+!       $Release:  HR9                                                 !
+!      $Revision:  101                                                 !
+!                                                                      *
+!***********************************************************************
+
+#define AE_PGM_LEN       12
+#define AE_SECTION_LEN   8
+#define SECTION_MAIN     'MAIN'
+#define TYPE_PROCESS     'P'
+#define TYPE_PRCSJOB     'J'
+#define TYPE_AELIB       'A'
+
+#define COMMA            ','
+#define SPACE            ' '
+#define PS_PREFIX        'PS'
+#define SQL_UPDATE       'UPDATE '
+#define SQL_INSERT       'INSERT '
+#define SQL_INSERT2      '%INSERTSELECT'
+#define SQL_DELETE       'DELETE '
+#define SQL_SELECT1      'SELECT'
+#define SQL_SELECT2      '%SELECT'
+#define SQL_TRUNCATE     '%TRUNCATETABLE'
+#define SQL_UPDSTATS     '%UPDATESTATS'
+#define SQL_EXECUTE      '%EXECUTE'
+#define SQL_METATABLE    '%TABLE'
+#define SQL_SQLOBJ       '%SQL('
+
+!***********************************
+begin-procedure Analyze-AEP-Programs
+!***********************************
+
+   do Init-AEP-Report
+   do Step-Through-TopLevel-AEPs
+
+end-procedure
+
+!*******************************
+begin-procedure Init-AEP-Report
+!*******************************
+
+   !----- Establish global variables -----
+   let #CallListStackPtr = 0
+
+   !----- Initialize Utility Libraries -----
+   do Set-Ignore-Quoted-String(0)
+
+   !----- Create Application Arrays -----
+   create-array name=CallListStack size={STACK_SIZE}
+   field=Pgm:char
+   field=Section:char
+
+end-procedure
+
+!*****************************************
+begin-procedure Step-Through-TopLevel-AEPs
+!*****************************************
+
+Begin-SELECT Distinct
+P.PRCSNAME     &AE.PRCSNAME,
+P.DESCR        &AE.DESCR,
+{TYPE_PROCESS} &AE.PROGTYPE
+
+   !Reset to prepare for analysis...
+   do ClearLinkedList
+   do ClearStack
+   do ClearCallStack
+   let #AEAnalysisError = 0
+   let #UsesMetaSQL = 0
+   let #UsesPCode = 0
+
+   let $PgmFile = RTrim(&AE.PRCSNAME,' ')
+   let $PgmTitle = &AE.DESCR
+
+   let #ItemCnt = #ItemCnt + 1
+   do Progress-Display($PgmFile)
+
+   do Build-Called-AE-Section-List
+   do Analyze-AE-Table-Usage
+   do Validate-Tables($IncludeToolsTables)
+   do Print-Table-Access-Report
+
+From PS_PRCSDEFN P,
+     PS_PRCSDEFNPNL C,
+     PSPNLGRPDEFN G
+Where P.PRCSTYPE = 'Application Engine'
+[$TargetPgmClause]
+And C.PRCSNAME = P.PRCSNAME
+And G.PNLGRPNAME = C.PNLGRPNAME
+[$OwnerIDClause]
+UNION
+Select
+P.PRCSNAME,
+J.DESCR,
+{TYPE_PRCSJOB}
+From PS_PRCSJOBDEFN J,
+     PS_PRCSJOBITEM P,
+     PS_PRCSJOBPNL C,
+     PSPNLGRPDEFN G
+Where P.PRCSJOBNAME=J.PRCSJOBNAME
+And P.PRCSTYPE = 'Application Engine'
+[$TargetPgmClause]
+And C.PRCSJOBNAME=J.PRCSJOBNAME
+And G.PNLGRPNAME=C.PNLGRPNAME
+[$OwnerIDClause]
+UNION
+Select
+G.AE_APPLID,
+G.DESCR,
+{TYPE_AELIB}
+From PSAEAPPLDEFN G
+Where G.AE_APPLLIBRARY='Y'
+[$TargetAELibClause]
+[$OwnerIDClause]
+Order By 1, 2
+End-SELECT
+
+end-procedure
+
+!*******************************************
+begin-procedure Build-Called-AE-Section-List
+!*******************************************
+
+   !For each AE program, determine if other libraries are called,
+   !and compile a complete list of called Pgm.Section.
+   !(Note that this required a separate application-specific
+   !stack array to be used, in addition to the generic Stack).
+
+   if (&AE.PROGTYPE = {TYPE_AELIB})
+      !Seed with all defined sections...
+      do Load-Library-Sections($PgmFile)
+   else
+      !Seed with MAIN section...
+      do Push2($PgmFile, {SECTION_MAIN}, 0, 0)
+      do Identify-Called-AE-Sections($PgmFile, '')
+   end-if
+
+   do Pop2($CallingPgm, $CallingSect, #Dummy, #Dummy, #EOS)
+   while Not (#EOS)
+      do PushCall($CallingPgm, $CallingSect)
+      do Identify-Called-AE-Sections($CallingPgm, $CallingSect)
+
+      do Pop2($CallingPgm, $CallingSect, #Dummy, #Dummy, #EOS)
+   end-while
+
+end-procedure
+
+!**********************************************************************
+begin-procedure Load-Library-Sections ($Library)
+!**********************************************************************
+
+begin-Select
+S.AE_APPLID,
+S.AE_SECTION
+
+   do AE-Call-Already-Logged(&S.AE_APPLID, &S.AE_SECTION, #AlreadyOnStack)
+   if (Not #AlreadyOnStack)
+      do Push2(&S.AE_APPLID, &S.AE_SECTION, 0, 0)
+   end-if
+
+From PSAESECTDEFN S
+Where S.AE_APPLID=$Library
+end-Select
+
+end-procedure
+
+!**********************************************************************
+begin-procedure Identify-Called-AE-Sections ($CallingPgm, $CallingSect)
+!**********************************************************************
+
+   let $SectionClause = ''
+   if Not IsBlank($CallingSect)
+      let $SectionClause = ' And S.AE_SECTION=''' || RTrim($CallingSect,' ') || ''' '
+   end-if
+
+begin-Select
+S.AE_DO_APPL_ID,
+S.AE_DO_SECTION
+
+   do AE-Call-Already-Logged(&S.AE_DO_APPL_ID, &S.AE_DO_SECTION, #AlreadyOnStack)
+   if (Not #AlreadyOnStack)
+      do Push2(&S.AE_DO_APPL_ID, &S.AE_DO_SECTION, 0, 0)
+   end-if
+
+From PSAESTEPDEFN S,
+     PSAESTMTDEFN A
+Where S.AE_APPLID=$CallingPgm
+[$SectionClause]
+And A.AE_APPLID=S.AE_APPLID
+And A.AE_SECTION=S.AE_SECTION
+And A.MARKET=S.MARKET
+And A.DBTYPE=S.DBTYPE
+And A.EFFDT=S.EFFDT
+And A.AE_STEP=S.AE_STEP
+And A.AE_STMT_TYPE='C'
+end-Select
+
+end-procedure
+
+!***************************************
+begin-procedure PushCall($Pgm, $Section)
+!***************************************
+
+   do AE-Call-Already-Logged($Pgm, $Section, #AlreadyOnStack)
+   if (Not #AlreadyOnStack)
+      let #_CallListStackPtr = #_CallListStackPtr + 1
+      if (#_CallListStackPtr >= {STACK_SIZE})
+         let $Msg = 'Error: CallList Stack size (' || to_char({STACK_SIZE}) || ') exceeded.'
+         display $Msg
+         stop
+      end-if
+      put $Pgm $Section into CallListStack(#_CallListStackPtr)
+   end-if
+
+end-procedure
+
+!***********************************************
+begin-procedure PopCall(:$Pgm, :$Section, :#EOS)
+!***********************************************
+
+   let $Pgm = ''
+   let $Section = ''
+   let #EOS = 0
+
+   if (#_CallListStackPtr)
+      get $Pgm $Section from CallListStack(#_CallListStackPtr)
+      let #_CallListStackPtr = #_CallListStackPtr - 1
+   else
+      let #EOS = 1
+   end-if
+
+end-procedure
+
+!**********************************************************************
+begin-procedure AE-Call-Already-Logged($Pgm, $Section, :#AlreadyLogged)
+!**********************************************************************
+
+   let #AlreadyLogged = 0
+   let #Idx = 1
+   while (#Idx <= #_CallListStackPtr)
+      get $TestPgm $TestSection from CallListStack(#Idx)
+      if ($TestPgm = $Pgm) And ($TestSection = $Section)
+         let #AlreadyLogged = 1
+         break
+      end-if
+      let #Idx = #Idx + 1
+   end-while
+
+end-procedure
+
+!*****************************
+begin-procedure ClearCallStack
+!*****************************
+
+   let #CallListStackPtr = 0
+   clear-array Name=CallListStack
+
+end-procedure
+
+!*************************************
+begin-procedure Analyze-AE-Table-Usage
+!*************************************
+
+   !Now step through every called Pgm.Section and analyze any
+   !SQL used (both direct SQL and indirect SQL-Objects).
+   !Note that there may be SQL within PCode programs, so we check
+   !for that, but we do not attenmpt to analyze SQL in PCode.
+
+   do ClearStack
+
+   do PopCall($CallingPgm, $CallingSect, #EOS)
+   while Not (#EOS)
+
+      do Analyze-AE-SQL($CallingPgm, $CallingSect)
+      do Check-AE-Section-For-PCode($CallingPgm, $CallingSect)
+
+      do PopCall($CallingPgm, $CallingSect, #EOS)
+   end-while
+
+end-procedure
+
+!********************************************************
+begin-procedure Analyze-AE-SQL($CallingPgm, $CallingSect)
+!********************************************************
+
+   let $Module  = RTrim($CallingPgm,' ') || '.' || RTrim($CallingSect,' ')
+   let $CallingPgm  = RPad($CallingPgm, {AE_PGM_LEN}, {SPACE})
+   let $CallingSect = RPad($CallingSect, {AE_SECTION_LEN}, {SPACE})
+   let $SQLID_Clause = ' S.SQLID Like ''' || $CallingPgm || $CallingSect || '%'' '
+
+begin-Select
+S.SQLID,
+T.SQLTEXT
+
+   let $SQLText = LTrim(Upper(&T.SQLTEXT),' ')
+   do Get-AE-SQL-Type ($SQLText, $Access, $Module)
+
+   do AEP-Get-PS-Table($SQLText, $TableName)
+   while Not IsBlank($TableName)
+
+      do Find-Key($TableName, #Link)
+      if Not (#Link)
+         do Add-Key-To-List($TableName, #Link)
+      end-if
+      do Set-Access(#Link, $Access, $AccessList)
+      do Record-Module(#Link, $Module, $ModuleList)
+      put $AccessList $ModuleList into List(#Link) StrData1 StrData2
+      let $Access = 'S'
+
+      do AEP-Get-PS-Table($SQLText, $TableName)
+   end-while
+
+   do Analyze-SQL-Objects($SQLText, $Module)
+
+From PSSQLDEFN S,
+     PSSQLTEXTDEFN T
+Where [$SQLID_Clause]
+And T.SQLID=S.SQLID
+#ifdef SYBASE
+And CONVERT(CHAR(255),T.SQLTEXT) Is Not NULL
+#else
+And T.SQLTEXT Is Not NULL
+#endif
+Order By S.SQLID
+end-Select
+
+end-procedure
+
+!************************************************************
+begin-procedure Get-AE-SQL-Type ($SQLText, :$Access, $Module)
+!************************************************************
+
+   !Attempt to determine what type of SQL is involved.
+   !Note that we group Delete/Truncate together, we ignore
+   !updating of statistics, and at this time we simply
+   !do not attempt to parse through platform-specific SQL
+   !found within %Execute().  Other meta-SQL may also confound
+   !this process.
+
+   let #Error = 0
+   let $Access = 'S'
+
+   if InStr($SQLText, {SQL_METATABLE}, 1)
+      let #_UsesMetaSQL = 1
+   end-if
+
+   if (InStr($SQLText, {SQL_INSERT}, 1) = 1) Or (InStr($SQLText, {SQL_INSERT2}, 1) = 1)
+      let $Access = 'I'
+   else
+      if (InStr($SQLText, {SQL_UPDATE}, 1) = 1)
+         let $Access = 'U'
+      else
+         if (InStr($SQLText, {SQL_DELETE}, 1) = 1) Or (InStr($SQLText, {SQL_TRUNCATE}, 1) = 1)
+            let $Access = 'D'
+         else
+            if (InStr($SQLText, {SQL_SELECT1}, 1) = 1) Or (InStr($SQLText, {SQL_SELECT2}, 1) = 1)
+               let $Access = 'S'
+            else
+               if (InStr($SQLText, {SQL_UPDSTATS}, 1) = 1)
+                  !Nothing
+               else
+                  if (InStr($SQLText, {SQL_EXECUTE}, 1) = 1)
+                     let #_UsesMetaSQL = 1
+                  else
+                     if InStr($SQLText, {SQL_SQLOBJ}, 1)
+                        !Nothing
+                     else
+                        let #Error = 1
+                     end-if
+                  end-if
+               end-if
+            end-if
+         end-if
+      end-if
+   end-if
+
+   if (#Error)
+      display $_XRPT-NO-ANALYZE-SQL noline
+      let $SQLID = '[' || $Module || ']'
+      let $SQLText = SubStr($SQLText, 1, 25)
+      display $SQLID   noline
+      display ': '     noline
+      display $SQLText noline
+      display ' ...'
+      let #_AEAnalysisError = 1
+   end-if
+
+end-procedure
+
+!*******************************************************
+begin-procedure AEP-Get-PS-Table(:$SQLText, :$TableName)
+!*******************************************************
+
+   if (InStr($SQLText, {SQL_INSERT2}, 1) = 1)
+
+      !Format is: %InsertSelect([Distinct] RecName, ...)
+      let #End = InStr($SQLText, ',', 1)
+      let $WorkStr = SubStr($SQLText, 1, #End - 1)
+      do Find_Last_In_CharList($WorkStr, '( ', 0, #Start)
+      let $TableName = SubStr($SQLText, #Start + 1, #End - #Start - 1)
+      do RemoveQuotes($TableName)
+      if (SubStr($TableName, 1, 2) <> {PS_PREFIX})
+         let $TableName = {PS_PREFIX} || '_' || $TableName
+      end-if
+      let $SQLText = SubStr($SQLText, #End + 1, Length($SQLText))
+   else
+
+      do Get-PS-Table($SQLText, $TableName)
+   end-if
+
+end-procedure
+
+!******************************************************
+begin-procedure  Analyze-SQL-Objects($SQLText, $Module)
+!******************************************************
+
+   let #Pos = InStr($SQLText, {SQL_SQLOBJ}, 1)
+   while (#Pos)
+      let #Len = Length($SQLText)
+      let #Start = #Pos + Length({SQL_SQLOBJ})
+      let $SQLText = SubStr($SQLText,#Start,#Len)
+      do Find_In_CharList($SQLText, '), ', 0, #Pos)
+      let $SQLObj = SubStr($SQLText,1,#Pos - 1)
+      do Get-SQLObject($SQLObj, $SQLObjText)
+      let $Access = 'S'
+      do AEP-Get-PS-Table($SQLObjText, $TableName)
+      while Not IsBlank($TableName)
+
+         do Find-Key($TableName, #Link)
+         if Not (#Link)
+            do Add-Key-To-List($TableName, #Link)
+         end-if
+         do Set-Access(#Link, $Access, $AccessList)
+         do Record-Module(#Link, $Module, $ModuleList)
+         put $AccessList $ModuleList into List(#Link) StrData1 StrData2
+
+         do AEP-Get-PS-Table($SQLText, $TableName)
+      end-while
+
+      let #Pos = InStr($SQLText, {SQL_SQLOBJ}, 1)
+   end-while
+
+end-procedure
+
+!***************************************************
+begin-procedure Get-SQLObject($SQLObj, :$SQLObjText)
+!***************************************************
+
+   let $SQLObjText = ''
+
+begin-Select LOOPS=1
+SO.MARKET,
+SO.DBTYPE,
+SO.EFFDT,
+SO.SQLTEXT
+
+   let $SQLObjText = Upper(&SO.SQLTEXT)
+
+From PSSQLTEXTDEFN SO
+Where SO.SQLID=$SQLObj
+Order By SO.MARKET Asc, SO.DBTYPE Asc, SO.EFFDT Desc
+end-Select
+
+end-procedure
+
+!********************************************************************
+begin-procedure Check-AE-Section-For-PCode($CallingPgm, $CallingSect)
+!********************************************************************
+
+begin-Select
+COUNT(*)    &PCODE_CNT
+
+   let #_UsesPCode = #_UsesPCode + &PCODE_CNT
+
+From PSAESTEPDEFN S,
+     PSAESTMTDEFN A
+Where S.AE_APPLID=$CallingPgm
+And S.AE_SECTION=$CallingSect
+And A.AE_APPLID=S.AE_APPLID
+And A.AE_SECTION=S.AE_SECTION
+And A.MARKET=S.MARKET
+And A.DBTYPE=S.DBTYPE
+And A.EFFDT=S.EFFDT
+And A.AE_STEP=S.AE_STEP
+And A.AE_STMT_TYPE='P'
+end-Select
+
+end-procedure
+
+!*************************** End of TBLS_AEP.SQC ******************************

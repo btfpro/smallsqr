@@ -1,0 +1,234 @@
+!**********************************************************
+!  FSADates: Flexible Spending Account Date routines      *
+!**********************************************************
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+!                                                                      *
+! This module contains confidential and proprietary information        *
+! of Oracle; it is not to be copied, reproduced, or transmitted        *
+! in any form, by any means, in whole or in part, nor is it to         *
+! be used for any purpose other than that for which it is              *
+! expressly provided under the applicable license agreement.           *
+!                                                                      *
+! Copyright (C) 2006 Oracle. All Rights Reserved.                      *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+!          $Date:  2006/07/19:09:04:38                                 
+!       $Release:  HR9                                                 
+!      $Revision:  101                                                 
+!                                                                      *
+!***********************************************************************
+
+!*************************************************
+begin-procedure Get-System-Date-Override
+!*************************************************
+
+!Allows tester to override system date for use in period determinations.
+!Retrieves an override date secretly introduced into PS_FSA_RUNCTL.
+!$AsOfDate returned in native date format.
+
+#ifdef debugT
+  if $prcs_process_instance = ''
+    input $AsOfToday 'Enter System Date override for testing as {Prompt-Date}'
+    do Format-DateTime($AsOfToday,$AsOfToday,{Prompt-Mask},'','native')
+  else
+    do Sys-Override-Date
+    display 'System Date override for testing: ' NoLine
+    if IsNULL(&O.SYSTEM_DATE)
+      display '[NULL - using today] '  NoLine
+      do Get-Current-DateTime
+    else
+      let $AsOfToday = &O.SYSTEM_DATE
+    end-if
+    display $AsofToday
+  end-if
+#end-if
+
+end-procedure
+
+!Assumes all rows updated with same desired override date.
+
+Begin-Procedure Sys-Override-Date
+Begin-Select
+O.SYSTEM_DATE
+O.FSA_RUN_ID
+FROM  PS_FSA_RUNCTL O
+ORDER BY O.FSA_RUN_ID
+End-Select
+End-Procedure
+
+
+!*************************************************
+begin-procedure Get-Balance-Year-Data
+!*************************************************
+
+  do Retrieve-Benefit-Plan
+  do Retrieve-BalanceID
+  do Get-BalanceID-Date-Range
+  do Determine-Quarter
+
+end-procedure
+
+
+!*************************************************
+begin-procedure Retrieve-Benefit-Plan
+!*************************************************
+
+begin-SELECT
+D.PLAN_TYPE
+D.BENEFIT_PLAN
+
+FROM  PS_BEN_DEFN_OPTN D
+WHERE D.BENEFIT_PROGRAM   = &B.Benefit_Program
+  AND D.EFFDT             = &B.Effdt
+  AND D.PLAN_TYPE      LIKE '6%'
+  AND D.OPTION_TYPE       = 'O'
+ORDER BY D.PLAN_TYPE DESC
+end-SELECT
+
+end-procedure
+
+
+!*************************************************
+begin-procedure Retrieve-BalanceID
+!*************************************************
+
+begin-SELECT
+I.SETID,
+I.BALANCE_ID
+
+  let $Balance_ID = &I.Balance_ID
+FROM  PS_FSA_BENEF_TBL I
+WHERE I.PLAN_TYPE    = &D.Plan_Type
+  AND I.BENEFIT_PLAN = &D.Benefit_Plan
+  AND I.EFFDT <= (SELECT MAX(EFFDT)
+                  FROM   PS_FSA_BENEF_TBL
+                  WHERE  PLAN_TYPE = I.PLAN_TYPE
+                    AND  BENEFIT_PLAN = I.BENEFIT_PLAN
+                    AND  EFFDT <= &B.Effdt)
+end-SELECT
+
+end-procedure
+
+
+!*************************************************
+begin-procedure Get-BalanceID-Date-Range
+!*************************************************
+
+  !Sybase doesn't like CHAR to INT comparisons...
+  let #Calendar_Year = $Calendar_Year
+
+begin-SELECT
+MIN(I1.BEGIN_DT)      &BeginDt,
+MAX(I1.END_DT)        &EndDt,
+
+   let $YearBegin = &BeginDt
+   let $YearEnd = &EndDt
+
+FROM  PS_BALANCE_ID_DEF I1
+WHERE I1.SETID        = &I.Setid
+  AND I1.BALANCE_ID   = &I.Balance_ID
+  AND I1.BALANCE_YEAR = #Calendar_Year
+end-SELECT
+
+end-procedure
+
+
+!*************************************************
+begin-procedure Determine-Quarter
+!*************************************************
+
+begin-SELECT
+I2.BALANCE_YEAR,
+I2.BALANCE_PERIOD,
+I2.BEGIN_DT,
+I2.END_DT
+
+  evaluate &I2.Balance_Period
+    when > 9
+      let $CurrentQtr = '03'
+      let #qBegin = 7
+      let #qEnd = 9
+      break
+    when > 6
+      let $CurrentQtr = '02'
+      let #qBegin = 4
+      let #qEnd = 6
+      break
+    when > 3
+      let $CurrentQtr = '01'
+      let #qBegin = 1
+      let #qEnd = 3
+      break
+    when-other
+      let $CurrentQtr = '04'
+      let #qBegin = 10
+      let #qEnd = 12
+  end-evaluate
+
+  move &I2.Balance_Year to $QtrYear
+  move &I2.Balance_Period to $CurrentMonth
+  if $QtrYear > $Calendar_Year and $CurrentQtr < '04'
+    let $CurrentQtr = '05'
+    let #qBegin = 1
+    let #qEnd = 3
+  else
+    let $QtrYear = $Calendar_Year
+  end-if
+
+  do Get-Quarter-Range
+
+FROM  PS_BALANCE_ID_DEF I2
+WHERE I2.SETID        = &I.Setid
+  AND I2.BALANCE_ID   = &I.Balance_ID
+  AND I2.BEGIN_DT    <= $AsOfToday
+  AND I2.END_DT      >= $AsOfToday
+end-SELECT
+
+end-procedure
+
+
+!*************************************************
+begin-procedure Get-Quarter-Range
+!*************************************************
+
+  !Sybase doesn't like CHAR to INT comparisons...
+  let #QtrYear = $QtrYear
+
+begin-SELECT
+MIN(I3.BEGIN_DT)      &QtrBegin,
+MAX(I3.END_DT)        &QtrEnd
+
+  let $QtrBegin = &QtrBegin
+  let $QtrEnd = &QtrEnd
+  do Get-Quarter-End-Prior
+
+FROM  PS_BALANCE_ID_DEF I3
+WHERE I3.SETID        = &I.Setid
+  AND I3.BALANCE_ID   = &I.Balance_ID
+  AND I3.BALANCE_YEAR = #QtrYear
+  AND I3.BALANCE_PERIOD BETWEEN #qBegin AND #qEnd
+end-SELECT
+
+end-procedure
+
+
+!*************************************************
+begin-procedure Get-Quarter-End-Prior
+!*************************************************
+
+begin-SELECT
+MAX(I4.END_DT)        &qtrEndPrior
+
+  move &QtrEndPrior to $QtrEndPrior
+
+FROM  PS_BALANCE_ID_DEF I4
+WHERE I4.SETID      = &I.Setid
+  AND I4.BALANCE_ID = &I.Balance_ID
+  AND I4.END_DT     < $QtrBegin
+end-SELECT
+
+end-procedure

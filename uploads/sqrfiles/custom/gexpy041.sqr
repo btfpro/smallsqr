@@ -1,0 +1,585 @@
+!***********************************************************************
+! GEXPY041:  Franchise Listing                                         *
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module is the confidential and proprietary information of       *
+! Giant Eagle, Inc.; it is not to be copied, reproduced, or transmitted*
+! in any form, by any means, in whole or in part, nor is it to be used *
+! for any purpose other than that for which it is expressly provided   *
+! without the written permission of Giant Eagle.                       *
+!                                                                      *
+!***********************************************************************
+!                         MODIFICATION HISTORY                         *
+!***********************************************************************
+!  INITIALS     DATE           DESCRIPTION OF THE CHANGE               *
+!***********************************************************************
+!  SXK          02/03/1998     INITIAL CREATION                        *
+!  SXK          09/22/1998     Added New Mobius ReportID               *
+!  JDH          10/15/1998     Formatted amt columns on report         *
+!  JDH          01/23/1999     Added logic to get the maximum          *
+!                               balance period per earnings code       *
+!                               from the earnings balance table.       *
+!                              Added SQRW run control logic.           *
+!                              Added logic to pull balance for         *
+!                               the month of the last confirmed        *
+!                               pay end date.                          *
+!  JDH          03/08/1999     Changed reportid.                       *
+!                              Added balance period to heading.        *
+!                              YTD earns shouldn't include erncd 525.  *
+!                              Display acct_cd and jobcode description *
+!                               instead of codes.                      *
+!                              Performance tuning.                     *
+!                              Included gexerncd.sqc.                  *
+!  JDH          04/23/1999     Removed company parameter.              *
+!                              Added company division code parameter.  *
+!  PSR          09/18/2002     EMPL_RCD is now part of the key for     *
+!                              PS_EARNINGS_BAL - V8.3 Upgrade          *
+!  SRK          02/25/2003   Modified pay_cal_bal_id select to retrieve*
+!                            right balance period and year and not to  *
+!                            print detail info if empl is termed and   *
+!                            has no YTD bal and increased size of YTD  *
+!                            bal                                       *
+!GEX_PY237  SXD 08/20/2007    Sqr from 8.3 is moved to 9.0 as it is.   *
+!                              No changes are made.                   *     
+! VENDAXG      09/24/2008    Modified Code for S3#11373179 
+! ISDVDZK      22-MAY-2009    Added code to report Position title instead   * 
+!                             of job title ITG#60687 ON 22-MAY-2009         *
+!***********************************************************************
+
+
+#include 'setenv.sqc' !Set environment
+
+begin-setup
+
+#include 'setup32a.sqc'
+
+declare-report Franchise-List
+Printer-Type=HPLASERJET
+  layout=DEFAULT
+end-declare
+
+declare-report Report-log
+Printer-Type=HPLASERJET
+  layout=DEFAULT
+end-declare
+
+end-setup
+
+
+begin-report
+  use-report Franchise-List
+
+  do Init-DateTime
+  do Init-Number
+  do stdapi-init
+  
+  move 'GEXPY041' to $ReportID
+  move 'Franchise List ' to $ReportTitle
+  display $ReportTitle
+
+  do Get-Current-DateTime
+
+  do Report
+  do Commit-Transaction
+  date-time () hh:mi:ss &timeEnded
+  display 'Report Ended: ' noline
+  display &timeEnded
+  do stdapi-term
+  do reset
+end-report
+
+
+begin-procedure Report
+  date-time () hh:mi:ss &timeBegan
+  display 'Report Began: ' noline
+  display &timeBegan
+
+  move 'N' to $Errorfound
+
+  Let $GEXXX907_DIV_CD_Alias = 'GDT.GEX_COMPANY_DIV_CD'
+
+  If $prcs_process_instance = ''
+    Do P110-SQRW-Run-Controls
+  Else
+    Do P120-Process-Scheduler-Run-Controls
+  End-If
+
+  Do Format-DateTime($X000_Where_Select_AsOfDate, $X000_Report_Heading_AsOfDate, {DEFDATE}, '', '')
+  Let $X000_Order_By = 'Company, Department, Employee ID'
+
+  Show '$GEXXX907_Include_Div_Cd_Criteria = ' $GEXXX907_Include_Div_Cd_Display_Criteria
+  Show '$X000_Where_Select_AsOfDate = ' $X000_Where_Select_AsOfDate
+
+  Do P130-Print-Cover-Page
+  Do P140-Get-Last-Confirmed-Pay
+
+  Let $GEXERNCD_Erncd_Alias = 'D.ERNCD'
+  Do Get-Non-Productive-Erncds
+
+  do process-employee-data
+
+  date-time () hh:mi:ss &timeProcess
+  display #InputTran 99999 noline
+  display ' Transactions Processed: ' noline
+  display &timeProcess
+End-Procedure
+
+
+Begin-Procedure P110-SQRW-Run-Controls
+#debug9 Show 'P110-SQRW-Run-Controls'
+  Let $DivCdString = ''''
+  Display 'Enter Company Division Code or leave blank to exit.'
+  While 1=1
+    Input $In-DivCd Maxlen=3 'Company Division Code'
+    Uppercase $In-DivCd
+    If Rtrim($In-DivCd, ' ') = ''
+      Concat '''' With $DivCdString
+      Break
+    End-If
+    If $DivCdString <> ''''
+      Concat ''',''' With $DivCdString
+    End-If
+    Concat $In-DivCd With $DivCdString
+  End-While
+
+  If $DivCdString = ''''''
+    Let $GEXXX907_INCLUDE_DIV_CD_CRITERIA = '1=1'
+    Let $GEXXX907_INCLUDE_DIV_CD_DISPLAY_CRITERIA = 'ALL'
+  Else
+    Let $GEXXX907_INCLUDE_DIV_CD_CRITERIA = $GEXXX907_Div_CD_Alias || ' In (' || $DivCdString || ')'
+    Let $GEXXX907_INCLUDE_DIV_CD_DISPLAY_CRITERIA = $GEXXX907_INCLUDE_DIV_CD_CRITERIA
+  End-If
+
+  Do Ask-As-Of-Date
+  Let $X000_Where_Select_AsOfDate = $AsOfDate
+End-Procedure
+
+
+Begin-Procedure P120-Process-Scheduler-Run-Controls
+#debug9 Show 'P120-Process-Scheduler-Run-Controls'
+  Do GEXXX922-Select-Parameters
+
+  Let $X000_Where_Select_AsOfDate = $GEX_RC_PAY.AsOfDate
+  If Rtrim ($GEX_RC_PAY.AsOfDate, ' ') = ''
+    Let $X000_Where_Select_AsOfDate = $AsOfToday
+  End-If
+
+  Do GEXXX907-Select-DIV-CD-Parameters
+End-Procedure
+
+
+begin-procedure P130-Print-Cover-Page
+#debug9 Show 'P130-Print-Cover-Page'
+  Print 'RUN CONTROL INFORMATION FOR THIS REPORT RUN:'            (+5,1)
+  Print '$Prcs_OprID          ='                                  (+2,5)
+  Print $Prcs_OprID                                               (0,+2)
+  Print '$Prcs_Run_Cntl_ID    ='                                  (+1,5)
+  Print $Prcs_Run_Cntl_ID                                         (0,+2)
+
+  Print 'SELECTION CRITERIA FOR THIS REPORT RUN:'                 (+5,2)
+  Print '$GEXXX907_Include_Div_Cd_Display_Criteria          ='    (+1,5)
+  Print $GEXXX907_Include_Div_Cd_Display_Criteria                 (0,+2)
+
+  Print 'As Of Date :'                      (+2,5)
+  Print $X000_Report_Heading_AsOfDate       (0,+2)
+
+  Print 'SORT ORDER FOR THIS REPORT RUN:'   (+5,2)
+  Print $X000_Order_By                      (+2,5)
+
+  Let #PAGE-COUNT = 0
+  NEW-PAGE
+End-Procedure
+
+
+Begin-Procedure P140-Get-Last-Confirmed-Pay
+#debug9 Show 'P140-Get-Last-Confirmed-Pay'
+
+Begin-Select Loops=1
+pay_end_dt
+!SRK 02/25/2003 commented out this logic since for some pay periods where check date falls into the next month, it should be pulling
+!balances as of the check date not as of pay end date
+!To_Number(To_Char(pay_end_dt,'MM'))          &balance_period
+!To_Number(To_Char(pay_end_dt,'YYYY'))        &balance_year
+!To_Char(pay_end_dt,'fmMonth YYYY')           &period
+!SRK 02/25/2003 and added these lines to get the right balance period and year
+To_Number(To_Char(check_dt,'MM'))          &balance_period
+To_Number(To_Char(check_dt,'YYYY'))        &balance_year
+To_Char(check_dt,'fmMonth YYYY')           &period
+
+  Let $AsOfDate         = &pay_end_dt
+  Let $pay_end_dt       = &pay_end_dt
+  Let #balance_year     = &balance_year
+  Let #balance_period   = &balance_period
+  Let $Reporting_Period = &period
+
+  Do Format-DateTime($pay_end_dt, $payenddt, {DEFDATE}, '', '')
+
+  Show 'Report will contain balances for the month of ' $Reporting_Period
+  Show 'Last confirmed pay end date:  ' $pay_end_dt
+
+  If Rtrim($pay_end_dt,' ') = ''
+    Show 'No confirmed pay period found in calendar'
+    Stop
+  End-If
+
+From   ps_pay_calendar
+
+Where  pay_end_dt         =
+      (Select Max(pay_end_dt)
+       From   ps_pay_calendar
+       Where  pay_end_dt <= $X000_Where_Select_AsOfDate
+       And    pay_confirm_run = 'Y')
+
+And    pay_confirm_run = 'Y'
+End-Select
+End-Procedure
+
+
+!*********************************************************************
+!Prints the header information in the report log.
+!*********************************************************************
+
+begin-heading 6 for-reports=(report-log)
+  let $reportid = 'PY041LOG'
+  let $ReportTitle = 'Report Log'
+
+  #Include 'stdhdg01.sqc'
+
+  Print $Reporting_Period (3,) Center 
+
+  print 'Trans#'          (+3,1)
+  print 'Emplid'          (,18)
+  print 'Message'         (,50)
+end-heading
+
+
+!*********************************************************************
+!Prints the header information in the Local-Occupation-Tax
+!*********************************************************************
+
+begin-heading 6 for-reports=(Franchise-List)
+  let $REPORTID = 'GEXPY041'
+  let $ReportTitle = 'Franchise List'
+
+  #Include 'stdhdg01.sqc'
+
+  Print $Reporting_Period  (3,) Center 
+
+  print 'Company'          (+3,1)
+  print 'DeptID'           (,12)
+  print 'Employee Name'    (,22)
+  print 'Employee ID'      (,56)
+  print 'Acct CD'          (,71)
+  print 'Jobcode'          (,85)
+  print 'Family ST'        (,99)
+  print 'Hrly Rate'        (,112)
+  print 'Salary'           (,129)
+  print 'YTD Earnings'     (,139)
+  print 'YTD Vac'          (,155)
+  print 'YTD Bonus'        (,166)
+end-heading
+
+
+Begin-Procedure Process-Employee-Data
+#debug9 Show 'Process-Employee-Data'
+  move 'N' to $errorfound
+  move 'N' to $found
+  move 'N' to $new_page
+
+  let #inputtran = 0
+
+  position (1)
+
+begin-SELECT
+A.COMPANY () on-break level=1 
+                      print=never
+
+A.DEPTID  () on-break level=2
+                      print=never
+                      save=$save_deptid
+                      after=dept-change
+
+A.EMPLID
+A.EMPL_RCD
+A.ACCT_CD
+A.JOBCODE
+A.HOURLY_RT
+A.ANNUAL_RT  &Salary
+A.EMPL_STATUS !SRK 02/25/2003
+B.NAME
+!Vendaxg Modified Code for S3#11373179 - Begin
+!B.GEX_FAMILY_MBR
+GEX.GEX_FAMILY_MBR
+!Vendaxg Modified Code for S3#11373179 - End
+
+A.POSITION_NBR   !ISDVDZK    22-MAY-2009   as per ITG #60867 start
+  add 1 to #inputtran
+
+  move 'Y' to $found
+
+  move &salary to #salary
+  divide 52 into #salary round=2 
+
+
+  let #bonus_ytd = 0
+  let #vac_ytd   = 0
+  let #grs_ytd   = 0
+
+  let #empl_grs_ytd = 0
+  do select-balances
+!SRK 02/25/2003 Added this to print detail info always for active people even if they don't have ytd balances
+!and don't print balances if they are termed and have no balances for ytd
+  evaluate &a.empl_status
+     when = 'A'
+     when = 'L'
+     when = 'P'
+     when = 'S'
+        add #salary to #dept_salary 
+        do print-detail-info
+     when-other
+         if #empl_grs_ytd > 0
+            add #salary to #dept_salary 
+            do print-detail-info
+         end-if
+  end-evaluate
+
+FROM   PS_GEX_DEPT_TBL   GDT,
+       PS_PERSONAL_DATA  B,
+       PS_GEX_PERSON GEX,	!Vendaxg Added Code for S3#11373179 
+       PS_JOB            A
+
+WHERE  A.EMPLID            = B.EMPLID
+AND B.EMPLID = GEX.EMPLID !Vendaxg Added Code for S3#11373179 
+!Vendaxg Modified Code for S3#11373179 - Begin
+!AND    B.GEX_FAMILY_MBR   IN ('FAM','OWN','SPO')
+AND    GEX.GEX_FAMILY_MBR   IN ('FAM','OWN','SPO')
+!Vendaxg Modified Code for S3#11373179 - End
+
+AND    A.EFFDT             =
+      (SELECT MAX(EFFDT)
+       FROM   PS_JOB
+       WHERE  EMPLID       = A.EMPLID
+       AND    EMPL_RCD    = A.EMPL_RCD
+       AND    EFFDT       <= $pay_end_dt)
+
+AND    A.EFFSEQ            =
+      (SELECT MAX(EFFSEQ)
+       FROM   PS_JOB
+       WHERE  EMPLID       = A.EMPLID
+       AND    EMPL_RCD    = A.EMPL_RCD
+       AND    EFFDT        = A.EFFDT)
+
+And    gdt.deptid          = a.deptid
+
+And    gdt.effdt           =
+      (Select Max(effdt)
+       From   ps_gex_dept_tbl
+       Where  deptid       = gdt.deptid
+       And    effdt       <= $pay_end_dt)
+
+And    gdt.sequence_number =
+      (Select Max(sequence_number)
+       From   ps_gex_dept_tbl
+       Where  deptid       = gdt.deptid
+       And    effdt        = gdt.effdt)
+
+And   [$GEXXX907_Include_Div_Cd_Criteria]
+
+ORDER BY A.COMPANY, A.DEPTID, A.EMPLID
+end-SELECT
+
+  if $found = 'N'
+    do error-found
+    print 'No Employees found for the Report '(,34)
+  end-if
+end-procedure
+
+
+Begin-Procedure Select-Balances
+#debug9 Show 'Select-Balances'
+
+Begin-Select on-error=sql-error-found('Select-Balances')
+D.ERNCD
+SUM(D.GRS_YTD) &D.GRS_YTD
+  !SRK 02/25/2003 we don't want to take into account if there are no balances for this year
+
+  move &d.grs_ytd to #empl_grs_ytd
+
+  !SRK 02/25/2003 Added this to print detail info always for active people even if they don't have ytd balances
+  !and don't print balances if they are termed and have no balances for ytd
+  
+  evaluate &a.empl_status
+     when = 'A'
+     when = 'L'
+     when = 'P'
+     when = 'S'
+	  Evaluate &D.ERNCD
+	    When = '510'
+	    When = '511'
+	    When = '512'
+	      add &d.grs_ytd to #bonus_ytd
+	      add &d.grs_ytd to #dept_bonus
+	      break
+	    When = '513'
+	      add &d.grs_ytd to #vac_ytd
+	      add &d.grs_ytd to #dept_vac
+	      break
+	  End-Evaluate
+
+	  add &d.grs_ytd to #grs_ytd
+	  add &d.grs_ytd to #dept_grs
+
+     when-other
+         if #empl_grs_ytd > 0
+
+		Evaluate &D.ERNCD
+		    When = '510'
+		    When = '511'
+		    When = '512'
+		      add &d.grs_ytd to #bonus_ytd
+		      add &d.grs_ytd to #dept_bonus
+		      break
+		    When = '513'
+		      add &d.grs_ytd to #vac_ytd
+		      add &d.grs_ytd to #dept_vac
+		      break
+		End-Evaluate
+
+		add &d.grs_ytd to #grs_ytd
+		add &d.grs_ytd to #dept_grs
+         end-if
+   end-evaluate
+  
+FROM   PS_EARNINGS_BAL D
+
+WHERE  D.EMPLID               = &A.EMPLID
+AND    D.COMPANY              = &A.COMPANY
+AND    D.BALANCE_ID           = 'CY'
+AND    D.BALANCE_YEAR         = #balance_year
+!PSR 09/18/2002 V8.3 Begin
+AND    D.EMPL_RCD             = &A.EMPL_RCD
+!PSR 09/18/2002 V8.3 End
+AND    D.BALANCE_PERIOD       =
+      (SELECT MAX(BALANCE_PERIOD)
+       FROM   PS_EARNINGS_BAL
+       WHERE  EMPLID          = D.EMPLID
+       AND    COMPANY         = D.COMPANY
+       AND    BALANCE_ID      = D.BALANCE_ID
+       AND    BALANCE_YEAR    = D.BALANCE_YEAR
+       AND    BALANCE_PERIOD <= #balance_period
+       AND    SPCL_BALANCE    = D.SPCL_BALANCE
+       !PSR 09/18/2002 V8.3 Begin
+       AND    EMPL_RCD        = D.EMPL_RCD
+       !PSR 09/18/2002 V8.3 End
+       AND    ERNCD           = D.ERNCD)
+
+AND    D.SPCL_BALANCE         = 'N'
+AND   [$GEXERNCD_EXCLUDE_ERNCD_CRITERIA]
+
+GROUP  BY D.ERNCD
+end-select
+end-procedure
+
+
+begin-procedure Dept-change
+#debug9 Show 'Dept-change'
+
+!SRK 02/27/2003 only print if atleast one employee was found to be printed
+if #dept_salary > 0
+  print 'Totals for Department' (+2,1)
+  print $save_deptid            (,+1)
+  print #dept_salary            (,125) Edit 9999990.00
+  print #dept_grs               (,139) Edit 999999990.00
+  print #dept_vac               (,155) Edit 9999990.00
+  print #dept_bonus             (,166) Edit 9999990.00
+  position  (+2)
+end-if
+  move 0 to #dept_salary
+  move 0 to #dept_grs
+  move 0 to #dept_vac
+  move 0 to #dept_bonus
+
+end-procedure
+
+
+begin-procedure print-detail-info
+#debug9 Show 'print-detail-info'
+  Let $Acctcd = &A.ACCT_CD
+  Do Get-Acct-cd-descr
+
+
+  Let $Jobcode = &A.JOBCODE
+  Do Get-Job-Title
+  
+  
+  !ISDVDZK    22-MAY-2009   as per ITG #60867 start
+
+  Let $Position_Nbr = &A.POSITION_NBR
+  Do Get-Position-Title			
+  if $PosNameAbbrv = ' '
+     Let $JobTitleAbbrv = $JobTitleAbbrv 
+  else
+     Let $JobTitleAbbrv = $PosNameAbbrv
+  end-if
+  !ISDVDZK    22-MAY-2009   as per ITG #60867 End
+         	 
+  print &A.COMPANY         (+1,3)
+  print &A.DEPTID          (,13)
+  print &B.NAME            (,22,30)
+  print &A.EMPLID          (,56)  !Edit xxx-xx-xxxx !GEX_SEC_REENG 2015-06-24 Vahini Katta
+  print $AcctNameAbbrv     (,71)
+  print $JobTitleAbbrv     (,85)
+  !Vendaxg Modified Code for S3#11373179 - Begin
+  !print &B.GEX_FAMILY_MBR  (,102)
+  print &GEX.GEX_FAMILY_MBR  (,102)
+  !Vendaxg Modified Code for S3#11373179 - End
+  print &A.HOURLY_RT       (,112) Edit 999990.00
+  print #salary            (,125) Edit 9999990.00
+  print #grs_ytd           (,139) Edit 999999990.00
+  print #vac_ytd           (,155) Edit 9999990.00
+  print #bonus_ytd         (,166) Edit 9999990.00
+end-procedure
+
+
+begin-procedure SQL-Error-Found($Proc_Name) 
+  do error-found
+  print 'SQL Error in ' (,34)
+  print $Proc_Name      ()  
+  print $_sql-error     () 
+  print 'sql-status:'   ()
+  print #_sql-status    () edit 99999 
+  use-report Franchise-List
+end-procedure
+
+
+begin-procedure Error-Found
+  move 'Y' to $ErrorFound
+  use-report report-log
+  do Format-Number(#InputTran, $out, '99999')
+  print $out (+1,1)
+  !GEX_SEC_REENG 2015-06-24 Vahini Katta Begins
+  !let $EmplId_1st3 = substr($EmplId,1,3)
+  !let $EmplId_mid2 = substr($EmplId,4,2)
+  !let $EmplId_last4 = substr($EmplId,6,4)
+  !String $EmplId_1st3 $EmplID_mid2 $EmplId_last4 by '-' into $EmplId11
+  !print $EmplID11 (,16)
+  print $EmplID (,16)
+  !GEX_SEC_REENG 2015-06-24 Vahini Katta Ends
+end-procedure
+
+
+#include 'gexerncd.sqc'  !Get-Non-Productive-Erncds procedure
+#include 'getactnm.sqc'  !Get-Acct-cd-descr procedure
+#include 'getjobtl.sqc'  !Get-Job-Title procedure
+#include 'askaod.sqc'    !Ask-As-Of-Date procedure
+#include 'gexxx907.sqc'  !Get company division code multiple row table
+#include 'gexxx922.sqc'  !Get pay single row run control
+#Include 'reset.sqc'     !Reset printer procedure
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'stdapi.sqc'    !Get_Run_Control Procedure
+#Include 'datemath.sqc'  !Does the date-math functions
+#Include 'getposnm.sqc'   !get position title  !ISDVDZK    22-MAY-2009   as per ITG #60867 

@@ -1,0 +1,739 @@
+!**********************************************************************!
+!  gpustxdp:  Tax Deposit Summary  Report     (USA)                    !
+!**********************************************************************!
+!                                                                      !
+!               Confidentiality Information:                           !
+!                                                                      !
+!                                                                      !
+! This module contains confidential and proprietary information        !
+! of Oracle; it is not to be copied, reproduced, or transmitted        !
+! in any form, by any means, in whole or in part, nor is it to         !
+! be used for any purpose other than that for which it is              !
+! expressly provided under the applicable license agreement.           !
+!                                                                      !
+! Copyright (C) 2006 Oracle. All Rights Reserved.                      !
+!                                                                      !
+!**********************************************************************!
+!                                                                      !
+!                $Date:  2006/02/06:08:23:40                           !
+!             $Release:  HR9                                           !
+!            $Revision:  101                                           !
+!                                                                      !
+!**********************************************************************!
+
+#include 'setenv.sqc'   !Set environment
+#Include 'setup32.sqc'  !Printer and page-size initialization
+#Include 'usarpt.sqc'   !Get USA variables
+
+Begin-Report
+  Do Init-Report
+  Do Stdapi-Term
+  Do delete-tmp
+End-Report
+
+Begin-Procedure Init-Report
+  Move 'GPUSTXDP' To $ReportID
+  Move 'Tax Deposit Summary Report' To $ReportTitle
+  display 'Special UI Rate'
+  Do Init-DateTime
+  Do Init-Number
+  Do Stdapi-Init
+  Do Array-Initialization
+  Do Select-Parameters
+  Do Payroll-Report-Initialization
+End-Procedure
+
+Begin-Procedure Array-Initialization
+  Move '**' To $priorState
+  Move ' '  To $USFederal_data_exists
+  Move  0   To #OtherTaxCount
+  Move  0   To #TaxType_Location
+
+
+  Create-Array name=OtherTaxes size=8  -
+    field=Jurisdiction:Char            -
+    field=TaxType:Char:18              -
+    field=GPUS_TAX_PCT:number:5        -
+    field=GPUS_TAX_GRS:number:18       -
+    field=GPUS_TAX_AMT:number:18       -
+    field=ER_Match:number:18           -
+    field=WithholdingGross:number      -
+    field=WithholdingTax:number        -
+    field=EIC:number                   -
+    field=Unempl_ER_Gross:number       -
+    field=Unempl_ER_Tax:number         -
+    field=Unempl_SP_Gross:number       -
+    field=Unempl_SP_Tax:number
+
+
+  Create-Array name=Totals size=5 -
+    field=TotalName:Char          -
+    field=total:number:5          -
+    field=startCol:number:5
+
+  Put 'Grand Total'            Into Totals(1) TotalName
+  Put 'Company Total'          Into Totals(2) TotalName
+  Put 'Pay Period Total'       Into Totals(3) TotalName
+  Put 'Check Date Total'       Into Totals(4) TotalName
+  Put  52                      Into Totals(0) startCol(0)
+  Put  92                      Into Totals(0) startCol(1)
+  Put 106                      Into Totals(0) startCol(2)
+  Put 121                      Into Totals(0) startCol(3)
+  Put 151                      Into Totals(0) startCol(4)
+End-Procedure
+
+Begin-Heading 9
+  #Include 'gpushgrc.sqc'
+  #Include 'stdhdg01.sqc'
+  print 'Pay Period End  ' (4,1)
+  do Format-DateTime($PayEndDate, $out, {DEFDATE}, '', '')
+  print $out ()
+    if $Company <> $priorCompany
+    do Get-Company-Data
+    move $Company to $priorCompany
+    move ''       to $priorPayGroup  !for use in Standard Heading #6
+  end-if
+  print 'W2 Rpt Company'   (3,1,15)
+  print $Company           (0,17,4)
+  print $CompanyName       (0,21)
+
+  print 'Payment Date'      (5,1,15)
+  do Format-DateTime($AsOfDate, $out, {DEFDATE}, '', '')
+  print $out               (0,17)
+
+  Print ' State/       Locality /Abbrv        <------ WITHHOLDING -----' (+2,1)
+  Print '-> <-------------------  OTHER  ----------------------->                 ' ()
+  Print ' <--------------  UI  ------------->'                    ()
+  Print 'SWT EIN       County/Loc EIN          Taxable Gross          Tax ' (+1,1)
+  Print ' Type       Taxable Gross           Tax      Employer  Total Deposit' ()
+  Print '   Taxable Gross           Tax   Rate'                       ()
+End-Heading
+
+Begin-Procedure Report
+Begin-Select
+A.GPUS_YE_RPT_CO      () on-break Print=never Level=1 Procedure=Company-Change
+A.PRD_END_DT          () on-break Print=never Level=2 Procedure=PayEndDate-Change
+A.PYMT_DT             () on-break Print=never Level=3 Procedure=CheckDate-Change
+A.GPUS_TAX_RPT_TYPE   () on-break Print=never Level=5 procedure=Federal-Change
+A.STATE               () on-break print=never level=4 after=State-Local-Change
+
+
+
+A.GPUS_TAX_PCT        &A.GPUS_TAX_PCT
+A.GPUS_TAX_CATEGORY
+SUM(A.GPUS_TAX_GRS)   &A.GPUS_TAX_GRS
+SUM(A.GPUS_TAX_AMT)   &A.GPUS_TAX_AMT
+         IF  &A.GPUS_TAX_CATEGORY = '06'
+          Let #FUTARate = &A.GPUS_TAX_PCT
+         END-IF
+          Do Process-Record
+
+From  PS_GPUS_FDLI_TMP A
+
+Where A.PROCESS_INSTANCE = #prcs_process_instance - 1
+
+
+Group By A.GPUS_YE_RPT_CO,A.PRD_END_DT,A.PYMT_DT,A.STATE,A.GPUS_TAX_RPT_TYPE,A.GPUS_TAX_CATEGORY,A.GPUS_TAX_PCT
+Order By A.GPUS_YE_RPT_CO,A.PRD_END_DT,A.PYMT_DT,A.STATE,A.GPUS_TAX_RPT_TYPE,A.GPUS_TAX_CATEGORY,A.GPUS_TAX_PCT
+
+End-Select
+
+  Move 1 To #changeLevel
+  Move 'Y' To $End
+  Do Print-Totals
+End-Procedure
+
+Begin-Procedure Process-Record
+
+  If &A.Gpus_Ye_Rpt_Co <> $priorCompany
+    Move &A.Gpus_Ye_Rpt_Co To $Company
+    Move &A.Gpus_Ye_Rpt_Co To $priorCompany
+    Do Get-Company-Data                                                         !for Federal_EIN, SUT Rate
+    Move &CT.GPUS_TAX_EIN To $FedEIN 099999999
+  End-If
+
+  Move &A.Prd_End_Dt To $PayEndDate
+  Move &A.Pymt_Dt    To $AsOfDate
+  Let $state = Rtrim(&A.STATE, ' ')
+  Let $tax_rpt_type = Rtrim(&A.GPUS_TAX_RPT_TYPE, ' ')
+  Move 0 to #Jurisdiction_Index                                                 ! Individual States
+  Evaluate $tax_rpt_type
+    When = '10'                                                                 ! Company Totals
+      Move 7 To #Jurisdiction_Index
+      Put '10' Into OtherTaxes(#Jurisdiction_Index)  Jurisdiction
+      If #TaxType_Location = 0
+        Move 7 To #TaxType_Location
+      End-If
+    Break
+    When = '40'                                                                 ! Puerto Rico
+      Move 2 To #Jurisdiction_Index
+      Put '40' Into OtherTaxes(#Jurisdiction_Index) Jurisdiction
+      If #TaxType_Location = 0
+        Move 2 To #TaxType_Location
+      End-If
+    Break
+    When = '20'                                                                 ! American Samoa
+      Move 3 To #Jurisdiction_Index
+      Put '20' Into OtherTaxes(#Jurisdiction_Index) Jurisdiction
+      If #TaxType_Location = 0
+        Move 3 To #TaxType_Location
+      End-If
+    Break
+    When = '30'                                                                 ! Guam
+      Move 4 To #Jurisdiction_Index
+      Put '30' Into OtherTaxes(#Jurisdiction_Index) Jurisdiction
+      If #TaxType_Location = 0
+        Move 4 To #TaxType_Location
+      End-If
+    Break
+    When = '50'                                                                 ! Virgin Islands
+      Move 5 To #Jurisdiction_Index
+      Put '50' Into OtherTaxes(#Jurisdiction_Index) Jurisdiction
+      If #TaxType_Location = 0
+        Move 5 To #TaxType_Location
+      End-If
+    Break
+  End-Evaluate
+
+  Let $Gpus_Tax_Category = Rtrim(&A.Gpus_Tax_Category, ' ')
+  Evaluate &A.Gpus_Tax_Category
+    When = '07'
+
+      Array-Add &A.GPUS_TAX_AMT To OtherTaxes(#Jurisdiction_Index)
+         EIC
+      Break
+
+    When = '02'                                                                 ! OASDI EE - Old Age Survivor
+      If #E_Index = 0                                                           !            Disability Income EE
+        Add 1 To #OtherTaxCount
+        Move #OtherTaxCount To #E_Index
+      End-If
+      Put 'OASEE' Into OtherTaxes(#Jurisdiction_Index) TaxType(#E_Index)
+      Array-Add &A.GPUS_TAX_GRS  &A.GPUS_TAX_AMT 0
+        To OtherTaxes(#Jurisdiction_Index)
+                GPUS_TAX_GRS(#E_Index) GPUS_TAX_AMT(#E_Index)
+                ER_Match(#E_Index)
+      Break
+
+    When = '03'                                                                 ! OASDI ER - Old Age Survivor
+      If #D_Index = 0                                                           ! Disability Income ER
+        Add 1 To #OtherTaxCount
+        Move #OtherTaxCount To #D_Index
+      End-If
+      Put 'OASER' Into OtherTaxes(#Jurisdiction_Index) TaxType(#D_Index)
+      Array-Add &A.GPUS_TAX_GRS 0  &A.GPUS_TAX_AMT
+        To OtherTaxes(#Jurisdiction_Index)
+                GPUS_TAX_GRS(#D_Index) GPUS_TAX_AMT(#D_Index)
+                ER_Match(#D_Index)
+      Break
+
+    When = '04'                                                                ! Medicare EE
+      If #F_Index = 0
+        Add 1 To #OtherTaxCount
+        Move #OtherTaxCount To #F_Index
+      End-If
+      Put 'MEDEE' Into OtherTaxes(#Jurisdiction_Index) TaxType(#F_Index)
+      Array-add &A.GPUS_TAX_GRS &A.GPUS_TAX_AMT 0
+        To OtherTaxes(#Jurisdiction_Index)
+                GPUS_TAX_GRS(#F_Index) GPUS_TAX_AMT(#F_Index)
+                ER_Match(#F_Index)
+      Break
+
+    When = '05'                                                                 ! Medicare ER
+      If #Q_Index = 0
+        Add 1 To #OtherTaxCount
+        Move #OtherTaxCount To #Q_Index
+      End-If
+      Put 'MEDER' Into OtherTaxes(#Jurisdiction_Index) TaxType(#Q_Index)
+      Array-Add &A.GPUS_TAX_GRS 0 &A.GPUS_TAX_AMT
+          To OtherTaxes(#Jurisdiction_Index)
+                  GPUS_TAX_GRS(#Q_Index) GPUS_TAX_AMT(#Q_Index)
+                  ER_Match(#Q_Index)
+      Break
+
+    When = '06'                                                                 ! FUTA
+       array-add &A.GPUS_TAX_GRS to OtherTaxes(#Jurisdiction_Index)
+                                               Unempl_ER_Gross
+
+      array-add &A.GPUS_TAX_AMT   to OtherTaxes(#Jurisdiction_Index)
+                               Unempl_ER_Tax
+      Break
+
+    When = '01'                                                                 ! Withholding Employee Income Tax
+
+      Array-Add &A.GPUS_TAX_GRS To OtherTaxes(#Jurisdiction_Index)
+                                WithholdingGross
+      Array-Add &A.GPUS_TAX_AMT To OtherTaxes(#Jurisdiction_Index)
+                                WithholdingTax
+      Break
+
+  End-Evaluate
+End-Procedure
+
+Begin-Procedure Company-Change
+
+  Move 2 To #changeLevel
+  do Print-Totals
+end-procedure
+
+begin-procedure PayEndDate-Change
+
+  move 3 to #changeLevel
+  do Print-Totals
+end-procedure
+
+begin-procedure CheckDate-Change
+
+  move 4 to #changeLevel
+  do Print-Totals
+end-procedure
+
+Begin-procedure Federal-Change
+
+  If #current-line > 56                                                         ! ensure enough lines for the tax authority
+
+    New-Page
+  End-If
+
+  If $tax_rpt_type = '10' or
+     $tax_rpt_type = '20' or
+     $tax_rpt_type = '30' or
+     $tax_rpt_type = '40' or
+     $tax_rpt_type = '50'
+
+      Let $Fed_Ind = 'Y'                                                         ! 'Y'=yes, ' '=no, 'P'=already processed
+  Else
+    Let $Fed_Ind = 'N'
+  End-If
+  Do Process-Federal-Detail
+  Do Print-detail
+  Do accum-totals
+  Do initialize-jurisdiction
+End-Procedure !Federal Change
+
+begin-procedure State-Local-Change
+
+  if #current-line > 56                                                         ! ensure enough lines for the tax authority
+
+    new-page
+
+  end-if
+  if $State <> $priorState
+    move $State to $priorState
+    do Get-State-Tax-Data
+  end-if
+  move 0 to #Jurisdiction_Index
+  print $StateName         (1,1)
+  print $StateEin     (+1,1)
+  if rtrim($Employer_ID_LWT, ' ') <> ''
+      print $Employer_ID_LWT     (,+1)
+  end-if
+  move '' to $Employer_ID_LWT
+  do Print-detail
+  do accum-totals
+  do initialize-jurisdiction
+end-procedure
+
+begin-procedure Process-Federal-Detail
+
+  MOVE 0 TO #Territory_Count
+  get $Jurisdiction from OtherTaxes(2)
+       Jurisdiction
+
+  if $Jurisdiction = '40'
+    ADD 1 TO #Territory_Count
+
+    move 2 to #Source_Index
+    move 1 to #Target_Index
+    put 'NET' into OtherTaxes(#Target_Index) Jurisdiction
+    do Subtract-Territory
+  end-if
+  get $Jurisdiction from OtherTaxes(3)
+       Jurisdiction
+  if $Jurisdiction = '20'
+    ADD 1 TO #Territory_Count
+    move 3 to #Source_Index
+    move 1 to #Target_Index
+    put 'NET' into OtherTaxes(#Target_Index) Jurisdiction
+    do Subtract-Territory
+    move 6 to #Target_Index
+    put 'TERR' into OtherTaxes(#Target_Index) Jurisdiction
+    do Add-Territory
+  end-if
+
+  get $Jurisdiction from OtherTaxes(4)
+       Jurisdiction
+  if  $Jurisdiction = '30'
+    ADD 1 TO #Territory_Count
+    move 4 to #Source_Index
+    move 1 to #Target_Index
+    put 'NET' into OtherTaxes(#Target_Index) Jurisdiction
+    do Subtract-Territory
+    move 6 to #Target_Index
+    put 'TERR' into OtherTaxes(#Target_Index) Jurisdiction
+    do Add-Territory
+  end-if
+
+  get $Jurisdiction from OtherTaxes(5)
+       Jurisdiction
+
+  if $Jurisdiction = '50'
+    ADD 1 TO #Territory_Count
+    move 5 to #Source_Index
+    move 1 to #Target_Index
+    put 'NET' into OtherTaxes(#Target_Index) Jurisdiction
+    do Subtract-Territory
+    move 6 to #Target_Index
+    put 'TERR' into OtherTaxes(#Target_Index) Jurisdiction
+    do Add-Territory
+  end-if
+
+  IF #Territory_Count > 1
+    move 7 to #Source_Index
+    move 1 to #Target_Index
+    put 'NET' into OtherTaxes(#Target_Index) Jurisdiction
+    do Add-Territory
+  end-if
+
+  IF #Territory_Count > 1    !10 net (1) must be printed
+    move 1 to #Jurisdiction_Index
+    get $Jurisdiction from OtherTaxes(#Jurisdiction_Index)
+         Jurisdiction
+
+    if #TaxType_Location <> 1
+      do Load-TaxType-Values
+    end-if
+    print 'U.S. Federal'     (1,1)
+     let #FUTARate_edit = #FUTARate
+     do Format-Number(#FUTARate_edit, $rate, 'B9.999')
+     print $FedEIN            (2,1)  edit xx-xxxxxxx
+     do Print-detail
+  end-if
+
+  move 2 to #Jurisdiction_Index
+  get $Jurisdiction from OtherTaxes(#Jurisdiction_Index)
+       Jurisdiction
+  if $Jurisdiction = '40'
+    if #TaxType_Location <> 2
+      do Load-TaxType-Values
+    end-if
+    print 'Puerto Rico'     (1,1)
+    let #FUTARate_edit = #FUTARate
+    do Format-Number(#FUTARate_edit, $rate, 'B9.999')
+    print $FedEIN            (2,1)  edit xx-xxxxxxx
+    do Print-detail
+  end-if
+
+  move 3 to #Jurisdiction_Index
+  get $Jurisdiction from OtherTaxes(#Jurisdiction_Index)
+       Jurisdiction
+  if $Jurisdiction = '20'
+    if #TaxType_Location <> 3
+      do Load-TaxType-Values
+    end-if
+    print 'American Samoa'     (1,1)
+    let #FUTARate_edit = #FUTARate
+    do Format-Number(#FUTARate_edit, $rate, 'B9.999')
+    print $FedEIN            (2,1)  edit xx-xxxxxxx
+    do Print-detail
+  end-if
+
+  move 4 to #Jurisdiction_Index
+  get $Jurisdiction from OtherTaxes(#Jurisdiction_Index)
+       Jurisdiction
+
+  if $Jurisdiction = '30'
+    if #TaxType_Location <> 4
+      do Load-TaxType-Values
+    end-if
+    print 'Guam'     (1,1)
+    let #FUTARate_edit = #FUTARate
+    do Format-Number(#FUTARate_edit, $rate, 'B9.999')
+    print $FedEIN            (2,1)  edit xx-xxxxxxx
+    do Print-detail
+  end-if
+
+  move 5 to #Jurisdiction_Index
+  get $Jurisdiction from OtherTaxes(#Jurisdiction_Index)
+       Jurisdiction
+  if $Jurisdiction = '50'
+    if #TaxType_Location <> 5
+      do Load-TaxType-Values
+    end-if
+    print 'Virgin Islands'     (1,1)
+    let #FUTARate_edit = #FUTARate
+    do Format-Number(#FUTARate_edit, $rate, 'B9.999')
+    print $FedEIN            (2,1)  edit xx-xxxxxxx
+    do Print-detail
+  end-if
+
+  if #Territory_Count > 1
+    move 6 to #Jurisdiction_Index
+    get $Jurisdiction from OtherTaxes(#Jurisdiction_Index)
+         Jurisdiction
+    if #TaxType_Location <> 6
+      do Load-TaxType-Values
+    end-if
+    print '941-SS Totals (20 + 30 + 50)' (1,1)
+    let #FUTARate_edit = #FUTARate
+    do Format-Number(#FUTARate_edit, $rate, 'B9.999')
+    print $FedEIN            (2,1)  edit xx-xxxxxxx
+    do Print-detail
+  end-if
+
+  move 7 to #Jurisdiction_Index
+  get $Jurisdiction from OtherTaxes(#Jurisdiction_Index) Jurisdiction
+  if $Jurisdiction = '10'
+    if #TaxType_Location <> 7
+      do Load-TaxType-Values
+    end-if
+    print 'Federal Totals ' (1,1)
+    let #FUTARate_edit = #FUTARate
+
+      do Format-Number(#FUTARate_edit, $rate, 'B9.999')
+      print $FedEIN            (2,1)  edit xx-xxxxxxx
+      do Accum-totals
+
+  end-if
+  move 'P' to $USFederal_data_exists
+end-procedure
+
+
+begin-procedure Add-Territory
+
+
+  move 0 to #TaxType_Index
+  while #TaxType_Index <= 17
+     get #GPUS_TAX_GRS #GPUS_TAX_AMT #ER_Match from
+         OtherTaxes(#Source_Index)
+          GPUS_TAX_GRS(#TaxType_Index)
+           GPUS_TAX_AMT(#TaxType_Index)   ER_Match(#TaxType_Index)
+     array-add  #GPUS_TAX_GRS #GPUS_TAX_AMT #ER_Match to
+         OtherTaxes(#Target_Index)
+                 GPUS_TAX_GRS(#TaxType_Index)   GPUS_TAX_AMT(#TaxType_Index)
+                 ER_Match(#TaxType_Index)
+     add 1 to #TaxType_Index
+  end-while
+
+     get #WithholdingGross #WithholdingTax #EIC
+         #Unempl_ER_Gross #Unempl_ER_Tax #Unempl_SP_Gross #Unempl_SP_Tax
+         from OtherTaxes(#Source_Index)
+          WithholdingGross  WithholdingTax  EIC
+          Unempl_ER_Gross  Unempl_ER_Tax  Unempl_SP_Gross  Unempl_SP_Tax
+     array-add #WithholdingGross #WithholdingTax #EIC
+               #Unempl_ER_Gross #Unempl_ER_Tax #Unempl_SP_Gross #Unempl_SP_Tax
+           to OtherTaxes(#Target_Index)
+                WithholdingGross  WithholdingTax  EIC
+                Unempl_ER_Gross  Unempl_ER_Tax  Unempl_SP_Gross  Unempl_SP_Tax
+end-procedure
+
+begin-procedure Subtract-Territory
+
+
+  move 1 to #TaxType_Index
+  while #TaxType_Index <= 17
+     get #GPUS_TAX_GRS #GPUS_TAX_AMT #ER_Match from OtherTaxes(#Source_Index)
+          GPUS_TAX_GRS(#TaxType_Index) GPUS_TAX_AMT(#TaxType_Index)
+          ER_Match(#TaxType_Index)
+     array-subtract  #GPUS_TAX_GRS #GPUS_TAX_AMT #ER_Match from
+         OtherTaxes(#Target_Index)
+                      GPUS_TAX_GRS(#TaxType_Index)   GPUS_TAX_AMT(#TaxType_Index)
+                      ER_Match(#TaxType_Index)
+     add 1 to #TaxType_Index
+  end-while
+
+     get #WithholdingGross #WithholdingTax #EIC
+         #Unempl_ER_Gross #Unempl_ER_Tax #Unempl_SP_Gross #Unempl_SP_Tax
+         from OtherTaxes(#Source_Index)
+          WithholdingGross  WithholdingTax  EIC
+          Unempl_ER_Gross  Unempl_ER_Tax  Unempl_SP_Gross  Unempl_SP_Tax
+     array-subtract #WithholdingGross #WithholdingTax #EIC
+               #Unempl_ER_Gross #Unempl_ER_Tax #Unempl_SP_Gross #Unempl_SP_Tax
+           from OtherTaxes(#Target_Index)
+                     WithholdingGross  WithholdingTax  EIC
+                Unempl_ER_Gross  Unempl_ER_Tax  Unempl_SP_Gross  Unempl_SP_Tax
+end-procedure
+
+begin-procedure Load-TaxType-Values
+
+
+  move 0 to #TaxType_Index
+  while #TaxType_Index <= 17
+    get $TaxType from OtherTaxes(#TaxType_Location)   TaxType(#TaxType_Index)
+    put $TaxType into OtherTaxes(#Jurisdiction_Index) TaxType(#TaxType_Index)
+    add 1 to #TaxType_Index
+  end-while
+end-procedure
+
+begin-procedure Print-detail
+
+
+   get #WithholdingGross #WithholdingTax #EIC
+      #Unempl_ER_Gross  #Unempl_ER_Tax
+      #Unempl_SP_Gross  #Unempl_SP_Tax   from OtherTaxes(#Jurisdiction_Index)
+       WithholdingGross  WithholdingTax EIC
+       Unempl_ER_Gross   Unempl_ER_Tax
+       Unempl_SP_Gross   Unempl_SP_Tax
+
+
+  Do Format-Number(#WithholdingGross, $out, 'B99,999,999.99mi')
+  Print $out        (1,37)
+  Do Format-Number(#WithholdingTax, $out, 'B9,999,999.99mi')
+  Print $out        (0,52)
+  Move #WithholdingTax to #TotalDeposit
+
+  if #EIC <> 0
+    print '(EIC)'   (2,40)
+    do Format-Number(#EIC, $out, 'B9,999,999.99mi')
+    print $out      (0,52)
+    add #EIC to #TotalDeposit
+  end-if
+
+  move 0 to #GPUS_TAX_AMT_Total
+  move 0 to #ER_Match_Total
+  move 0 to #TaxType_Index
+  move 1 to #Detail_Lineno
+  while #TaxType_Index <= 17
+    get $TaxType #GPUS_TAX_GRS #GPUS_TAX_AMT #ER_Match
+      from OtherTaxes(#Jurisdiction_Index)
+          TaxType(#TaxType_Index)  GPUS_TAX_GRS(#TaxType_Index)
+          GPUS_TAX_AMT(#TaxType_Index)  ER_Match(#TaxType_Index)
+
+    if #GPUS_TAX_GRS <> 0 or #GPUS_TAX_AMT <> 0
+      print $TaxType     (#Detail_Lineno,67)
+      add 1 to #Detail_Lineno
+      do Format-Number(#GPUS_TAX_GRS, $out, 'B99,999,999.99mi')
+      print $out         (0,77)
+      do Format-Number(#GPUS_TAX_AMT, $out, 'B9,999,999.99mi')
+      print $out         (0,92)
+      do Format-Number(#ER_Match, $out, 'B9,999,999.99mi')
+      print $out         (0,106)
+      add #GPUS_TAX_AMT to #GPUS_TAX_AMT_Total
+      add #ER_Match to #ER_Match_Total
+      add #GPUS_TAX_AMT to #TotalDeposit
+      add #ER_Match to #TotalDeposit
+    end-if
+
+    add 1 to #TaxType_Index
+  end-while
+
+  do Format-Number(#TotalDeposit, $out, 'B9,999,999.99mi')
+  print $out           (1,121)
+  do Format-Number(#Unempl_ER_Gross, $out, 'B99,999,999.99mi')
+  print $out           (1,136)
+  IF #Unempl_ER_Gross <>  0
+  print $rate               (1,165)
+  END-IF
+
+
+  do Format-Number(#Unempl_ER_Tax, $out, 'B9,999,999.99mi')
+  print $out           (1,151)
+
+  if #Unempl_SP_Gross <> 0 or #Unempl_SP_Tax <> 0
+    do Format-Number(#Unempl_SP_Gross, $out, 'B99,999,999.99mi')
+    print $out           (2,136)
+    do Format-Number(#Unempl_SP_Tax, $out, 'B9,999,999.99mi')
+    print $out           (2,151)
+
+    let #SpecialUIRate = #SpecialUIRate
+
+    do Format-Number(#SpecialUIRate, $out, 'B9.999')
+    print $out           (2,165)
+
+    print 'Spcl'         (,+1)
+  end-if
+  next-listing need=3 skiplines=1
+
+end-procedure
+
+begin-procedure accum-totals
+
+  if #Jurisdiction_Index = 0 or
+     #Jurisdiction_Index = 7
+    array-add #GPUS_TAX_AMT_Total #ER_Match_Total
+        to Totals(4) total(1) total(2)
+  end-if
+  array-add #WithholdingTax #EIC #TotalDeposit
+            #Unempl_ER_Tax #Unempl_SP_Tax #Dis_ER_Tax
+            to Totals(4) total(0) total(0) total(3)
+                         total(4) total(4) total(4)
+end-procedure
+
+begin-procedure initialize-jurisdiction
+
+  move 0 to #TotalDeposit
+  move 0 to #OtherTaxCount
+  move 0 to #Territory_Count
+  move 0 to #TaxType_Location
+  move 0 to #A_Index
+  move 0 to #B_Index
+  move 0 to #D_Index
+  move 0 to #E_Index
+  move 0 to #F_Index
+  move 0 to #G_Index
+  move 0 to #J_Index
+  move 0 to #Q_Index
+  move 0 to #R_Index
+  move 0 to #L_Index
+  move 0 to #M_Index
+  move 0 to #N_Index
+  move 0 to #T_Index
+  move 0 to #V_Index
+  move 0 to #W_Index
+  move 0 to #X_Index
+  move 0 to #Z_Index
+  Clear-Array name=OtherTaxes
+
+end-procedure
+
+
+begin-procedure Print-Totals
+
+   Do Federal-Change
+
+  If $Fed_Ind ='Y'
+    Do Process-Federal-Detail
+    Do initialize-jurisdiction
+  End-If
+  move 4 to #totalRow
+  while #totalRow >= #changeLevel
+    move #totalRow to #rollRow
+    subtract 1 from #rollRow
+    get $TotalName from Totals(#totalRow) TotalName
+    print $TotalName (+2,21)
+    move 0 to #i
+    while #i <= 4
+      get #total from Totals(#totalRow) total(#i)
+      get #startCol from Totals(0) startCol(#i)
+      do Format-Number(#total, $out, 'B9,999,999.99mi')
+      print $out (0,#startCol)
+      array-add #total to Totals(#rollRow) total(#i)
+      put 0 into Totals(#totalRow) total(#i)
+      add 1 to #i
+    end-while
+    subtract 1 from #totalRow
+  end-while
+  move ' ' to $USFederal_data_exists
+
+  if $End = 'Y'
+    do Reset
+  end-if
+  new-page
+end-procedure
+
+begin-procedure delete-tmp
+begin-Sql
+delete from PS_GPUS_FDLI_TMP
+  WHERE PROCESS_INSTANCE   = #prcs_process_instance - 1
+end-SQL
+end-procedure
+
+#Include 'gpuscodt.sqc'  !Get-Company-Data procedure
+#Include 'gpusstdt.sqc'  !Get-State-Tax-Data procedure
+#Include 'gpuspctl.sqc'  !Process Scheduler Run Control
+#Include 'gpuspint.sqc'  !Report Initialization and Timing
+#Include 'reset1.sqc'    !Reset printer procedure
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'stdapi.sqc'    !Update Process API

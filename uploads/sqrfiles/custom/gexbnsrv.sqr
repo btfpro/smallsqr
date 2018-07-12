@@ -1,0 +1,1099 @@
+!***********************************************************************
+! gexbnsrv:  This program determines the benefits eligibility based on *
+!            service.                                                  *    
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module is the confidential and proprietary information of       *
+! Giant Eagle, Inc.; it is not to be copied, reproduced, or transmitted*
+! in any form, by any means, in whole or in part, nor is it to be used *
+! for any purpose other than that for which it is expressly provided   *
+! without the written permission of Giant Eagle.                       *
+!                                                                      *
+!                                                                      *
+!***********************************************************************
+!***********************************************************************
+!                         MODIFICATION HISTORY                         *
+!***********************************************************************
+!  ID#     INITIALS    DATE           DESCRIPTION OF THE CHANGE        *        
+!***********************************************************************
+!  GBNC010   SXK       11/11/1997     INITIAL CREATION                 *
+!                                                                      *
+!            CJH       01/13/1998     correct insert logic - see date  *
+!                                     stamp                            *
+!                                                                      *
+!  GBNC019   JNB       03/13/1998     handle BP's R06 and R07          *
+!                                                                      *
+!            PLN       04/15/1998     Functional signoff               *
+!                                                                      *
+!  GBNC019   SXK       04/28/1998     Added Array logic to store the   *
+!                                     distinct minimum months for each *
+!                                     benefit program and compare the  *
+!                                     employees' service months with   *
+!                                     the array elements.              *     
+!                                                                      *
+!  GBNC065   JDH       08/13/1998     Added logic to create an audit   *
+!                                     report of W08 employees who need *
+!                                     to be promoted from Temp PT to   *
+!                                     Reg PT after 6 months of service *
+!                                                                      *
+!            SXK       09/22/1998     Added New Mobius ReportID        *
+!                                                                      *
+!            SXK       11/25/1998     Added code to be able to process *
+!				      EEs who met service either       *
+!				      yesterday or today.              *
+!                                                                      *
+!            AXL       11/02/1999     Used Rule optimizer              *
+!                                                                      *
+!            SXK       12/13/1999     Modified to have union cd from   *
+!                                     from job_labor. Removed job      *
+!                                     inserts and replaced with bas    *
+!                                     activity insert.                 *
+!                                                                      *
+!  HR70133   AXL       05/14/2001     Add new job field                *
+!                                     GEX_SEASONAL_EMP.                *
+!                                                                      *
+!  HR-10103  CJH       09/18/2001     Add name to BNSRVLOA report      *
+!  PSR      08/12/2002  Modified UNION_CD FROM JOB_LABOR TO JOB        * 
+!                       - Upgrade 8.3                                  *
+!                                                                      *
+!  HR-10344  GBD       10/04/2002     Remove code that produces report *
+!                                     BNSRVPRM - Butler promotion rpt. *
+!                                                                      *
+!  HR-10306  GBD       11/14/2002     Added BAS_ACTIVITY.BAS_ALL_JOBS  *
+!                                     default value to insert proc.    *
+!                                                                      *
+!  HR-10306  GBD       01/03/2003     Added BAS_SUPPRESS_FORMS field to*
+!                                     Bas_Activity table insert.       *
+!  VENDNYS   NYS       08/30/2007     Modified for Upgrade 9.0         *
+!                                     JOB, ACTION_REASON_TBL           *
+!                                     retrofitted                      *
+!***********************************************************************
+
+#include 'setenv.sqc' !Set environment
+
+begin-setup
+
+!#include 'setup32a.sqc' PSR 08/12/02 8 Upgrade
+#include 'ptpsl177.sqc' 
+!GBD 10/04/2002 begin
+!declare-report W08-Promotion-Audit-report
+!   layout=DEFAULT
+!end-declare
+!GBD 10/04/2002 End
+
+
+
+
+declare-report Leave-of-Absence-report
+Printer-Type=HPLASERJET
+   layout=DEFAULT
+end-declare
+
+declare-report Report-log
+Printer-Type=HPLASERJET
+   layout=DEFAULT
+end-declare
+
+end-setup
+
+!*********************************************************************
+!Initial processing, retrieving current dates and calls the main 
+!procedure to do the processing.                                     
+!*********************************************************************
+begin-report
+!  move 'N' to $W08-rpt-printed                          GBD 10/04/2002
+  move 'N' to $LOA-rpt-printed
+  move 'N' to $rpt-log-printed
+
+  use-report Report-log
+  
+  !AXL 11/02/1999 Begin
+  !  do Alter-Session   ! Set Session to RULE Optimizer  Upgrace 9.0 commented code
+  !AXL 11/02/1999 End
+  do Init-DateTime
+  do Init-Number
+  do stdapi-init
+  
+  move 'GEXBNSRV' to $ReportID
+  move 'Benefits Eligibility based on Service' to $ReportTitle
+  display $ReportTitle
+
+  do format-datetime($reportdate_ccyyyy,$rnctl_date_dbf,{DEFMDY},'','NATIVE') 
+
+  do Report
+  do Commit-Transaction
+  If $rpt-log-printed = 'N'
+     use-report Report-log  
+     print 'No log information to report' (+1,1) bold
+  end-if
+  If $LOA-rpt-printed = 'N'
+     use-report Leave-of-Absence-report  
+     print 'No Leave of Absence information to report' (+1,1) bold
+     use-report Report-log  
+  end-if
+
+!GBD 10/04/2002 Begin
+!  If $W08-rpt-printed = 'N'
+!     use-report W08-Promotion-Audit-report
+!     print 'No W08 promotion audit information to report' (+1,1) bold
+!     use-report Report-log  
+!  end-if
+!GBD 10/04/2002 End
+  date-time () hh:mi:ss &timeEnded
+  display 'Report Ended: ' noline
+  display &timeEnded
+  do stdapi-term
+
+end-report
+
+!*********************************************************************
+!If this Program is being executed through process scheduler, 
+!the run control parameters and calls the main processing procedure.
+!Otherwise, interrogates the user for the run control parameters and 
+!validates them. If the run control parameters are invalid, stops the
+!execution.
+!*********************************************************************
+begin-procedure Report
+
+date-time () hh:mi:ss &timeBegan
+display 'Report Began: ' noline
+display &timeBegan
+
+ move 'N' to $Errorfound
+
+!if $prcs_process_instance = ''
+!    input $rnctl_date 'Enter Run Control Date({Prompt-Date}): ' type=char
+!    do format-datetime($rnctl_date,$rnctl_date_dbf,{prompt-mask},'','native')
+!else
+!    do Select-Parameters
+!    if $found = 'N'
+!	goto report-exit
+!    end-if
+!end-if
+
+  do Get-Current-DateTime
+  move $AsOfToday to $rnctl_date_dbf
+  Display 'Run Date: ' noline
+  display $AsOfToday
+  Display 'Run As Of Date: ' noline
+  display $rnctl_date_dbf
+  
+
+
+ move 0 to #total_inserts
+ move 0 to #total_EEs
+
+ CREATE-ARRAY name=service size=51
+    field=months:number:3
+ 
+ do process-employee-data
+
+ if $sev-error = 'Y'
+    goto report-exit
+ end-if
+  
+Report-Exit:
+
+  date-time () hh:mi:ss &timeProcess
+  display ' Total Employees Processed: ' noline
+  display #total_EEs 99999 
+  display ' Total JOB rows inserted: ' noline
+  display #total_inserts 99999
+
+end-procedure
+
+!*********************************************************************
+!Prints the header information in the report log.
+!*********************************************************************
+
+begin-heading 8 for-reports=(report-log)
+!SXK 09/22/1998 Begin
+let $ReportID = 'BNSRVLOG'
+!SXK 09/22/1998 End
+ #Include 'stdhdg01.sqc'
+  position (+1)
+  print 'Report Log' () center bold
+
+  position (+2)
+  print 'Trans#' (,1) bold
+  print 'Emplid' (,18) bold
+  print 'Message' (,50) bold
+  print '-' (+1,1,127) fill
+ 
+end-heading
+
+!*********************************************************************
+!Prints the header information in the Leave of Absence Report
+!*********************************************************************
+
+begin-heading 8 for-reports=(Leave-of-Absence-report)
+!SXK 09/22/1998 Begin
+let $ReportID = 'BNSRVLOA'
+!SXK 09/22/1998 End
+ #Include 'stdhdg01.sqc'
+  position (+1)
+
+  print 'Leave of Absence Report' () center bold
+  position (+2)
+
+  print 'Emplid' (,4) bold
+! CJH - 09/18/2001 
+  Print 'Name' (,20) bold
+  print 'Company' (,60) bold
+  print 'Store#' (,75) bold
+  print 'Empl Status' (,90) bold
+  print 'Job Code' (,108) bold
+  print 'Union Code' (,120) bold
+  print 'Benefit Program' (,135) bold
+  print 'Service Date' (,155) bold
+
+  print '-' (+1,1,167) fill
+ 
+end-heading
+
+!GBD 10/04/2002 Begin
+!*********************************************************************
+!Prints the header information in the W08 Promotion Audit Report
+!*********************************************************************
+!begin-heading 10 for-reports=(W08-Promotion-Audit-report)
+!SXK 09/22/1998 Begin
+!let $ReportID = 'BNSRVPRM'
+!SXK 09/22/1998 End
+! #Include 'stdhdg01.sqc'
+!  position (+1)
+!
+!  print 'Benefit Program W08 (Butler) Employees that need promoted to Reg PT' () center bold
+!  position (+1)
+!  print 'Use the employee data listed below to promote the employee' () center bold
+!  position (+2)
+
+!  print 'Empl' (,26) bold
+!  print 'Action' (,84) bold
+!  print 'Benefit' (,103) bold
+!  print 'Reg/' (,123) bold
+
+!  position (+1)
+!  print 'Emplid' (,5) bold
+!  print 'Rcd#' (,26) bold
+!  print 'EffDt' (,45) bold
+!  print 'Action' (,65) bold
+!  print 'Reason' (,84) bold
+!  print 'Program' (,103) bold
+!  print 'Temp' (,123) bold
+
+!  print '-' (+1,1,127) fill
+ 
+!end-heading
+!GBD 10/04/2002 End
+
+!*********************************************************************
+!Prints the footer in the report log
+!*********************************************************************
+
+begin-footing 2 for-reports=(Report-log)
+page-number (1,108) 'Page '  
+last-page () ' of ' '.'
+
+end-footing
+
+!*********************************************************************
+!Prints the footer in the Leave of Absence Report
+!*********************************************************************
+
+begin-footing 2 for-reports=(Leave-of-Absence-Report)
+page-number (1,108) 'Page '  
+last-page () ' of ' '.'
+
+end-footing
+
+!GBD 10/04/2002 Begin
+!*********************************************************************
+!Prints the footer in the W08 Promotion Audit Report
+!*********************************************************************
+!begin-footing 2 for-reports=(W08-Promotion-Audit-report)
+!page-number (1,108) 'Page '  
+!last-page () ' of ' '.'
+!
+!end-footing
+!GBD 10/04/2002 End
+
+!*********************************************************************
+!Determines previous month's number of weeks to find out the weekly 
+!hours worked for each employee. Calls the main benefits participation
+!logic and leave of absence logic
+!*********************************************************************
+
+Begin-Procedure Process-Employee-Data
+
+move 'N' to $errorfound
+move 'N' to $found
+
+do get-benefit-program
+
+end-procedure
+
+!*********************************************************************
+!Retrieves active benefit programs one by one.
+!********************************************************************* 
+
+begin-procedure get-benefit-program
+
+move 'N' to $errorfound
+move 'N' to $beninfo_found
+
+begin-select on-error=sql-error-found('get-benefit-program')
+A.BENEFIT_PROGRAM
+A.EFFDT
+   display 'PROCESSING BENEFIT PROGRAM: ' noline
+   display &A.BENEFIT_PROGRAM
+   move 'Y' to $beninfo_found
+   CLEAR-ARRAY name=service
+   do get-min-service-dt
+FROM PS_BEN_DEFN_PGM A
+
+WHERE A.EFF_STATUS = 'A'
+  AND A.EFFDT = (SELECT MAX(EFFDT)
+		   FROM PS_BEN_DEFN_PGM
+		  WHERE BENEFIT_PROGRAM = A.BENEFIT_PROGRAM
+		    AND EFF_STATUS = 'A'
+		    AND EFFDT <= $rnctl_date_dbf)
+end-SELECT
+
+if $beninfo_found = 'N'
+   do error-found
+   print 'No Benefit Program information found' (,34)
+end-if
+
+end-procedure
+
+!*********************************************************************
+!Retrieves the minimum service date requirement for the benefit program
+!*********************************************************************
+
+begin-procedure get-min-service-dt
+
+
+move 'N' to $errorfound
+move 'N' to $serv_found
+move 'N' to $found
+let #i = 1
+
+begin-select on-error=sql-error-found('get-min-service-dt')
+distinct((B.MIN_SERVICE_MM))   &min_mm
+   display 'Searching for Employees with service = ' noline
+   display &min_mm noline
+   display ' months '
+   move &min_mm to #min_mm
+   move 'Y' to $serv_found
+
+   PUT #min_mm INTO service(#i)
+   add 1 to #i
+       
+FROM PS_BAS_ELIG_RULES B,
+     PS_BEN_DEFN_OPTN C
+WHERE C.BENEFIT_PROGRAM = &A.BENEFIT_PROGRAM
+  AND C.ELIG_RULES_ID = B.ELIG_RULES_ID
+  AND B.EFF_STATUS = 'A'
+  AND B.MIN_SERVICE_MM <> 0
+  AND B.EFFDT = (SELECT MAX(EFFDT)
+		   FROM PS_BAS_ELIG_RULES
+		  WHERE ELIG_RULES_ID = C.ELIG_RULES_ID
+                    AND EFF_STATUS = 'A'
+		    AND EFFDT <= $rnctl_Date_Dbf)
+  AND C.EFFDT = &A.EFFDT
+end-SELECT
+
+if $serv_found = 'N'
+   move #inputtran to #save_tran
+   move 0 to #inputtran
+   move '' to $emplid
+   do error-found
+   move #save_tran to #inputtran
+   print 'No Min service months found for benefit program:' (,34)
+   print &A.BENEFIT_PROGRAM ()
+   display 'No Min service months found for benefit program: ' noline
+   display &A.BENEFIT_PROGRAM 
+else
+   do process-empl-elig-rules
+end-if
+
+end-procedure    
+
+!*********************************************************************
+!Determines the benefits eligibility configuratin byte value for each
+!employee who participated in G01 Benefit Program to be able to compare
+!with the existing job table field and prepares the voluntary low hours
+!problem report
+!*********************************************************************
+
+begin-procedure process-empl-elig-rules
+
+move 'N' to $errorfound
+move 'N' to $found
+move 'N' to $empl_exists
+display 'processing   ' noline 
+display &a.benefit_program
+
+begin-select 
+E.EMPLID
+E.EMPL_RCD &empl_rcd
+E.EFFDT 
+E.EFFSEQ
+E.EMPL_STATUS
+E.DEPTID
+E.JOBCODE
+E.COMPANY
+F.SERVICE_DT
+!SXK 12/13/1999 Begin - Changed from f.union_Cd, added benefit_rcd_nbr
+E.UNION_CD
+F.BENEFIT_RCD_NBR
+D.BENEFIT_PROGRAM
+ display &e.emplid
+PD.NAME        ! CJH - 09/18/2001
+
+ move &F.BENEFIT_RCD_NBR to #bac_benefit_rcd
+    move 'Y' to $found
+    move 'Y' to $empl_exists
+    do get-service-months
+    if #service_mm <> 0
+       move #service_mm to $service_mm
+       do process-eligibility-rule
+    end-if
+    
+FROM PS_BEN_PROG_PARTIC D,
+     PS_JOB E,
+     PS_EMPLOYMENT F, 
+     PS_PERSONAL_DATA PD     ! CJH - 09/18/2001
+
+WHERE D.BENEFIT_PROGRAM = &A.BENEFIT_PROGRAM
+  AND D.EMPLID = E.EMPLID
+  AND D.EMPL_RCD = E.EMPL_RCD
+! CJH - 09/18/2001 
+  AND E.EMPLID = PD.EMPLID
+! CJH - 09/18/2001
+  AND E.EMPLID = F.EMPLID
+  AND E.EMPL_RCD = F.EMPL_RCD
+  AND E.EMPL_STATUS IN ('A','L','P')
+  AND D.EFFDT = (SELECT MAX(EFFDT)
+		   FROM PS_BEN_PROG_PARTIC DD
+                   WHERE DD.emplid = e.emplid
+                    and DD.empl_rcd = e.empl_rcd
+		    AND DD.EFFDT <= $rnctl_date_dbf)
+  AND E.EFFDT = (SELECT MAX(EFFDT)
+		   FROM PS_JOB
+		  WHERE EMPLID = E.EMPLID
+		    AND EMPL_RCD = E.EMPL_RCD
+		    AND EFFDT <= $rnctl_date_dbf)
+  AND E.EFFSEQ = (SELECT MAX(EFFSEQ)
+                    FROM PS_JOB
+		   WHERE EMPLID = E.EMPLID
+		     AND EMPL_RCD = E.EMPL_RCD
+		     AND EFFDT = E.EFFDT)
+
+end-SELECT
+
+!if $empl_exists = 'N'
+!   move #inputtran to #save_tran
+!   move 0 to #inputtran
+!   move '' to $emplid
+!   do error-found
+!   move #save_tran to #inputtran
+!end-if
+
+end-procedure
+
+!*********************************************************************
+!Retrieves the difference between current date and the service date of
+!the employee
+!*********************************************************************
+
+begin-procedure get-service-months
+
+move 0 to #service_mm
+
+
+    do Convert-To-DTU-Date($rnctl_Date_dbf,$dtu_rnctl_dt)
+    do Convert-To-DTU-Date(&F.SERVICE_DT,$dtu_service_dt)
+    do dtu-diff-months($dtu_service_dt, $dtu_rnctl_dt, #service_mm)
+
+
+!if #service_mm = 0
+!   do error-found
+!   print 'Calculation of service months failed for employee' (,34)
+!end-if
+
+end-procedure
+
+!*********************************************************************
+!If the service months calculated matches with the required minimum 
+!months, interrogates the employee status whether to write leave-of-
+!absence report or insert new auto insert row in job table.
+!*********************************************************************
+
+begin-procedure process-eligibility-rule
+
+  move #service_mm to $serv_min
+  let #j = 1
+  move 'N' to $months_match
+  let #match_months = 0
+
+!  move #min_mm to $rule_mm
+!  if #service_mm = #min_mm
+
+      
+     do dtu-subtract-days($dtu_rnctl_dt,1,$dtu_rnctl_dt_1)
+     do dtu-diff-months($dtu_service_dt, $dtu_rnctl_dt_1, #service_mm_1)
+     move #service_mm_1 to $ser1
+
+     if #service_mm_1 < #service_mm
+        let #match_months = #service_mm
+        do Match-Service-Months
+
+  !SXK 11/25/1998 Added code to check if they met the service as of 
+  ! yesterday. This is necessary because if this program runs after 12AM
+  ! we have to make sure that we pick employees that met service as of
+  ! yesterday, otherwise they would not picked up anywhere.
+
+    else   ! EE did not meet the service as of today
+
+     do dtu-subtract-days($dtu_rnctl_dt,2,$dtu_rnctl_dt_2)
+     do dtu-diff-months($dtu_service_dt, $dtu_rnctl_dt_2, #service_mm_2)
+     move #service_mm_2 to $ser1
+
+     if #service_mm_2 < #service_mm_1
+        let #match_months = #service_mm_1
+        let $save_rnctl_date_dbf = $rnctl_date_dbf
+        do convert-from-dtu-date($dtu_rnctl_dt_1,$rnctl_date_dbf)
+        do Match-Service-Months
+        let $rnctl_date_dbf = $save_rnctl_date_dbf
+     end-if
+  !SXK 11/25/1998 End
+    end-if
+		
+end-procedure
+
+!*********************************************************************
+!Selects the job table row with runcontrol effdt. If it does not exist
+!calls the select to get the maximum effdt row for the employee
+!*********************************************************************
+
+Begin-Procedure Match-Service-Months
+
+      while #j <= 50 and ($months_match = 'N')
+       GET #min_mm FROM service(#j)
+       if #match_months = #min_mm
+        move 'Y' to $months_match
+
+        add 1 to #inputtran
+        move &E.EMPLID to $emplid 
+        move &EMPL_RCD to #empl_rcd
+        move 'N' to $update-is-done
+        add +1 to #total_EEs
+        display 'Employee : ' noline
+        display $emplid noline
+        display ' met the service requirement'
+
+!GBD 10/04/2002 Begin
+!        if &A.BENEFIT_PROGRAM = 'W08' and #min_mm = 6
+!          do write-W08-promotion-audit
+!          use-report report-log
+!        end-if
+!GBD 10/04/2002 End
+
+        evaluate &E.EMPL_STATUS
+    	  when = 'L'
+	  when = 'P'
+	      if substr(&A.BENEFIT_PROGRAM,1,1) = 'G'
+	         do write-leave-of-absence-report
+	         use-report report-log
+	      end-if
+	  when-other   ! = A because main EE select is L,P,A
+	      do select-job-row
+	      if $errorfound = 'N'
+!SXK 12/13/1999 Begin
+               if $bas_action_retrieved <> 'Y'
+                  do get-bas-action
+               end-if
+!SXK 12/13/1999 End
+	         if $effdt_row_exists = 'Y'
+                  if &I.ACTION = 'ATO' AND &I.ACTION_REASON = 'BLC'
+		        do error-found
+		        move 'N' to $errorfound
+		        print 'Auto insert row already exists for emplid,' (,34)
+  		        print 'EFFDT:' ()
+		        print &I.EFFDT ()
+		      end-if
+                  if &I.ACTION = 'ATO' AND (&I.ACTION_REASON = '001' or
+                                            &I.ACTION_REASON = '002')
+                  else
+                    !SXK 12/13/1999 Begin
+                    !  do insert-job-row-effdt-exists
+                      let $bac_emplid = &I.EMPLID
+                      let #bac_empl_rcd = &I.EMPL_RCD
+                      let $bac_bas_action_source = 'PS'
+	              let $bac_event_dt = &I.EFFDT
+                      let #bac_event_effseq = 0
+                      let $bac_cobra_action = &I.COBRA_ACTION
+                      let $bas_activity_exists = 'N'
+                      do select-bas-activity-row
+                      if $bas_activity_exists = 'N'
+                         do insert-bas-activity-row
+                      end-if
+                    !SXK 12/13/1999 End
+                  end-if
+	         else
+                 !SXK 12/13/1999 Begin
+		 !    do insert-job-row
+                  let $bac_emplid = &J.EMPLID
+                  let #bac_empl_rcd = &J.EMPL_RCD
+                  let $bac_bas_action_source = 'PS'
+		  let $bac_event_dt = $effdt_dbf
+                  let #bac_event_effseq = 0
+                  let $bac_cobra_action = &J.COBRA_ACTION
+               let $bas_activity_exists = 'N'
+               do select-bas-activity-row
+               if $bas_activity_exists = 'N'
+                  do insert-bas-activity-row
+               end-if
+!SXK 12/13/1999 End
+	         end-if
+!	         if $errorfound = 'N' and $update-is-done = 'N'
+!		      do update-personal-data
+!	         end-if
+	      end-if
+        end-evaluate
+      end-if
+      add 1 to #j
+     end-while
+
+end-procedure
+
+!*********************************************************************
+!Selects the job table row with runcontrol effdt. If it does not exist
+!calls the select to get the maximum effdt row for the employee
+!*********************************************************************
+
+begin-procedure select-job-row
+
+let $effdt_dbf = $rnctl_date_dbf
+
+
+move 'N' to $found
+move 'N' to $effdt_row_exists
+move 'N' to $errorfound
+
+begin-select on-error=sql-error-found('select-job-row')
+I.EMPLID
+I.EMPL_RCD
+I.EFFDT
+I.EFFSEQ
+I.DEPTID
+I.JOBCODE
+I.POSITION_NBR
+I.POSITION_OVERRIDE
+I.POSN_CHANGE_RECORD
+I.EMPL_STATUS
+I.ACTION
+I.ACTION_dT
+I.ACTION_REASON
+I.LOCATION
+I.TAX_LOCATION_cD
+I.JOB_ENTRY_DT
+I.DEPT_ENTRY_DT
+I.POSITION_ENTRY_DT
+I.SHIFT
+I.REG_TEMP
+I.FULL_PART_TIME
+I.COMPANY
+I.PAYGROUP
+I.BAS_GROUP_ID
+I.ELIG_CONFIG1
+I.ELIG_CONFIG2
+I.ELIG_CONFIG3
+I.ELIG_CONFIG4
+I.ELIG_CONFIG5
+I.ELIG_CONFIG6
+I.ELIG_CONFIG7
+I.ELIG_CONFIG8
+I.ELIG_CONFIG9
+I.BEN_STATUS
+I.COBRA_aCTION
+I.EMPL_TYPE
+I.HOLIDAY_SCHEDULE
+I.STD_HOURS
+I.OFFICER_CD
+I.EMPL_CLASS
+I.SAL_ADMIN_PLAN
+I.GRADE
+I.GRADE_ENTRY_dT
+I.STEP
+I.STEP_ENTRY_DT
+I.GL_PAY_TYPE
+I.ACCT_cD
+I.EARNS_DIST_TYPE
+!I.SALARY_MATRIX_CD               !Upgrade 9.0 changes
+!I.RATING_SCALE                   !Upgrade 9.0 changes
+!I.REVIEW_RATING                  !Upgrade 9.0 changes
+!I.REVIEW_DT                      !Upgrade 9.0 changes
+I.COMP_FREQUENCY
+I.COMPRATE
+I.CHANGE_AMT
+I.CHANGE_PCT
+I.ANNUAL_RT
+I.MONTHLY_RT
+I.HOURLY_RT
+I.ANNL_BENEF_BASE_RT
+I.SHIFT_RT
+I.SHIFT_FACTOR
+I.CURRENCY_CD
+I.FLSA_STATUS
+I.EEO_CLASS
+I.FUNCTION_CD
+I.HOURLY_RT_FRA
+I.ACCDNT_CD_FRA
+I.ESTABID
+I.LAST_dATE_WORKED
+I.GEX_LIGHT_DUTY
+I.GEX_CHANGE_RECORD
+I.GEX_VOLUN_LOW_HRS
+I.GEX_STUDENT_IND
+I.GEX_MOON_IND
+I.GEX_DEPTID_OVR
+I.GEX_ACCT_CD_OVR
+I.GEX_GL_EXP_OVR
+I.GEX_STEWARD
+I.GEX_DUES_EXEMPT
+I.GEX_FINAN_CORE
+I.GEX_INFLATED_HRS
+I.GEX_FP_CODE
+I.GEX_SEASONAL_EMP	!AXL 5/14/2001  New job field 
+
+    move 'Y' to $found
+    move 'Y' to $effdt_row_exists
+    let #effseq = &I.EFFSEQ + 1
+
+FROM PS_JOB I
+
+WHERE I.EMPLID = $emplid
+  AND EFFDT = $effdt_Dbf
+  AND EFFSEQ = 
+      (SELECT MAX(EFFSEQ)
+	 FROM PS_JOB
+	WHERE EMPLID = $emplid
+	  AND EFFDT = $effdt_dbf)
+
+end-SELECT
+
+if $found = 'N'
+  do select-current-job-row
+end-if
+
+end-procedure
+
+!*********************************************************************
+!Selects maximum effdt row for the employee
+!*********************************************************************
+
+begin-procedure select-current-job-row
+
+move 'N' to $found2
+move 'N' to $errorfound
+
+begin-select on-error=sql-error-found('select-current-job-row')
+J.EMPLID
+J.EMPL_RCD
+J.EFFDT
+J.EFFSEQ    &effseq
+J.DEPTID
+J.JOBCODE
+J.POSITION_NBR
+J.POSITION_OVERRIDE
+J.POSN_CHANGE_RECORD
+J.EMPL_STATUS
+J.ACTION
+J.ACTION_dT
+J.ACTION_REASON
+J.LOCATION
+J.TAX_LOCATION_cD
+J.JOB_ENTRY_DT
+J.DEPT_ENTRY_DT
+J.POSITION_ENTRY_DT
+J.SHIFT
+J.REG_TEMP
+J.FULL_PART_TIME
+J.COMPANY
+J.PAYGROUP
+J.BAS_GROUP_ID
+J.ELIG_CONFIG1
+J.ELIG_CONFIG2
+J.ELIG_CONFIG3
+J.ELIG_CONFIG4
+J.ELIG_CONFIG5
+J.ELIG_CONFIG6
+J.ELIG_CONFIG7
+J.ELIG_CONFIG8
+J.ELIG_CONFIG9
+J.BEN_STATUS
+J.COBRA_aCTION
+J.EMPL_TYPE
+J.HOLIDAY_SCHEDULE
+J.STD_HOURS
+J.OFFICER_CD
+J.EMPL_CLASS
+J.SAL_ADMIN_PLAN
+J.GRADE
+J.GRADE_ENTRY_dT
+J.STEP
+J.STEP_ENTRY_DT
+J.GL_PAY_TYPE
+J.ACCT_cD
+J.EARNS_DIST_TYPE
+!J.SALARY_MATRIX_CD                     !Upgrade 9.0 changes
+!J.RATING_SCALE                         !Upgrade 9.0 changes
+!J.REVIEW_RATING                        !Upgrade 9.0 changes
+!J.REVIEW_DT                            !Upgrade 9.0 changes                  
+J.COMP_FREQUENCY
+J.COMPRATE
+J.CHANGE_AMT
+J.CHANGE_PCT
+J.ANNUAL_RT
+J.MONTHLY_RT
+J.HOURLY_RT
+J.ANNL_BENEF_BASE_RT
+J.SHIFT_RT
+J.SHIFT_FACTOR
+J.CURRENCY_CD
+J.FLSA_STATUS
+J.EEO_CLASS
+J.FUNCTION_CD
+J.HOURLY_RT_FRA
+J.ACCDNT_CD_FRA
+J.ESTABID
+J.LAST_dATE_WORKED
+J.GEX_LIGHT_DUTY
+J.GEX_CHANGE_RECORD
+J.GEX_VOLUN_LOW_HRS
+J.GEX_STUDENT_IND
+J.GEX_MOON_IND
+J.GEX_DEPTID_OVR
+J.GEX_ACCT_CD_OVR
+J.GEX_GL_EXP_OVR
+J.GEX_STEWARD
+J.GEX_DUES_EXEMPT
+J.GEX_FINAN_CORE
+J.GEX_INFLATED_HRS
+J.GEX_FP_CODE
+J.GEX_SEASONAL_EMP	!AXL 5/14/2001 New job field
+
+   move 'Y' to $found2
+   move &effseq to #effseq
+
+FROM PS_JOB J
+WHERE J.EMPLID = $emplid
+  AND J.EFFDT = 
+       (SELECT MAX(EFFDT)
+	  FROM PS_JOB 
+	 WHERE EMPLID = $emplid
+           and EMPL_RCD = #empl_rcd 
+           and EFFDT <= $rnctl_Date_dbf)
+  AND J.EFFSEQ = 
+       (SELECT MAX(EFFSEQ)
+	  FROM PS_JOB
+	 WHERE EMPLID = $emplid
+	   AND EFFDT = J.EFFDT)
+end-SELECT
+
+if $found2 = 'N'
+   do error-found
+   print 'No Job information exists for the employee' (,34)
+end-if
+	   
+end-procedure
+
+!*********************************************************************
+!Prints the Leave-of-Absence report
+!*********************************************************************
+
+begin-procedure write-leave-of-absence-report
+
+  move 'Y' to $LOA-rpt-printed
+
+  use-report leave-of-absence-report
+
+  let $EmplId_1st3 = substr($emplid,1,3)
+  let $EmplId_mid2 = substr($emplid,4,2)
+  let $EmplId_last4 = substr($emplid,6,4)
+ 
+  String $EmplId_1st3 $EmplID_mid2 $EmplId_last4 by '-' into $EmplId11
+   
+  print $emplid11  (+1,1)        
+! CJH - 09/18/2001
+  print &PD.NAME (,22)
+! CJH - 09/18/2001
+  print &E.COMPANY (,62)
+  print &E.DEPTID  (,76)
+  print &E.EMPL_STATUS  (,93)
+  print &E.JOBCODE (,109) 
+  print &E.UNION_CD (,121)
+  print &D.BENEFIT_PROGRAM (,136)
+  print &F.SERVICE_DT  (,156)
+
+end-procedure
+
+!GBD 10/04/2002 Begin
+!*********************************************************************
+!Prints the W08 Promotion Audit report
+!*********************************************************************
+!
+!begin-procedure write-W08-promotion-audit
+!
+!  move 'Y' to $W08-rpt-printed
+!
+!  use-report W08-Promotion-Audit-report
+!
+!  print $emplid (+1,2) Edit xxx-xx-xxxx
+!  print #empl_rcd# (,26) Edit 9999
+!  do format-datetime($effdt_dbf,$effdt,{DEFMDY},'','') 
+!  print $effdt (,43)
+!  print 'PRO' (,67)
+!  print 'NCP' (,86)
+!  print 'W08' (,105)
+!  print 'E' (,125)
+!end-procedure
+!GBD 10/04/2002 End
+!SXK 12/13/1999 Begin - No need to update personal data in 7.5
+!*********************************************************************
+!Updates the BAS_DATA_CHG field on the personal data table
+!*********************************************************************
+
+!begin-procedure update-personal-data
+
+!begin-sql on-error=sql-error-found('update-personal-data')
+!UPDATE PS_PERSONAL_DATA
+!   SET BAS_DATA_CHG = 'Y'
+!WHERE EMPLID = $emplid
+!end-sql
+
+!move 'Y' to $update-is-done
+
+!end-procedure
+!SXK 12/13/1999 End
+!SXK 12/13/1999 Begin
+!*******************************************************************
+!Retrieves Bas Action Value from Action Reason Table
+!*******************************************************************
+Begin-Procedure get-bas-action
+
+begin-select on-error=sql-error-found('Get-Bas-Action')
+BAC.BAS_ACTION
+  let $bas_action_retrieved = 'Y'
+! FROM PS_ACTN_REASON_TBL BAC                 ! Upgrade 8.3 - 9.0 code commented
+FROM PS_ACT_RSN_TBL_NA BAC                    ! Upgrade 8.3 - 9.0 changes
+WHERE BAC.ACTION = 'ATO'
+AND BAC.ACTION_REASON = '001'
+AND BAC.EFFDT = (select max(effdt)
+		! from ps_actn_reason_tbl    ! Upgrade 8.3 - 9.0 code commented
+		FROM PS_ACT_RSN_TBL_NA       ! Upgrade 8.3 - 9.0 changes
+		where action = bac.action
+		and action_Reason = bac.action_reason
+		and effdt <= $rnctl_date_dbf)
+end-select
+end-procedure
+
+!********************************************************************
+!Check to see if bas_activity already exists
+!********************************************************************
+begin-procedure select-bas-activity-row
+
+Begin-Select on-error=sql-error-found('Select-Bas-Activity-Row')
+'BAC'
+    let $bas_activity_exists = 'Y'
+FROM PS_BAS_ACTIVITY BAC1
+WHERE BAC1.EMPLID = $bac_emplid
+and bac1.empl_rcd = #bac_empl_rcd
+and bac1.bas_action in ('001','002')
+and bac1.event_dt = $bac_event_dt
+and bac1.event_effseq = #bac_event_effseq
+end-select
+end-procedure
+
+!*******************************************************************
+!Inserts into BAS_ACTIVITY table
+!*******************************************************************
+begin-procedure insert-bas-activity-row
+
+begin-sql on-error=sql-error-found('Insert-Bas-Activity-Row')
+INSERT INTO PS_BAS_ACTIVITY
+(EMPLID,
+EMPL_RCD,
+BAS_ACTION_SOURCE,
+EVENT_DT,
+EVENT_EFFSEQ,
+BAS_ACTION,
+BENEFIT_RCD_NBR,
+COBRA_ACTION,
+BAS_ALL_JOBS,                                        !GBD 11/14/2002
+BAS_SUPPRESS_FORMS)                                  !GBD 01/03/2003
+VALUES(
+$bac_emplid,
+#bac_empl_rcd,
+$bac_bas_action_source,
+$bac_event_dt,
+#bac_event_effseq,
+&BAC.BAS_ACTION,
+#bac_benefit_rcd,
+$bac_cobra_action,
+'Y',                                                 !GBD 11/14/2002
+' ')                                                 !GBD 01/03/2003
+end-sql
+end-procedure
+
+!SXK 12/13/1999 End
+
+!********************************************************************
+!This procedure displays in the error report if there are any sql erros
+!happened in the program
+!********************************************************************
+
+begin-procedure SQL-Error-Found($Proc_Name) 
+  do error-found
+  print 'SQL Error in ' (,34)
+  print $Proc_Name ()  
+  print $_sql-error () 
+  print 'sql-status:' ()
+  print #_sql-status () edit 99999 
+
+end-procedure
+
+!*********************************************************************
+!This procedure displays the error message for the records that are in
+!progress
+!*********************************************************************
+
+begin-procedure Error-Found
+  move 'Y' to $ErrorFound
+  move 'Y' to $rpt-log-printed
+  use-report report-log
+  do Format-Number(#InputTran, $out, '99999')
+  print $out (+1,1)
+  let $EmplId_1st3 = substr($EmplId,1,3)
+  let $EmplId_mid2 = substr($EmplId,4,2)
+  let $EmplId_last4 = substr($EmplId,6,4)
+ 
+  String $EmplId_1st3 $EmplID_mid2 $EmplId_last4 by '-' into $EmplId11
+
+  print $EmplID11 (,16)
+end-procedure
+
+!**********************************************************************
+#Include 'tranctrl.sqc'  !Common Transaction Control Procedures
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'datemath.sqc'  !Date Arithmetic functions
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'payrnctl.sqc'  !Select-Parameters
+#Include 'stdapi.sqc'    !Get_Run_Control Procedure
+#include 'gexaltse.sqc'  !Alter session SQC
+

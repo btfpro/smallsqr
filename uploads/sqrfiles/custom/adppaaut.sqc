@@ -1,0 +1,2109 @@
+!**********************************************************************
+! SQR Name:           adppaaut.sqc
+! SQR Descr:          ADP Employment Tax, PA Act 32
+! Created by:         drmonroe
+! Create date:        02/02/2011
+! Last modified by:   drmonroe
+! Last modified date: 05/07/2013
+!***********************************************************************
+
+#define adppaloc_release     20170420
+
+#ifdef ADP_TAX_PERIODIC
+ #define debug_adppaloc 1140825 !debug option added, add EMPLID to diagnose for one person or leave blank for all associates
+#endif
+
+! *************************************************************************************************************************************
+! adppaaut.sqc            included by pbzper.sqr and pbzqtr.sqr if PA_WORKSITE_EXTRACT has been defined
+! purpose:                to implement the Pennsylvania Act 32 early adopters V1Q2011 update
+!
+! Author: Dan Monroe
+! Property: ADP / CAPS
+!
+! Q1, 2011 update
+! ***************
+!        Mar  04, 2011
+!              BYPASS_PA_WORK_EXTRACT no logic should be implement for PA with this
+!              checking for a work location for Periodic
+!        Mar  10, default to using logic, if clients do not want this code have them add BYPASS_PA_WORK_EXTRACT
+!                 START_PA_WORK_EXTRACT_YYYYQ added,  #define START_PA_WORK_EXTRACT_YYYYQ 20113 (example to start Act 32 in July 2011
+!        Mar  15, INCLUDE_ALL_PA_RESIDENT_TAXES (not just the residents in the early adopter counties) as long as they are in the right
+!                 Work counties
+!                 Philly does not fall inside the PA Act 32 logic
+!        Mar  16, check_multi_res_mapped_to_work (counter in 11th position of work location)
+!        Mar  23, periodic sets counter too for clients with muni and city EIT's setup
+!                 they'd need this release and add #define PA_ACT_32_PERIODIC_MULTI_RESIDENT
+!        Mar  28, 2011 no opt/lst taxes in our query to find Work locations
+!                 accept the START_PA_WORK_EXTRACT definition (from the release notes / V1Q2011)
+!                 IGNORE_SPECIAL_LWT_STATUS for 'split's the SPECIAL_LWT_STATUS is not 'E' (VZN1)
+!        Mar  29, PSS1 - get OPT as the Work locality (PSS1) - USE_OPT_FOR_WORK_LOCALITY
+!                        needs both IGNORE_SPECIAL_LWT_STATUS and IGNORE_RESIDENT
+!        Mar  30, Print totals (last company totals was missing and the Company tax total column was in 88 not 82
+!        Apr  05, All 'coordinated' rows must have the same effective date.' VZN1 - PA_ACT_32_COORDINATE_EFFDT
+!                 only the max effective dated rows are active, so if someone has a resident local, and we look for
+!                 the work local row, it must have the same date as the resident local row.
+!        Apr  06, added Resident totals for helping reconciliation
+!        May  23, 2011
+!                 INCLUDE_ALL_PA_RESIDENT_TAXES made standard always (removed)
+!        Jun  28, 2011
+!         -       add SPECIAL_LWT_STATUS_VALUES_OVERRIDE   (G vs E for example to identify work locality), default is 'E' only
+!                    eg #define SPECIAL_LWT_STATUS_VALUES_OVERRIDE 'E','G'
+!         -       get PS_LOCAL_TAX_TBL.OTH_LOCALITY_ABBRV for Tax Collector Dist codes into PSD codes
+!         -       add taxable wages to report
+!        Aug 12, 2011
+!                 - get Out of State and NRA status for setting PSD to 880000, add logic to report either the PSD or Local Resident codes
+!        Aug 22, 2011
+!                 - We need to pull in the PSD code for Work Locality based taxes too (tested @Petco)
+!        Aug 29, 2011
+!                 - added USE_PS_TAX_DISTRIB_TABLE option to pull in WORK locality from PS_TAX_DISTRIB, not PS_LOCAL_TAX_DATA
+!        Aug 30, 2011
+!                 - Fix WAGE totals on PA Act 32 report
+! **********************  V3Q2011 ******************************
+!        Sep 12, 2011
+!                     added IGNORE_OPT_FOR_WORK_LOCALITY (CGI1)
+!        Oct  3, 2011 USE_PS_TAX_DISTRIB_TABLE testing complete
+!        Oct  6, 2011 fix to get-resident-data... was not finding the person living out of state
+!                     Get-Resident-Data reworked
+!        Oct  7, 2011 SET_PA_RES_LOCALITY_IF_RES_LOCALITY_IS_BLANK option made standard for hot patch 10/7 to report resident locals
+!                     to match work locals as necessary
+!                     change show statements to 'PA Act 32', add $SelectEmplid statements for debugging
+!      ****************************** Oct 7,2011 patch *************************************************
+!        Oct  8, 2011 USE_OPT_FOR_RES_LOCALITY
+!        Oct 11, 2011 counter in position 14 was maxing out at '2'
+!                      this is not a problem for the quarterly, but the periodic would fail on the history insert trying to write the
+!                      2nd '2' counter record
+!        Oct 21, 2011 replace the '1' counter with a ' ' to ease mapping per Chris M.                              see 10/21/2011
+!                     setup for 2012... all counties and all clients report this way starting in 20121 (Q1, 2012)
+!        Oct 26, 2011 MANDATORY_START_YYYYQ, reworked for 2012
+!        Oct 27, 2011 testing against multiple scenarios @GE, including testing 2012 data
+!                     no periodic PA Act 32 report employee level details starting in 2012
+!        Oct 28, 2011 we allow clients to choose wheter to get the employee details or not on the report
+!                     we should check for Philadelphia for either Work or Res locations, not just checking the initial
+!                     reworked Res and non-resident RATE logic
+!                     PA Act 32: Warning added to validate rates for withholding
+!        Oct 31, 2011 implement the 'ADJUST_ZERO_LOCALS_PA_EIT' logic for everyone for PA / EIT
+!        Nov 10, 2011 Change:  live in Philadelphia, but work in PA outside of Philadelphia? - Act 32 (and the Residency Certification Form) applies.
+!        Nov 16, 2011 clarity on Philly, PA Act 32 does not apply to Philly residents or associates working in Philly.
+!                     #define SKIP_PA_ASSOCIATE_DETAILS_ON_REPORT
+!                     - option that we still get the Work and Res based totals on the report, but not the associate details
+!
+!                     #define SKIP_PA_WORK_DETAILS_ON_REPORT
+!                     - option to eliminate the associate details, and Work/Res Totals on the report
+!        Nov 21, 2011 ADJUST_ZERO_LOCALS_PA_EIT for periodics only per Chris...
+!        Nov 23, 2011 adjust warning based on Rimini witholding at WORK always
+!                         warning that the taxes w/h don't equal the wages X the higher rate
+!        Nov 30, 2011 debug_adppaloc
+!      ****************************** Nov 30, 2011 Q4 release *************************************************
+!        Dec  7, 2011 PA_Act_32_withholding_warning_limit up'd to 2000 from 100, and check made in the print (Issue8)
+!        Dec 12, 2011 PAACT_32_11F_Logic added
+!                     Warnings on periodic only
+!        Dec 16, 2011 Warnings on associates with PSD codes in PA  (not = 880000) only
+!        Dec 21, 2011 added check for running out of array space for worksite arrays
+!        Dec 30, 2011 ADJUST_QUARTERLY_WAGES_PA_EIT
+!                     11-F fix to not clear the default res and work locations if the new fields are not yet populated in tax balance
+!        Jan 05, 2012 ADJUST_QUARTERLY_WAGES_PA_EIT, look for matches on location or state, county and description as well as location
+!        Jan 06, 2012 ADJUST_QUARTERLY_WAGES_PA_EIT for all who want it in Q4
+!        Jan 10, 2012 11-F fix, to handle workers residing in PA with worksites out of PA - WORK_PSD_CD will be 880000, and
+!                     withholding will be on the Resident RES_PSD_CD
+!        Jan 12, 2012 added logic to only update the wages if the amounts differ for each QTD and YTD amounts
+!                     bracketed the new code with #ifdef ADP_TAX_QUARTERLY...#endif, to eliminate potential periodic aborts
+!        Jan 13, 2012 Rimini recognition, do not want to rollup wages as this would cause Transporter to overreport for Rimini clients
+!        Jan 25, 2012 for 11-F clients - Use $Res_PSD_CD into 503-508
+!                     add check for the Unknown code 990000 for the 11-F clients
+!        Feb 29, 2012 PA_ACT_32_SET_X1_FIELD_CODE option for non-Rimini Street clients
+!                     fix res and non-res rates being the same for 11-F
+!                     PS_ACT_32_CLEAR_COUNTER
+!   ********************************************** Q1, 2012 release ******************************************************************
+!        Mar 12, 2012 ADJUST_QUARTERLY_WAGES_PA_EIT modified to make sure the RES and Non-RES rates match for the 'matches'
+!                     Client must add: #define ADJUST_QUARTERLY_WAGES_PA_EIT  (#RptYear = 2011 and #RptQtr = 4 ) or #RptYear >= 2012
+!        Mar 28, 2012 if Work code is 880000 or 990000 we need to force the work location to be the RES_PSD_CD for 11-F logic (3/28/2012)
+!        Apr  9, 2012 Treat Philly so that we get the resident info to keep the TF_PBZQOUT_W from failing (if #define PHILADELPHIA_CITY is in place below)
+!                     TREAT_PHILLY_WITHIN_ACT_32   ( we might want to roll this to all the USE_TEMP_TABLE_FOR_OUTPUT clients
+!        Apr 10, 2012 for 11-F+ we don't want to check for the out of state resident status for and, so we will depend 100% on the new fields
+!        May 15, 2012 if TREAT_PHILLY_WITHIN_ACT_32, and if PA_Local <> WORK_PSD_CD, use the PA_Local (Locality)
+!        Jun  1, 2012 removed prior option USE_PS_TAX_DISTRIB_TABLE
+!        Jun 20, 2012 check the TAX_CLASS to make sure it's a withholding tax (not Local ER) when we match up via the Rimini logic
+!        Jun 21, 2012 flag the resident field in the output_taxcode in the quarterly for Philly residences (takes care of associates moving out of Philly in mid-qtr
+!        Jul 02, 2012 same as the 6/21, but do it for the Philly associates if the TREAT_PHILLY_WITHIN_ACT_32 is also enabled
+!        Aug 15, 2012 amendment runs will not have ee detail on the report (save space)
+! ********************************************* Q3, 2012  *****************************************************************************
+!        Oct 12, 2012 fix: 10122012 - $Philly_Resident critical for Rimini clients, tested @JLL1, 
+!                                     Philly codes were coming across as all 'Y' in Qtrly
+! ********************************************* Q4, 2012  *****************************************************************************
+!        Jan  7, 2013 Use Locality always #define PA_ACT_32_USE_LOCALITY_AS_WORK_LOCALITY_ALWAYS
+!        Jan 15, 2013 set Jan 7 option for normal oracle clients too as an option
+!        Feb 26, 2013 PS_ACT_32_CLEAR_COUNTER_QUARTERLY option added
+!        Apr  2, 2013 04022013, periodic report warning of wrong rate being used is fixed (PA_ACT_32_USE_LOCALITY_AS_WORK_LOCALITY_ALWAYS)
+!        May  7, 2013 treat old Philly code same as 510101
+!        Oct  1, 2013 INCLUDE_LCL_ADJ option, needs the TF_ADP_LCL_ADJ table and project built
+!        Feb 28, 2017 CUSTOM_PA_EIT_GIE1 (GIE1)
+!        Mar 6,  2017 GIE1 update
+!        Apr 12, 2017 see 4/12/17
+!        Apr 18, 2017 use max effdt on local tax data for GIE1
+!        Apr 20, 2017 fix above for Periodic
+!----------------------------------------------------------------------------------------------------------------------------------
+
+#ifndef PA_STATE
+  #define PA_STATE PA
+#endif
+
+#define PHILADELPHIA_CITY          PHILADELPHIA
+
+#define PS_ACT_32_CLEAR_COUNTER          !This instructs the periodic to clear the counter to make the Transporter translations simpler
+
+#ifdef ADP_TAX_AMEND
+  #define  SKIP_PA_ASSOCIATE_DETAILS_ON_REPORT
+  #define  SKIP_PA_WORK_DETAILS_ON_REPORT
+#endif
+
+!#define TREAT_PHILLY_WITHIN_ACT_32
+
+!Rollup enabled
+!#ifdef ADP_TAX_QUARTERLY
+!  #define ADJUST_QUARTERLY_WAGES_PA_EIT       #RptYear >= 2012
+!#endif
+
+#ifdef INCLUDE_LCL_ADJ
+  #define ADP_LCL_ADJ_TBL    PS_{Client_Table_Prefix}ADP_LCL_ADJ{Client_Table_Suffix}
+#endif
+
+
+#ifdef ADP_TAX_QUARTERLY
+ #if {SITE_ID} = 'AON1'  !4/9/2012
+   #define TREAT_PHILLY_WITHIN_ACT_32
+ #endif
+ #if {SITE_ID} = 'ALS1'  !4/9/2012
+   #define TREAT_PHILLY_WITHIN_ACT_32
+ #endif
+ #if {SITE_ID} = 'JLL1'  !4/12/2012
+   #define TREAT_PHILLY_WITHIN_ACT_32
+ #endif
+ #if {SITE_ID} = 'TUH1'  !6/8/2012
+   #define TREAT_PHILLY_WITHIN_ACT_32
+ #endif
+ #ifdef TREAT_PHILLY_WITHIN_ACT_32
+  #define PHILADELPHIA_CITY        DONT_SKIP_PHILADELPHIA  ! <-- causes Philly to be treated like all others
+ #endif
+#endif
+
+#if {SITE_ID} = 'RSS1' 
+   #define PA_ACT_32_USE_LOCALITY_AS_WORK_LOCALITY_ALWAYS
+#endif
+
+#if {SITE_ID} = 'GHV1' 
+   #define PA_ACT_32_USE_LOCALITY_AS_WORK_LOCALITY_ALWAYS
+#endif
+
+#if {SITE_ID} = 'HHG1' 
+   #define PA_ACT_32_USE_LOCALITY_AS_WORK_LOCALITY_ALWAYS
+#endif
+
+#if {SITE_ID} = 'VZN1' 
+   #define PA_ACT_32_USE_LOCALITY_AS_WORK_LOCALITY_ALWAYS
+#endif
+
+#if {SITE_ID} = 'DZA1' 
+   #define PA_ACT_32_USE_LOCALITY_AS_WORK_LOCALITY_ALWAYS
+#endif
+
+#if {SITE_ID} = 'WFG1'                                        
+   #define PA_ACT_32_USE_LOCALITY_AS_WORK_LOCALITY_ALWAYS     
+#endif                                                        
+
+
+#define PA_OUT_OF_STATE_PSD_CODE   880000
+#define PA_UNKNOWN_PSD_CODE        990000
+
+#ifdef ADP_TAX_PERIODIC  !only for periodics, 11/21/2011
+  #define ADJUST_ZERO_LOCALS_PA_EIT
+#endif
+
+!#ifdef ADP_TAX_QUARTERLY
+! #ifndef ADJUST_QUARTERLY_WAGES_PA_EIT
+!  #define ADJUST_QUARTERLY_WAGES_PA_EIT       (#RptYear = 2011 and #RptQtr = 4 ) or #RptYear >= 2012
+! #endif
+!#endif
+
+#ifndef SPECIAL_LWT_STATUS_VALUES_OVERRIDE
+  #define SPECIAL_LWT_STATUS_VALUES 'E'
+#else
+  #define SPECIAL_LWT_STATUS_VALUES {SPECIAL_LWT_STATUS_VALUES_OVERRIDE}
+#endif
+
+#define PA_ACT_32_PERIODIC_MULTI_RESIDENT     ! 4/5/2011  made standard
+#define IGNORE_SPECIAL_LWT_STATUS             ! 10/26/2011 made standard
+#define PA_ACT_32_COORDINATE_EFFDT          ! 4/5/2011  made standard
+
+#if {SITE_ID} = 'PSS1'
+  #define USE_OPT_FOR_WORK_LOCALITY
+#endif
+
+#ifdef USE_OPT_FOR_WORK_LOCALITY
+  #define IGNORE_SPECIAL_LWT_STATUS
+  #define IGNORE_RESIDENT
+#endif
+
+#ifndef MANDATORY_START_YYYYQ
+  #define MANDATORY_START_YYYYQ 20121
+#endif
+
+#ifndef PA_COUNTY_SELECTION ! in future, change this definition to 1=1, or rtrim($PALOC_COUNTY,' ') <> ''
+    !Starting in the Q1, 2011 release, process these 4 counties with Work location
+    #define PA_COUNTY_SELECTION ($PALOC_COUNTY = 'LEBANON' or $PALOC_COUNTY = 'WYOMING' or $PALOC_COUNTY = 'CHESTER' or $PALOC_COUNTY = 'LANCASTER')
+#endif
+
+#ifdef START_PA_WORK_EXTRACT
+  #define START_PA_WORK_EXTRACT_YYYYQ {START_PA_WORK_EXTRACT}  !this resolved the v1q2011 release notes error
+#else
+ #ifndef START_PA_WORK_EXTRACT_YYYYQ
+  #define START_PA_WORK_EXTRACT_YYYYQ  20111  !default to starting the PA Act 32 processing in Q1, 2011
+ #endif
+#endif
+
+begin-procedure init-PA-worksites   !if this definition is NOT enabled (ATE1, PFZ1), then check client specific files
+
+   #ifndef State_worksite_xref_limit
+     #define State_worksite_xref_limit 50000
+   #endif
+   create-array name=State_worksite_xref size={State_worksite_xref_limit} -
+               field=Company:char                            -
+               field=Emplid:char                                -
+               field=Resident_State:char                        -
+               field=Resident_County:char                       -
+               field=Tax_Class:char                             -
+               field=Locality:char                              -
+               field=Resident:char                              -
+               field=Locality_Name:char                         -
+               field=RESIDENT_TAX_RT:number                     -
+               field=NONRESIDENT_TAX_RT:number                  -
+               field=Taxes:number                               -
+               field=Txgrs:number                               -
+               field=Txgrs_YTD:number                           -
+               field=Tax_Location_cd:char                       -
+               field=Work_State:char                            -
+               field=Work_County:char                           -
+               field=Tax_Location_Descr:char                    -
+               field=WorkPSDCode:char                           -
+               field=ResPSDCode:char
+
+#ifndef SKIP_PA_WORK_DETAILS_ON_REPORT
+   #ifndef State_worksite_totals_limit
+     #define State_worksite_totals_limit 5000
+   #endif
+
+   create-array name=State_worksite_totals size={State_worksite_totals_limit} -
+     field=Company:char                               -
+     field=Tax_Location_cd:char                       -
+     field=Tax_Location_Descr:char                    -
+     field=Work_County:char                           -
+     field=Work_State:char                            -
+     field=Taxcode:char                               -
+     field=Taxes:number                               -
+     field=Txgrs:number                               -
+     field=WorkPSDCode:char
+
+   create-array name=State_resident_totals size={State_worksite_totals_limit} -
+     field=Company:char                               -
+     field=Tax_Location_cd:char                       -
+     field=Tax_Location_Descr:char                    -
+     field=Resi_County:char                           -
+     field=Resi_State:char                            -
+     field=Taxcode:char                               -
+     field=Taxes:number                               -
+     field=Txgrs:number                               -
+     field=ResPSDCode:char
+
+#endif
+
+  #ifdef ADP_TAX_PERIODIC
+   #ifndef PA_Act_32_withholding_warning_limit
+    #define PA_Act_32_withholding_warning_limit 5000
+   #endif
+   create-array name=PA_ACT32_Warning size={PA_Act_32_withholding_warning_limit} -
+    field=err_str:char
+
+  #endif
+
+  show ''
+  show 'init-PA-worksites: {adppaloc_release}, Initializing (auto) for {PA_STATE}'
+  #ifdef BYPASS_PA_WORK_EXTRACT
+  #debugd show 'BYPASS_PA_WORK_EXTRACT enabled {BYPASS_PA_WORK_EXTRACT}.'
+  #endif
+  #ifdef START_PA_WORK_EXTRACT_YYYYQ
+  #debugd show 'START_PA_WORK_EXTRACT_YYYYQ {START_PA_WORK_EXTRACT_YYYYQ}'
+  #endif
+  #ifdef PA_ACT_32_PERIODIC_MULTI_RESIDENT
+  #debugd show 'PA_ACT_32_PERIODIC_MULTI_RESIDENT enabled'
+  #endif
+  #ifdef IGNORE_SPECIAL_LWT_STATUS
+  #debugd show 'IGNORE_SPECIAL_LWT_STATUS enabled.'
+  #endif
+  #ifdef SPECIAL_LWT_STATUS_VALUES_OVERRIDE
+   #debugd show 'SPECIAL_LWT_STATUS_VALUES_OVERRIDE enabled'
+  #endif
+  #ifdef IGNORE_RESIDENT
+  #debugd show 'IGNORE_RESIDENT enabled.'
+  #endif
+  #ifdef IGNORE_OPT_FOR_WORK_LOCALITY
+  #debugd show 'IGNORE_OPT_FOR_WORK_LOCALITY enabled'
+  #endif
+  #ifdef USE_OPT_FOR_WORK_LOCALITY
+  #debugd show 'USE_OPT_FOR_WORK_LOCALITY enabled.'
+  #endif
+  #ifdef USE_OPT_FOR_RES_LOCALITY
+  #debugd show 'USE_OPT_FOR_RES_LOCALITY enabled'
+  #endif
+  #ifdef IGNORE_OPT_FOR_WORK_LOCALITY
+  #debugd show 'IGNORE_OPT_FOR_WORK_LOCALITY enabled.'
+  #endif
+  #ifdef PA_ACT_32_COORDINATE_EFFDT
+  #debugd show 'PA_ACT_32_COORDINATE_EFFDT enabled.'
+  #endif
+  #ifdef SKIP_PA_ASSOCIATE_DETAILS_ON_REPORT
+  #debugd show 'SKIP_PA_ASSOCIATE_DETAILS_ON_REPORT enabled'
+  #endif
+  #ifdef PA_ACT_32_USE_LOCALITY_AS_WORK_LOCALITY_ALWAYS
+   #debugd show 'PA_ACT_32_USE_LOCALITY_AS_WORK_LOCALITY_ALWAYS enabled'
+  #endif
+  #ifdef SKIP_PA_WORK_DETAILS_ON_REPORT
+  #debugd show 'SKIP_PA_WORK_DETAILS_ON_REPORT enabled'
+  #endif
+  #ifdef ADJUST_ZERO_LOCALS_PA_EIT
+  #debugd show 'ADJUST_ZERO_LOCALS_PA_EIT enabled'
+  #endif
+  #ifdef ADP_TAX_QUARTERLY
+   #ifdef ADJUST_QUARTERLY_WAGES_PA_EIT
+   #debugd show 'ADJUST_QUARTERLY_WAGES_PA_EIT enabled for {ADJUST_QUARTERLY_WAGES_PA_EIT}'
+   #endif
+  #endif
+  #ifdef PA_ACT_32_SET_X1_FIELD_CODE
+   #debugd show 'PA_ACT_32_SET_X1_FIELD_CODE enabled'
+  #endif
+  #ifdef PS_ACT_32_CLEAR_COUNTER
+   #debugd show 'PS_ACT_32_CLEAR_COUNTER enabled'
+  #endif
+  #ifdef PS_ACT_32_CLEAR_COUNTER_QUARTERLY
+   #debugd show 'PS_ACT_32_CLEAR_COUNTER_QUARTERLY enabled'
+  #endif
+  #ifdef TREAT_PHILLY_WITHIN_ACT_32
+   #debugd show 'TREAT_PHILLY_WITHIN_ACT_32 enabled'
+  #endif
+  #ifdef debug_adppaloc
+    show 'debug_adppaloc = {debug_adppaloc}'
+  #endif
+ #debugd show 'MANDATORY_START_YYYYQ = {MANDATORY_START_YYYYQ}'
+  move '{MANDATORY_START_YYYYQ}' to #MANDATORY_START_YYYYQ
+  do get-tax-update
+  #ifdef PAACT_32_11F_Logic
+  #debugd show 'PAACT_32_11F_Logic enabled, Tax Update = ' $Tax_update ' as of ' $AsofToday
+  #else
+  #debugd show 'PAACT_32_11F_Logic NOT enabled, Tax Update = ' $Tax_update ' as of ' $AsofToday
+   if $Tax_update = '2011-F'
+    #debugd show 'Suggestion: add ''#define PAACT_32_11F_Logic'' to the end of your probiz.sqc file, as Tax update 11-F is installed and should be utilized.'
+   end-if
+  #endif
+
+  if substr($Tax_update ,1,2) = 'RS'
+   #debugd show 'Rimini Tax Update = ' $Tax_update ' as of ' $AsofToday ' (ADJUST_QUARTERLY_WAGES_PA_EIT logic will not apply)'
+    let $Rimini_PA_Act_32 = 't'
+  end-if
+
+end-procedure
+
+begin-procedure get-tax-update  !look for 2012-F
+
+BEGIN-SELECT
+UPD.TAX_UPDT
+
+  let $Tax_update =  rtrim(&UPD.TAX_UPDT,' ')
+
+  FROM PS_TAX_UPDATE UPD
+   WHERE UPD.DT_ENTERED = (SELECT MAX(UPD2.DT_ENTERED)
+        FROM PS_TAX_UPDATE UPD2
+          WHERE UPD2.DT_ENTERED <= $AsofToday)
+
+END-SELECT
+
+end-procedure
+
+!this procedure works for the new table driven or for the hardcoded ATE1 and PFZ1 work mappings
+!-----------------------------------------------------------------------------------------------
+
+begin-procedure determine_pa_worksite  !$PA_Emplid, $PA_Company, $PA_Taxcode, $PA_State, $PA_end_date, #payline_empl_rcd
+                                       !                         $PA_Class, $PA_Local, $PA_Resid
+                                       !output:  $PA_Worksite_Location (tax_location_cd)
+
+   let $PA_PSD_Locality  = ''           ! if no remapping to work locality... don't set these field values
+   let $PA_RES_Locality  = ''
+   let $PA_Work_Locality = ''
+   let $ADJUST_ZERO_LOCALS_PA_EIT = 'f'
+   let $Philly_Resident = ' '                !10122012
+   let $Local_Resident_found = ''            !10122012
+   
+   if $SelectEmplid <> ''
+     show ''
+     show 'PA Act 32: start determine_pa_worksite --> Work PSD ' $Work_PSD_CD ' Res PSD ' $Res_PSD_CD ' Taxes = ' #PA_Taxes edit 999,999,999.99 ', Taxable = ' #PA_Txgrs edit 999,999,999.99
+   end-if
+
+#ifndef BYPASS_PA_WORK_EXTRACT
+
+  #ifdef ADP_TAX_PERIODIC
+     let $PA_AUTO_EFFDT = $PA_end_date         !check date
+     move $PA_AUTO_EFFDT to $Dt_in
+     do Get-Quarter-PA  !$Dt_in --> #year_out, #qtr_out
+     let #RptQtr  = #qtr_out
+     let #RptYear = #year_out
+  #else
+    let $PA_AUTO_EFFDT = $Qtr_end_Native       !quarter end date
+  #endif
+
+  #ifdef START_PA_WORK_EXTRACT_YYYYQ
+    let $start_YYYYQ = rtrim('{START_PA_WORK_EXTRACT_YYYYQ}',' ')
+    if $start_YYYYQ <> ''                                      !YYYYQ must be the format.... process STARTING on this quarter
+      move $PA_AUTO_EFFDT to $Dt_in
+      do Get-Quarter-PA
+      move #year_qtr to #current_YYYYQ
+      move $start_YYYYQ to #start_YYYYQ
+      if #determine_pa_worksite_cnt = 0
+      #debugd show 'PA Act 32: current_YYYYQ = ' #current_YYYYQ ', start_YYYYQ = ' #start_YYYYQ
+       add 1 to #determine_pa_worksite_cnt
+      end-if
+      if #current_YYYYQ < #start_YYYYQ and #current_YYYYQ < #MANDATORY_START_YYYYQ   !10/21/2011 - always do this for 2012 and beyond
+         goto done_determine_pa_worksite
+      end-if
+    else
+      goto done_determine_pa_worksite
+    end-if
+  #endif
+
+  let $PA_Worksite_Location = ''  !this is what will be a blank or the 11 character code between positions 4-14 of taxcode
+  let $PA_Resident_Location = ''
+
+  !carry on if PA withholding locals only
+  !--------------------------------------
+  if $PA_State <> rtrim('{PA_STATE}',' ') or rtrim($PA_Class,' ') <> 'H' or rtrim($PA_Local,' ') = ''
+    goto done_determine_pa_worksite
+  end-if
+
+  !we need to not write the WAGE record if we have PA EIT wages, but no taxes.... no reason to write this record (C.Murp 11/1/2011)
+   #ifdef ADJUST_ZERO_LOCALS_PA_EIT
+    #ifdef ADP_TAX_QUARTERLY
+     if (#TaxBalance_Tax_Qtd = 0) and (#TaxBalance_Tax_Ytd = 0)
+       add #TaxBalance_Txgrs_Qtd to #TaxBalance_Taxable_PA_EIT_cleared_QTD
+       add #TaxBalance_Txgrs_Ytd to #TaxBalance_Taxable_PA_EIT_cleared_YTD
+       put 0 0 0 0 0 0 into TaxBalance(#Last_Q1_Cnt) TaxBalance_Nlgrs_Qtd TaxBalance_Txgrs_Qtd TaxBalance_Tax_Qtd
+                                                     TaxBalance_Nlgrs_Ytd TaxBalance_Txgrs_Ytd TaxBalance_Tax_Ytd
+
+       let $ADJUST_ZERO_LOCALS_PA_EIT = 't'
+       goto done_determine_pa_worksite
+     end-if
+    #else
+     if (#PA_Taxes = 0)
+       let $ADJUST_ZERO_LOCALS_PA_EIT = 't'
+       add #PA_Txgrs to #TaxBalance_Taxable_PA_EIT_cleared
+       goto done_determine_pa_worksite
+     end-if
+    #endif
+  #endif
+
+ !default to setting both codes to the PA Locality out of Tax Balances
+ let $PA_Worksite_Location = $PA_Local  !11 chars
+ let $PA_Resident_Location = $PA_Local
+ let $PA_LocalityName        = ''
+ let $PA_LocalityState       = ''
+ let $PA_LocalityCounty      = ''
+ let $PA_Tax_Location_state  = ''
+ let $PA_Tax_Location_county = ''
+ let $PA_Tax_Location_descr  = ''
+
+ let $local_tax_data_effdt = ''
+ let #RESIDENT_TAX_RT    = 0
+ let #NONRESIDENT_TAX_RT = 0
+ let $generate_PA_Act_32_Audit = 't'
+
+#ifdef PAACT_32_11F_Logic  !we always have the non-res code withheld and the resident code is in the RES_PSD_CD field
+
+  #ifdef TREAT_PHILLY_WITHIN_ACT_32
+     if rtrim($Work_PSD_CD,' ') <> rtrim($PA_Local,' ') !5/15/2012, use the LOCALITY .. these are situations where the WORK_PSD_CD is not right
+       and rtrim($PA_Local,' ') <> rtrim('{PA_OUT_OF_STATE_PSD_CODE}',' ')
+       and rtrim($PA_Local,' ') <> rtrim('{PA_UNKNOWN_PSD_CODE}',' ')
+        if $SelectEmplid <> ''
+          #debugd show 'PA Act 32: processing --> Work_PSD_CD ' $Work_PSD_CD ' is being replaced by ' $PA_Local
+        end-if
+        let $Work_PSD_CD = $PA_Local
+     end-if
+  #endif
+
+  if rtrim($Work_PSD_CD,' ') <> '' and rtrim($Res_PSD_CD,' ') <> ''   !12/30/2011 to not clear the following two variables if 11-F in 2011
+    
+    #ifdef PA_ACT_32_USE_LOCALITY_AS_WORK_LOCALITY_ALWAYS
+        let $PA_Worksite_Location = $PA_local
+    #else
+        let $PA_Worksite_Location = $Work_PSD_CD
+    #endif
+    let $PA_Resident_Location = $Res_PSD_CD
+
+    !10122012 to flag Philly Residents with 'Y' in positions 15 of the taxcode
+    if $Res_PSD_CD = '510101' or $Res_PSD_CD = 'I510012M'
+       let $Philly_Resident = 'Y'
+    end-if
+
+    #ifdef debug_adppaloc
+      if rtrim($PA_Emplid,' ') = rtrim('{debug_adppaloc}',' ') or rtrim('{debug_adppaloc}',' ') = ''
+         show 'PA Act 32: processing --> ' $PA_LocalityState ' EIT tax locality: ' $PA_Local ' Res ' $PA_Resid  ' Taxes = ' #PA_Taxes ', Taxable = ' #PA_Txgrs ', Res_PSD_cd = ' $Res_PSD_cd ', Work_PSD_cd = ' $Work_PSD_cd
+      end-if
+    #else
+      if $SelectEmplid <> ''
+         show 'PA Act 32: processing --> ' $PA_LocalityState ' EIT tax locality: ' $PA_Local ' Res ' $PA_Resid  ' Taxes = ' #PA_Taxes ', Taxable = ' #PA_Txgrs ', Res_PSD_cd = ' $Res_PSD_cd ', Work_PSD_cd = ' $Work_PSD_cd
+      end-if
+    #endif
+
+    let $local = $Res_PSD_CD
+    let $state = $PA_state
+    let $res_chk = 'Y'
+    do get_local_tax_tbl_pa
+    let $PA_LocalityName   = $LocalityName
+    let $PA_LocalityState  = $LocalityState
+    let $PA_LocalityCounty = $LocalityCounty
+
+   
+    !1/10/2012 to handle workers residing in PA with worksites out of PA - Work_PSD_CD will be 880000
+    if rtrim($Work_PSD_CD,' ') = rtrim('{PA_OUT_OF_STATE_PSD_CODE}',' ') or rtrim($Work_PSD_CD,' ') = rtrim('{PA_UNKNOWN_PSD_CODE}',' ')
+    
+     #ifdef PA_ACT_32_USE_LOCALITY_AS_WORK_LOCALITY_ALWAYS
+      let $PA_Worksite_Location   = $PA_Local          
+     #else
+      let $PA_Worksite_Location   = $Res_PSD_CD        
+     #endif
+     
+     let $PA_Tax_Location_descr  = $LocalityName
+     let $PA_Tax_Location_state  = $LocalityState
+     let $PA_Tax_Location_county = $LocalityCounty
+     if $SelectEmplid <> ''
+        #debugd show 'PA Act 32: Work_PSD_CD = ' $Work_PSD_CD ' Causes PA_Worksite_Location to be set to Res_PSD_CD: ' $Res_PSD_CD
+     end-if
+    else
+     #ifdef PA_ACT_32_USE_LOCALITY_AS_WORK_LOCALITY_ALWAYS
+      let $local = $PA_Local
+     #else
+      let $local = $Work_PSD_CD
+     #endif
+     let $state = $PA_state
+     let $res_chk = 'N'
+     do get_local_tax_tbl_pa
+     let $PA_Tax_Location_descr  = $LocalityName
+     let $PA_Tax_Location_state  = $LocalityState
+     let $PA_Tax_Location_county = $LocalityCounty
+    end-if
+
+    if rtrim($Res_PSD_CD,' ') = rtrim('{PA_OUT_OF_STATE_PSD_CODE}',' ') or rtrim($Work_PSD_CD,' ') = rtrim('{PA_OUT_OF_STATE_PSD_CODE}',' ') or
+       rtrim($Res_PSD_CD,' ') = rtrim('{PA_UNKNOWN_PSD_CODE}',' ') or rtrim($Work_PSD_CD,' ') = rtrim('{PA_UNKNOWN_PSD_CODE}',' ') or #PA_Txgrs = 0
+      let $generate_PA_Act_32_Audit = 'f'
+    end-if
+  end-if
+#endif
+
+move '' to $CUSTOM_PA_EIT_GIE1
+#ifdef CUSTOM_PA_EIT_GIE1
+ !if $Res_PSD_CD = '' or ($Work_PSD_CD = '{PA_OUT_OF_STATE_PSD_CODE}' or $Work_PSD_CD = '')  or ($Res_PSD_CD = $Work_PSD_CD) !3/2/17 updated
+ if 1=1  !3/2/17 always 
+  move 't' to $CUSTOM_PA_EIT_GIE1
+  do Select_Max_PA_LCL_EFFDT
+#else
+ if $Res_PSD_CD = '' or $Work_PSD_CD = ''  ! the client may enable 11-F with no WORK or RES codes tracked in Tax Balances
+#endif
+  if $SelectEmplid <> ''
+    show 'PA Act 32: processing --> ' $PA_LocalityState ' EIT locality: ' $PA_Local ' Res: ' $PA_Resid  ' Tax: ' #PA_Taxes ', Wages: ' #PA_Txgrs ', RESPSD: ' $Res_PSD_Cd ', WRKPSD: ' $Work_PSD_CD ', CUSTOM: ' $CUSTOM_PA_EIT_GIE1
+  end-if
+
+!if we have a RES tax.. we'll look for a non-res row, if we have a non-RES tax, we'll look for the last RES row
+  !--------------------------------------------------------------------------------------------------------------
+  if $PA_Resid = 'Y'
+
+   let $res_chk = 'Y'
+   let $local_chk = $PA_Local
+   if $CUSTOM_PA_EIT_GIE1 = 't'
+     let $local_chk = ''
+   end-if
+   do get_local_tax_data_pa                     !get information about the RES Location
+   if $local <> ''
+    let $PA_Resident_Location = $Local
+    let $Local_Resident_found = 't'             !10122012
+   else
+    let $local = $PA_local
+    let $state = $PA_state
+   end-if
+   do get_local_tax_tbl_pa
+   let $PA_LocalityName   = $LocalityName
+   let $PA_LocalityState  = $LocalityState
+   let $PA_LocalityCounty = $LocalityCounty
+
+   !10122012 added to accurately flag Philly Residents
+   if substr($LocalityName,1,12) = 'PHILADELPHIA' and rtrim($LocalityState,' ') = rtrim('{PA_STATE}',' ') and $Local_Resident_found = 't'
+      let $Philly_Resident = 'Y'
+   end-if
+
+   !DEFAULT to setting work and res info the same
+   let $PA_Tax_Location_descr  = $PA_LocalityName
+   let $PA_Tax_Location_state  = $PA_LocalityState
+   let $PA_Tax_Location_county = $PA_LocalityCounty
+
+   let $res_chk = 'N'
+   let $local_chk = ''
+   do get_local_tax_data_pa                     !get information about the WORK Location
+   if $local <> ''
+    let $PA_Worksite_Location = $Local
+   else
+    let $local = $PA_local
+    let $state = $PA_state
+   end-if
+   
+   do get_local_tax_tbl_pa
+   let $PA_Tax_Location_descr  = $LocalityName
+   let $PA_Tax_Location_state  = $LocalityState
+   let $PA_Tax_Location_county = $LocalityCounty
+
+  else  ! this is if the record we're processing is a non-resident based tax
+
+   let $res_chk = 'N'
+   let $local_chk = $PA_Local
+   if $CUSTOM_PA_EIT_GIE1 = 't'
+     let $local_chk = ''
+   end-if
+   
+   do get_local_tax_data_pa                     !get information about the WORK Location
+   if $local <> ''
+      let $PA_Worksite_Location = $Local
+   else
+      let $local = $PA_local
+      let $state = $PA_state
+   end-if
+   do get_local_tax_tbl_pa
+   let $PA_Tax_Location_descr  = $LocalityName
+   let $PA_Tax_Location_state  = $LocalityState
+   let $PA_Tax_Location_county = $LocalityCounty
+
+   !DEFAULT to setting work and res info the same
+   let $PA_LocalityName   = $PA_Tax_Location_descr
+   let $PA_LocalityState  = $PA_Tax_Location_state
+   let $PA_LocalityCounty = $PA_Tax_Location_county
+
+   let $res_chk = 'Y'
+   let $local_chk = ''
+   do get_local_tax_data_pa                     !get information about the RES Location
+   if $local <> ''
+     let $PA_Resident_Location = $Local
+     let $Local_Resident_found = 't'           !10122012
+   else
+     let $local = $PA_local
+     let $state = $PA_state
+   end-if
+   do get_local_tax_tbl_pa
+   let $PA_LocalityName   = $LocalityName
+   let $PA_LocalityState  = $LocalityState
+   let $PA_LocalityCounty = $LocalityCounty
+
+   !10122012 added to accurately flag Philly Residents
+   if substr($LocalityName,1,12) = 'PHILADELPHIA' and rtrim($LocalityState,' ') = rtrim('{PA_STATE}',' ') and $Local_Resident_found = 't'
+      let $Philly_Resident = 'Y'
+   end-if
+
+  end-if
+ end-if   !blank RES or WORK PSD codes from balances
+
+ #ifdef PA_ACT_32_USE_LOCALITY_AS_WORK_LOCALITY_ALWAYS
+    let $PA_Worksite_Location = $PA_local
+    let $local = $PA_local
+    let $state = $PA_state
+    let $res_chk = 'N'     !added 04022013 without this the periodic report was displaying/warning incorrectly
+    do get_local_tax_tbl_pa
+    let $PA_Tax_Location_descr  = $LocalityName
+    let $PA_Tax_Location_state  = $LocalityState
+    let $PA_Tax_Location_county = $LocalityCounty
+    if $SelectEmplid <> ''
+     #debugd show 'PA Act 32: Forcing Work Location to the Balance Locality ' $PA_Local ' ' $PA_Tax_Location_descr
+    end-if
+ #endif
+
+ uppercase $PA_Resident_Location
+ uppercase $PA_LocalityState
+ uppercase $PA_LocalityCounty
+ uppercase $PA_LocalityName
+ uppercase $PA_Worksite_Location
+ uppercase $PA_Tax_Location_state
+ uppercase $PA_Tax_Location_county
+ uppercase $PA_Tax_Location_descr
+
+#ifdef debug_adppaloc
+  if rtrim($PA_Emplid,' ') = rtrim('{debug_adppaloc}',' ') or rtrim('{debug_adppaloc}',' ') = ''
+   show 'PA Act 32: ID complete. Res info: ' $PA_Emplid ' ' $PA_Resident_Location ' ' $PA_LocalityState ' ' $PA_LocalityCounty ' '$PA_LocalityName ' ' #RESIDENT_TAX_RT edit 99.9999 ', TBA? ' $PA_TBA
+   show 'PA Act 32: ID complete. Wrk info: ' $PA_Emplid ' ' $PA_Worksite_Location ' ' $PA_Tax_Location_state ' ' $PA_Tax_Location_county ' ' $PA_Tax_Location_descr ' ' #NONRESIDENT_TAX_RT edit 99.9999
+  end-if
+ #else
+  if $SelectEmplid <> ''
+   show 'PA Act 32: ID complete. Res info: ' $PA_Resident_Location ' ' $PA_LocalityState ' ' $PA_LocalityCounty ' '$PA_LocalityName ' ' #RESIDENT_TAX_RT edit 99.9999
+   show 'PA Act 32: ID complete. Wrk info: ' $PA_Worksite_Location ' ' $PA_Tax_Location_state ' ' $PA_Tax_Location_county ' ' $PA_Tax_Location_descr ' ' #NONRESIDENT_TAX_RT edit 99.9999
+  end-if
+ #endif
+
+
+!see if this is an early adopter work county or see if we're in 2012 and check both Res and Work for not being in PHILADELPHIA  (Default)
+!----------------------------------------------------------------------------------------------------------------------------------------
+ let $PALOC_COUNTY = $PA_Tax_Location_county
+ if $PA_Worksite_Location <> ''
+   if $PA_Tax_Location_state = rtrim('{PA_STATE}',' ') and ( {PA_COUNTY_SELECTION} or #current_YYYYQ >= #MANDATORY_START_YYYYQ )
+      and (substr($PA_LocalityName,1,12) <> '{PHILADELPHIA_CITY}') and (substr($PA_Tax_Location_descr,1,12) <> '{PHILADELPHIA_CITY}')  ! this is if we ignore Philly Res
+     
+     if $SelectEmplid <> ''
+      #debugd show 'PA Act 32: Applies to this PA EIT tax, Output_Taxcode = ' $Output_Taxcode
+      #debugd show 'PA Act 32: Applies to this PA EIT tax, Output_Taxcode = ' $Output_Taxcode
+     end-if
+
+     !7/2/2012 this condition added to flag the taxcode in the quarterly for Philly residences (takes care of associates moving out of Philly in mid-quarter
+     #ifdef ADP_TAX_QUARTERLY
+       if substr($PA_LocalityName,1,12) = 'PHILADELPHIA' and rtrim($PA_LocalityState,' ') = rtrim('{PA_STATE}',' ')
+        let $Resident = $Philly_Resident
+        Let $Output_Taxcode = substr($Output_Taxcode,1,14)  || $Resident
+        if $SelectEmplid <> ''
+        #debugd show 'PA Act 32: Philly Locality, Output_Taxcode = ' $Output_Taxcode
+        end-if
+       end-if
+     #endif
+
+     #ifdef ADP_TAX_PERIODIC
+      if $generate_PA_Act_32_Audit = 't'
+       !new audit, warning that the taxes w/h don't equal the wages X the higher rate
+       if #RESIDENT_TAX_RT >= #NONRESIDENT_TAX_RT
+         let #higher_rate = #RESIDENT_TAX_RT
+       else
+         let #higher_rate = #NONRESIDENT_TAX_RT
+       end-if
+       let #PA_tax_calc =  (#PA_Txgrs * #higher_rate)
+       let #PA_tax_diff = #PA_Taxes - #PA_tax_calc
+
+       if round(#PA_tax_diff,1) <> 0
+           do Format-Number(#RESIDENT_TAX_RT, $RES_RT, '99.9999')
+           do Format-Number(#NONRESIDENT_TAX_RT, $NONRES_RT, '99.9999')
+           do Format-Number(#PA_Taxes, $PA_Taxes, '999,999.99')
+           do Format-Number(#PA_Txgrs, $PA_Txgrs, '999,999.99')
+           do Format-Number(#PA_Tax_calc, $PA_Tax_calc, '999,999.99')
+           let $err_str = 'PA Act 32: Warning. Emplid: ' || $PA_Emplid || ', Res: ' || $PA_Resident_Location || ', Wrk: ' || $PA_Worksite_Location || ', Res Rate '
+           let $err_str = $err_str ||  $RES_RT     || ', Wrk Rate ' || $NONRES_RT || ', Taxable = ' || $PA_Txgrs || ', Taxes w/h = ' || $PA_Taxes  || ', Taxes calced = ' || $PA_Tax_calc
+           do log-res-rate-warning
+           add 1 to #PA_Act_32_withholding_warnings
+       end-if
+      end-if
+     #endif
+     !--------------------------------------------------------------------------------------
+   else
+      let $PA_Worksite_Location = ''
+      let $PA_Resident_Location = ''
+      if $SelectEmplid <> ''
+       #debugd show 'PA Act 32: Does not apply to this PA EIT tax'
+      end-if
+
+      !6/21/2012 this condition added to flag the taxcode in the quarterly for Philly residences (takes care of associates moving out of Philly in mid-quarter
+      #ifdef ADP_TAX_QUARTERLY
+       if substr($PA_LocalityName,1,12) = '{PHILADELPHIA_CITY}' and rtrim($PA_LocalityState,' ') = rtrim('{PA_STATE}',' ')
+        let $Resident = $Philly_Resident
+        Let $Output_Taxcode = substr($Output_Taxcode,1,14)  || $Resident
+        if $SelectEmplid <> ''
+        #debugd show 'PA Act 32: Philly Locality, Output_Taxcode = ' $Output_Taxcode
+        end-if
+       end-if
+      #endif
+
+   end-if
+ end-if
+
+ if rtrim($PA_Worksite_Location,' ') <> ''
+    do Get-Local-Ee-Data
+   !if we have a situation where we are w/h on the WORK, we need to report the Live Resident taxcode anyway
+   if $OutOfState <> 'Y' and $NRA_Status <> 'A'
+     let $PA_Derived_Res_Locality = $PA_State || $PA_Class || $PA_Resident_Location
+     let $PA_Derived_Res_Locality = rpad($PA_Derived_Res_Locality, 14, ' ') || 'Y'
+   end-if
+ end-if
+
+ if $PA_Worksite_Location <> ''
+
+     #ifdef ADP_TAX_QUARTERLY
+       !check if we have more than one resident tax for this person mapped to this work location
+       do check_multi_res_mapped_to_work  !changes the $PA_Worksite_Location to include counter in position 14
+
+       #ifdef ADJUST_QUARTERLY_WAGES_PA_EIT
+        if {ADJUST_QUARTERLY_WAGES_PA_EIT}
+         do adjust-quarterly-wages-for-common-worksites
+        end-if
+       #endif
+
+     #else
+       #ifdef PA_ACT_32_PERIODIC_MULTI_RESIDENT
+         !check if we have more than one resident tax for this person mapped to this work location
+         do check_multi_res_mapped_to_work  !changes the $PA_Worksite_Location to include counter in position 14
+       #endif
+     #endif
+
+     #ifdef PAACT_32_11F_Logic  ! Use $Res_PSD_CD into 503-508  1/25/2012
+       let $ResPSDCode = $Res_PSD_CD
+       if $CUSTOM_PA_EIT_GIE1 = 't' and rtrim($PA_Resident_Location,' ') <> ''
+        let $ResPSDCode = $PA_Resident_Location
+       end-if
+     #endif
+
+     !log the PA local information
+     !----------------------------  DETAILS -----------------
+     if #State_worksite_xref < {State_worksite_xref_limit}
+      put $PA_Company
+         $PA_Emplid
+         $PA_LocalityState
+         $PA_LocalityCounty
+         $PA_Class
+         $PA_Resident_Location
+         $PA_Resid
+         $PA_LocalityName
+         #RESIDENT_TAX_RT
+         #NONRESIDENT_TAX_RT
+         #PA_Taxes
+         #PA_Txgrs
+         #TaxBalance_Txgrs_Ytd
+          $PA_Worksite_Location
+          $PA_Tax_Location_state
+          $PA_Tax_Location_county
+          $PA_Tax_Location_descr
+          $ResPSDCode
+          $WorkPSDCode
+       into State_worksite_xref(#State_worksite_xref)
+               Company
+               Emplid
+               Resident_State
+               Resident_County
+               Tax_Class
+               Locality
+               Resident
+               Locality_Name
+               RESIDENT_TAX_RT
+               NONRESIDENT_TAX_RT
+               Taxes
+               Txgrs
+               Txgrs_YTD
+               Tax_Location_cd
+               Work_State
+               Work_County
+               Tax_Location_Descr
+               ResPSDCode
+               WorkPSDCode
+
+
+     add 1 to #State_worksite_xref
+    else
+      show 'PA Act 32: error:  increase State_worksite_xref_limit array size from {State_worksite_xref_limit}'
+      show '   Add #define State_worksite_xref_limit xxxxx in probiz.sqc to resolve.  Stopping program'
+      stop
+    end-if
+
+   let $PA_Worksite_Location_final = $PA_Worksite_Location
+   #ifdef ADP_TAX_PERIODIC
+    #ifdef PS_ACT_32_CLEAR_COUNTER
+      let $PA_Worksite_Location_final = substr($PA_Worksite_Location,1,10)
+    #endif
+   #endif
+   #ifdef ADP_TAX_QUARTERLY
+    #ifdef PS_ACT_32_CLEAR_COUNTER_QUARTERLY
+      let $PA_Worksite_Location_final = substr($PA_Worksite_Location,1,10)
+    #endif
+   #endif
+
+
+ #ifndef SKIP_PA_WORK_DETAILS_ON_REPORT
+     !---------------------------------- TOTALS (WORK) -------------------------
+     let #cnt = 0
+     let $found = 'n'
+     while #cnt < #State_worksite_totals
+      get $PA_Company_test $PA_Worksite_test from State_worksite_totals(#cnt) Company Tax_Location_cd
+      if rtrim($PA_Worksite_test,' ') = rtrim($PA_Worksite_Location_final,' ') and
+         rtrim($PA_Company_test,' ') = rtrim($PA_Company,' ')
+        array-add #PA_Taxes to State_worksite_totals(#cnt) Taxes
+        array-add #PA_Txgrs to State_worksite_totals(#cnt) Txgrs
+        let $found = 'y'
+        break
+      end-if
+      add 1 to #cnt
+     end-while
+
+     let $tcode = 'PAH' || rpad($PA_Worksite_Location,11,' ')
+
+     if $found <> 'y'
+      if #State_worksite_totals < {State_worksite_totals_limit}
+      put    $PA_Company
+             $PA_Worksite_Location_final
+             $PA_Tax_Location_county
+             $PA_Tax_Location_state
+             $PA_Tax_Location_descr
+             $tcode
+             #PA_Taxes
+             #PA_Txgrs
+             $WorkPSDCode
+       into State_worksite_totals(#State_worksite_totals)
+             Company
+             Tax_Location_cd
+             Work_County
+             Work_State
+             Tax_Location_Descr
+             Taxcode
+             Taxes
+             Txgrs
+             WorkPSDCode
+
+       add 1 to #State_worksite_totals
+      else
+        show 'PA Act 32: error:  increase State_worksite_totals_limit array size from {State_worksite_totals_limit}'
+        show '   Add #define State_worksite_totals_limit xxxxx in probiz.sqc to resolve.  Stopping program'
+        stop
+      end-if
+     end-if
+
+     !---------------------------------- TOTALS (RES) -------------------------
+     let #cnt = 0
+     let $found = 'n'
+     while #cnt < #State_resident_totals
+      get $PA_Company_test $PA_Worksite_test from State_resident_totals(#cnt) Company Tax_Location_cd
+      if rtrim($PA_Worksite_test,' ') = rtrim($PA_Resident_Location,' ') and
+         rtrim($PA_Company_test,' ') = rtrim($PA_Company,' ')
+        array-add #PA_Taxes to State_resident_totals(#cnt) Taxes
+        array-add #PA_Txgrs to State_resident_totals(#cnt) Txgrs
+        let $found = 'y'
+        break
+      end-if
+      add 1 to #cnt
+     end-while
+
+     if $OutOfState = 'Y'  or $NRA_Status = 'A'
+        let $tcode = 'OutofState'
+     else
+        let $tcode = $PA_Derived_Res_Locality || ' *'
+     end-if
+
+     if $found <> 'y'
+      if #State_resident_totals < {State_worksite_totals_limit}
+      put    $PA_Company
+             $PA_Resident_Location
+             $PA_LocalityCounty
+             $PA_LocalityState
+             $PA_LocalityName
+             $tcode
+             #PA_Taxes
+             #PA_Txgrs
+             $ResPSDCode
+       into State_resident_totals(#State_resident_totals)
+             Company
+             Tax_Location_cd
+             Resi_County
+             Resi_State
+             Tax_Location_Descr
+             Taxcode
+             Taxes
+             Txgrs
+             ResPSDCode
+
+       add 1 to #State_resident_totals
+      else
+        show 'PA Act 32: error:  increase State_worksite_totals_limit array size from {State_worksite_totals_limit}'
+        show '   Add #define State_worksite_totals_limit xxxxx in probiz.sqc to resolve.  Stopping program'
+        stop
+      end-if
+     end-if
+
+#endif
+
+     !--------------------------------------------------------------
+     let $PA_PSD_Locality       = rpad($ResPSDCode,6,' ')
+     let $PA_Work_Locality      = rpad($PA_Worksite_Location,11,' ')
+
+     !8/12/2011 - only one of the PA_PSD_Locality/PA_RES_Locality codes can be populated, and if it is an out of state situation, PSD {PA_OUT_OF_STATE_PSD_CODE} code in the PSD field
+     !----------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+     if rtrim($PA_Work_Locality,' ') <> ''
+      #ifdef ADP_TAX_QUARTERLY
+       If $OutOfState = 'Y' or $NRA_Status = 'A'
+          let $PA_PSD_Locality  = '{PA_OUT_OF_STATE_PSD_CODE}'
+          let $PA_RES_Locality  = '               '
+       else
+          #ifdef PA_ACT_32_SET_X1_FIELD_CODE
+            if $Rimini_PA_Act_32 = 't'
+              if rtrim($PA_PSD_Locality,' ') <> ''
+                let $PA_RES_Locality  = '               '
+              else
+                let $PA_PSD_Locality  = '      '
+                let $PA_RES_Locality  = $PA_Derived_Res_Locality
+              end-if
+            else
+              if rtrim($PA_PSD_Locality,' ') <> ''
+                let $PA_RES_Locality  = '               '
+              else
+                let $PA_PSD_Locality  = '      '
+                let $PA_RES_Locality  = $PA_Derived_Res_Locality
+              end-if
+            end-if
+          #else
+            let $PA_PSD_Locality  = '      '  ! we'll always report the full RES locality, not the PSD code for
+            let $PA_RES_Locality  = $PA_Derived_Res_Locality
+          #endif
+       end-if
+      #endif
+     else
+          let $PA_PSD_Locality  = '      '           ! if no remapping to work locality... don't set these field values
+          let $PA_RES_Locality  = '               '
+     end-if
+
+    #ifdef debug_adppaloc
+     if $PA_Emplid = '{debug_adppaloc}' or rtrim('{debug_adppaloc}',' ') = ''
+       show 'PA Act 32: complete, ' $PA_Emplid ', Work Locality: ' $PA_Work_Locality ', ResPSD: ' $PA_PSD_Locality ', ResLoc: ' $PA_RES_Locality ', Taxes = ' #PA_Taxes edit '999,999.99' ', Txgrs = ' #PA_Txgrs edit '999,999.99'
+       show '---------------------'
+     end-if
+    #else
+     if $SelectEmplid <> ''
+       show 'PA Act 32: complete, ' $PA_Emplid ', Work Locality: ' $PA_Work_Locality ', ResPSD: ' $PA_PSD_Locality ', ResLoc: ' $PA_RES_Locality ', Taxes = ' #PA_Taxes edit '999,999.99' ', Txgrs = ' #PA_Txgrs edit '999,999.99'
+       show '---------------------'
+     end-if
+    #endif
+    
+end-if
+
+done_determine_pa_worksite:
+
+#endif
+
+end-procedure
+
+
+
+begin-procedure check_multi_res_mapped_to_work  !changes the $PA_Worksite_Location to include counter in position 11
+
+!10/11/11 reworked.. it was working for two but not more than two '1' and '2' were fine.. then '2' was repeating
+
+   let $PA_Worksite_Location    = rpad($PA_Worksite_Location,10,' ')
+
+   let #max_cntr = 0
+   let #cnt = 0
+   while #cnt < #State_worksite_xref
+    get  $PA_C $PA_E $PA_W from State_worksite_xref(#cnt) Company Emplid Tax_Location_cd
+    if $PA_C = $PA_Company and $PA_E = $PA_Emplid and substr($PA_W,1,10) = $PA_Worksite_Location
+      let $cur_cntr    = substr($PA_W,11,1)
+      !10/21/2011
+      if $cur_cntr = ' '
+        let $cur_cntr = '1'
+      end-if
+      !-------------
+      move $cur_cntr to #cur_cntr
+      if #cur_cntr > #max_cntr
+        let #max_cntr = #cur_cntr
+      end-if
+
+    end-if
+    add 1 to #cnt
+   end-while
+
+   add 1 to #max_cntr
+   do Format-Number(#max_cntr, $cntr, '9')
+
+   !10/21/2011
+   if $cntr = '1'
+     let $cntr = ' '
+   end-if
+   !-------------
+
+   let $PA_Worksite_Location    = rpad($PA_Worksite_Location,10,' ') || substr($cntr,1,1)
+
+end-procedure
+
+#ifdef ADP_TAX_QUARTERLY
+#ifdef ADJUST_QUARTERLY_WAGES_PA_EIT
+
+begin-procedure adjust-quarterly-wages-for-common-worksites
+
+ if $Rimini_PA_Act_32 = 't'
+   if $SelectEmplid <> ''
+    #debugd show 'ADJUST_QUARTERLY_WAGES_PA_EIT, Rimini Street Tax client, no ADJUST_QUARTERLY_WAGES_PA_EIT is required (this logic would overreport PA EIT Wages)'
+   end-if
+ else
+   if $SelectEmplid <> ''
+    #debugd show 'ADJUST_QUARTERLY_WAGES_PA_EIT, adjust-quarterly-wages-for-common-worksites.  Worksite ' $PA_Tax_Location_descr ' Resident: ' $PA_LocalityName
+   end-if
+
+   let $WorkDesc = $PA_Tax_Location_descr
+   do Convert-WorkDesc
+   let $Tax_Location_Descr_stripped = $WorkDesc
+   let $WorkDesc = $PA_LocalityName
+   do Convert-WorkDesc
+   let $PA_LocalityName_stripped = $WorkDesc
+
+   let #cnt = 0
+   while #cnt < #State_worksite_xref
+    get  $PA_C $PA_E $PA_W #tx #wg_qtd #wg_ytd $PA_sta $PA_Cty $PA_Des $PA_Rsta $PA_RCty $PA_RDes #rrt #nrt
+        from State_worksite_xref(#cnt)
+          Company Emplid Tax_Location_cd Taxes Txgrs Txgrs_YTD Work_State Work_County Tax_Location_Descr Resident_State Resident_County Locality_Name
+          RESIDENT_TAX_RT NONRESIDENT_TAX_RT
+
+    let $WorkDesc = $PA_Des
+    do Convert-WorkDesc
+    let $PA_Des_stripped = $WorkDesc
+    let $WorkDesc = $PA_RDes
+    do Convert-WorkDesc
+    let $PA_RDes_stripped = $WorkDesc
+
+    !match on work and resident for wages that are different.
+    if ($PA_C = $PA_Company and $PA_E = $PA_Emplid) and
+       ($PA_sta = $PA_Tax_Location_state and $PA_Cty = $PA_Tax_Location_county and $PA_Des_stripped = $Tax_Location_Descr_stripped) and
+       ($PA_Rsta = $PA_LocalityState and $PA_RCty = $PA_LocalityCounty and $PA_RDes_stripped = $PA_LocalityName_stripped) and  !match on resident too
+       (#PA_Txgrs <> #wg_qtd or #TaxBalance_Txgrs_Ytd <> #wg_ytd) and   !match only if the wages are different than the current wages
+       (#rrt = #RESIDENT_TAX_RT) and (#nrt = #NONRESIDENT_TAX_RT)       !added 3/12/2012 to make sure the rates match
+
+       #debugd show 'ADJUST_QUARTERLY_WAGES_PA_EIT, Match.  Worksite ' $PA_Tax_Location_descr ' Resident: ' $PA_LocalityName ' Emplid: ' $PA_Emplid
+
+        !1/12/2012 logic to only update the wages if the amounts differ for each QTD and YTD amounts
+        if (#PA_Txgrs <> #wg_qtd)
+          let #TaxBalance_Txgrs_Qtd = #TaxBalance_Txgrs_Qtd + #wg_QTD
+          let #TaxBalance_Nlgrs_Qtd = #TaxBalance_Nlgrs_Qtd + #wg_QTD
+         #debugd show '              Adjusting QTD wages by: ' #wg_QTD edit 99,999,999.99 ' to ' #TaxBalance_Txgrs_Qtd edit 99,999,999.99
+          add #wg_QTD to #TaxBalance_Taxable_PA_EIT_wage_adjustment_QTD
+        end-if
+
+        if (#TaxBalance_Txgrs_Ytd <> #wg_ytd)
+          let #TaxBalance_Txgrs_Ytd = #TaxBalance_Txgrs_Ytd + #wg_YTD
+          let #TaxBalance_Nlgrs_Ytd = #TaxBalance_Nlgrs_Ytd + #wg_YTD
+         #debugd show '              Adjusting YTD wages by: ' #wg_YTD edit 99,999,999.99 ' to ' #TaxBalance_Txgrs_Ytd edit 99,999,999.99
+          add #wg_YTD to #TaxBalance_Taxable_PA_EIT_wage_adjustment_YTD
+        end-if
+
+        put #TaxBalance_Txgrs_Qtd #TaxBalance_Nlgrs_Qtd #TaxBalance_Txgrs_Ytd #TaxBalance_Nlgrs_Ytd into TaxBalance(#Last_Q1_Cnt)
+             TaxBalance_Txgrs_Qtd  TaxBalance_Nlgrs_Qtd  TaxBalance_Txgrs_Ytd  TaxBalance_Nlgrs_Ytd
+
+    end-if
+    add 1 to #cnt
+   end-while
+
+  end-if
+
+end-procedure
+
+begin-procedure Convert-WorkDesc    !$WorkDesc --> $WorkDesc
+  let $w = ''
+  let #l = 0
+  let #len = length($WorkDesc)
+  while #l < #len
+    add 1 to #l
+    if substr($WorkDesc,#l,1) <> ' '
+      let $w = $w || substr($WorkDesc,#l,1)
+    end-if
+  end-while
+  let $w = rtrim($w,'(M+SD)')
+  let $WorkDesc = $w
+end-procedure
+
+#endif
+#endif
+
+begin-procedure print-PA-Locality-Summary              !call from pbzper.sqr and pbzqtr.sqr
+
+ let #header_type = 60
+ let $ReportTitle  = 'ADP Employment Tax, PA Act 32 Consolidation'
+
+ print 'PA Act 32 Logic: adppaaut.sqc Version: {adppaloc_release}'  (+1,1)
+
+#ifdef BYPASS_PA_WORK_EXTRACT
+  print 'Pennsylvania Act 32 Bypassed (#define BYPASS_PA_WORK_EXTRACT has been enabled).' (+2,1)
+#else
+ if #State_worksite_xref < 1
+   print 'There were no Pennsylvania Act 32 Local records in the extract' (+2,1)
+ else
+
+   move '$$$,$$$,$$9.99mi' to $Fmt
+   move '99.9999' to $FmtRt
+
+#ifndef SKIP_PA_WORK_DETAILS_ON_REPORT
+#ifndef SKIP_PA_ASSOCIATE_DETAILS_ON_REPORT
+
+!DETAILS
+
+   let #cnt = 0
+   print ' ' (+1,1)
+   while #cnt < #State_worksite_xref
+    get  $PA_Company
+         $PA_Emplid
+         $PA_LocalityState
+         $PA_LocalityCounty
+         $PA_Class
+         $PA_Local
+         $PA_Resid
+         $PA_LocalityName
+         #RESIDENT_TAX_RT
+         #NONRESIDENT_TAX_RT
+         #Taxes
+         #Txgrs
+         $PA_Worksite_Location
+         $PA_Tax_Location_state
+         $PA_Tax_Location_county
+         $PA_Tax_Location_descr
+         $ResPSDCode
+         $WorkPSDCode
+       from State_worksite_xref(#cnt)
+               Company
+               Emplid
+               Resident_State
+               Resident_County
+               Tax_Class
+               Locality
+               Resident
+               Locality_Name
+               RESIDENT_TAX_RT
+               NONRESIDENT_TAX_RT
+               Taxes
+               Txgrs
+               Tax_Location_cd
+               Work_State
+               Work_County
+               Tax_Location_Descr
+               ResPSDCode
+               WorkPSDCode
+
+      if #current-line > 56
+         New-Page
+         print 'Company  Emplid      ResSt ResCounty     Class ResLocal   ResPSD    Res  ResRt    NonResRt TaxesWithheld    WorkLoc    WorkPSD   WorkSt WorkCounty    WorkDescr' (+1,1)
+         print ' ' (+1,1)
+      end-if
+
+      do Format-Number(#Taxes, $Taxes, $Fmt)
+      do Format-Number(#Txgrs, $Txgrs, $Fmt)
+      do Format-Number(#RESIDENT_TAX_RT, $RESIDENT_TAX_RT, $FmtRt)
+      do Format-Number(#NONRESIDENT_TAX_RT, $NONRESIDENT_TAX_RT, $FmtRt)
+
+      print $PA_Company             (+1,1)
+      print $PA_Emplid              (0,10)
+      print $PA_LocalityState       (0,22)
+      print $PA_LocalityCounty      (0,28)
+      print $PA_Class               (0,42)
+      print $PA_Local               (0,48)
+      print $ResPSDCode             (0,59)
+      print $PA_Resid               (0,69)
+      print $RESIDENT_TAX_RT        (0,74)
+      print $NONRESIDENT_TAX_RT     (0,83)
+      print $Taxes                  (0,92)
+      print $Txgrs                  (0,112)
+      print $PA_Worksite_Location   (0,128)
+      print $WorkPSDCode            (0,140)
+      print $PA_Tax_Location_state  (0,150)
+      print $PA_Tax_Location_county (0,157,9)
+      print $PA_Tax_Location_descr  (0,167,20)
+
+      add 1 to #cnt
+    end-while
+
+#endif
+
+!TOTALS (Work)
+   print 'Pennsylvania Act 32 consolidation - Totals mapped to WORK LOCATIONS' (+2,1)
+
+   print ' ' (+1,1)
+   let #cnt = 0
+   while #cnt < #State_worksite_totals
+      get    $PA_Company
+             $PA_Worksite_Location
+             $PA_Tax_Location_county
+             $PA_Tax_Location_state
+             $PA_Tax_Location_descr
+             $tcode
+             #Taxes
+             #Txgrs
+             $WorkPSDCode
+       from State_worksite_totals(#cnt)
+             Company
+             Tax_Location_cd
+             Work_County
+             Work_State
+             Tax_Location_Descr
+             Taxcode
+             Taxes
+             Txgrs
+             WorkPSDCode
+
+      if #current-line > 56
+         New-Page
+         print 'Company  Emplid      ResSt ResCounty     Class ResLocal   ResPSD    Res  ResRt    NonResRt TaxesWithheld    WorkLoc    WorkPSD   WorkSt WorkCounty    WorkDescr' (+1,1)
+         print ' ' (+1,1)
+      end-if
+
+      do Format-Number(#Taxes, $Taxes, $Fmt)
+      do Format-Number(#Txgrs, $Txgrs, $Fmt)
+
+      if $PA_Company <> $c_prior and ($c_prior <> '')
+        do Format-Number(#Taxes_c, $Taxes_c, $Fmt)
+        do Format-Number(#Txgrs_c, $Txgrs_c, $Fmt)
+        print 'Company total: ' (+1,1)
+        print $c_prior          ()
+        print $taxes_c          (0,92)
+        print $txgrs_c          (0,112)
+        print ' ' (+1,1)
+	move 0		      to #taxes_c
+	move 0		      to #txgrs_c
+      end-if
+
+      move  $PA_Company to $c_prior
+      print $PA_Company             (+1,1)
+      print 'Taxcode: '             (0,10)
+      print $tcode                  (0,20)
+      print $Taxes                  (0,92)
+      print $Txgrs                  (0,112)
+      print $PA_Worksite_Location   (0,128)
+      print $WorkPSDCode            (0,140)
+      print $PA_Tax_Location_state  (0,150)
+      print $PA_Tax_Location_county (0,157,9)
+      print $PA_Tax_Location_descr  (0,167,20)
+
+      add #taxes to #taxes_c
+      add #taxes to #taxes_h
+      add #txgrs to #txgrs_c
+      add #txgrs to #txgrs_h
+
+      add 1 to #cnt
+    end-while
+
+    if $c_prior <> ''
+      do Format-Number(#Taxes_c, $Taxes_c, $Fmt)
+      do Format-Number(#Txgrs_c, $Txgrs_c, $Fmt)
+      print 'Company total: ' (+1,1)
+      print $c_prior          ()
+      print $taxes_c          (0,92)
+      print $txgrs_c          (0,112)
+      print ' ' (+1,1)
+    end-if
+
+    do Format-Number(#Taxes_h, $Taxes_h, $Fmt)
+    do Format-Number(#Txgrs_h, $Txgrs_h, $Fmt)
+    print 'Grand total taxes mapped to WORK Locations: ' (+2,1)
+    print $taxes_h          (0,92)
+    print $txgrs_h          (0,112)
+
+!TOTALS (Resi)
+   print 'Pennsylvania Act 32 consolidation - Totals mapped from RESIDENT LOCATIONS' (+2,1)
+   print ' ' (+1,1)
+
+   let #cnt = 0
+   let #taxes_c = 0
+   let #taxes_h = 0
+   let #txgrs_c = 0
+   let #txgrs_h = 0
+   let $c_prior = ''
+
+   while #cnt < #State_resident_totals
+      get    $PA_Company
+             $PA_Worksite_Location
+             $PA_Tax_Location_county
+             $PA_Tax_Location_state
+             $PA_Tax_Location_descr
+             $tcode
+             #Taxes
+             #Txgrs
+             $ResPSDCode
+       from State_resident_totals(#cnt)
+             Company
+             Tax_Location_cd
+             Resi_County
+             Resi_State
+             Tax_Location_Descr
+             Taxcode
+             Taxes
+             Txgrs
+             ResPSDCode
+
+
+      if #current-line > 56
+         New-Page
+         print 'Company  Emplid      ResSt ResCounty     Class ResLocal   ResPSD    Res  ResRt    NonResRt TaxesWithheld    WorkLoc    WorkPSD   WorkSt WorkCounty    WorkDescr' (+1,1)
+         print ' ' (+1,1)
+      end-if
+
+      do Format-Number(#Taxes, $Taxes, $Fmt)
+      do Format-Number(#Txgrs, $Txgrs, $Fmt)
+
+      if $PA_Company <> $c_prior and ($c_prior <> '')
+        do Format-Number(#Taxes_c, $Taxes_c, $Fmt)
+        do Format-Number(#Txgrs_c, $Txgrs_c, $Fmt)
+        print 'Company total: ' (+1,1)
+        print $c_prior          ()
+        print $taxes_c          (0,92)
+        print $txgrs_c          (0,112)
+        print ' ' (+1,1)
+	move 0		      to #taxes_c
+	move 0		      to #txgrs_c
+      end-if
+
+      move  $PA_Company to $c_prior
+      print $PA_Company             (+1,1)
+      print 'Taxcode: '             (0,10)
+      print $tcode                  (0,20)
+      print $ResPSDCode             (0,59)
+      print $Taxes                  (0,92)
+      print $Txgrs                  (0,112)
+      print $PA_Worksite_Location   (0,128)
+      print $PA_Tax_Location_state  (0,150)
+      print $PA_Tax_Location_county (0,157,9)
+      print $PA_Tax_Location_descr  (0,167,20)
+
+      add #taxes to #taxes_c
+      add #taxes to #taxes_h
+      add #txgrs to #txgrs_c
+      add #txgrs to #txgrs_h
+      add 1 to #cnt
+    end-while
+
+    if $c_prior <> ''
+      do Format-Number(#Taxes_c, $Taxes_c, $Fmt)
+      do Format-Number(#Txgrs_c, $Txgrs_c, $Fmt)
+      print 'Company total: ' (+1,1)
+      print $c_prior          ()
+      print $taxes_c          (0,92)
+      print $txgrs_c          (0,112)
+      print ' ' (+1,1)
+    end-if
+
+    do Format-Number(#Taxes_h, $Taxes_h, $Fmt)
+    do Format-Number(#Txgrs_h, $Txgrs_h, $Fmt)
+    print 'Grand total taxes & wages from RESIDENT Locations'  (+2,1)
+    print $taxes_h          (0,92)
+    print $txgrs_h          (0,112)
+
+    print '  (Note: Entries marked (*) are RES Taxcodes associated with WORK Local withholding) ' (+2,1)
+
+#endif
+
+    show  'Pennsylvania Act 32 consolidation - Count for all associates processed by the PA Act 32 logic = ' #State_worksite_xref edit 999,999
+    print 'Pennsylvania Act 32 consolidation - Count for all associates processed by the PA Act 32 logic = ' (+2,1)
+    print #State_worksite_xref () edit 999,999
+
+    #ifdef ADP_TAX_PERIODIC
+     if #PA_Act_32_withholding_warnings > 0
+      New-Page
+     #debugd show 'Pennsylvania Act 32 consolidation - Warnings for incorrect Res/Non-Res withholdings = '#PA_Act_32_withholding_warnings edit 999,999
+      print 'Pennsylvania Act 32 consolidation - Warnings for incorrect Res/Non-Res withholdings           = ' (+2,1)
+      print #PA_Act_32_withholding_warnings () edit 999,999
+      print 'Maximum count of Res/Non-Res rate warnings (PA_Act_32_withholding_warning_limit) is set to {PA_Act_32_withholding_warning_limit}' (+2,1)
+      do print-res-rate-warnings
+     end-if
+    #endif
+
+    New-Page
+    print 'PA Act 32 Explanation of ADP Extract logic / Pre-requisites for PA Act 32 WORK Location reporting' (+2,1) bold
+    print '  *** Note: the extract does NOT populate the PSD codes (except for associates living outside of PA).  The PSD codes are populated by the ADP Employment Tax.' (+2,1) bold
+    print '            These PSD codes are based on the Work and Resident Locality codes in the extract.' (+1,1) bold
+
+ end-if
+
+  #ifdef START_PA_WORK_EXTRACT_YYYYQ
+       let $start_yyyy = substr('{START_PA_WORK_EXTRACT_YYYYQ}',1,4)
+       let $start_q = substr('{START_PA_WORK_EXTRACT_YYYYQ}',5,1)
+       print 'START_PA_WORK_EXTRACT_YYYYQ {START_PA_WORK_EXTRACT_YYYYQ} ****> PA Act 32 processing begins in Year: ' (+2,1)
+       print $start_yyyy   ()
+       print ', Qtr: '     ()
+       print $start_q      ()
+  #endif
+
+  #ifdef MANDATORY_START_YYYYQ
+    print 'MANDATORY_START_YYYYQ {MANDATORY_START_YYYYQ}' (+1,1)
+  #endif
+  #ifdef PA_ACT_32_PERIODIC_MULTI_RESIDENT
+    print 'PA_ACT_32_PERIODIC_MULTI_RESIDENT enabled.  (Periodic extract generates counter for multi-resident taxes)' (+1,1)
+  #endif
+  #ifdef IGNORE_SPECIAL_LWT_STATUS
+    print 'IGNORE_SPECIAL_LWT_STATUS enabled.  (Extract does not require ''Exempt'' Local Work Records)' (+1,1)
+  #endif
+  #ifdef IGNORE_RESIDENT
+    print 'IGNORE_RESIDENT enabled.  (Extract does not look at Resident flag in Local Tax Data)' (+1,1)
+  #endif
+  #ifdef USE_OPT_FOR_WORK_LOCALITY
+    print 'USE_OPT_FOR_WORK_LOCALITY enabled.  (Extract pulls Work Local from ''O'' (LST) Tax Data)' (+1,1)
+  #endif
+  #ifdef USE_OPT_FOR_RES_LOCALITY
+    print 'USE_OPT_FOR_RES_LOCALITY enabled.  (Extract pulls Res Local from ''O'' (LST) Tax Data)' (+1,1)
+  #endif
+  #ifdef IGNORE_OPT_FOR_WORK_LOCALITY
+    print 'IGNORE_OPT_FOR_WORK_LOCALITY enabled.  (Extract pulls Work Local from LST and non-LST)' (+1,1)
+  #endif
+  #ifdef PA_ACT_32_SET_X1_FIELD_CODE
+    print 'PA_ACT_32_SET_X1_FIELD_CODE enabled.  (Extract populates X1 Res PSD code when possible)' (+1,1)
+  #endif
+  #ifdef PA_ACT_32_COORDINATE_EFFDT
+    print 'PA_ACT_32_COORDINATE_EFFDT enabled.  (Extract syncs work and resident rows by EFFDT)' (+1,1)
+  #endif
+  #ifdef PS_ACT_32_CLEAR_COUNTER
+    print 'PS_ACT_32_CLEAR_COUNTER enabled.' (+1,1)
+  #endif
+  #ifdef SKIP_PA_ASSOCIATE_DETAILS_ON_REPORT
+    print 'SKIP_PA_ASSOCIATE_DETAILS_ON_REPORT enabled.' (+1,1)
+  #endif
+  #ifdef SKIP_PA_WORK_DETAILS_ON_REPORT
+    print 'SKIP_PA_WORK_DETAILS_ON_REPORT enabled.' (+1,1)
+  #endif
+  #ifdef PAACT_32_11F_Logic
+    print 'PAACT_32_11F_Logic enabled' (+1,1)
+  #endif
+  if $Rimini_PA_Act_32 = 't'
+    print 'Rimini Street Client, Tax update:    '     (+1,1)
+    print $Tax_Update                                 ()
+  else
+    print 'Oracle/PeopleSoft Client Tax update: '     (+1,1)
+    print $Tax_Update                                 ()
+  end-if
+  #ifdef ADJUST_ZERO_LOCALS_PA_EIT
+   print 'ADJUST_ZERO_LOCALS_PA_EIT enabled, Wage records bypassed for ZERO Tax PA EIT Local records'            (+2,1)
+   #ifdef ADP_TAX_QUARTERLY
+    do Format-Number(#TaxBalance_Taxable_PA_EIT_cleared_QTD, $TaxBalance_Taxable_PA_EIT_cleared_QTD, $Fmt)
+    do Format-Number(#TaxBalance_Taxable_PA_EIT_cleared_YTD, $TaxBalance_Taxable_PA_EIT_cleared_YTD, $Fmt)
+    print '                      PA EIT  QTD  Wages bypassed = '                                            (+1,1)
+    print $TaxBalance_Taxable_PA_EIT_cleared_QTD                                                            ()
+    print '                      PA EIT  YTD  Wages bypassed = '                                            (+1,1)
+    print $TaxBalance_Taxable_PA_EIT_cleared_YTD                                                            ()
+   #else
+    do Format-Number(#TaxBalance_Taxable_PA_EIT_cleared, $TaxBalance_Taxable_PA_EIT_cleared, $Fmt)
+    print '                      PA EIT Local Wages bypassed = '                                            (+1,1)
+    print $TaxBalance_Taxable_PA_EIT_cleared                                                            ()
+   #endif
+  #endif
+ #endif
+
+ #ifdef ADP_TAX_QUARTERLY
+  #ifdef ADJUST_QUARTERLY_WAGES_PA_EIT
+    print 'ADJUST_QUARTERLY_WAGES_PA_EIT enabled, Wage records adjusted'             (+1,1)
+    do Format-Number(#TaxBalance_Taxable_PA_EIT_wage_adjustment_QTD, $TaxBalance_Taxable_PA_EIT_wage_adjustment_QTD, $Fmt)
+    do Format-Number(#TaxBalance_Taxable_PA_EIT_wage_adjustment_YTD, $TaxBalance_Taxable_PA_EIT_wage_adjustment_YTD, $Fmt)
+    print '                      PA EIT  QTD  Wages Adjusted = '                                            (+1,1)
+    print $TaxBalance_Taxable_PA_EIT_wage_adjustment_QTD                                                            ()
+    print '                      PA EIT  YTD  Wages Adjusted = '                                            (+1,1)
+    print $TaxBalance_Taxable_PA_EIT_wage_adjustment_YTD                                                            ()
+  #endif
+ #endif
+
+ New-Page
+
+end-procedure
+
+#ifdef ADP_TAX_PERIODIC
+begin-procedure  log-res-rate-warning
+ if #PA_Act_32_withholding_warnings < {PA_Act_32_withholding_warning_limit}
+   put $err_str into PA_ACT32_Warning(#PA_Act_32_withholding_warnings) err_str
+ end-if
+end-procedure
+
+begin-procedure  print-res-rate-warnings
+ let #warn_cnt = 0
+ while #warn_cnt < #PA_Act_32_withholding_warnings and #warn_cnt < {PA_Act_32_withholding_warning_limit}
+   get $err_str from PA_ACT32_Warning(#warn_cnt) err_str
+   print $err_str (+1,1)
+   add 1 to #warn_cnt
+ end-while
+end-procedure
+#endif
+
+!**********************************************************************     !
+!----------------------------------------------------------------------     !
+! Procedure: Get-Quarter                                                    !
+! Descr:     determines which quarter in the year a date ($Dt_in)           !
+!            is in, assigning the result to #qtr_out                        !
+!----------------------------------------------------------------------     !
+begin-procedure Get-Quarter-PA
+
+ !Get the Quarter that the Check date is in, from the pay calendar
+ !----------------------------------------------------------------
+ do Convert-To-DTU-Date($Dt_in, $Dt_in_DTU)
+
+ let $Mo  = substr($Dt_in_DTU,6,2)
+ move $Mo to #Mo
+ let #i = (#Mo - 1) / 3
+ let #qtr_out  = floor(#i) + 1
+ let #year_out = substr($Dt_in_DTU,1,4)
+ let #year_qtr = (#year_out * 10) + #qtr_out    !19993, 19994, 20001, 20002...
+
+end-procedure
+
+!***********************************************************************
+! Procedure Get-Local-Ee-Data
+!***********************************************************************
+Begin-Procedure Get-Local-Ee-Data
+
+  let $ResPSDCode  = ''
+  let $OutOfState = 'N'
+  let $NRA_Status = ' '
+
+#ifndef PAACT_32_11F_Logic  !4/10/2012 added to not perform this for 11-F+
+
+  do Get-Resident-Data
+
+  If $OutOfState = 'Y'
+     let $ResPSDCode  = '{PA_OUT_OF_STATE_PSD_CODE}'
+  End-If
+
+  do Get-Res-NRA-Status
+  If $NRA_Status = 'A'
+     let $ResPSDCode  = '{PA_OUT_OF_STATE_PSD_CODE}'
+  End-If
+
+  if $SelectEmplid <> ''
+    show 'PA Act 32: Get-Local-Ee-Data OutOfState = ' $OutOfState ', $NRA_Status = ' $NRA_Status ', Res PSD = ' $ResPSDCode ' for Res State = ' $Resident_State
+  end-if
+
+#endif
+
+End-Procedure
+
+
+!***********************************************************************
+! Procedure Get-Resident-Data
+!***********************************************************************
+Begin-Procedure Get-Resident-Data
+
+  let $OutOfState = 'N'
+  let $Resident_state = ''
+
+BEGIN-SELECT
+STD2.STATE
+
+  let $Resident_state =  rtrim(&STD2.STATE,' ')
+  If $Resident_state <> '{PA_STATE}'
+     let $OutOfState = 'Y'
+  End-If
+
+  FROM PS_STATE_TAX_DATA STD2
+   WHERE STD2.EMPLID   = $Pa_Emplid
+     AND STD2.COMPANY  = $Pa_Company
+     AND STD2.RESIDENT = 'Y'
+     AND STD2.EFFDT    = (SELECT MAX(STD22.EFFDT)
+                       FROM PS_STATE_TAX_DATA STD22
+                       WHERE STD22.EMPLID  = STD2.EMPLID
+                         AND STD22.COMPANY = STD2.COMPANY
+                         AND STD22.EFFDT <= $PA_AUTO_EFFDT)
+#ifdef SELECT_WITH_UR
+ with ur
+#end-if
+end-select
+
+End-Procedure
+
+
+! ****************** QUERY routines *************************
+
+#ifdef PA_ACT_32_COORDINATE_EFFDT
+begin-procedure Select_Max_PA_LCL_EFFDT
+
+ let $Max_PA_LCL_EFFDT = $PA_AUTO_EFFDT
+
+ #ifdef debug_adppaloc
+   if $PA_Emplid = '{debug_adppaloc}' or rtrim('{debug_adppaloc}',' ') = ''
+      show 'PA Act 32: Select_Max_PA_LCL_EFFDT for ' $PA_Emplid ' ' $PA_Company ' ' $PA_State ' ' $PA_AUTO_EFFDT
+   end-if
+ #else
+   if $SelectEmplid <> ''
+      show 'PA Act 32: Select_Max_PA_LCL_EFFDT for ' $PA_Emplid ' ' $PA_Company ' ' $PA_State ' ' $PA_AUTO_EFFDT
+   end-if
+ #endif
+ 
+
+begin-select loops=1
+LDM.EFFDT
+LDM.LOCALITY
+
+  let $Max_PA_LCL_EFFDT = &LDM.EFFDT
+
+  #ifdef debug_adppaloc
+    if $PA_Emplid = '{debug_adppaloc}' or rtrim('{debug_adppaloc}',' ') = ''
+      show 'PA Act 32: Select_Max_PA_LCL_EFFDT retrieved ' $Max_PA_LCL_EFFDT ' ' &LDM.LOCALITY
+    end-if
+  #else
+   if $SelectEmplid <> ''
+      show 'PA Act 32: Select_Max_PA_LCL_EFFDT retrieved ' $Max_PA_LCL_EFFDT
+   end-if
+  #endif
+
+  FROM PS_LOCAL_TAX_DATA LDM
+     WHERE LDM.EMPLID       = $PA_Emplid
+       AND LDM.COMPANY      = $PA_Company
+       AND LDM.STATE        = $PA_State
+       AND LDM.LOCALITY     not like 'I%'
+       AND LDM.LOCALITY     not like 'O%'
+       AND LDM.EFFDT=(SELECT MAX(EFFDT)
+        FROM   PS_LOCAL_TAX_DATA
+        WHERE  EMPLID   = LDM.EMPLID
+          AND  COMPANY  = LDM.COMPANY
+          AND  STATE    = LDM.STATE
+          AND  LOCALITY = LDM.LOCALITY
+          AND  EFFDT    <= $PA_AUTO_EFFDT)
+     
+     ORDER BY LDM.EFFDT DESC
+     
+
+#ifdef SELECT_WITH_UR
+  {SELECT_WITH_UR} with ur
+#endif
+end-select
+
+end-procedure
+#endif
+
+begin-procedure get_local_tax_tbl_pa  !gets info out of PS_LOCAL_TAX_TBL about the RES and WORK Localities
+
+    let $LocalityName        = ''
+    let $LocalityState       = ''
+    let $LocalityCounty      = ''
+
+begin-SELECT
+PAW.STATE
+PAW.COUNTY
+PAW.LOCALITY_NAME
+PAW.EFFDT
+PAW.RESIDENT_TAX_RT
+PAW.NONRESIDENT_TAX_RT
+
+  if $res_chk = 'Y'
+   let #RESIDENT_TAX_RT    = &PAW.RESIDENT_TAX_RT
+  else
+   let #NONRESIDENT_TAX_RT = &PAW.NONRESIDENT_TAX_RT
+  end-if
+
+  let $LocalityCounty = rtrim(&PAW.COUNTY,' ')
+  let $LocalityState  = rtrim(&PAW.STATE,' ')
+  let $LocalityName   = rtrim(&PAW.LOCALITY_NAME,' ')
+
+  #ifdef debug_adppaloc
+   if $PA_Emplid = '{debug_adppaloc}' or rtrim('{debug_adppaloc}',' ') = ''
+     show 'PA Act 32: get_local_tax_tbl_pa retrieved: for ' $state ' ' $PA_class ' ' $local ' --> '$LocalityState ' ' $LocalityCounty ' ' $LocalityName ' on ' &PAW.EFFDT
+   end-if
+  #else
+   if $SelectEmplid <> ''
+     show 'PA Act 32: get_local_tax_tbl_pa retrieved: for ' $state ' ' $PA_class ' ' $local ' --> '$LocalityState ' ' $LocalityCounty ' ' $LocalityName ' on ' &PAW.EFFDT
+   end-if
+  #endif
+  
+  FROM  PS_LOCAL_TAX_TBL PAW
+  WHERE PAW.STATE     = $state
+   AND PAW.TAX_CLASS  = $PA_Class
+   AND PAW.LOCALITY   = $local
+   AND PAW.EFFDT =
+      (SELECT MAX(EFFDT)
+       FROM   PS_LOCAL_TAX_TBL
+       WHERE  STATE     = PAW.STATE
+         AND  TAX_CLASS = PAW.TAX_CLASS
+         AND  LOCALITY  = PAW.LOCALITY
+         AND  EFFDT   <= $PA_AUTO_EFFDT)
+
+#ifdef SELECT_WITH_UR
+ with ur
+#end-if
+end-select
+
+end-procedure
+
+begin-procedure get_local_tax_data_pa  !Get the info out of PS_LOCAL_TAX_DATA (Res and non-res)
+
+  #ifdef debug_adppaloc
+   if $PA_Emplid = '{debug_adppaloc}' or rtrim('{debug_adppaloc}',' ') = ''
+     show 'PA Act 32: get_local_tax_data_pa: local_chk ' $local_chk ' ' $res_chk ' ' $PA_Company ' ' $PA_state ' ' $PA_Emplid ' ' $PA_AUTO_EFFDT
+   end-if
+  #else
+   if $SelectEmplid <> ''
+     show 'PA Act 32: get_local_tax_data_pa: local_chk ' $local_chk ' ' $res_chk ' ' $PA_Company ' ' $PA_state ' ' $PA_Emplid ' ' $PA_AUTO_EFFDT
+   end-if
+  #endif
+  
+  let $local = ''
+  let $state = ''
+
+  if rtrim($local_chk,' ') = ''
+    do get_local_tax_data_pa_match
+  else
+
+BEGIN-SELECT
+LDPA.STATE
+LDPA.LOCALITY
+LDPA.EFFDT
+
+ if rtrim($local_chk,' ') = rtrim(&LDPA.LOCALITY,' ')
+    let $local = rtrim(&LDPA.LOCALITY,' ')
+    let $state = rtrim(&LDPA.STATE,' ')
+    let $local_tax_data_effdt = &LDPA.EFFDT
+
+   #ifdef debug_adppaloc
+    if $PA_Emplid = '{debug_adppaloc}' or rtrim('{debug_adppaloc}',' ') = ''
+     show 'PA Act 32: get_local_tax_data_pa retrieved --> ' $state ' ' $local ' on ' $local_tax_data_effdt
+    end-if
+   #else
+    if $SelectEmplid <> ''
+     show 'PA Act 32: get_local_tax_data_pa retrieved --> ' $state ' ' $local ' on ' $local_tax_data_effdt
+    end-if
+   #endif
+
+ end-if
+ 
+ FROM PS_LOCAL_TAX_DATA LDPA
+     WHERE LDPA.EMPLID       = $PA_Emplid
+       AND LDPA.COMPANY      = $PA_Company
+       AND LDPA.STATE        = $PA_State
+       AND LDPA.RESIDENT     = $res_chk
+       AND LDPA.LOCALITY  not like 'O%'
+       AND LDPA.EFFDT=(SELECT MAX(EFFDT)
+        FROM   PS_LOCAL_TAX_DATA
+        WHERE  EMPLID   = LDPA.EMPLID
+          AND  COMPANY  = LDPA.COMPANY
+          AND  STATE    = LDPA.STATE
+          AND  LOCALITY = LDPA.LOCALITY
+          AND  EFFDT    <= $PA_AUTO_EFFDT)
+
+#ifdef SELECT_WITH_UR
+ {SELECT_WITH_UR} with ur
+#endif
+end-select
+
+ end-if
+
+end-procedure
+
+
+begin-procedure get_local_tax_data_pa_match
+
+  let $local = ''
+  let $state = ''
+
+   #ifdef debug_adppaloc
+    if $PA_Emplid = '{debug_adppaloc}' or rtrim('{debug_adppaloc}',' ') = ''
+     show 'PA Act 32: get_local_tax_data_pa_match ' $res_chk ' ' $PA_Company ' ' $PA_state ' ' $PA_Emplid ' ' $PA_AUTO_EFFDT ' maxdt ' $Max_PA_LCL_EFFDT
+    end-if
+   #else
+    if $SelectEmplid <> ''
+     show 'PA Act 32: get_local_tax_data_pa_match ' $res_chk ' ' $PA_Company ' ' $PA_state ' ' $PA_Emplid ' ' $PA_AUTO_EFFDT ' maxdt ' $Max_PA_LCL_EFFDT
+    end-if
+   #endif
+   
+BEGIN-SELECT 
+LDPAM.STATE
+LDPAM.LOCALITY
+LDPAM.EFFDT
+
+  #ifdef debug_adppaloc
+    if $PA_Emplid = '{debug_adppaloc}' or rtrim('{debug_adppaloc}',' ') = ''
+       show 'PA Act 32: get_local_tax_data_pa_match retrieved --> state ' &LDPAM.STATE ' locality ' &LDPAM.LOCALITY ' on ' &LDPAM.EFFDT
+    end-if
+  #else
+    if $SelectEmplid <> ''
+       show 'PA Act 32: get_local_tax_data_pa_match retrieved --> state ' &LDPAM.STATE ' locality ' &LDPAM.LOCALITY ' on ' &LDPAM.EFFDT
+    end-if
+  #endif
+  
+  !4/12/17
+  if $CUSTOM_PA_EIT_GIE1 = 't'
+    if (&LDPAM.EFFDT <> $Max_PA_LCL_EFFDT) or substr(&LDPAM.LOCALITY,1,1) = 'I' or length(rtrim(&LDPAM.LOCALITY,' ')) <> 6  !PSD codes only
+      #ifdef debug_adppaloc
+        if $PA_Emplid = '{debug_adppaloc}' or rtrim('{debug_adppaloc}',' ') = ''
+         show 'PA Act 32: get_local_tax_data_pa_match skipping local tax data'
+        end-if
+      #else
+       if $SelectEmplid <> ''
+         show 'PA Act 32: get_local_tax_data_pa_match skipping local tax data'
+       end-if
+      #endif
+      goto skip_lcl_row
+    end-if
+  end-if
+
+   do get_local_tax_tbl_class
+   if $matching_class = 'H'
+      let $local   = rtrim(&LDPAM.LOCALITY,' ')
+      let $state   = rtrim(&LDPAM.STATE,' ')
+      #ifdef debug_adppaloc
+        if $PA_Emplid = '{debug_adppaloc}' or rtrim('{debug_adppaloc}',' ') = ''
+         show 'PA Act 32: get_local_tax_data_pa_match match --> $matching_class ' $matching_class  'state ' $state ' local ' $local ' on ' &LDPAM.EFFDT
+        end-if
+      #else
+       if $SelectEmplid <> ''
+         show 'PA Act 32: get_local_tax_data_pa_match match --> $matching_class ' $matching_class  'state ' $state ' local ' $local ' on ' &LDPAM.EFFDT
+       end-if
+      #endif
+      exit-select
+   end-if
+
+skip_lcl_row:
+ 
+ FROM PS_LOCAL_TAX_DATA LDPAM
+     WHERE LDPAM.EMPLID       = $PA_Emplid
+       AND LDPAM.COMPANY      = $PA_Company
+       AND LDPAM.STATE        = $PA_State
+       AND LDPAM.RESIDENT     = $res_chk
+       AND LDPAM.LOCALITY     NOT LIKE 'O%'
+       AND LDPAM.EFFDT        <= $PA_AUTO_EFFDT
+     ORDER BY LDPAM.EFFDT  DESC                
+   
+#ifdef SELECT_WITH_UR
+ {SELECT_WITH_UR} with ur
+#endif
+end-select
+
+end-procedure
+
+begin-procedure get_local_tax_tbl_class
+
+  let $matching_class = ''
+  
+begin-SELECT
+PAM.TAX_CLASS
+
+  let $matching_class = rtrim(&PAM.TAX_CLASS,' ')
+
+  FROM  PS_LOCAL_TAX_TBL PAM
+  WHERE PAM.STATE      = &LDPAM.STATE
+    AND PAM.LOCALITY   = &LDPAM.LOCALITY
+    AND PAM.TAX_CLASS  = 'H'
+    AND PAM.EFFDT =
+      (SELECT MAX(EFFDT)
+       FROM   PS_LOCAL_TAX_TBL
+       WHERE  STATE     = PAM.STATE
+         AND  TAX_CLASS = PAM.TAX_CLASS
+         AND  LOCALITY  = PAM.LOCALITY
+         AND  EFFDT   <= $PA_AUTO_EFFDT)
+
+#ifdef SELECT_WITH_UR
+ with ur
+#end-if
+end-select
+
+end-procedure
+
+Begin-Procedure Get-Res-NRA-Status
+
+  let $NRA_Status = ' '
+
+BEGIN-SELECT
+FTD.SPECIAL_FWT_STATUS
+
+  let $NRA_Status = rtrim(&FTD.SPECIAL_FWT_STATUS,' ')
+
+FROM PS_FED_TAX_DATA FTD
+WHERE FTD.EMPLID  = $Pa_Emplid
+  AND FTD.COMPANY = $Pa_Company
+  AND FTD.EFFDT   = (SELECT MAX(FTD1.EFFDT)
+                     FROM PS_FED_TAX_DATA FTD1
+                     WHERE FTD.EMPLID  = FTD1.EMPLID
+                       AND FTD.COMPANY = FTD1.COMPANY
+                       AND FTD1.EFFDT <= $PA_AUTO_EFFDT)
+#ifdef SELECT_WITH_UR
+ with ur
+#end-if
+end-select
+End-Procedure
+
+#ifdef ADP_TAX_QUARTERLY
+#ifdef INCLUDE_LCL_ADJ
+begin-procedure Include-LCL-ADJ  !hook from pbzqtr.sqr
+
+  let $Include-LCL-ADJ-PA=''
+  
+  let #cur_cnt = 0
+  while #cur_cnt < #Last_TaxBalance_Cnt
+    Add 1 to #cur_cnt
+    get   $TaxBalance_State  $TaxBalance_Tax_Class $TaxBalance_Locality  #cTAX_QTD #cTXGRS_QTD #cTAX_YTD #cTXGRS_YTD -
+       from TaxBalance(#Cur_Cnt) TaxBalance_State TaxBalance_Tax_Class TaxBalance_Locality TaxBalance_Tax_Qtd TaxBalance_Txgrs_Qtd TaxBalance_Tax_Ytd TaxBalance_Txgrs_Ytd 
+    let $state_trimmed	 = rtrim($TaxBalance_State,' ')
+    let $Local_trimmed   = rtrim($TaxBalance_Locality,' ')
+    let $class_trimmed	 = rtrim($TaxBalance_Tax_Class,' ')
+    if $state_trimmed <> '$U' and $class_trimmed = 'H' and $local_trimmed <> ''
+      do Check-LCL-ADJ
+    end-if
+  end-while
+
+  do Retrieve-LCL-ADJ
+    
+end-procedure
+
+Begin-Procedure Check-LCL-ADJ
+BEGIN-SELECT loops=1
+PAADJC.STATE
+
+  add #cTAX_QTD   to #ADC.TAX_QTD
+  add #cTXGRS_QTD to #ADC.TXGRS_QTD
+  add #cTAX_YTD   to #ADC.TAX_YTD
+  add #cTXGRS_YTD to #ADC.TXGRS_YTD  
+  
+  put 0 0 0 0 into TaxBalance(#cur_cnt)  TaxBalance_Tax_Qtd TaxBalance_Txgrs_Qtd TaxBalance_Tax_Ytd TaxBalance_Txgrs_Ytd 
+
+  if rtrim(&PAADJC.STATE,' ') = 'PA'
+    let $Include-LCL-ADJ-PA = 't'
+  end-if
+  
+FROM {ADP_LCL_ADJ_TBL} PAADJC
+WHERE PAADJC.EMPLID       = $Current_Emplid
+  AND PAADJC.COMPANY      = $Current_Company
+  AND PAADJC.BALANCE_YEAR = #RptYear
+  AND PAADJC.BALANCE_QTR  = #RptQtr
+  AND PAADJC.STATE        = $state_trimmed
+
+#ifdef SELECT_WITH_UR
+ with ur
+#end-if
+end-select
+End-Procedure
+
+
+Begin-Procedure Retrieve-LCL-ADJ
+
+BEGIN-SELECT
+PAADJ.STATE
+PAADJ.LOCALITY
+PAADJ.LOCALITY1
+PAADJ.RESIDENT
+PAADJ.TAX_QTD
+PAADJ.TXGRS_QTD
+PAADJ.TAX_YTD
+PAADJ.TXGRS_YTD
+
+  do insert-LCL-ADJ
+
+FROM {ADP_LCL_ADJ_TBL} PAADJ
+WHERE PAADJ.EMPLID       = $Current_Emplid
+  AND PAADJ.COMPANY      = $Current_Company
+  AND PAADJ.BALANCE_YEAR = #RptYear
+  AND PAADJ.BALANCE_QTR  = #RptQtr
+  
+  Order by PAADJ.STATE, PAADJ.LOCALITY, PAADJ.RESIDENT, PAADJ.LOCALITY1
+  
+#ifdef SELECT_WITH_UR
+ with ur
+#end-if
+end-select
+
+End-Procedure
+
+Begin-Procedure insert-LCL-ADJ
+  
+  let $A_State        = rtrim(&PAADJ.STATE,' ')
+  let $A_Tax_Class    = 'H'
+  let $A_Locality     = rtrim(&PAADJ.LOCALITY,' ')
+  let $A_WrkLocality  = rtrim(&PAADJ.LOCALITY,' ')
+  let $A_ResLocality  = rtrim(&PAADJ.LOCALITY1,' ')
+  let $A_Resident     = rtrim(&PAADJ.RESIDENT,' ')
+  
+  add 1 to #Last_TaxBalance_Cnt
+  
+  put $A_State $A_Tax_Class $A_Locality $A_WrkLocality $A_ResLocality $A_Resident &PAADJ.TAX_QTD &PAADJ.TXGRS_QTD &PAADJ.TAX_YTD &PAADJ.TXGRS_YTD  -
+   into TaxBalance(#Last_TaxBalance_Cnt) TaxBalance_State TaxBalance_Tax_Class TaxBalance_Locality TaxBalance_Work_PSD_CD TaxBalance_RES_PSD_CD TaxBalance_Resident    -
+        TaxBalance_Tax_Qtd TaxBalance_Txgrs_Qtd  TaxBalance_Tax_Ytd TaxBalance_Txgrs_Ytd
+  
+  show 'Local Adj: ' $Current_Company ' ' $Current_Emplid ' ' $A_State 'H' $A_Locality ' ' $A_Resident ' ' $A_WrkLocality '/' $A_ResLocality ' ' &PAADJ.TAX_QTD edit 999,999,999.99 ' ' &PAADJ.TXGRS_QTD edit 999,999,999.99 ',' &PAADJ.TAX_YTD edit 999,999,999.99 ' ' &PAADJ.TXGRS_YTD edit 999,999,999.99 
+  add &PAADJ.TAX_QTD   to #ADJ.TAX_QTD
+  add &PAADJ.TXGRS_QTD to #ADJ.TXGRS_QTD
+  add &PAADJ.TAX_YTD   to #ADJ.TAX_YTD
+  add &PAADJ.TXGRS_YTD to #ADJ.TXGRS_YTD
+  add 1 to #Local_Adj_count
+  
+End-Procedure
+#endif
+#endif
+
+#ifdef ADP_TAX_PERIODIC
+ #include 'gettxlnm.sqc'
+#endif
+

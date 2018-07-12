@@ -1,0 +1,948 @@
+! ****************************************************************** !
+! ORACLE CONFIDENTIAL.  For authorized use only.  Except for as      !
+! expressly authorized by Oracle, do not disclose, copy, reproduce,  !
+! distribute, or modify.                                             !
+! ****************************************************************** !
+!                                                                    !
+!----------------------------------------------------------------------
+! Report Name: UPG75GBL.SQR - Globalization Upgrades to 7.5
+!----------------------------------------------------------------------
+!
+!
+!----------------------------------------------------------------------
+! Program Descr: Migrates data from the old table structures to new
+!                structures introduced in PeopleTools 7.5. The areas
+!                to which this applies are:
+!                   - Query Names / Descriptions
+!                   - Query Field / Heading translations
+!                   - Currency Rate Types
+!                   - Currency Rates
+!----------------------------------------------------------------------
+!
+!----------------------------------------------------------------------
+! Environment Include Files:
+#include 'setenv.sqc'
+#include 'setup01.sqc'
+
+!----------------------------------------------------------------------!
+! Procedure: Begin-Report                                              !
+!----------------------------------------------------------------------!
+
+begin-REPORT
+
+  do Init-Report
+  do Define-Prcs-Vars
+  do Init-DateTime
+  do Get-Current-DateTime
+  do Process-Main
+
+  if #prcs_process_instance > 0
+     let #prcs_run_status = #prcs_run_status_successful
+     let $prcs_message_parm1 = 'Successful Completion'
+  end-if
+
+  !T-MOBRI-HU9SW - created procedure to code around problem in tranctrl.sqc
+  do commits
+
+end-REPORT
+
+
+begin-PROCEDURE Process-Main
+
+   do Get-Operator-Input
+   do Check-Base-Language
+   do Process-PSQRYDEFN
+   do Process-PSQRYHEADLANG
+   do Insert-Rt-Type
+   do Insert-Rt-Rate-Tbl
+   do Insert-Rt-Rate-Def-Tbl
+   do Insert-Default-Rt-Index
+   do Report-Status  !T-SROBER-PC2WT: added procedure to print msg.
+end-PROCEDURE
+
+!----------------------------------------------------------------------
+!
+! T-HLAM-HT9KX - s. bacon 1/4/01 changed local $sql-statement to
+! global $_sql-statement in ALL local procedures
+!
+!----------------------------------------------------------------------
+
+!----------------------------------------------------------------------
+!Procedure INIT-REPORT
+!----------------------------------------------------------------------
+
+begin-procedure INIT-REPORT
+
+#debug show 'Init-Report'
+
+        move 'Globalization conversion for PeopleTools 7.5' to $ReportTitle
+        display ' '
+        display $ReportTitle
+        display ' '
+
+end-procedure
+
+!----------------------------------------------------------------------
+begin-procedure Get-Operator-Input
+!----------------------------------------------------------------------
+
+   while 1
+      input $default_index 'Enter default currency index [DEFAULT]'
+
+      if $default_index = ''
+        let $default_index = 'DEFAULT'
+      end-if
+
+      if length($default_index) > 10
+        display 'Error:  Ten characters is the maximum length'
+      else
+        break
+      end-if
+   end-while
+
+   let $default_index = upper($default_index)
+
+   let $SQL_DefIndex=''''||$default_index||''''
+
+end-procedure
+
+!----------------------------------------------------------------------
+begin-procedure Check-Base-Language
+!----------------------------------------------------------------------
+
+#debug show 'FLOW:Check-Base-Language'
+
+let $_sql-statement = 'UPG75GBL.SQR,Check-Base-Language,Select,PSOPTIONS'
+begin-SELECT on-error=SQL-Error
+
+LANGUAGE_CD     &base_language
+
+FROM PSOPTIONS
+
+end-select
+
+if &base_language != 'ENG'
+   display 'WARNING: Database base language is not ENG. Query name'
+   display '         migrations will be based on new base language'
+   display '         query name if ENG translations no longer exist.'
+end-if
+
+end-procedure
+
+!----------------------------------------------------------------------
+! Procedure: Process-PSQRYDEFN
+!----------------------------------------------------------------------
+begin-procedure Process-PSQRYDEFN
+
+#debug show 'FLOW:Process-PSQRYDEFN'
+
+let #QryCounter = 0
+let #dupfound = 0    !flag to determine if heading should be printed
+let #Duplicate = 0   !flag to determine if at least one duplicate was found
+
+! T-HLAM-HT9KX - s. bacon 1/4/01 changed newquery size to match
+! that of qrydefn. it's possible that all queries will need to
+! be renamed.
+
+create-array name=newquery size=30000
+field=qryname:char
+field=oprid:char
+field=dupcount:number=1
+
+create-array name=qrydefn size=30000
+    field=oprid:char
+    field=qryname:char
+
+show 'Loading Array........'
+
+let #qryput = 0
+
+begin-select
+LA.OPRID
+LA.QRYNAME
+    put &LA.OPRID &LA.QRYNAME into qrydefn(#qryput)
+    show &LA.QRYNAME
+    add 1 to #qryput
+FROM PSQRYDEFN LA
+ORDER BY LA.QRYNAME
+end-select
+
+show '#qryput: ' #qryput
+
+display 'Processing Queries...'
+
+let $_sql-statement = 'UPG75GBL.SQR,Process-PSQRYDEFN,Update,PSQRYDEFN'
+begin-sql on-error=SQL-Error
+   UPDATE PSQRYDEFN
+   SET DESCR = QRYNAME
+end-sql
+#debug show 'SQL: UPDATE PSQRYDEFN SET DESCR = QRYNAME'
+
+! Main processing loop
+let #qryget = 0
+while #qryget < #qryput
+
+  get $arr_oprid $arr_qryname from qrydefn(#qryget)
+
+  if &base_language != 'ENG'
+     do Get-Eng-QueryName($arr_qryname, $arr_oprid, $value)
+  else
+     let $value = $arr_qryname
+  end-if
+
+  do Clean-Value
+
+  let $QryName = $new_value
+
+  let #CheckRecursive = 0
+  do Check-Dup-Qryname($arr_qryname, $QryName, $arr_oprid, $NDQryName, #Duplicate)
+  #debug show '$arr_qryname: ' $arr_qryname
+  #debug show '  $NDQryName: ' $NDQryName
+  if $arr_qryname != $NDQryName
+      !print report heading - at this point there is no way to
+      !know if a duplicate query has been found, so printing that
+      !message is handled after all queries have been processed
+      if #dupfound = 0
+        print 'These Query renames have been performed: ' (+1,1)
+        print 'Old Queryname' (+2,1,30)
+        print 'New Queryname' (0,35)
+        print '-------------' (+1,1)
+        print '-------------' (0,35)
+        let #dupfound = 1
+      end-if
+
+     print $arr_qryname (+1,1)
+     print $NDQryname       (0,35)
+  end-if
+
+
+  put $QryName         into newquery(#QryCounter) qryname
+  put $arr_oprid   into newquery(#QryCounter) oprid
+
+  add 1 to #QryCounter
+
+  do Update-Cascade('PSQRYDEFN',$arr_qryname,$arr_oprid,$NDQryName)
+  do Update-Cascade-NoOprID('PSMSGAGTDEFN',$arr_qryname,$arr_oprid,$NDQryName)
+  do Update-Cascade('PSQRYBIND',$arr_qryname,$arr_oprid,$NDQryName)
+  do Update-Cascade('PSQRYCRITERIA',$arr_qryname,$arr_oprid,$NDQryName)
+  do Update-Cascade('PSQRYDEL',$arr_qryname,$arr_oprid,$NDQryName)
+  do Update-Cascade('PSQRYEXPR',$arr_qryname,$arr_oprid,$NDQryName)
+  do Update-Cascade('PSQRYFIELD',$arr_qryname,$arr_oprid,$NDQryName)
+  do Update-Cascade('PSQRYHEADLANG',$arr_qryname,$arr_oprid,$NDQryName)
+  do Update-Cascade-NoOprID('PSQRYLINK',$arr_qryname,$arr_oprid,$NDQryName)
+  do Update-Cascade('PSQRYRECORD',$arr_qryname,$arr_oprid,$NDQryName)
+  do Update-Cascade('PSQRYSELECT',$arr_qryname,$arr_oprid,$NDQryName)
+  do Update-Cascade-NoOprID('PSROLEDEFN',$arr_qryname,$arr_oprid,$NDQryName)
+  do Update-Cascade-NoOprID('PS_ANL_MOD_DAT_SRC',$arr_qryname,$arr_oprid,$NDQryName)
+  do Update-Cascade-NoOprID('PS_ANL_MOD_DIM_FLD',$arr_qryname,$arr_oprid,$NDQryName)
+
+!***********************************************************************************
+! T-PROMER-R94QP - commenting out references to tables that no longer
+! exist in PT81 : PS_DIM_ROLLUP_LVL, PS_DIM_SUPL_QRY & PS_DIM_SUPL_QRY_AT
+!
+ do Update-Cascade-NoOprID('PS_DIM_ROLLUP_LVL',$arr_qryname,$arr_oprid,$NDQryName)
+ do Update-Cascade-NoOprID('PS_DIM_SUPL_QRY',$arr_qryname,$arr_oprid,$NDQryName)
+ do Update-Cascade-NoOprID('PS_DIM_SUPL_QRY_AT',$arr_qryname,$arr_oprid,$NDQryName)
+!
+! Added calls to procedure for new PT81 tables: PS_DIM_DATA_SRC & PS_DIM_INPUT_FLD
+!***********************************************************************************
+
+!***********************************************************************************
+! T-SBACON-YW7D9 - order of steps in 7 -> 8.1 upgrade has changed so that UPG75GBL.SQR is run before REL800.SQL
+ !   uncommented lines above. commenting out the following lines.  
+! do Update-Cascade-NoOprID('PS_DIM_DATA_SRC',$arr_qryname,$arr_oprid,$NDQryName)
+! do Update-Cascade-NoOprID('PS_DIM_INPUT_FLD',$arr_qryname,$arr_oprid,$NDQryName)
+!***********************************************************************************
+
+
+
+  do Update-QryDefnLang($arr_qryname,$arr_oprid,$NDQryName)
+
+  do Update-ProjItem($arr_qryname,$arr_oprid,$NDQryName)
+  do Update-ChangeControl($arr_qryname,$arr_oprid,$NDQryName)
+  do Update-QryLinkChild($arr_qryname,$NDQryName)
+
+  add 1 to #qryget
+
+end-while
+
+display 'Number of queries updated: '
+display #QryCounter
+
+end-procedure
+
+!----------------------------------------------------------------------
+! Procedure: Check-Dup-Qryname
+! T-SROBER_PC2WT: added #Duplicate as a parameter to ensure that its
+!                 value is not reinitialized to 0.
+!----------------------------------------------------------------------
+begin-procedure Check-Dup-Qryname($OrigQryName, $QryName, $OprID, :$NDQryName, :#Duplicate)
+
+#debug show 'FLOW:Check-Dup-Qryname'
+#debug show 'QryName = ' $QryName ' OprID = ' $OprID
+
+let $NDQryName = $QryName
+let #i = 0
+while #i <= #QryCounter
+  get $QryCompare $OprIDCompare #dupcount from newquery(#i) qryname oprid dupcount
+
+  if $QryCompare = $QryName
+   if $OprIDCompare = $OprID
+
+    let #dupcount = #dupcount + 1
+    let #Duplicate = 1
+
+    put #dupcount into newquery(#i) dupcount
+
+    do Gen-NonDup-QryName($OrigQryName, $QryName, $OprID, #dupcount, $NonDupQryName, #Duplicate)
+    let $QryName = $NonDupQryName
+    let $NDQryName = $NonDupQryName
+
+   end-if
+  end-if
+
+add 1 to #i
+
+end-while
+
+if $QryName != rtrim($OrigQryName,' ')
+  #debug show 'Checking for dupes of Oprid: ' $OprID ' Qryname: ' $QryName
+  let $_sql-statement = 'UPG75GBL.SQR,Check-Dup-QryName,Select,PSQRYDEFN'
+begin-SELECT on-error=SQL-Error
+COUNT(*)  &QHC.NUMQRY
+
+    #debug show 'Found ' &QHC.NUMQRY ' dupes.'
+    if &QHC.NUMQRY > 0
+       let #Duplicate=1
+       do Gen-NonDup-QryName($OrigQryName, $QryName, $OprID, 1, $NonDupQryName, #Duplicate)
+       let $QryName = $NonDupQryName
+       let $NDQryName = $NonDupQryName
+    end-if
+
+FROM PSQRYDEFN QHC
+WHERE QRYNAME = $QryName
+AND OPRID = $OprID
+end-SELECT
+
+end-if
+
+end-procedure
+
+
+!----------------------------------------------------------------------
+! Procedure: Gen-NonDup-QryName
+! T-SROBER_PC2WT: added #Duplicate as a parameter to ensure that its
+!                 value is not reinitialized to 0 when Check-Dup-QryName
+!                 is called recursively.
+!----------------------------------------------------------------------
+begin-procedure Gen-NonDup-QryName($OrigQryName, $QryName, $OprID, #dupid, :$NonDupQryName, :#Duplicate)
+
+    let #qryname_len = length($QryName)
+
+    if #qryname_len < 27
+      let $NonDupQryname = rtrim($QryName,' ') ||
+               to_char(round(#dupid,0))
+    else
+      let $NonDupQryname = substr($QryName,1,27) ||
+               to_char(round(#dupid,0))
+    end-if
+
+!
+! Recursive call to ensure that newly generated Query Name is unique
+!
+    let $QryName = $NonDupQryName
+    let #CheckRecursive = 1
+    #debug show 'Calling recursively with Qryname = ' $QryName
+    do Check-Dup-QryName($OrigQryName, $NonDupQryName, $OprID, $NonDupQryName, #Duplicate)
+
+end-procedure
+
+!----------------------------------------------------------------------
+! Procedure: Get-Eng-QueryName
+!----------------------------------------------------------------------
+begin-procedure Get-Eng-QueryName($baseqryname, $oprid, :$langqryname)
+
+#debug show 'FLOW:Get-Eng-QryName'
+
+let $_sql-statement = 'UPG75GBL.SQR,Ger-Eng-QueryName,Select,PSQRYDEFNLANG'
+begin-SELECT on-error=SQL-Error
+QDL.QRYNAME_LANG        &engqryname
+
+FROM PSQRYDEFNLANG QDL
+WHERE QRYNAME = $baseqryname
+AND OPRID = $oprid
+AND LANGUAGE_CD = 'ENG'
+
+end-SELECT
+
+if isnull(&engqryname) or isblank(&engqryname)
+      move $baseqryname to $langqryname
+else
+      move &engqryname to $langqryname
+end-if
+
+end-procedure
+
+!----------------------------------------------------------------------
+! Procedure: Update-Cascade
+!----------------------------------------------------------------------
+begin-procedure Update-Cascade($table_name, $oldqryname, $OprID, $newqryname)
+
+#debug show 'FLOW:Update-Cascade'
+#debug show 'Update-Cascade table=' $table_name ' oldqry=' $oldqryname ' oprid=' $oprid
+#debug show ' newqryname=' $newqryname
+
+let $_sql-statement = 'UPG75GBL.SQR,Update-Cascade,Update,DYNAMIC'
+begin-sql on-error=SQL-Error
+   UPDATE [ PSQRYDEFN : $table_name ]
+   SET QRYNAME   = $newqryname
+   WHERE QRYNAME = $oldqryname
+   AND OPRID = $OprID
+end-sql
+
+end-procedure
+
+!----------------------------------------------------------------------
+! Procedure: Update-Cascade-NoOprID
+!----------------------------------------------------------------------
+begin-procedure Update-Cascade-NoOprID($table_name, $oldqryname, $OprID, $newqryname)
+
+#debug show 'FLOW:Update-Cascade'
+#debug show '$table_name = ' $table_name
+#debug show '$oldqryname = ' $oldqryname
+#debug show '     $OprID = ' $OprID
+#debug show '$newqryname = ' $newqryname
+#debug show ' '
+
+! 7/25/98 TPhipps: Tables without OPRID can only refer to public
+!                  queries.  We shouldn't update them if OPRID != ' '
+if isblank($OprID)
+
+  let $_sql-statement = 'UPG75GBL.SQR,Update-Cascade-NoOprID,Update,DYNAMIC'
+#debug show 'SQL: UPDATE ' $table_name ' SET QRYNAME = ' $newqryname ' WHERE QRYNAME = '$oldqryname
+begin-sql on-error=SQL-Error
+     UPDATE [ PSQRYDEFN : $table_name ]
+     SET QRYNAME   = $newqryname
+     WHERE QRYNAME = $oldqryname
+end-sql
+
+end-if
+
+end-procedure
+
+!----------------------------------------------------------------------
+! Procedure: Update-QryDefnLang
+!----------------------------------------------------------------------
+begin-procedure Update-QryDefnLang($oldqryname, $OprID, $newqryname)
+
+let $_sql-statement = 'UPG75GBL.SQR,Update-QryDefnLang,Update,PSQRYDEFNLANG'
+begin-sql on-error=SQL-Error
+   UPDATE PSQRYDEFNLANG
+   SET DESCR = QRYNAME_LANG,
+       QRYNAME = $newqryname
+   WHERE QRYNAME = $oldqryname
+   AND OPRID = $OprID
+end-sql
+
+end-procedure
+
+!----------------------------------------------------------------------
+! Procedure: Update-ProjItem
+!----------------------------------------------------------------------
+begin-procedure Update-ProjItem($oldqryname, $OprID, $newqryname)
+
+let $_sql-statement = 'UPG75GBL.SQR,Update-ProjItem,Update,PSPROJECTITEM1'
+begin-sql on-error=SQL-Error
+   UPDATE PSPROJECTITEM
+   SET OBJECTVALUE1 = $newqryname
+   WHERE OBJECTVALUE1 = $oldqryname
+   AND OBJECTVALUE2 = $OprID
+   AND OBJECTTYPE = 10
+   AND OBJECTID1 = 30
+   AND OBJECTID2 = 25
+end-sql
+
+let $_sql-statement = 'UPG75GBL.SQR,Update-ProjItem,Update,PSPROJECTITEM2'
+begin-sql on-error=SQL-Error
+   UPDATE PSPROJECTITEM
+   SET OBJECTVALUE2 = $newqryname
+   WHERE OBJECTVALUE2 = $oldqryname
+   AND OBJECTTYPE = 10
+   AND OBJECTID2 = 30
+   AND OBJECTID1 = 25
+end-sql
+
+end-procedure
+
+!----------------------------------------------------------------------
+! Procedure: Update-ChangeControl
+!----------------------------------------------------------------------
+begin-procedure Update-ChangeControl($oldqryname, $OprID, $newqryname)
+
+let $_sql-statement = 'UPG75GBL.SQR,Update-ChangeContro,Update,PSCHGCTLHIST1'
+begin-sql on-error=SQL-Error
+   UPDATE PSCHGCTLHIST
+   SET OBJECTVALUE1 = $newqryname
+   WHERE OBJECTVALUE1 = $oldqryname
+   AND OBJECTVALUE2 = $OprID
+   AND OBJECTTYPE = 10
+   AND OBJECTID1 = 30
+   AND OBJECTID2 = 25
+end-sql
+
+let $_sql-statement = 'UPG75GBL.SQR,Update-ChangeContro,Update,PSCHGCTLHIST2'
+begin-sql on-error=SQL-Error
+   UPDATE PSCHGCTLHIST
+   SET OBJECTVALUE2 = $newqryname
+   WHERE OBJECTVALUE2 = $oldqryname
+   AND OBJECTVALUE1 = $OprID
+   AND OBJECTTYPE = 10
+   AND OBJECTID2 = 30
+   AND OBJECTID1 = 25
+end-sql
+
+let $_sql-statement = 'UPG75GBL.SQR,Update-ChangeContro,Update,PSCHGCTLLOCK1'
+begin-sql on-error=SQL-Error
+   UPDATE PSCHGCTLLOCK
+   SET OBJECTVALUE1 = $newqryname
+   WHERE OBJECTVALUE1 = $oldqryname
+   AND OBJECTVALUE2 = $OprID
+   AND OBJECTTYPE = 10
+   AND OBJECTID1 = 30
+   AND OBJECTID2 = 25
+end-sql
+
+let $_sql-statement = 'UPG75GBL.SQR,Update-ChangeContro,Update,PSCHGCTLLOCK2'
+begin-sql on-error=SQL-Error
+   UPDATE PSCHGCTLLOCK
+   SET OBJECTVALUE2 = $newqryname
+   WHERE OBJECTVALUE2 = $oldqryname
+   AND OBJECTVALUE1 = $OprID
+   AND OBJECTTYPE = 10
+   AND OBJECTID2 = 30
+   AND OBJECTID1 = 25
+end-sql
+
+end-procedure
+
+!----------------------------------------------------------------------
+! Procedure: Update-QryLinkChild
+!----------------------------------------------------------------------
+! 7/25/98 TPhipps: Potential bug? Can't use OPRID clause as
+!                  PSQRYLINK doesn't contain OPRID
+begin-procedure Update-QryLinkChild($oldqryname, $newqryname)
+
+let $_sql-statement = 'UPG75GBL.SQR,Update-QryLinkChild,Update,PSQRYLINK'
+begin-sql on-error=SQL-Error
+   UPDATE PSQRYLINK
+   SET QRYNAMECHILD = $newqryname
+   WHERE QRYNAMECHILD = $oldqryname
+end-sql
+
+end-procedure
+
+!----------------------------------------------------------------------
+! Procedure: Process-PSQRYHEADLANG
+!----------------------------------------------------------------------
+begin-procedure Process-PSQRYHEADLANG
+
+#debug show 'FLOW:Process-PSQRYHEADLANG'
+
+let $_sql-statement = 'UPG75GBL.SQR,Process-PSQRYHEADLANG,SELECT,PSQRYHEADLANG'
+begin-select on-error=SQL-Error
+QRYHEADLANG.OPRID
+QRYHEADLANG.QRYNAME
+QRYHEADLANG.HEADING
+QRYHEADLANG.LANGUAGE_CD
+QRYHEADLANG.HEADING_LANG
+
+ do Get-PSQRYFIELD
+
+FROM PSQRYHEADLANG QRYHEADLANG
+ORDER BY QRYHEADLANG.OPRID, QRYHEADLANG.QRYNAME, QRYHEADLANG.HEADING
+end-select
+
+print 'Number of heading translations inserted:' (+1,1)
+print #HeadCounter  (0,45)
+
+end-procedure
+
+!----------------------------------------------------------------------
+! Procedure: Get-PSQRYFIELD
+!----------------------------------------------------------------------
+begin-procedure Get-PSQRYFIELD
+
+let $_sql-statement = 'UPG75GBL.SQR,Get-PSQRYFIELD,SELECT,PSQRYFIELD'
+begin-select on-error=SQL-Error
+QRYFIELD.QRYFLDNAME
+
+  do Insert-PSQRYFIELDLANG
+
+FROM PSQRYFIELD QRYFIELD
+WHERE OPRID = &QRYHEADLANG.OPRID
+AND   QRYNAME = &QRYHEADLANG.QRYNAME
+AND   HEADING = &QRYHEADLANG.HEADING
+end-select
+
+end-procedure
+!----------------------------------------------------------------------
+! Procedure: Insert-PSQRYFIELDLANG
+!----------------------------------------------------------------------
+begin-procedure Insert-PSQRYFIELDLANG
+
+let #HeadCounter = #HeadCounter + 1
+
+let $_sql-statement = 'UPG75GBL.SQR,Insert-PSQRYFIELDLANG,Update,PSQRYFIELDLANG'
+begin-SQL on-error=SQL-Error
+   INSERT INTO PSQRYFIELDLANG
+               (OPRID,
+                QRYNAME,
+                QRYFLDNAME,
+                LANGUAGE_CD,
+                HEADING)
+   VALUES (&QRYHEADLANG.OPRID,
+           &QRYHEADLANG.QRYNAME,
+           &QRYFIELD.QRYFLDNAME,
+           &QRYHEADLANG.LANGUAGE_CD,
+           &QRYHEADLANG.HEADING_LANG)
+end-SQL
+
+end-Procedure
+
+!----------------------------------------------------------------------
+! Procedure: Clean-Value
+!----------------------------------------------------------------------
+begin-procedure Clean-Value
+#debug show 'Flow: Clean-Value'
+   let $new_value = ''
+
+   let $temp = rtrim(upper($value),' ')
+#debug show 'QryValue: ' $value
+   let $value = $temp
+
+   let #length = length($value)
+
+   let #i = 1
+
+   while #i <= #length
+
+      let $single_byte = substr($value,#i,1)
+
+      if $single_byte >= 'A' and $single_byte <= 'Z'
+         let $new_byte = $single_byte
+      else
+         if $single_byte >='a' and $single_byte <= 'z'
+            let $new_byte = $single_byte
+         else
+            if $single_byte >='0' and $single_byte <= '9'
+               let $new_byte = $single_byte
+            else
+               let $new_byte = '_'
+            end-if
+         end-if
+      end-if
+
+      let $new_value = $new_value || $new_byte
+
+      add 1 to #i
+
+   end-while
+
+   if $new_value = ''
+      let $new_value = '_'
+   end-if
+#debug show 'NewQryValue: ' $new_value
+end-procedure
+
+!----------------------------------------------------------------------
+! Procedure: Insert-Rt-Type
+! Descr:     This procedure loads CUR_RT_TYPE_TBL into RT_TYPE_TBL.
+!            The old rate type will be loaded to the new table only if
+!            the current effective row has an active status.
+!----------------------------------------------------------------------
+
+begin-procedure Insert-Rt-Type
+
+#debug show 'Insert-Rt-Type'
+
+! Don't copy rate type information where the most recent effective dated
+! record is inactive.
+let $_sql-statement = 'UPG75GBL.SQR,Insert-Rt-Type,Select,PS_CUR_RT_TYPE_TBL'
+begin-SELECT on-error=SQL-Error
+
+CUR_RT_TYPE
+EFFDT
+DESCR
+DESCRSHORT
+
+    do Insert-Rt-Type-Tbl
+    do Insert-Rt-Type-Lang
+
+FROM PS_CUR_RT_TYPE_TBL T
+WHERE EFFDT= ( SELECT MAX(EFFDT) FROM PS_CUR_RT_TYPE_TBL
+        WHERE CUR_RT_TYPE = T.CUR_RT_TYPE
+          AND EFFDT <= $AsOfToday)
+  AND EFF_STATUS = 'A'
+
+end-SELECT
+
+end-procedure
+
+!----------------------------------------------------------------------
+begin-procedure Insert-Rt-Type-Tbl
+!----------------------------------------------------------------------
+
+#debug show 'Insert-Rt-Type-Tbl'
+
+let $_sql-statement = 'UPG75GBL.SQR,Insert-RT-Type-TBL,Insert,PS_RT_TYPE_TBL'
+begin-SQL on-error=SQL-Error
+
+INSERT INTO PS_RT_TYPE_TBL (RT_TYPE, DESCR, DESCRSHORT)
+VALUES (&CUR_RT_TYPE, &DESCR, &DESCRSHORT)
+
+end-SQL
+
+end-procedure
+
+!----------------------------------------------------------------------
+begin-procedure Insert-Rt-Type-Lang
+!----------------------------------------------------------------------
+
+#debug show 'Insert-Rt-Type-Lang'
+
+! TPHIPPS 1/28/98:
+! Move statement below added to work around SQR bug on DB2/400 and DB2/390 see T-RTNT159-RXJ2C.
+move &Effdt to $EFFDT
+
+
+let $_sql-statement = 'UPG75GBL.SQR,Insert-Rt-Type-Lang,Insert,PS_RT_TYPE_LANG'
+begin-SQL on-error=SQL-Error
+
+INSERT INTO PS_RT_TYPE_LANG
+(RT_TYPE, LANGUAGE_CD, DESCR, DESCRSHORT)
+SELECT CUR_RT_TYPE, LANGUAGE_CD, DESCR, DESCRSHORT
+FROM PS_CURR_RTTYP_LANG A
+WHERE CUR_RT_TYPE = &CUR_RT_TYPE
+AND EFFDT = $EFFDT
+
+end-SQL
+
+end-procedure
+
+!----------------------------------------------------------------------
+! Procedure: Insert-Rt-Rate-Tbl
+! Descr:     This procedure loads RT_RATE_TBL with all of the rates
+!            from CUR_RT_TBL.  All rates are loaded into the new table
+!            as "direct" rates, since that all that was supported
+!            historically.
+!----------------------------------------------------------------------
+
+begin-procedure Insert-Rt-Rate-Tbl
+
+#debug show 'Insert-Rt-Rate-Tbl'
+
+
+
+let $_sql-statement = 'UPG75GBL.SQR,Insert-Rt-Rate-Tbl,Insert,PS_RT_RATE_TBL1'
+begin-SQL ON-ERROR=SQL-Error
+
+! This assumes that there are no inactive future dated rates defined
+  INSERT INTO PS_RT_RATE_TBL
+     (RT_RATE_INDEX, TERM,
+      FROM_CUR, TO_CUR,
+      RT_TYPE, EFFDT,
+      RATE_MULT, RATE_DIV)
+  SELECT [$SQL_DefIndex], 0,
+         A.FROM_CUR, A.TO_CUR,
+         A.CUR_RT_TYPE, A.EFFDT,
+         A.CUR_EXCHNG_RT, 1
+  FROM PS_CUR_RT_TBL A
+  WHERE EXISTS (SELECT 'X'
+                FROM   PS_CUR_RT_TBL B
+                WHERE  A.CUR_RT_TYPE = B.CUR_RT_TYPE
+                AND    A.FROM_CUR = B.FROM_CUR
+                AND    A.TO_CUR = B.TO_CUR
+                AND    EFFDT <= $AsOfToday
+                AND    EFF_STATUS = 'I')
+  AND EFFDT > (SELECT  MAX(EFFDT)
+               FROM    PS_CUR_RT_TBL C
+               WHERE   A.CUR_RT_TYPE = C.CUR_RT_TYPE
+               AND     A.FROM_CUR = C.FROM_CUR
+               AND     A.TO_CUR = C.TO_CUR
+               AND     C.EFF_STATUS = 'I')
+
+end-SQL
+
+let $_sql-statement = 'UPG75GBL.SQR,Insert-Rt-Rate-Tbl,Insert,PS_RT_RATE_TBL2'
+begin-SQL ON-ERROR=SQL-Error
+
+  INSERT INTO PS_RT_RATE_TBL
+     (RT_RATE_INDEX, TERM,
+      FROM_CUR, TO_CUR,
+      RT_TYPE, EFFDT,
+      RATE_MULT, RATE_DIV)
+  SELECT [$SQL_DefIndex], 0,
+         A.FROM_CUR, A.TO_CUR,
+         A.CUR_RT_TYPE, A.EFFDT,
+         A.CUR_EXCHNG_RT, 1
+  FROM PS_CUR_RT_TBL A
+  WHERE NOT EXISTS (SELECT 'X'
+                    FROM   PS_CUR_RT_TBL B
+                    WHERE  A.CUR_RT_TYPE = B.CUR_RT_TYPE
+                    AND    A.FROM_CUR = B.FROM_CUR
+                    AND    A.TO_CUR = B.TO_CUR
+                    AND    EFFDT <= $AsOfToday
+                    AND    EFF_STATUS = 'I')
+
+end-SQL
+
+end-procedure
+
+
+!----------------------------------------------------------------------
+! Procedure: Insert-Rt-Rate-Def-Tbl
+! Descr:     This procedure loads rt_rate_def_tbl with all of the
+!            from_cur and to_cur pairs from cur_rt_old.
+!----------------------------------------------------------------------
+
+begin-procedure Insert-Rt-Rate-Def-Tbl
+
+#debug show 'Insert-Rt-Rate-Def-Tbl'
+
+let $_sql-statement = 'UPG75GBL.SQR,Insert-Rt-Rate-Def-Tbl,Insert,PS_DEF_TBL1'
+begin-sql on-error=SQL-Error
+
+  INSERT INTO PS_RT_RATE_DEF_TBL
+      (RT_RATE_INDEX, TERM,
+       FROM_CUR, TO_CUR,
+       MAX_VARIANCE, ERROR_TYPE, INT_BASIS)
+  SELECT DISTINCT
+         [$SQL_DefIndex], 0,
+         A.FROM_CUR, A.TO_CUR,
+         2.5, 'WAR', ' '
+  FROM PS_CUR_RT_TBL A;
+
+end-SQL
+
+end-procedure
+
+!----------------------------------------------------------------------
+begin-procedure Insert-Default-Rt-Index
+!----------------------------------------------------------------------
+
+#debug show 'Insert-Default-Rt-Index'
+
+let $_sql-statement = 'UPG75GBL.SQR,Insert-Default-Rt-Index,Insert,RT_INDEX_TBL'
+begin-SQL on-error=SQL-Error
+
+  INSERT INTO PS_RT_INDEX_TBL (RT_RATE_INDEX, RT_CATEGORY,
+                               DESCR, DECIMAL_POSITIONS, DEFAULT_INDEX)
+  VALUES ($default_index, '10', 'Default', 0, 'Y');
+
+end-SQL
+
+end-procedure
+
+!----------------------------------------------------------------------
+! Procedure: Report-Status
+! T-SROBER_PC2WT: once all query renames have been processed, if
+!                 #Duplicate=1 at least 1 duplicate was found. Print
+!                 appropriate message.
+!----------------------------------------------------------------------
+begin-procedure Report-Status
+
+#debug show 'Report-Status'
+#debug show '#Duplicate=' #Duplicate
+if #Duplicate = 0
+   display 'No Duplicate Query Names found.'
+   print 'No Duplicate Query Names found.'  (+2,1)
+else
+   display 'Duplicate Query Names found.  Please check SQR output...'
+   print 'Duplicate Query Names found.' (+2,1)
+end-if
+
+end-procedure
+
+!----------------------------------------------------------------------
+! Procedure: Commits
+! T-MOBRI-HU9SW - commits not being handled properly by procedure
+! commit-transaction in tranctrl.sqc. added this procedure to code
+! around the problem.
+!----------------------------------------------------------------------
+begin-procedure Commits
+
+#debug show 'Enter procedure Commits'
+
+  #ifdef SYBASE
+    do commit-transaction
+  #else
+    #ifdef INFORMIX
+      do commit-transaction
+    #else
+      Begin-SQL
+      COMMIT
+      End-Sql
+    #endif
+  #endif
+
+#debug show 'Exit procedure Commits'
+end-procedure
+
+
+begin-procedure SQL-Error
+    #ifdef debugx
+        display 'Entering SQLERR.SQC: SQL-Error'
+        display ' Input #sql-status: ' noline
+        display #sql-status
+    #end-if
+
+evaluate #sql-status
+
+#include 'sqlstat.sqc'
+
+
+    let #return-Status = 1
+
+    stop
+
+end-evaluate
+
+  #ifdef debugx
+    display 'Exiting SQLERR.SQC: SQL-Error'
+  #end-if
+end-procedure
+
+
+
+
+
+!----------------------------------------------------------------------
+! Section:      Include Files
+! Descr:        This sections contains all include files.
+!----------------------------------------------------------------------
+
+!----------------------------------------------------------------------!
+! Called SQC Procedures
+!----------------------------------------------------------------------!
+
+!  Include files for PeopleTools Process Scheduler.
+
+#include 'prcsdef.sqc'      ! Update Process Request variable declaration
+
+#include 'tranctrl.sqc'     ! Procedures: Commit-Transaction
+                            ! Procedures: Rollback-Transaction
+                            ! Procedures: Begin-Transaction
+
+
+#include 'reset.sqc'            ! Reset printer procedure
+
+#include 'curdttim.sqc'         ! Get-Current-DateTime procedure
+                                ! Procedures: Get-Current-DateTime
+
+#include 'datetime.sqc'         ! Routines for date and time formatting
+                                ! Procedures: Init-Datetime
+                                ! Procedures: Format-DateTime
+                                ! Procedures: Diff-Date
+                                ! Procedures: many others.
+
+#include 'number.sqc'           ! Routines to format numbers

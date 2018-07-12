@@ -1,0 +1,1631 @@
+!***********************************************************************
+!  NDT001:  Determine Highly Compensated Employees
+!***********************************************************************
+
+!***********************************************************************
+!                                                                      *
+!  Confidentiality Information:                                        *
+!                                                                      *
+!                                                                      *
+! This module contains confidential and proprietary information        *
+! of Oracle; it is not to be copied, reproduced, or transmitted        *
+! in any form, by any means, in whole or in part, nor is it to         *
+! be used for any purpose other than that for which it is              *
+! expressly provided under the applicable license agreement.           *
+!                                                                      *
+! Copyright (C) 2006 Oracle. All Rights Reserved.                      *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+!          $Date:  2006/07/19:09:13:48                                 
+!       $Release:  HR9                                                 
+!      $Revision:  101                                                 
+!                                                                      *
+!***********************************************************************
+
+!This program gathers compensation data for all eligible employees in
+!the organization and then identifies employees who are considered
+!highly-compensated.  Each employee's data represents two snapshots: the
+!first containing the preceding plan year's data, and the second containing
+!the current plan year's actual and forecasted data.  The operation of this
+!program is controlled by the regulatory parameters in the table
+!PS_NDT_HCE_Tbl and by run-time parameters in the table PS_NDT_RunCtl.
+!These parameters include the following:
+!
+!Special Earnings Code:  The value for ErnCd under which the eligible
+!    compensation is stored on the PS_Earnings_Bal table.
+!Plan Year Begin Date:  The plan's begin date for the current plan year.
+!Month End Date:  The ending date of the month through which actual
+!    compensation data will be present on the data base; the program
+!    will forecast compensation after this date and through the plan
+!    year's end date (if requested).
+!Year Code: A one character code representing which plan year(s) should
+!    be built for testing purposes.  The possible values are:
+!    C = Current Plan Year Only (Preceding year has been built) (Section
+!        129 testing always uses this code).
+!    B = Both Plan Years
+!Year-end Projection Percentage: The percentage of the plan year remaining
+!    for projection purposes. If zero, the program will not project the
+!    employees' compensation.
+!Benefits Base:  Specifies which rate should be used for the employees
+!    when projecting the remaining compensation:
+!    1 = Use employee's Annual_Rt
+!    2 = Use employee's Annl_Benef_Base_Rt if this rate is greater
+!        than the employee's Annual_Rt.
+!ADP Calc Year:  The method used to determine the highly-compensated
+!    population.  The possible values are:
+!    C = Use current HCE population (determined by prior year's comp)
+!        (Section 129 testing always uses this code).
+!    P = Use prior year's NHCE population (determined using comp from
+!        two year previous).
+!
+!For example, if Month End Date were 1991-03-31, Plan Year Begin Date were
+!1991-01-01, Year Code were 'B', and ADP Calc Year were 'C', the program
+!will create a file containing all of Calendar-year 1990's eligible
+!compensation and all of Calendar-year 1991's eligible compensation
+!through and including March.  If Year-end Projection Percentage is not zero,
+!the program would augment the current-year portion of the file with an
+!estimate of the employees' eligible compensation through plan-year-end
+!(that is, 1991-12-31).  This version of the program also supports those
+!plans whose fiscal years begin at the start of a calendar month.
+!
+!Note: A special table, PS_NDT_Co_Paygroup, must be established to aggregate
+!several company and paygroup combinations into one for testing purposes.
+!This information is entered using the NDT Run Control panel.  An alternate
+!table, PS_NDT_Co_Pay_SLOB, is available for Section 129 testing to aggregate
+!several company and paygroup combinations into one for Separate Lines of
+!Business testing.
+!
+!At the conclusion of Nondiscrimination Testing, the values of the highly-
+!compensated flag on Personal Data will be one of the following:
+!  N = Not Eligible for the Plan
+!  E = Eligible for the Plan
+!  H = Highly Compensated Employee
+!***********************************************************************
+
+#include 'setenv.sqc'    !Set environment
+
+Begin-setup
+#Include 'ptpsp125.sqc'   !Printer and page-size initialization
+end-setup
+
+!#define debugD  YES
+!#define debugF  YES
+
+!***************************************************************************
+begin-report
+!***************************************************************************
+
+  do Init-Report
+
+  display 'Program Began at: ' NoLine
+  do Display-Time
+
+  evaluate $GO
+  when = 'NO'
+     display '*** Test Cancelled ***'
+  when = 'WRONG'
+     display '*** Wrong Choice - Restart Test with Correct Test Type ***'
+  when-other
+     do Main-Report
+     display '*** Test Concluded ***'
+  end-evaluate
+
+  display 'Program Ended at: ' noline
+  do display-time
+
+  do StdAPI-Term
+
+end-report
+
+!***************************************************************************
+begin-procedure Init-Report
+!***************************************************************************
+
+#ifdef debugF
+  display 'DEBUG: Procedure: Init-Report'
+#end-if
+
+  do Init-DateTime
+  do Get-Current-DateTime
+
+  do StdAPI-Init
+  do Get-Calendar-Year-Id
+
+  if $prcs_process_instance = ''
+    do Ask-Values
+  else
+    do Get-Values
+  end-if
+
+  do Display-Main-Title
+
+end-procedure
+
+!***************************************************************************
+Begin-Procedure Ask-Values
+!***************************************************************************
+
+#ifdef debugF
+  display 'DEBUG: Procedure: Ask-Values'
+#end-if
+
+  input $NDT_Test_Type '(1) Standard NDT (2) Section 129 NDT (3) Section 129 NDT by SLOB (X) Exit'
+  do Evaluate-NDT-Test-Type
+
+end-procedure
+
+!***************************************************************************
+Begin-Procedure Get-Values
+!***************************************************************************
+
+#ifdef debugF
+  display 'DEBUG: Procedure: Get-Values'
+#end-if
+
+  do Select-Parameters
+  do get-NDT-Test-Type
+  do Evaluate-NDT-Test-Type
+
+end-procedure
+
+!***************************************************************************
+begin-procedure Evaluate-NDT-Test-Type
+!***************************************************************************
+
+#ifdef debugF
+  display 'DEBUG: Procedure: Evaluate-NDT-Test-Type'
+#end-if
+
+  evaluate $NDT_Test_Type
+  when = '1'
+    let $GO        = 'YES'
+    let $TEST_TYPE = 'HCE'
+    let $ELIG_VIEW = 'PS_NDT_PLAN_ELIG'
+    let $GRP_VIEW  = 'PS_NDT_CO_PAYGROUP'
+    let $SLOB      = 'N'
+  when = '2'
+    let $GO        = 'YES'
+    let $TEST_TYPE = '129'
+    let $ELIG_VIEW = 'PS_NDT_PLAN_ELIG'
+    let $GRP_VIEW  = 'PS_NDT_CO_PAYGROUP'
+    let $SLOB      = 'N'
+  when = '3'
+    let $GO        = 'YES'
+    let $TEST_TYPE = '129'
+    let $ELIG_VIEW = 'PS_NDT_PLAN_SLOB'
+    let $GRP_VIEW  = 'PS_NDT_CO_PAY_SLOB'
+    let $SLOB      = 'Y'
+  when = 'X'
+    let $GO        = 'NO'
+  when-other
+    let $GO        = 'WRONG'
+  end-evaluate
+
+#ifdef debugD
+  display 'DEBUG: Data:'    Noline
+  display ' $GO='           Noline
+  display $GO               Noline
+  display ' $TEST_TYPE='    Noline
+  display $TEST_TYPE        Noline
+  display ' $ELIG_VIEW='    Noline
+  display $ELIG_VIEW        Noline
+  display ' $GRP_VIEW='     Noline
+  display $GRP_VIEW         Noline
+  display ' $SLOB='         Noline
+  display $SLOB
+#end-if
+
+end-procedure
+
+!***************************************************************************
+begin-procedure Main-Report
+!***************************************************************************
+
+#ifdef debugF
+  display 'DEBUG: Procedure: Main-Report'
+#end-if
+
+  do Read-Run-Control
+
+  Evaluate $ADP_Calc_Method
+
+  !********************************************************************
+  when = 'C'
+
+    display 'Rebuilding current year NHCE and current year HCE population ...'
+    do Set-Current-Dates
+    do Clear-Eligibility-Flags($Year_Cd)
+    do Clear-Compensation-Data($Year_Cd)
+    do Establish-Eligibility($Year_Cd)
+    do Mark-5Percent-Owners
+    do Commit-Transaction
+    do Gather-Compensation-Data($Year_Cd)
+    do Compensation-Projections
+    do Commit-Transaction
+
+    do Highly-Compensated-Testing
+    if ($TEST_TYPE = '129')
+        do Find-HCE-Empls
+        do Exclude-Empls
+    end-if
+    if ($SLOB = 'Y') and (&RC.Cafeteria_Plan = 'Y')
+        do Delete_Cafe_Empls
+    end-if
+
+  !******************************************************************
+  when = 'P'
+
+    if ($Year_Cd = 'B')
+
+      display 'Rebuilding the NHCE population for the prior year ...'
+      do Set-LookBack-Dates
+      do Clear-Eligibility-Flags($Year_Cd)
+      do Clear-Compensation-Data($Year_Cd)
+      do Establish-Eligibility($Year_Cd)
+      do Mark-5Percent-Owners
+      do Commit-Transaction
+      do Gather-Compensation-Data('P')
+      do Commit-Transaction
+      do Highly-Compensated-Testing
+      do Swap-HCE-Flags
+      do Commit-Transaction
+
+    end-if
+
+    display 'Rebuilding the HCE population for the current year ...'
+    do Set-Current-Dates
+    do Clear-Eligibility-Flags('C')
+    do Clear-Compensation-Data($Year_Cd)
+    do Establish-Eligibility('C')
+    do Mark-5Percent-Owners
+    do Commit-Transaction
+    do Gather-Compensation-Data($Year_Cd)
+    do Compensation-Projections
+    do Commit-Transaction
+    do Highly-Compensated-Testing
+
+  end-evaluate
+
+end-procedure
+
+!***************************************************************************
+begin-procedure Read-Run-Control
+
+!Read the basic Run Control and Regulatory parameters for this run and update
+!   the Run Control with any functional overrides.
+!***************************************************************************
+
+#ifdef debugF
+  display 'DEBUG: Procedure: Read-Run-Control'
+#end-if
+
+begin-SELECT
+!HCE-determination parameters...
+RC.YEAR_CD,
+RC.PLAN_YEAR_BEGIN_DT,
+RC.MONTH_END_DT,
+RC.ERNCD_SPCL,
+RC.PROJECTION_PERCENT,
+RC.BENEFITS_BASE,
+!Section-129 run parameters...
+RC.AMT,
+RC.CAFETERIA_PLAN,
+RC.MIN_SERVICE_REQD,
+RC.AGE_RANGE_HIGH
+
+FROM  PS_NDT_RUNCTL RC
+end-SELECT
+
+#ifdef debugD
+  display 'DEBUG: Data:'               Noline
+  display ' RC.YEAR_CD='               Noline
+  display &RC.YEAR_CD                  Noline
+  display ' RC.PLAN_YEAR_BEGIN_DT='    Noline
+  display &RC.PLAN_YEAR_BEGIN_DT     YYYYMMDD  Noline
+  display ' RC.MONTH_END_DT='          Noline
+  display &RC.MONTH_END_DT             Noline
+  display ' RC.ERNCD_SPCL='            Noline
+  display &RC.ERNCD_SPCL               Noline
+  display ' RC.PROJECTION_PERCENT='    Noline
+  display &RC.PROJECTION_PERCENT       Noline
+  display ' RC.BENEFITS_BASE='         Noline
+  display &RC.BENEFITS_BASE
+  display 'DEBUG: Data:'               Noline
+  display ' RC.AMT='                   Noline
+  display &RC.AMT                      Noline
+  display ' RC.CAFETERIA_PLAN='        Noline
+  display &RC.CAFETERIA_PLAN           Noline
+  display ' RC.MIN_SERVICE_REQD='      Noline
+  display &RC.MIN_SERVICE_REQD         Noline
+  display ' RC.AGE_RANGE_HIGH='        Noline
+  display &RC.AGE_RANGE_HIGH
+#end-if
+
+begin-SELECT
+NDT.ADP_CALC_YEAR
+
+FROM  PS_NDT_HCE_TBL NDT
+WHERE NDT.EFFDT =
+      (SELECT MAX(EFFDT)
+       FROM   PS_NDT_HCE_TBL
+       WHERE  EFFDT <= &RC.PLAN_YEAR_BEGIN_DT)
+end-SELECT
+
+  let $Year_Cd = &RC.YEAR_CD
+  if ($TEST_TYPE = '129')
+    let $ADP_Calc_Method = 'C'
+  else
+    let $ADP_Calc_Method = &NDT.ADP_CALC_YEAR
+  end-if
+
+#ifdef debugD
+  display 'DEBUG: Data:'          Noline
+  display ' NDT.ADP_CALC_YEAR='   Noline
+  display &NDT.ADP_CALC_YEAR      Noline
+  display ' $ADP_Calc_Method='    Noline
+  display $ADP_Calc_Method
+#end-if
+
+let $sql-statement = 'NDT001.SQR,Run-Control-Init,PS_NDT_RunCtl,Update'
+begin-SQL on-error=SQL-Error
+UPDATE PS_NDT_RUNCTL
+   SET YEAR_CD = $Year_CD,
+       SLOB    = $SLOB;
+end-SQL
+
+let $sql-statement = 'NDT001.SQR,Run-Control-Init,PS_R_NDT_Control,Del/Ins'
+begin-SQL on-error=SQL-Error
+DELETE FROM PS_R_NDT_CONTROL;
+
+INSERT INTO PS_R_NDT_CONTROL
+ (ERNCD, BALANCE_ID, BALANCE_YEAR, BALANCE_PERIOD, YEAR_CD, SIGNVALUE)
+VALUES (' ',' ',0,0,' ',0);
+end-SQL
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Set-Current-Dates
+!***************************************************************************
+
+#ifdef debugF
+  display 'DEBUG: Procedure: Set-Current-Dates'
+#end-if
+
+  do Format-DateTime(&RC.Plan_Year_Begin_Dt, $out, {DEFCMP}, '', '')
+  let #PlanYear = To_Number(SubStr($out, 1, 4))
+  let $BeginMonth = SubStr($out, 5, 2)
+
+  do Format-DateTime(&RC.Month_End_Dt, $out, {DEFCMP}, '', '')
+  let $EndMonth = SubStr($out, 5, 2)
+
+  let #ThisYear   = #PlanYear
+  let #LastYear   = #PlanYear - 1
+  let #NextYear   = #PlanYear + 1
+  let #FirstMonth = To_Number($BeginMonth)
+  let #LastMonth  = To_Number($EndMonth)
+
+  let $Current_Begin_Dt = &RC.Plan_Year_Begin_Dt
+  let $Current_End_Dt   = &RC.Month_End_Dt
+
+  do Convert-To-DTU-Date(&RC.Plan_Year_Begin_Dt, $dtu_begin)
+
+  do DTU-Subtract-Days($dtu_begin, 1, $Lookback_End_Dt)
+  do Convert-From-DTU-Date($Lookback_End_Dt, $Lookback_End_Dt)
+
+  do DTU-Add-Years($dtu_begin, -1, $Lookback_Begin_Dt)
+  do Convert-From-DTU-Date($Lookback_Begin_Dt, $Lookback_Begin_Dt)
+
+#ifdef debugD
+  display 'DEBUG: Data:'         Noline
+  display ' #PlanYear='          Noline
+  display #PlanYear              Noline
+  display ' #LastYear='          Noline
+  display #LastYear              Noline
+  display ' #ThisYear='          Noline
+  display #ThisYear              Noline
+  display ' #NextYear='          Noline
+  display #NextYear
+  display 'DEBUG: Data:'         Noline
+  display ' $BeginMonth='        Noline
+  display $BeginMonth            Noline
+  display ' $EndMonth='          Noline
+  display $EndMonth              Noline
+  display ' #FirstMonth='        Noline
+  display #FirstMonth            Noline
+  display ' #LastMonth='         Noline
+  display #LastMonth
+  display 'DEBUG: Data:'         Noline
+  display ' $Lookback_Begin_Dt=' Noline
+  display $Lookback_Begin_Dt     Noline
+  display ' $Lookback_End_Dt='   Noline
+  display $Lookback_End_Dt
+#end-if
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Set-LookBack-Dates
+!***************************************************************************
+
+#ifdef debugF
+  display 'DEBUG: Procedure: Set-LookBack-Dates'
+#end-if
+
+  do Format-DateTime(&RC.Plan_Year_Begin_Dt, $out, {DEFCMP}, '', '')
+  let #PlanYear = To_Number(SubStr($out, 1, 4))
+  let $BeginMonth = SubStr($out, 5, 2)
+
+  let #ThisYear   = #PlanYear - 1
+  let #LastYear   = #PlanYear - 2
+  let #NextYear   = #PlanYear
+  let #FirstMonth = To_Number($BeginMonth)
+  if (#FirstMonth = 1)
+    let #LastMonth = 12
+  else
+    let #LastMonth = #LastMonth - 1
+  end-if
+
+  do Convert-to-DTU-date(&RC.Plan_Year_Begin_Dt, $dtu_begin)
+
+  do DTU-Subtract-Days($dtu_begin, 1, $Current_End_Dt)
+  do Convert-From-DTU-Date($Current_End_Dt, $Current_End_Dt)
+
+  do DTU-Add-Years($dtu_begin, -1, $Current_Begin_Dt)
+  do Convert-From-DTU-Date($Current_Begin_Dt, $Current_Begin_Dt)
+
+  do DTU-Add-Years($dtu_begin, -1, $dtu_begin)
+
+  do DTU-Subtract-Days($dtu_begin, 1, $Lookback_End_Dt)
+  do Convert-From-DTU-Date($Lookback_End_Dt, $Lookback_End_Dt)
+
+  do DTU-Add-Years($dtu_begin, -1, $Lookback_Begin_Dt)
+  do Convert-From-DTU-Date($Lookback_Begin_Dt, $Lookback_Begin_Dt)
+
+#ifdef debugD
+  display 'DEBUG: Data:'         Noline
+  display ' #PlanYear='          Noline
+  display #PlanYear              Noline
+  display ' #LastYear='          Noline
+  display #LastYear              Noline
+  display ' #ThisYear='          Noline
+  display #ThisYear              Noline
+  display ' #NextYear='          Noline
+  display #NextYear
+  display 'DEBUG: Data:'         Noline
+  display ' $BeginMonth='        Noline
+  display $BeginMonth            Noline
+  display ' #FirstMonth='        Noline
+  display #FirstMonth            Noline
+  display ' #LastMonth='         Noline
+  display #LastMonth
+  display 'DEBUG: Data:'         Noline
+  display ' $Current_Begin_Dt='  Noline
+  display $Current_Begin_Dt      Noline
+  display ' $Current_End_Dt='    Noline
+  display $Current_End_Dt        Noline
+  display ' $Lookback_Begin_Dt=' Noline
+  display $Lookback_Begin_Dt     Noline
+  display ' $Lookback_End_Dt='   Noline
+  display $Lookback_End_Dt
+#end-if
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Clear-Compensation-Data ($Which_Run_Year)
+!***************************************************************************
+
+#ifdef debugF
+  display 'DEBUG: Procedure: Clear-Compensation-Data()'
+#end-if
+
+let $sql-statement = 'NDT001.SQR,Clear-Comp-Data,PS_R_NDT_Empl_YTD,Delete'
+begin-SQL on-error=SQL-Error
+DELETE FROM PS_R_NDT_EMPL_YTD
+ WHERE YEAR_CD IN ('C','F')
+    OR (YEAR_CD = 'P' And $Which_Run_Year = 'B');
+end-SQL
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Clear-Eligibility-Flags ($Which_Run_Year)
+!
+!Reset all employees to "Not Eligible".
+!***************************************************************************
+
+#ifdef debugF
+  display 'DEBUG: Procedure: Clear-Eligibility-Flags()'
+#end-if
+
+let $sql-statement = 'NDT001.SQR,Clear-Elig-Flags,PS_Person,Update'
+begin-SQL on-error=SQL-Error
+UPDATE PS_BN_PERSON
+   SET HIGHLY_COMP_EMPL_P = 'N',
+       HIGHLY_COMP_EMPL_C = 'N'
+ WHERE $Which_Run_Year = 'B';
+
+UPDATE PS_BN_PERSON
+   SET HIGHLY_COMP_EMPL_C = 'N'
+ WHERE $Which_Run_Year = 'C';
+end-SQL
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Establish-Eligibility ($Which_Run_Year)
+!***************************************************************************
+
+  do Create-Person-Entries
+
+#ifdef debugF
+  display 'DEBUG: Procedure: Establish-Eligibility()'
+#end-if
+#ifndef debugF
+  display 'Status: Determining overall plan eligibility ...'
+#end-if
+#ifdef debugD
+  display 'DEBUG: Data:'         Noline
+  display ' $Which_Run_Year='    Noline
+  display $Which_Run_Year        Noline
+  display ' $Current_Begin_Dt='  Noline
+  display $Current_Begin_Dt      Noline
+  display ' $Current_End_Dt='    Noline
+  display $Current_End_Dt
+#end-if
+
+  do Mark-Empl-Eligibility($_Current_Begin_Dt, $_Current_End_Dt, 'current')
+
+  if ($Which_Run_Year = 'B')
+#ifdef debugD
+  display 'DEBUG: Data:'         Noline
+  display ' $Lookback_Begin_Dt=' Noline
+  display $Lookback_Begin_Dt     Noline
+  display ' $Lookback_End_Dt='   Noline
+  display $Lookback_End_Dt
+#end-if
+    do Mark-Empl-Eligibility($_Lookback_Begin_Dt, $_Lookback_End_Dt, 'previous')
+  end-if
+
+end-procedure
+
+!***************************************************************************
+begin-procedure Create-Person-Entries
+!***************************************************************************
+
+#ifdef debugF
+  display 'DEBUG: Create-Person-Entries'
+#end-if
+
+let $sql-statement = 'NDT001.SQR, Create-Person-Entries,PS_R_BN_PERSON,Del/Ins'
+begin-SQL on-error=SQL-Error
+DELETE FROM PS_R_BN_PERSON;
+
+INSERT INTO PS_R_BN_PERSON
+(EMPLID)
+SELECT
+ DISTINCT A.EMPLID
+FROM PS_PERSON A,
+     PS_PER_ORG_ASGN EM,
+     PS_JOB J
+WHERE J.EMPLID = A.EMPLID
+AND EM.EMPLID = A.EMPLID            !Only consider employees...
+AND EM.PER_ORG = 'EMP'
+AND J.EMPLID = EM.EMPLID            !Person is managed by Benefits...
+AND J.EMPL_RCD = EM.EMPL_RCD
+AND J.BENEFIT_SYSTEM <> 'OT'
+AND NOT EXISTS                      !Does not have a BN_PERSON record...
+   (SELECT 'X'
+    FROM PS_BN_PERSON BN
+    WHERE BN.EMPLID = A.EMPLID)
+AND ((J.EFFDT =                     !Person was active at end of testing period...
+     (SELECT MAX(EFFDT)
+      FROM PS_JOB J1
+      WHERE J1.EMPLID = J.EMPLID
+      AND J1.EMPL_RCD = J.EMPL_RCD
+      AND J1.EFFDT <= $Current_End_Dt)
+  AND J.EFFSEQ =
+     (SELECT MAX(EFFSEQ)
+      FROM PS_JOB J2
+      WHERE J2.EMPLID = J.EMPLID
+      AND J2.EMPL_RCD = J.EMPL_RCD
+      AND J2.EFFDT = J.EFFDT)
+  AND J.HR_STATUS = 'A')
+OR ((J.EFFDT BETWEEN $Lookback_Begin_Dt AND $Current_End_Dt)  !Person was previously active but terminated during testing period...
+  AND J.HR_STATUS = 'I'));
+end-SQL
+
+let $sql-statement = 'NDT001.SQR, Create-Person-Entries,PS_BN_PERSON,Ins'
+begin-SQL on-error=SQL-Error
+INSERT INTO PS_BN_PERSON
+(EMPLID, BN_TOGGLE, HIGHLY_COMP_EMPL_P, HIGHLY_COMP_EMPL_C)
+SELECT
+ EMPLID, ' ', 'N', 'N'
+FROM PS_R_BN_PERSON;
+end-SQL
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Mark-Empl-Eligibility ($From,$To,$Which_Year)
+
+!Determine "eligibility" based on employee's Job Status and Company/PayGroup
+!membership for the period specified.
+!***************************************************************************
+
+#ifdef debugF
+  display 'DEBUG: Procedure: Mark-Empl-Eligibility()'
+#end-if
+#ifdef debugD
+  display 'DEBUG: Data:'   Noline
+  display ' $From='        Noline
+  display $From            Noline
+  display ' $To'           Noline
+  display $To              Noline
+  display ' $Which_Year'   Noline
+  display $Which_Year
+#end-if
+
+  let $_HCE_Flag = 'E'
+  let $Prior_Emplid = ' '
+
+begin-SELECT
+
+A.EMPLID
+
+  move &A.EmplID to $_EmplID
+  if &A.EMPLID <> $Prior_Emplid
+     if ($Which_Year = 'current')
+        do Update-HCE-Current
+     else
+        do Update-HCE-Preceding
+     end-if
+     move &A.EMPLID to $Prior_Emplid
+  end-if
+
+FROM PS_PERSON A,
+     PS_PER_ORG_ASGN EM,
+     PS_PRIMARY_JOBS PJ,
+     PS_JOB J
+WHERE J.EMPLID = A.EMPLID
+!Only consider employees...
+   AND EM.EMPLID = A.EMPLID
+   AND EM.PER_ORG = 'EMP'
+   AND PJ.EMPLID = EM.EMPLID            !Only look at primary job within each benefit track...
+   AND PJ.PRIMARY_JOB_APP = 'BN'
+   AND PJ.EMPL_RCD = EM.EMPL_RCD
+   AND PJ.EFFDT =
+       (SELECT MAX(PJ1.EFFDT)
+        FROM PS_PRIMARY_JOBS PJ1
+        WHERE PJ1.EMPLID = PJ.EMPLID
+           AND PJ1.PRIMARY_JOB_APP = PJ.PRIMARY_JOB_APP
+           AND PJ1.EMPL_RCD = PJ.EMPL_RCD
+           AND PJ1.EFFDT <= $To)
+   AND PJ.PRIMARY_JOB_IND = 'Y'
+   AND J.EMPLID = EM.EMPLID             !Person is managed by Benefits...
+   AND J.EMPL_RCD = EM.EMPL_RCD
+   AND J.BENEFIT_SYSTEM <> 'OT'
+   AND ((J.EFFDT =                      !Person was active at end of testing period...
+        (SELECT MAX(EFFDT)
+         FROM PS_JOB J1
+         WHERE J1.EMPLID = J.EMPLID
+         AND J1.EMPL_RCD = J.EMPL_RCD
+         AND J1.EFFDT <= $To)
+   AND J.EFFSEQ =
+        (SELECT MAX(EFFSEQ)
+         FROM PS_JOB J2
+         WHERE J2.EMPLID = J.EMPLID
+            AND J2.EMPL_RCD = J.EMPL_RCD
+            AND J2.EFFDT = J.EFFDT)
+         AND J.HR_STATUS = 'A')
+   OR ((J.EFFDT BETWEEN $From AND $To)   !Person was previously active but terminated during testing period...
+        AND J.HR_STATUS = 'I'))
+   AND EXISTS                            !Person meets population criteria...
+      (SELECT 'X'
+       FROM [PS_NDT_CO_PAYGROUP: $_GRP_VIEW]
+       WHERE COMPANY = J.COMPANY
+          AND PAYGROUP = J.PAYGROUP)
+   ORDER BY A.EMPLID
+
+End-SELECT
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Mark-5Percent-Owners
+!***************************************************************************
+
+#ifdef debugF
+  display 'DEBUG: Procedure: Mark-5Percent-Owners'
+#end-if
+#ifndef debugF
+  display 'Status: Identifying 5% Owners ...'
+#end-if
+#ifdef debugD
+  display 'DEBUG: Data: '   Noline
+#end-if
+
+  let $HCE_Flag = 'H'
+
+begin-SELECT
+J1.EMPLID
+
+  move &J1.EmplID to $EmplID
+  do Update-HCE-Current
+#ifdef debugD
+  display &J1.EmplID   Noline
+  display ', '         Noline
+#end-if
+
+FROM PS_BN_PERSON    J1
+WHERE ( (J1.HIGHLY_COMP_EMPL_P <> 'N')
+        OR
+        (J1.HIGHLY_COMP_EMPL_C <> 'N') )
+AND EXISTS
+     (SELECT 'x'
+        FROM PS_PER_ORG_ASGN E
+       WHERE E.EMPLID = J1.EMPLID
+         AND E.OWN_5PERCENT_CO = 'Y')
+end-SELECT
+
+#ifdef debugD
+  display ''
+#end-if
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Gather-Compensation-Data ($Which_Run_Year)
+!***************************************************************************
+
+#ifdef debugF
+  display 'DEBUG: Procedure: Gather-Compensation-Data()'
+#end-if
+#ifdef debugD
+  display 'DEBUG: Data:'      Noline
+  display ' $BeginMonth='     Noline
+  display $_BeginMonth        Noline
+  display ' $Which_Run_Year'  Noline
+  display $Which_Run_Year     Noline
+#end-if
+
+    if ($_BeginMonth = '01')
+      do Calendar-Plan($Which_Run_Year)
+    else
+      do Fiscal-Plan($Which_Run_Year)
+    end-if
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Calendar-Plan ($Which_Run_Year)
+!***************************************************************************
+
+#ifdef debugF
+  display 'DEBUG: Procedure: Calendar-Plan()'
+#end-if
+#ifndef debugF
+  display 'Status: Beginning Calendar Year Calculations ...'
+#end-if
+
+  !Load the preceding plan year data...
+  if ($Which_Run_Year = 'B') Or ($Which_Run_Year = 'P')
+
+    let $_ViewYearCd  = 'P'
+    let #_ViewYear    = #_LastYear
+    let $_ViewMonth   = '12'
+    let #_SignValue   = 1
+    let $_AsOfDate    = $_Lookback_End_Dt
+
+#ifdef debugD
+  display 'DEBUG: Data: Preceding Year:'    Noline
+  display ' $ViewYearCd='   Noline
+  display $_ViewYearCd      Noline
+  display ' #ViewYear='     Noline
+  display #_ViewYear        Noline
+  display ' $ViewMonth='    Noline
+  display $_ViewMonth       Noline
+  display ' #SignValue='    Noline
+  display #_SignValue       Noline
+  display ' $AsOfDate='     Noline
+  display $_AsOfDate
+#end-if
+
+    do Insert-Employee-Earnings
+  end-if
+
+  !Load the current plan year data...
+  if ($Which_Run_Year = 'B') Or ($Which_Run_Year = 'C')
+
+    let $_ViewYearCd  = 'C'
+    let #_ViewYear    = #_ThisYear
+    let $_ViewMonth   = $_EndMonth
+    let #_SignValue   = 1
+    let $_AsOfDate    = $_Current_End_Dt
+
+#ifdef debugD
+  display 'DEBUG: Data: Current Year:'    Noline
+  display ' $ViewYearCd='   Noline
+  display $_ViewYearCd      Noline
+  display ' #ViewYear='     Noline
+  display #_ViewYear        Noline
+  display ' $ViewMonth='    Noline
+  display $_ViewMonth       Noline
+  display ' #SignValue='    Noline
+  display #_SignValue       Noline
+  display ' $AsOfDate='     Noline
+  display $_AsOfDate
+#end-if
+
+    do Insert-Employee-Earnings
+  end-if
+
+end-procedure
+
+!***************************************************************************
+begin-procedure Fiscal-Plan ($Which_Run_Year)
+!***************************************************************************
+
+#ifdef debugF
+  display 'DEBUG: Procedure: Fiscal-Plan()'
+#end-if
+#ifndef debugF
+  display 'Status: Beginning Fiscal Year Calculations ....'
+#end-if
+
+  let #First_Mth_Fiscal  = #_FirstMonth
+  let #Last_Mth_Fiscal   = #_FirstMonth - 1
+  move #First_Mth_Fiscal to $First_Mth_Fiscal 09
+  move #Last_Mth_Fiscal  to $Last_Mth_Fiscal 09   !Values can be '01' through '11'
+
+  if (#_LastMonth > #Last_Mth_Fiscal)
+    move $_EndMonth  to $PeriodEnd
+  else
+    move '12'        to $PeriodEnd
+  end-if
+
+  !Load the preceding plan year data...
+  if ($Which_Run_Year = 'B') Or ($Which_Run_Year = 'P')
+
+    let $_ViewYearCd = 'P'
+
+    let #_ViewYear   =  #_LastYear
+    let $_ViewMonth  = '12'
+    let #_SignValue  = 1
+    do Make-EOM-DateString(#_ViewYear,$_ViewMonth,'31', $_AsOfDate)
+    do Insert-Employee-Earnings
+
+    let #_ViewYear   =  #_LastYear
+    let $_ViewMonth  =  $Last_Mth_Fiscal
+    let #_SignValue  =  -1
+    do Make-EOM-DateString(#_ViewYear,$_BeginMonth,'01', $_AsOfDate)
+    do Insert-Employee-Earnings
+
+    let #_ViewYear   =  #_ThisYear
+    let $_ViewMonth  =  $Last_Mth_Fiscal
+    let #_SignValue  =  1
+    do Make-EOM-DateString(#_ViewYear,$First_Mth_Fiscal,'01', $_AsOfDate)
+    do Insert-Employee-Earnings
+  end-if
+
+  !Load the current plan year data...
+  if ($Which_Run_Year = 'B') Or ($Which_Run_Year = 'C')
+
+    let $_ViewYearCd = 'C'
+
+    let #_ViewYear   = #_ThisYear
+    let $_ViewMonth  = $PeriodEnd
+    let #_SignValue  = 1
+    do Make-EOM-DateString(#_ViewYear,$_ViewMonth,'01', $_AsOfDate)
+    do Insert-Employee-Earnings
+
+    let #_ViewYear   =  #_ThisYear
+    let $_ViewMonth  =  $Last_Mth_Fiscal
+    let #_SignValue  =  -1
+    do Make-EOM-DateString(#_ViewYear,$First_Mth_Fiscal,'01', $_AsOfDate)
+    do Insert-Employee-Earnings
+
+    if (#_LastMonth <= #Last_Mth_Fiscal)
+      let #_ViewYear   =  #_NextYear
+      let $_ViewMonth  =  $_EndMonth
+      let #_SignValue  =  1
+      do Make-EOM-DateString(#_ViewYear,$_ViewMonth,'01', $_AsOfDate)
+      do Insert-Employee-Earnings
+    end-if
+
+  end-if
+
+end-procedure
+
+!***************************************************************************
+begin-procedure Insert-Employee-Earnings
+
+!This procedure retrieves Earnings and Imputed Income records for all
+!plan-eligible employees having gross earnings in one or more of the
+!companies which are aggregated together for nondiscrimination testing.
+!The SELECTs also reference PS_R_NDT_Control which is a temporary, one-row
+!table which must first be loaded with five elements:  the Earnings Code to
+!retrieve, the appropriate Calendar Year, the appropriate MonthCd,  the
+!one-character code designating either the (P)receding plan year or the
+!(C)urrent plan year, and, for fiscal plan years only, a value of either
+!+1 or -1 to be multiplied times the Grs_YTD (where -1 means to reduce the
+!employee's total for the period in consideration).
+!***************************************************************************
+
+#ifdef debugF
+  display 'DEBUG: Procedure: Insert-Employee-Earnings'
+#end-if
+#ifndef debugF
+  display 'Status: Inserting Employee Earnings ...'
+#end-if
+
+  let #ViewMonth = To_Number($ViewMonth)
+
+#ifdef debugD
+  display 'DEBUG: Data:'            Noline
+  display ' Comp: Year='            Noline
+  display #ViewYear            9999 Noline
+  display ' Month='                 Noline
+  display #ViewMonth             99 Noline
+  display ' Code='                  Noline
+  display $ViewYearCd               Noline
+  display ' Sign='                  Noline
+  display #SignValue             99 Noline
+  display ' AsOfDate='              Noline
+  display $AsOfDate
+#end-if
+
+let $sql-statement = 'NDT001.SQR,Insert-Empl-Earnings,PS_R_NDT_Control,Update'
+begin-SQL on-error=SQL-Error
+UPDATE PS_R_NDT_CONTROL
+   SET ERNCD           = &RC.ERNCD_SPCL,
+       BALANCE_ID      = $Calendar_Year_Id,
+       BALANCE_YEAR    = #ViewYear,
+       BALANCE_PERIOD  = #ViewMonth,
+       YEAR_CD         = $ViewYearCd,
+       SIGNVALUE       = #SignValue;
+end-SQL
+
+let $sql-statement = 'NDT001.SQR,Insert-Empl-Earnings,PS_R_NDT_Empl_YTD,Insert'
+begin-SQL on-error=SQL-Error
+
+!***** Gather Earnings Data *****
+
+INSERT INTO PS_R_NDT_EMPL_YTD
+(YEAR_CD, EMPLID, HCE_TYPE, YTD_401_K_M, GRS_YTD, DED_YTD)
+
+SELECT C.YEAR_CD, B.EMPLID, 'L', ' ', B.GRS_YTD*C.SIGNVALUE, 0
+  FROM PS_BN_PERSON     A,
+       PS_EARNINGS_BAL  B,
+       PS_R_NDT_CONTROL C
+ WHERE ((C.YEAR_CD = 'P' AND A.HIGHLY_COMP_EMPL_P <> 'N')
+    OR  (C.YEAR_CD = 'C' AND A.HIGHLY_COMP_EMPL_C <> 'N'))
+   AND  B.COMPANY  IN (SELECT COMPANY
+                       FROM [PS_NDT_CO_PAYGROUP: $GRP_VIEW])
+   AND  B.EMPLID         = A.EMPLID
+   AND  B.ERNCD          = C.ERNCD
+   AND  B.BALANCE_ID     = C.BALANCE_ID
+   AND  B.BALANCE_YEAR   = C.BALANCE_YEAR
+   AND  B.BALANCE_PERIOD =
+        (SELECT MAX(BALANCE_PERIOD)
+          FROM PS_EARNINGS_BAL
+         WHERE EMPLID          = B.EMPLID
+           AND COMPANY         = B.COMPANY
+           AND ERNCD           = B.ERNCD
+           AND EMPL_RCD        = B.EMPL_RCD
+           AND BALANCE_ID      = B.BALANCE_ID
+           AND BALANCE_YEAR    = B.BALANCE_YEAR
+           AND BALANCE_PERIOD <= C.BALANCE_PERIOD);
+
+!***** Gather Imputed Income Data *****
+
+INSERT INTO PS_R_NDT_EMPL_YTD
+(YEAR_CD, EMPLID, HCE_TYPE, YTD_401_K_M, GRS_YTD, DED_YTD)
+
+SELECT R.YEAR_CD, A.EMPLID, 'L', ' ', SUM(C.DED_YTD)*R.SIGNVALUE, 0
+  FROM PS_DEDUCTION_BAL   C,
+       PS_BN_PERSON       A,
+       PS_R_NDT_CONTROL   R
+
+ WHERE C.COMPANY IN (SELECT COMPANY
+                       FROM [PS_NDT_CO_PAYGROUP: $GRP_VIEW])
+   AND C.BALANCE_ID     = R.BALANCE_ID
+   AND C.BALANCE_YEAR   = R.BALANCE_YEAR
+   AND C.BALANCE_PERIOD =
+         (SELECT MAX(BALANCE_PERIOD)
+            FROM PS_DEDUCTION_BAL
+           WHERE EMPLID          = C.EMPLID
+             AND COMPANY         = C.COMPANY
+             AND BENEFIT_RCD_NBR = C.BENEFIT_RCD_NBR
+             AND PLAN_TYPE       = C.PLAN_TYPE
+             AND BENEFIT_PLAN    = C.BENEFIT_PLAN
+             AND DEDCD           = C.DEDCD
+             AND DED_CLASS       = C.DED_CLASS
+             AND BALANCE_ID      = C.BALANCE_ID
+             AND BALANCE_YEAR    = C.BALANCE_YEAR
+             AND BALANCE_PERIOD <= R.BALANCE_PERIOD)
+
+   AND EXISTS
+         (SELECT 'x'
+            FROM PS_LIMIT_IMPIN_TBL I
+           WHERE I.LIMIT_TYPE      = '415'
+             AND I.PLAN_TYPE       = C.PLAN_TYPE
+             AND ((I.PLAN_TYPE     = '00'
+             AND   I.DEDCD         = C.DEDCD)
+              OR  (I.PLAN_TYPE     <> '00'
+             AND   I.BENEFIT_PLAN  = C.BENEFIT_PLAN))
+             AND I.DED_CLASS       = C.DED_CLASS
+             AND I.EFFDT           = (SELECT MAX(I1.EFFDT)
+                                      FROM PS_LIMIT_IMPIN_TBL I1
+                                      WHERE I1.LIMIT_TYPE   = I.LIMIT_TYPE
+                                        AND I1.EFFDT   <= $AsOfDate
+                                        AND I1.PLAN_TYPE = I.PLAN_TYPE
+                                        AND I1.BENEFIT_PLAN = I.BENEFIT_PLAN
+                                        AND I1.DEDCD = I.DEDCD
+                                        AND I1.DED_CLASS = I.DED_CLASS))
+
+   AND A.EMPLID = C.EMPLID
+   AND ((R.YEAR_CD = 'P' AND A.HIGHLY_COMP_EMPL_P <> 'N')
+     OR (R.YEAR_CD = 'C' AND A.HIGHLY_COMP_EMPL_C <> 'N'))
+
+   GROUP BY A.EMPLID,R.YEAR_CD,
+            R.SIGNVALUE
+   HAVING SUM(C.DED_YTD) <> 0;
+end-SQL
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Compensation-Projections
+!***************************************************************************
+
+#ifdef debugF
+  display 'DEBUG: Procedure: Compensation-Projections'
+#end-if
+#ifndef debugF
+  display 'Status: Performing Compensation Projections ...'
+#end-if
+
+  let $ViewStr = $ELIG_VIEW || ' A, PS_NDT_RUNCTL B'
+
+let $sql-statement = 'NDT001.SQR,Compensation-Projections,PS_R_NDT_Empl_YTD,Insert'
+begin-SQL on-error=SQL-Error
+
+UPDATE PSASOFDATE
+   SET ASOFDATE = &RC.Month_End_Dt;
+
+end-SQL
+
+let $sql-statement = 'NDT001.SQR,Comp-Projections(1),PS_R_NDT_Empl_YTD,Insert'
+begin-SQL on-error=SQL-Error
+
+INSERT INTO PS_R_NDT_EMPL_YTD
+(YEAR_CD, EMPLID, HCE_TYPE, YTD_401_K_M, GRS_YTD, DED_YTD)
+
+SELECT
+'F', A.EMPLID, 'L', ' ', (A.ANNUAL_RT * B.PROJECTION_PERCENT / 100), 0
+FROM  [PS_NDT_PLAN_ELIG A, PS_NDT_RUNCTL B: $ViewStr]
+WHERE B.PROJECTION_PERCENT > 0
+  AND (B.BENEFITS_BASE = '1'
+    OR A.ANNL_BENEF_BASE_RT <= A.ANNUAL_RT);
+
+end-SQL
+
+let $sql-statement = 'NDT001.SQR,Comp-Projections(2),PS_R_NDT_Empl_YTD,Insert'
+begin-SQL on-error=SQL-Error
+
+INSERT INTO PS_R_NDT_EMPL_YTD
+(YEAR_CD, EMPLID, HCE_TYPE, YTD_401_K_M, GRS_YTD, DED_YTD)
+
+SELECT
+'F', A.EMPLID, 'L', ' ', (A.ANNL_BENEF_BASE_RT * B.PROJECTION_PERCENT / 100), 0
+FROM  [PS_NDT_PLAN_ELIG A, PS_NDT_RUNCTL B: $ViewStr]
+WHERE B.PROJECTION_PERCENT > 0
+  AND B.BENEFITS_BASE     = '2'
+  AND A.ANNL_BENEF_BASE_RT > A.ANNUAL_RT;
+
+end-SQL
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Highly-Compensated-Testing
+!***************************************************************************
+
+#ifdef debugF
+  display 'DEBUG: Procedure: Compensation-Projections'
+#end-if
+#ifndef debugF
+  display 'Status: Determining non-excludable population ...'
+#end-if
+
+let $sql-statement = 'NDT001.SQR,Highly-Comp-Testing,PS_NDT_HCE_Tbl,Select'
+begin-SELECT
+Z.TOP_PCT,
+Z.COMP_HIGH,
+Z.COMP_TOP_PCT,
+Z.HCE_COMP_METHOD,
+Z.MIN_SERVICE_REQD,
+Z.AGE_RANGE_HIGH
+
+FROM  PS_NDT_HCE_TBL Z
+WHERE Z.EFFDT =
+      (SELECT MAX(EFFDT)
+         FROM PS_NDT_HCE_TBL
+        WHERE EFFDT <= $Current_Begin_Dt)
+end-SELECT
+
+  do Convert-To-DTU-Date($Current_Begin_Dt, $DTU_Reference)
+  let #MinAge = &Z.AGE_RANGE_HIGH * -1
+  do DTU-Add-Years($DTU_Reference, #MinAge, $AgeCutoffDate)
+  do Convert-From-DTU-Date($AgeCutoffDate, $AgeCutoffDate)
+  let #MinSvc = &Z.MIN_SERVICE_REQD * -1
+  do DTU-Add-Months($DTU_Reference, #MinSvc, $SvcCutoffDate)
+  do Convert-From-DTU-Date($SvcCutoffDate, $SvcCutoffDate)
+
+  if (RTrim(&Z.HCE_COMP_METHOD,' ') = '')
+    display ''
+    let $Msg = '***** No PS_NDT_HCE_TBL entry for Plan Year ' ||
+               $DTU_Reference || ' *****'
+    display $Msg
+    let $Msg = '***** Testing cannot continue using Prior Year Data    *****'
+    display $Msg
+    display ''
+    let $sql-error = 'No Rows Found'
+    do SQL-Error
+  end-if
+
+#ifdef debugD
+  display 'DEBUG: Data:'      Noline
+  display ' Exclusions: '     Noline
+  display ' AgeCutOff='       Noline
+  display $AgeCutoffDate      Noline
+  display ' SvcCutOff='       Noline
+  display $SvcCutoffDate
+#end-if
+
+begin-SELECT
+COUNT(DISTINCT A.EMPLID)  &NonExCount
+
+FROM  PS_PERSON        A,
+      PS_PER_ORG_ASGN  B,
+      PS_BN_PERSON     C
+WHERE C.EMPLID = A.EMPLID
+AND   C.HIGHLY_COMP_EMPL_P <> 'N'
+AND   A.BIRTHDATE   < $AgeCutoffDate
+AND   B.EMPLID      = A.EMPLID
+AND   B.SERVICE_DT  < $SvcCutoffDate
+end-SELECT
+
+  let #TopPct_No_Of_Emps = &Z.TOP_PCT * &NonExCount / 100
+  let #TopPct_No_Of_Emps = Round(#TopPct_No_Of_Emps, 0)
+
+#ifdef debugD
+  display 'DEBUG: Data:'                 Noline
+  display ' Top '                        Noline
+  display &Z.TOP_PCT                  99 Noline
+  display '% of '                        Noline
+  display &NonExCount              99999 Noline
+  display ' nonexcludable EEs ='         Noline
+  display #TopPct_No_Of_Emps        9999
+#end-if
+
+  do Order-By-Gross
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Order-By-Gross
+
+!Since PS_R_NDT_Empl_YTD can contain multiple rows for the same employee
+!for the same plan year (in the case of Fiscal plans), we use the SUM function
+!to get one total for a particular employee.
+!***************************************************************************
+
+#ifdef debugF
+  display 'DEBUG: Procedure: Order-By-Gross'
+#end-if
+#ifndef debugF
+  display 'Status: Testing for Highly Compensated EE`s ...'
+#end-if
+
+  let #Rank = 0
+  let $HCE_Flag = 'H'
+
+begin-SELECT
+L.EMPLID,
+
+#ifdef INFORMIX
+ROUND(SUM(L.GRS_YTD),3)      &Gross
+#else
+#ifdef DB2ALL
+DECIMAL(SUM(L.GRS_YTD),15,3) &Gross
+#else
+SUM(L.GRS_YTD)               &Gross
+#endif
+#endif
+
+  move &L.EmplID to $EmplID
+  let #Rank = #Rank + 1
+
+#ifdef debugD
+  display 'DEBUG: Data:'         Noline
+  display ' Rank='               Noline
+  display #Rank              099 Noline
+  display ' Gross='              Noline
+  display &Gross      $9,999,999 Noline
+  display ' EmplID='             Noline
+  display $EmplID
+#end-if
+
+  Evaluate &Z.HCE_COMP_METHOD
+  when = '1'
+    if (&Gross > &Z.COMP_HIGH)
+      do Update-HCE-Current
+    end-if
+  when = '2'
+    if (&Gross > &Z.COMP_TOP_PCT) And (#Rank <= #TopPct_No_Of_Emps)
+      do Update-HCE-Current
+#ifdef debugD
+  if (#Rank = #TopPct_No_Of_Emps)
+    display 'DEBUG: ----- Top Pct CutOff -----'
+  end-if
+#end-if
+    end-if
+  end-evaluate
+
+FROM  PS_R_NDT_EMPL_YTD L
+WHERE L.YEAR_CD = 'P'
+GROUP BY L.EMPLID
+HAVING SUM(L.GRS_YTD) > &Z.COMP_HIGH
+    OR SUM(L.GRS_YTD) > &Z.COMP_TOP_PCT
+ORDER BY 2 DESC, L.EMPLID ASC
+end-SELECT
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Update-HCE-Current
+!***************************************************************************
+
+#ifdef debugF
+  display 'DEBUG: Procedure: Update-HCE-Current'
+#end-if
+#ifdef debugD
+  display 'DEBUG: Data:'    Noline
+  display ' $HCE_Flag='     Noline
+  display $HCE_Flag         Noline
+  display ' $EmplID='       Noline
+  display $EmplID
+#end-if
+
+let $sql-statement = 'NDT001.SQR,Update-HCE-Current,PS_Person,Update'
+begin-SQL on-error=SQL-Error
+UPDATE PS_BN_PERSON
+  SET  HIGHLY_COMP_EMPL_C = $HCE_Flag
+WHERE  EMPLID = $EmplID;
+end-SQL
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Update-HCE-Preceding
+!***************************************************************************
+
+#ifdef debugF
+  display 'DEBUG: Procedure: Update-HCE-Preceding'
+#end-if
+#ifdef debugD
+  display 'DEBUG: Data:'    Noline
+  display ' $HCE_Flag='     Noline
+  display $HCE_Flag         Noline
+  display ' $EmplID='       Noline
+  display $EmplID
+#end-if
+
+let $sql-statement = 'NDT001.SQR,Update-HCE-Preceding,PS_Person,Update'
+begin-SQL on-error=SQL-Error
+UPDATE PS_BN_PERSON
+  SET  HIGHLY_COMP_EMPL_P = $HCE_Flag
+WHERE  EMPLID = $EmplID
+end-SQL
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Swap-HCE-Flags
+!***************************************************************************
+
+#ifdef debugF
+  display 'DEBUG: Procedure: Swap-HCE-Flags'
+#end-if
+#ifndef debugF
+  display 'Status: Moving HCE flags to prior year ...'
+#end-if
+
+let $sql-statement = 'NDT001.SQR,Swap-HCE-Flags,PS_Person,Update'
+begin-SQL on-error=SQL-Error
+UPDATE PS_BN_PERSON
+  SET  HIGHLY_COMP_EMPL_P = HIGHLY_COMP_EMPL_C
+end-SQL
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Find-HCE-Empls
+!***************************************************************************
+
+#ifdef debugF
+  display 'DEBUG: Procedure: Find-HCE-Empls'
+#end-if
+#ifndef debugF
+  display 'Status: Marking HCEs for 129 Testing ...'
+#end-if
+
+begin-SELECT
+HCE.EMPLID
+
+  move &HCE.Emplid to $Emplid
+  do Update-Empl-YTD
+
+FROM  PS_BN_PERSON   HCE
+WHERE HIGHLY_COMP_EMPL_C = 'H'
+GROUP BY HCE.EMPLID
+end-SELECT
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Update-Empl-YTD
+!***************************************************************************
+
+#ifdef debugF
+  display 'DEBUG: Procedure: Update-Empl-YTD'
+#end-if
+
+let $sql-statement = 'NDT001.SQR,Update-Empl-YTD,PS_Person,update'
+begin-SQL on-error=SQL-Error
+UPDATE PS_R_NDT_EMPL_YTD
+  SET  HCE_TYPE = 'H'
+WHERE  EMPLID = $EmplID;
+end-SQL
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Exclude-Empls
+!***************************************************************************
+
+#ifdef debugF
+  display 'DEBUG: Procedure: Exclude-Empls'
+#end-if
+#ifndef debugF
+  display 'Status: Excluding EEs from 129 Test by Age and Service ...'
+#end-if
+
+  do Convert-To-DTU-Date($Current_Begin_Dt, $DTU_Reference)
+  let #MinAge = &RC.AGE_RANGE_HIGH * -1
+  do DTU-Add-Years($DTU_Reference, #MinAge, $AgeCutoffDate)
+  do Convert-From-DTU-Date($AgeCutoffDate, $AgeCutoffDate)
+  let #MinSvc = &RC.MIN_SERVICE_REQD * -1
+  do DTU-Add-Months($DTU_Reference, #MinSvc, $SvcCutoffDate)
+  do Convert-From-DTU-Date($SvcCutoffDate, $SvcCutoffDate)
+
+#ifdef debugD
+  display 'DEBUG: Data:'      Noline
+  display ' Reference='       Noline
+  display $Current_Begin_Dt   Noline
+  display ' AgeCutOff='       Noline
+  display $AgeCutoffDate      Noline
+  display ' SvcCutOff='       Noline
+  display $SvcCutoffDate
+#end-if
+
+begin-SELECT
+EX.EMPLID,
+EX.BIRTHDATE
+
+  move &EX.Emplid to $Emplid
+  do   Delete-Empl
+
+#ifdef debugD
+  display 'DEBUG: Data:'   Noline
+  display ' EmplID '       Noline
+  display $EmplID          Noline
+  display ' BDay='         Noline
+  display &EX.BIRTHDATE
+#end-if
+
+FROM  PS_PERSON  EX,
+      PS_BN_PERSON  B
+WHERE B.EMPLID = EX.EMPLID
+AND   B.HIGHLY_COMP_EMPL_C <> 'N'
+AND   (EX.BIRTHDATE > $AgeCutoffDate
+OR    NOT EXISTS
+          (SELECT 'X'
+             FROM PS_PER_ORG_ASGN B
+            WHERE B.EMPLID = EX.EMPLID
+              AND B.SERVICE_DT <= $SvcCutoffDate))
+end-SELECT
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Delete_Cafe_Empls
+!***************************************************************************
+
+#ifdef debugF
+  display 'DEBUG: Procedure: Delete_Cafe_Empls'
+#end-if
+#ifndef debugF
+  display 'Status: Excluding Caferteria EEs from 129 Test ...'
+#end-if
+
+let $sql-statement = 'NDT001.SQR,Delete_Cafe_Empls,PSAsOfDate,Update'
+begin-SQL on-error=SQL-Error
+UPDATE PSASOFDATE
+   SET ASOFDATE = &RC.Month_End_Dt;
+end-SQL
+
+begin-SELECT
+DC.EMPLID
+R.BENEFITS_BASE,
+R.AMT
+
+  move &DC.Emplid to $Emplid
+  do   Delete-Empl
+
+#ifdef debugD
+  display 'DEBUG: Data:'       Noline
+  display ' EmplID '           Noline
+  display $EmplID              Noline
+  display ' Use='              Noline
+  display &R.BENEFITS_BASE  9  Noline
+  display ' CutOff='           Noline
+  display &R.AMT            $9,999,999
+#end-if
+
+FROM  PS_BN_PERSON     DC,
+      PS_NDT_RUNCTL    R
+WHERE DC.HIGHLY_COMP_EMPL_C <> 'N'
+AND   NOT EXISTS
+         (SELECT 'X'
+            FROM PS_CURRENT_JOB J
+           WHERE J.EMPLID = DC.EMPLID
+             AND ((R.BENEFITS_BASE = '2'
+             AND   J.ANNL_BENEF_BASE_RT >= R.AMT)
+              OR  ((R.BENEFITS_BASE = '1'
+              OR    J.ANNL_BENEF_BASE_RT <= J.ANNUAL_RT)
+             AND   (J.ANNUAL_RT >= R.AMT))))
+end-SELECT
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Delete-Empl
+!***************************************************************************
+
+#ifdef debugF
+  display 'DEBUG: Procedure: Delete-Empl'
+#end-if
+#ifdef debugD
+  display 'DEBUG: Data:'    Noline
+  display ' $EmplID='       Noline
+  display $EmplID
+#end-if
+
+let $sql-statement = 'NDT001.SQR,Delete-Empl,PS_R_NDT_EMPL_YTD,delete'
+begin-SQL on-error=SQL-Error
+DELETE FROM PS_R_NDT_EMPL_YTD
+ WHERE EMPLID  = $Emplid
+   AND YEAR_CD = 'C';
+end-SQL
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Make-EOM-DateString (#Year, $Month, $Day, :$Date_String)
+!***************************************************************************
+
+#ifdef debugF
+  display 'DEBUG: Procedure: Make-EOM-DateString()'
+#end-if
+
+  move #Year to  $Year 9999
+  let $Date_String = $Year || $Month || $Day
+  do Format-DateTime($Date_String, $Date_String, {DEFCMP},'','native')
+  do Convert-to-DTU-date($Date_String, $Date_String)
+  do DTU-Month-End($Date_String, $Date_String)
+  do Convert-From-DTU-Date($Date_String, $Date_String)
+
+end-procedure
+
+
+!***************************************************************************
+begin-Procedure Display-Main-Title
+!***************************************************************************
+
+#ifdef debugF
+  display 'DEBUG: Procedure: Display-Main-Title'
+#end-if
+
+  move 'NDT001' to $ReportID
+  move 'Determine Highly Compensated Employees' to $ReportTitle
+
+  display $ReportTitle
+  display ''
+  display 'Prior to running this program, you should have verified that the'
+  display 'Run Control record (401 Nondiscrimination Testing or Section 129)'
+  display 'and the NDT Regulatory record (NDT_HCE_TBL) contain the correct data'
+  display 'for the plan under study.  Also, if you are only running testing for'
+  display 'for the current year, that the previous year''s data have already been'
+  display 'built.'
+  display ''
+
+if ($TEST_TYPE = '129')
+     display '*******************************************'
+     display '*          Section 129 HCE Test           *'
+     display '*******************************************'
+else
+     display '*******************************************'
+     display '*           Standard HCE Test             *'
+     display '*******************************************'
+end-if
+
+if ($SLOB = 'Y')
+     display '*      by Separate Lines of Business      *'
+     display '*******************************************'
+end-if
+
+  display ''
+
+end-procedure
+
+
+!*******************************
+begin-procedure Display-Time
+!*******************************
+
+  do Get-Current-Datetime
+  display $AsOfToday NoLine
+  display ', '       NoLine
+  display $AsOfNow
+  display ''
+
+end-procedure
+
+!***************************************************************************
+
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'datemath.sqc'  !Routines for date math
+#Include 'stdapi.sqc'    !Update Process API
+#Include 'bnrunctl.sqc'  !Get application run control parameters
+#Include 'bngetval.sqc'  !Get BEN values mask routines
+#Include 'getbalid.sqc'  !Get-Calendar-Year-Id
+
+!****************************** End of NDT001 ******************************
+

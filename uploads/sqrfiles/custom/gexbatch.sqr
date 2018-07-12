@@ -1,0 +1,1413 @@
+! Program name: gexbatch                                            !
+! Description:                                
+! This program will read and clone an existing record to a new      !
+! process instance number and handle the password requirements      !
+! and any other changes required.                                   !
+!                                                                   !
+! Program assumptions:                                              !
+!                                                                   !
+! It is assumed by the program that there is only one row queued    !
+! under the keys/id requested. If there are more than one row, this !
+! program will requeue each of the rows as ready for processing.    !
+!                                                                   !
+! For instance, if ten rows are queued under this combination of    !
+! keys, then all ten rows will be requeued for processing.          !
+!                                                                   !
+! Inputs:                                                           !
+!                                                                   !
+!    {$process-name}  = name of the process  arupdate, ar11002, etc !
+!    {$run-cntl-id}   = name of run control id  nightly, daily      !
+!    {$oprid}         = operator id      batch, isdvfdr, etc        !
+!    {$process-type}  = type of process 'application engine",       !
+!                           "sqr report", "cobol sql"               !
+!    {$db-instance}   = data base name   fsdev, fsstage, etc        !
+!                                                                   !
+! Note that there is one display statements which put some data     !
+! into the log file from this sqr. The batch.sh script that calls   !
+! this program scans the log file looking for that line of data,    !
+! so that display cannot be removed.                                !
+!-------------------------------------------------------------------!
+!            Modification history                                   !
+!-------------------------------------------------------------------!
+! INIT DATE      DESCRIPTION                                        !
+!-------------------------------------------------------------------!
+!                                                                   !
+! SXK 01/27/2000 Modified ACCESSPSWDSRC to ACCESSPSWDTGT            !
+!                                                                   !
+! SRK 09/19/2002 Added psprcsque and psprcsparms tables             !
+!                       as part of 8.3 retro-fit                    !
+! SDH 02/15/2003 Revised the entire program. Took out lots of code  !
+!                that was unneeded. Added some comments to explain  !
+!                what is being done. Added a new procedure to       !
+!                monitor the processing status of the newly created !
+!                job, instead of trying to do this in the script    !
+!                (batch.sh) that calls this program.                !
+! SDH 11/22/2004 Modifications so that this program can be used for !
+!                financials version 8.8. In addition to a few field !
+!                changes, a whole new process has been added to     !
+!                handle the processes that are now collected as jobs!
+!                with a proces type of PSJob.                       !
+!                Also, code had to be added to handle the report    !
+!                distribution tables, ps_cdm_list and ps_cdm_auth.  !
+! SDH 03/11/2005 Change ps_cdm_list and ps_cdm_auth to an outer join!
+!                so that this program will still work for times when!
+!                queued jobs do not populate those tables.          !
+! DXS 03/24/2005 Added a If condition in the procedure              !
+!                create-new-entry for printing the latest Finance   !
+!                Charge Reports. Uses gexfc.sqc to get the ID.      !
+! DXS 06/02/2007 In the procedure create-new-psjob added call to    !
+!                get-next-contentid so that we can pull up log and  !
+!                trace files via Process Monitor in case of PSJob   !
+! DXS 06/05/2007 Added new fields which were delivered as part of   !
+!                PT 8.48.09                                         !
+!                psprcsque.tuxsvcid                                 !
+!                psprcsque.runserveroption                          !
+!                psprcsrqst.runserveroption                         !
+!-------------------------------------------------------------------!
+ 
+#include 'setenv.sqc'
+
+begin-setup
+
+#include 'setup02a.sqc'
+
+   ask     $process-name 'Enter process name   = '
+   ask     $run-cntl-id  'Enter run control    = '
+   ask     $oprid        'Enter operator id    = '
+   ask     $process-type 'Enter process type   = '
+   ask     $db-instance  'Enter data base name = '
+                                                       
+end-setup
+
+!-------------------------------------------------------------------!
+begin-report
+!-------------------------------------------------------------------!
+ 
+   do init-datetime
+   do init-number
+   do get-current-datetime
+                        
+   let  $reportid     = 'GEXBATCH'
+   let  $reporttitle  = 'BATCH.SH CLONE PROGRAM    '
+   show 'BEGIN JOB: ' $asoftoday ' ' $asofnow
+   display ' '
+   show $reporttitle
+   display ' '
+
+   do report
+ 
+   do commit-transaction
+ 
+   date-time () hh:mi:ss &timeended
+   display 'report ended: ' noline
+   display &timeended
+   do stdapi-term
+   do reset
+ 
+end-report
+ 
+!-------------------------------------------------------------------!
+begin-procedure report
+!-------------------------------------------------------------------!
+
+   date-time () hh:mi:ss &timebegan
+   display 'REPORT BEGAN: ' noline
+   display &timebegan
+ 
+   move 'n' to $errorfound
+ 
+   let     $process-name = '{$process-name}'
+   let     $run-cntl-id  = '{$run-cntl-id}'
+   let     $oprid        = '{$oprid}'
+   let     $process-type = '{$process-type}'
+   let     $db-instance  = '{$db-instance}'
+
+   let $badparm = 'N'
+   if rtrim($process-name,' ') = ''
+      display '**** ERROR >>> Invalid process name supplied'
+      let $badparm = 'Y'
+   end-if
+
+   if rtrim($run-cntl-id,' ') = ''
+      display '**** ERROR >>> Invalid run control id supplied'
+      let $badparm = 'Y'
+   end-if
+
+   if rtrim($oprid,' ') = ''
+      display '**** ERROR >>> Invalid operator id supplied'
+      let $badparm = 'Y'
+   end-if
+
+   if rtrim($process-type,' ') = ''
+      display '**** ERROR >>> Invalid process type supplied'
+      let $badparm = 'Y'
+   end-if
+
+   if rtrim($db-instance,' ') = ''
+      display '**** ERROR >>> Invalid database instance supplied'
+      let $badparm = 'Y'
+   end-if
+
+   if $badparm = 'Y'
+      let #return-status = 1
+      stop 
+   end-if
+
+   display 'Process name:    ' noline
+   display $process-name
+   display 'Run control id:  ' noline
+   display $run-cntl-id 
+   display 'Operator id:     ' noline
+   display $oprid   
+   display 'Process type:    ' noline
+   display $process-type
+   display 'Database name:   ' noline
+   display $db-instance 
+
+   if $process-type = 'PSJob'
+      do create-new-psjob
+   else
+      do create-new-entry
+   end-if
+   
+   do commit-transaction
+   do monitor-new-entry
+
+   ! If the monitor procedure found an error, abend this program.   !
+   ! This in turn will cause the batch.sh script to pass a bad      !
+   ! return code to autosys.                                        !
+   if $monitor-error = 'Y'
+      let #return-status = 1
+      stop
+   end-if
+ 
+   date-time () hh:mi:ss &timeprocess
+   display &timeprocess
+ 
+end-procedure         ! end procedure - report
+ 
+!-------------------------------------------------------------------!
+begin-procedure create-new-entry
+! Read the three tables, finding the queued row on each that matches!
+! the parameters passed into the program. Copy this data into a new !
+! row on each table. The new rows are given a new process instance  !
+! number; and the process instance number is changed in the parmlist!
+! field. The rundttm field is set to the current date and time,     !
+! therefore the server agent will select the job for processing.    !
+!-------------------------------------------------------------------!
+
+  let $sql-statement = 'create-new-entry,select,psprcsrqst,psprcsparms,psprcsque'
+  let $no-found = '3'
+
+begin-select on-error=sql-error
+psprcsrqst1.prcsinstance
+psprcsrqst1.jobinstance
+psprcsrqst1.mainjobinstance
+psprcsrqst1.prcsjobseq
+psprcsrqst1.prcsjobname
+psprcsrqst1.prcstype
+psprcsrqst1.prcsname
+psprcsrqst1.prcsitemlevel
+psprcsrqst1.mainjobname
+psprcsrqst1.mainjobseq 
+psprcsrqst1.runlocation
+psprcsrqst1.opsys
+psprcsrqst1.dbtype
+psprcsrqst1.dbname
+psprcsrqst1.servernamerqst
+psprcsrqst1.servernamerun
+psprcsrqst1.rundttm
+psprcsrqst1.recurname
+psprcsrqst1.oprid
+psprcsrqst1.prcsversion
+psprcsrqst1.runstatus
+psprcsrqst1.rqstdttm
+psprcsrqst1.lastupddttm
+psprcsrqst1.begindttm
+psprcsrqst1.enddttm
+psprcsrqst1.runcntlid
+psprcsrqst1.prcsrtncd
+psprcsrqst1.continuejob
+psprcsrqst1.usernotified
+psprcsrqst1.initiatednext
+psprcsrqst1.outdesttype
+psprcsrqst1.outdestformat    
+psprcsrqst1.origprcsinstance
+psprcsrqst1.genprcstype
+psprcsrqst1.restartenabled
+psprcsrqst1.timezone  
+psprcsrqst1.psrf_folder_name
+psprcsrqst1.schedulename
+psprcsrqst1.retrycount
+psprcsrqst1.recurorigprcsinst
+psprcsrqst1.p_prcsinstance
+psprcsrqst1.diststatus  
+psprcsrqst1.prcscategory
+psprcsrqst1.prcscurrexpiredttm
+psprcsrqst1.runserveroption      ! new field in PT 8.48.09
+psprcsparms.parmlist
+psprcsparms.workingdir
+psprcsparms.cmdline
+psprcsparms.outdest 
+psprcsparms.origparmlist 
+psprcsparms.origoutdest
+psprcsparms.prcsoutputdir
+psprcsparms.prcsparmextflag
+psprcsparms.prcsfilename
+psprcsque.serverassign 
+psprcsque.prcsprty
+psprcsque.sessionidnum
+psprcsque.recurdttm
+psprcsque.email_web_rpt
+psprcsque.email_log_flag
+psprcsque.prcswinpop 
+psprcsque.mcfren_url_id 
+psprcsque.prcsstartdttm 
+psprcsque.runserveroption       ! new in PT 8.48.09
+psprcsque.tuxsvcid              ! new in PT 8.48.09
+nvl(cdmlist.content_descr,' ')          &content_descr      
+nvl(cdmlist.distnodename,' ')           &distnodename
+nvl(cdmlist.admin_filename,' ')         &admin_filename
+nvl(cdmlist.logfileonly_flag,' ')       &logfileonly_flag
+nvl(cdmlist.filename,'NOTFOUND')        &filename
+nvl(cdmauth.distid,' ')                 &distid
+nvl(cdmauth.distidtype,' ')             &distidtype
+
+   let $out_prcsinstance     = to_char(&psprcsrqst1.prcsinstance)
+   let #out_prcsinstance     = &psprcsrqst1.prcsinstance
+   let #out_jobinstance      = &psprcsrqst1.jobinstance
+   let #out_mainjobinstance  = &psprcsrqst1.mainjobinstance
+   let #out_prcsjobseq       = &psprcsrqst1.prcsjobseq
+   let $out_prcsjobname      = &psprcsrqst1.prcsjobname
+   let $out_prcstype         = &psprcsrqst1.prcstype
+   let $out_prcsname         = &psprcsrqst1.prcsname
+   let #out_prcsitemlevel    = &psprcsrqst1.prcsitemlevel
+   let $out_mainjobname      = &psprcsrqst1.mainjobname
+   let #out_mainjobseq       = &psprcsrqst1.mainjobseq 
+   let $out_runlocation      = &psprcsrqst1.runlocation
+   let $out_opsys            = &psprcsrqst1.opsys
+   let $out_dbtype           = &psprcsrqst1.dbtype
+   let $out_dbname           = &psprcsrqst1.dbname
+   let $out_servernamerqst   = &psprcsrqst1.servernamerqst
+   let $out_servernamerun    = &psprcsrqst1.servernamerun
+   let $out_rundttm          = &psprcsrqst1.rundttm
+   let $out_recurname        = &psprcsrqst1.recurname
+   let $out_oprid            = &psprcsrqst1.oprid
+   let #out_prcsversion      = &psprcsrqst1.prcsversion
+   let $out_runstatus        = &psprcsrqst1.runstatus
+   let $out_rqstdttm         = &psprcsrqst1.rqstdttm
+   let $out_lastupddttm      = &psprcsrqst1.lastupddttm
+   let $out_begindttm        = &psprcsrqst1.begindttm
+   let $out_enddttm          = &psprcsrqst1.enddttm
+   let $out_runcntlid        = &psprcsrqst1.runcntlid
+   let #out_prcsrtncd        = &psprcsrqst1.prcsrtncd
+   let #out_continuejob      = &psprcsrqst1.continuejob
+   let #out_usernotified     = &psprcsrqst1.usernotified
+   let #out_initiatednext    = &psprcsrqst1.initiatednext
+   let $out_outdesttype      = &psprcsrqst1.outdesttype
+   let $out_outdestformat    = &psprcsrqst1.outdestformat
+   let #out_origprcsinstance = &psprcsrqst1.origprcsinstance
+   let $out_genprcstype      = &psprcsrqst1.genprcstype
+   let $out_restartenabled   = &psprcsrqst1.restartenabled
+   let $out_timezone         = &psprcsrqst1.timezone
+   let $out_psrf_folder_name = &psprcsrqst1.psrf_folder_name
+   let $out_schedulename     = &psprcsrqst1.schedulename
+   let #out_retrycount       = &psprcsrqst1.retrycount
+   let #out_p_prcsinstance   = &psprcsrqst1.p_prcsinstance
+   let $out_diststatus       = &psprcsrqst1.diststatus  
+   let $out_prcscategory     = &psprcsrqst1.prcscategory
+   let $out_prcscurrexpiredttm = &psprcsrqst1.prcscurrexpiredttm
+   let $out_runserveroption = &psprcsrqst1.runserveroption
+   let $out_parmlist         = &psprcsparms.parmlist
+   let $out_workingdir       = &psprcsparms.workingdir
+   let $out_cmdline          = &psprcsparms.cmdline
+   let $out_outdest          = &psprcsparms.outdest
+   let $out_origparmlist     = &psprcsparms.origparmlist
+   let $out_origoutdest      = &psprcsparms.origoutdest
+   let $out_prcsoutputdir    = &psprcsparms.prcsoutputdir
+   let $out_prcsparmextflag  = &psprcsparms.prcsparmextflag
+   let $out_prcsfilename     = &psprcsparms.prcsfilename
+   let $out_serverassign     = &psprcsque.serverassign 
+   let #out_prcsprty         = &psprcsque.prcsprty
+   let #out_sessionid        = &psprcsque.sessionidnum
+   let $out_recurdttm        = &psprcsque.recurdttm
+   let $out_email_web_rpt    = &psprcsque.email_web_rpt
+   let $out_email_log_flag   = &psprcsque.email_log_flag
+   let $out_prcswinpop       = &psprcsque.prcswinpop 
+   let $out_mcfren_url_id    = &psprcsque.mcfren_url_id 
+   let $out_prcsstartdttm    = &psprcsque.prcsstartdttm 
+   let $out_runserveroption  = &psprcsque.runserveroption
+   let $out_tuxsvcid         = &psprcsque.tuxsvcid
+   let $out_content_descr    = &content_descr
+   let $out_distnodename     = &distnodename
+   let $out_admin_filename   = &admin_filename
+   let $out_logfileonly_flag = &logfileonly_flag
+   let $out_filename         = &filename
+   let $out_distid           = &distid
+   let $out_distidtype       = &distidtype
+
+
+   let $no-found = '0'
+ 
+   do process-nextnumber
+ 
+   ! Find the process instance in the parmlist, and replace it with  !
+   ! the new process instance.                                       !
+   display 'Parmlist before replacement: ' noline
+   display $out_parmlist 
+
+   let #len1 = length($out_prcsinstance)
+   let #len2 = length($out_lastprcsinstance)
+   let #len3 = 254
+
+   let #found = instr($out_parmlist, $out_prcsinstance, #foundx)
+
+   if #found > 0
+      let #found1 = #found - 1
+      let #next   = #found + #len1
+      let #totlen = #len3 - #found1 - #len1
+      let $out_parmlist1 = substr($out_parmlist, 1, #found1) || 
+                           $out_lastprcsinstance ||
+                           substr($out_parmlist,#next,#totlen)
+     !
+     ! Deepak, Rapidigm, 03/24/05
+     ! Following IF condition is for printing the 
+     ! latest Finance Charge Reports 
+     ! Uses gexfc.sqc to get the ID. 
+     ! We do not need this for any HR process yet
+     ! But have kept the code just incase if we need similar logic
+     ! if $process-name = 'AR35000-'
+     !	 let $search = '-ORIENTP'
+     !	 let #new_length = length($out_parmlist1)
+     !	 let #pos = instr($out_parmlist1,$search,1)
+     !	 let #pos = #pos + length($search)
+     !	 let $new_parmlist = substr($out_parmlist1,1,#pos)
+     !
+     !       do get-oc-id-num
+     ! 
+     !	 let $new_parmlist = $new_parmlist || '"' || $oc_id_num || '"'
+     !   move $new_parmlist to $out_parmlist1
+     ! end-if
+     ! end-change 
+   else
+      display '**** ERROR >>>> NO STRING FOUND TO REPLACE...CANNOT OCCUR'
+      display '**** ERROR >>>> PATH : SQR PATH <<<< **** ERROR '           
+      let #return-status = 1
+      stop 
+   end-if
+
+   display 'Parmlist after replacement:  ' noline
+   display $out_parmlist1
+
+   let #out_recurorigprcsinst = #out_lastprcsinstance
+   let #monitor_prcsinstance = #out_lastprcsinstance
+
+   do get-next-contentid    
+
+   do insert-prcsrqst
+   do insert-prcsparms
+   do insert-prcsque
+   if $out_filename <> 'NOTFOUND'
+      do insert-cdmlist
+      do insert-cdmauth
+   end-if
+
+from psprcsrqst psprcsrqst1,
+     psprcsparms psprcsparms,
+     psprcsque psprcsque,
+     ps_cdm_list cdmlist,
+     ps_cdm_auth cdmauth
+where psprcsrqst1.prcsname  = $process-name
+  and psprcsrqst1.runcntlid = $run-cntl-id
+  and psprcsrqst1.oprid     = $oprid
+  and psprcsrqst1.prcstype  = $process-type
+  and psprcsrqst1.runstatus = 5
+  and psprcsrqst1.prcsinstance = psprcsque.prcsinstance
+  and psprcsrqst1.prcsinstance = psprcsparms.prcsinstance
+  and cdmlist.prcsinstance(+) = psprcsrqst1.prcsinstance
+  and cdmauth.prcsinstance(+) = psprcsrqst1.prcsinstance
+                                                                 
+end-select
+
+   if $no-found = '3'
+      display '**** ERROR >>> ROW NOT FOUND IN PSPRCSRQST  ****  <<< ERROR'
+      display '**** ERROR >>> THERE MUST BE A ROW EQUAL TO THE FOLLOWING: '
+      display '**** ERROR >>> PROCESS-NAME=>' noline
+      display $process-name
+      display '**** ERROR >>> RUN-CNTL-ID==>' noline
+      display $run-cntl-id 
+      display '**** ERROR >>> OPERATOR ID==>' noline
+      display $oprid       
+      display '**** ERROR >>> PROCESS-TYPE=>' noline
+      display $process-type
+      display '**** ERROR >>> RUN STATUS===>' noline
+      display '5'
+      let #return-status = 1
+      stop 
+    end-if
+
+end-procedure          ! end procedure - create-new-entry
+
+!-------------------------------------------------------------------!
+begin-procedure process-nextnumber
+! Get the next process instance.                                    !
+! To prevent multiple jobs getting the same process instance, first !
+! lock the table. Then, update the table to add one to the process  !
+! instance. Next, read the table to get the new process instance.   !
+! Last, release the lock by doing a commit.                         !
+! Note that the row with a prcsseqkey of 0 is used to hold the      !
+! process instance.                                                 !
+!-------------------------------------------------------------------!
+    
+   let $sql-statement = 'process-nextnumber,select,ps_prcssequence'
+
+begin-sql
+   lock table PS_PRCSSEQUENCE in exclusive mode
+end-sql                                      
+ 
+begin-sql
+   update ps_prcssequence
+   set sequenceno = (sequenceno + 1)
+   where prcsseqkey = 0
+end-sql
+
+begin-select on-error=sql-error
+prcssystem1.sequenceno
+ 
+   let #out_lastprcsinstance = &prcssystem1.sequenceno
+   let $out_lastprcsinstance = to_char(&prcssystem1.sequenceno)
+ 
+from ps_prcssequence prcssystem1
+where prcsseqkey = 0
+end-select
+ 
+   do commit-transaction
+
+   ! The batch.sh script greps out this display line to get the     !
+   ! process instance of the new job.                               !
+   display 'LAST PROCESS NUMBER: '  noline
+   display $out_lastprcsinstance
+ 
+end-procedure            ! end procedure - process-nextnumber
+
+!-------------------------------------------------------------------!
+begin-procedure get-next-contentid
+! Get the next contentid.                                           !
+! Note that the row with a prcsseqkey of 1 is used to hold the      !
+! content id (aka report instance).                                 !
+!-------------------------------------------------------------------!
+    
+   let $sql-statement = 'get-next-contentid,select,ps_prcssequence'
+
+begin-sql
+   lock table PS_PRCSSEQUENCE in exclusive mode
+end-sql                                      
+ 
+begin-sql
+   update ps_prcssequence
+   set sequenceno = (sequenceno + 1)
+   where prcsseqkey = 1
+end-sql
+
+begin-select on-error=sql-error
+prcssystem3.sequenceno
+ 
+   let #out_newcontentid = &prcssystem3.sequenceno
+ 
+from ps_prcssequence prcssystem3
+where prcsseqkey = 1
+end-select
+ 
+   do commit-transaction
+
+end-procedure            ! end procedure - get-next-contentid
+
+!-------------------------------------------------------------------!
+begin-procedure get-next-pi
+! Get the next process instance. But do not lock the table, because !
+! it has already been locked in the calling procedure. And do not do!
+! a commit transaction to unlock the table, either.                 !
+! Note that the row with a prcsseqkey of 0 is used to hold the      !
+! process instance.                                                 !
+!-------------------------------------------------------------------!
+    
+   let $sql-statement = 'get-next-pi,select,ps_prcssequence'
+
+begin-sql
+   update ps_prcssequence
+   set sequenceno = (sequenceno + 1)
+   where prcsseqkey = 0
+end-sql
+
+begin-select on-error=sql-error
+prcssystem2.sequenceno
+ 
+   let #out_lastprcsinstance = &prcssystem2.sequenceno
+   let $out_lastprcsinstance = to_char(&prcssystem2.sequenceno)
+ 
+from ps_prcssequence prcssystem2
+where prcsseqkey = 0
+end-select
+ 
+end-procedure            ! end procedure - get-next-pi
+
+!-------------------------------------------------------------------!
+begin-procedure get-next-content
+! Get the next contentid. But do not lock the table, because        !
+! it has already been locked in the calling procedure. And do not do!
+! a commit transaction to unlock the table, either.                 !
+! Note that the row with a prcsseqkey of 1 is used to hold the      !
+! content id (aka report instance).                                 !
+!-------------------------------------------------------------------!
+    
+   let $sql-statement = 'get-next-content,select,ps_prcssequence'
+
+begin-sql
+   update ps_prcssequence
+   set sequenceno = (sequenceno + 1)
+   where prcsseqkey = 1
+end-sql
+
+begin-select on-error=sql-error
+prcssystem4.sequenceno
+ 
+   let #out_newcontentid = &prcssystem4.sequenceno
+ 
+from ps_prcssequence prcssystem4
+where prcsseqkey = 1
+end-select
+ 
+end-procedure            ! end procedure - get-next-content
+
+
+!-------------------------------------------------------------------!
+begin-procedure insert-prcsrqst
+!-------------------------------------------------------------------!
+
+   display 'ENTERING INSERT LOGIC ROUTINE'
+   let $sql-statement = 'insert-prcsrqst,insert,psprcsrqst'
+
+begin-sql
+ 
+insert into
+psprcsrqst
+(prcsinstance
+,jobinstance
+,mainjobinstance
+,prcsjobseq
+,prcsjobname
+,prcstype
+,prcsname
+,prcsitemlevel
+,mainjobname
+,mainjobseq
+,runlocation
+,opsys
+,dbtype
+,dbname
+,servernamerqst
+,servernamerun
+,rundttm
+,recurname
+,oprid
+,prcsversion
+,runstatus
+,rqstdttm
+,lastupddttm
+,begindttm
+,enddttm
+,runcntlid
+,prcsrtncd
+,continuejob
+,usernotified
+,initiatednext
+,outdesttype
+,outdestformat
+,origprcsinstance
+,genprcstype
+,restartenabled
+,timezone
+,psrf_folder_name
+,schedulename
+,retrycount
+,recurorigprcsinst
+,p_prcsinstance
+,diststatus
+,prcscategory
+,prcscurrexpiredttm
+,runserveroption)  ! new field in PT 8.48.09
+values 
+(#out_lastprcsinstance        
+,#out_jobinstance
+,#out_mainjobinstance
+,#out_prcsjobseq
+,$out_prcsjobname
+,$out_prcstype
+,$out_prcsname
+,#out_prcsitemlevel
+,$out_mainjobname
+,#out_mainjobseq
+,$out_runlocation
+,$out_opsys
+,$out_dbtype
+,$out_dbname
+,$out_servernamerqst
+,$out_servernamerun
+,to_date($SysDateTime,'{Native-DateTime}')
+,$out_recurname
+,$out_oprid
+,#out_prcsversion
+,$out_runstatus
+,to_date($SysDateTime,'{Native-DateTime}')
+,$out_lastupddttm
+,$out_begindttm
+,$out_enddttm
+,$out_runcntlid
+,#out_prcsrtncd
+,#out_continuejob
+,#out_usernotified
+,#out_initiatednext
+,$out_outdesttype
+,$out_outdestformat
+,#out_lastprcsinstance  
+,$out_genprcstype
+,$out_restartenabled
+,$out_timezone
+,$out_psrf_folder_name
+,$out_schedulename
+,#out_retrycount
+,#out_recurorigprcsinst 
+,#out_p_prcsinstance
+,$out_diststatus
+,$out_prcscategory
+,$out_prcscurrexpiredttm
+,$out_runserveroption)
+
+end-sql
+
+   ! Note: the batch.sh script looks for this display in the sqr    !
+   ! logfile as an indication that gexbatch.sqr completed.          !
+   display 'LEAVING INSERT LOGIC ROUTINE  '
+
+end-procedure            ! end procedure - insert records
+
+!-------------------------------------------------------------------!
+begin-procedure insert-prcsparms
+!-------------------------------------------------------------------!
+
+   let $sql-statement = 'insert-prcsparms,insert,psprcsparms'
+
+begin-sql 
+insert into psprcsparms
+(prcsinstance,
+cmdline,
+parmlist,
+workingdir,
+outdest,
+origparmlist,
+origoutdest,
+prcsoutputdir,
+prcsparmextflag,
+prcsfilename)
+values
+(#out_lastprcsinstance 
+,$out_cmdline
+,$out_parmlist1
+,$out_workingdir
+,$out_outdest
+,$out_parmlist1
+,$out_origoutdest
+,$out_prcsoutputdir
+,$out_prcsparmextflag
+,$out_prcsfilename)
+end-sql
+
+end-procedure
+
+!-------------------------------------------------------------------!
+begin-procedure insert-prcsque
+!-------------------------------------------------------------------!
+
+   let $sql-statement = 'insert-prcsque,insert,psprcsque'
+
+begin-sql
+insert into psprcsque 
+(prcsinstance, 
+jobinstance, 
+prcsjobseq, 
+prcsjobname,
+mainjobinstance,
+prcstype,
+prcsname,
+mainjobname,
+mainjobseq,
+prcsitemlevel,
+runlocation,
+opsys,
+servernamerqst,
+servernamerun,
+serverassign,
+rundttm,
+recurname,
+oprid,
+prcsprty,
+sessionidnum,
+runstatus,
+rqstdttm,
+recurdttm,
+lastupddttm,
+runcntlid,
+prcsrtncd,
+continuejob,
+usernotified,
+initiatednext,
+outdesttype,
+outdestformat,
+origprcsinstance,
+genprcstype,
+restartenabled,
+timezone,
+email_web_rpt,
+email_log_flag,
+psrf_folder_name,
+schedulename,
+prcswinpop,
+mcfren_url_id,
+retrycount,
+recurorigprcsinst,
+p_prcsinstance,
+prcscategory,
+prcscurrexpiredttm,
+diststatus,
+prcsstartdttm,
+runserveroption,  ! new in PT 8.48.09
+tuxsvcid)         ! new in PT 8.48.09 
+values
+(#out_lastprcsinstance 
+,#out_jobinstance
+,#out_prcsjobseq
+,$out_prcsjobname
+,#out_mainjobinstance
+,$out_prcstype
+,$out_prcsname
+,$out_mainjobname
+,#out_mainjobseq
+,#out_prcsitemlevel
+,$out_runlocation
+,$out_opsys
+,$out_servernamerqst
+,$out_servernamerun
+,$out_serverassign
+,to_date($SysDateTime,'{Native-DateTime}')
+,$out_recurname
+,$out_oprid
+,#out_prcsprty
+,#out_sessionid
+,$out_runstatus
+,to_date($SysDateTime,'{Native-DateTime}')
+,$out_recurdttm
+,$out_lastupddttm
+,$out_runcntlid
+,#out_prcsrtncd
+,#out_continuejob
+,#out_usernotified
+,#out_initiatednext
+,$out_outdesttype
+,$out_outdestformat
+,#out_lastprcsinstance 
+,$out_genprcstype
+,$out_restartenabled
+,$out_timezone
+,$out_email_web_rpt
+,$out_email_log_flag
+,$out_psrf_folder_name
+,$out_schedulename
+,$out_prcswinpop
+,$out_mcfren_url_id
+,#out_retrycount
+,#out_recurorigprcsinst
+,#out_p_prcsinstance
+,$out_prcscategory
+,$out_prcscurrexpiredttm
+,$out_diststatus
+,$out_prcsstartdttm
+,$out_runserveroption
+,$out_tuxsvcid)
+end-sql
+
+end-procedure
+
+!-------------------------------------------------------------------!
+begin-procedure insert-cdmlist
+!-------------------------------------------------------------------!
+
+   let $sql-statement = 'insert-cdmlist,insert,psprcsque'
+
+begin-sql
+insert into ps_cdm_list
+(prcsinstance,
+contentid,
+prcsname,
+prcstype,
+prcsoutputdir,
+content_descr,
+outdestformat,
+rqstdttm,
+enddttm,
+expiration_date, 
+diststatus,
+distnodename,
+outputdir,
+transferinstance,
+admin_filename,
+genprcstype,
+logfileonly_flag,
+filename,
+psrf_folder_name)
+values
+(#out_lastprcsinstance,
+#out_newcontentid,
+$out_prcsname,
+$out_prcstype,
+' ',
+$out_content_descr,
+$out_outdestformat,
+to_date($SysDateTime,'{Native-DateTime}'),
+'',
+'',
+$out_diststatus,
+$out_distnodename,
+' ',
+0,
+$out_admin_filename,
+$out_genprcstype,
+$out_logfileonly_flag,
+$out_filename,
+$out_psrf_folder_name)
+end-sql
+
+end-procedure
+
+!-------------------------------------------------------------------!
+begin-procedure insert-cdmauth
+!-------------------------------------------------------------------!
+
+   let $sql-statement = 'insert-cdmauth,insert,psprcsque'
+
+begin-sql
+insert into ps_cdm_auth
+(contentid,
+prcsinstance,
+distid,
+distidtype)
+values
+(#out_newcontentid,
+#out_lastprcsinstance,
+$out_distid,
+$out_distidtype)
+end-sql
+
+end-procedure
+
+!-------------------------------------------------------------------!
+begin-procedure create-new-psjob
+! A PSJob is a collection of other process types, most often app    !
+! engines, and sometimes including other psjob entries. Each of the !
+! processes has a row on the process request tables with its own    !
+! process instance, and the rows are interrelated. Each row from the!
+! set of queued rows must be copied and the process instance changed!
+! while maintaining the relationship between the rows.              !
+!-------------------------------------------------------------------!
+
+   let $first_new_pi = 'Y'
+
+! Lock the table that contains the next process instance number     !
+! until all of the rows for the psjob have been created. This table !
+! will be read several times to get sequential process instance     !
+! numbers. It will be released by the commit transaction that       !
+! executes immediately after the call to this procedure.            !
+begin-sql
+   lock table PS_PRCSSEQUENCE in exclusive mode
+end-sql                                      
+
+! Within the set of queued rows for the psjob, the first row matches!
+! all of the input criteria. Read this row to obtain the value of   !
+! mainjobinstance. This value will be the same in all of the        !
+! subordinate rows of the psjob, therefore it will be used to find  !
+! all of the processes that belong to the psjob.                    !
+  let $sql-statement = 'create-new-psjob,select,psprcsrqst'
+
+begin-select on-error=sql-error
+psprcsrqst2.mainjobinstance
+
+   let #psjob_mainjobinstance  = &psprcsrqst2.mainjobinstance
+
+from psprcsrqst psprcsrqst2
+where psprcsrqst2.prcsname  = $process-name
+  and psprcsrqst2.runcntlid = $run-cntl-id
+  and psprcsrqst2.oprid     = $oprid
+  and psprcsrqst2.prcstype  = $process-type
+  and psprcsrqst2.runstatus = 5
+
+end-select
+
+! Select the queued records that will be used as a source of data to!
+! build the new records. Note that a process type of PSJob does not !
+! have rows in the ps_cdm_list or ps_cdm_auth table. Therefore outer!
+! joins are used for those tables so that data is still returned    !
+! from the other tables for PSJob process types.                    !
+  let $sql-statement = 'create-new-psjob,select,psprcsrqst,psprcsparms,psprcsque'
+
+if #psjob_mainjobinstance = 0    ! The sql above didn't find a queued row
+    let $monitor-error = 'Y'
+    let #return-status = 1
+    stop                         ! Stop process and send error code back
+else                             ! to the calling shell script (batch.sh)
+
+begin-select on-error=sql-error
+psprcsrqst3.prcsinstance
+psprcsrqst3.jobinstance
+psprcsrqst3.mainjobinstance
+psprcsrqst3.prcsjobseq
+psprcsrqst3.prcsjobname
+psprcsrqst3.prcstype
+psprcsrqst3.prcsname
+psprcsrqst3.prcsitemlevel
+psprcsrqst3.mainjobname
+psprcsrqst3.mainjobseq 
+psprcsrqst3.runlocation
+psprcsrqst3.opsys
+psprcsrqst3.dbtype
+psprcsrqst3.dbname
+psprcsrqst3.servernamerqst
+psprcsrqst3.servernamerun
+psprcsrqst3.rundttm
+psprcsrqst3.recurname
+psprcsrqst3.oprid
+psprcsrqst3.prcsversion
+psprcsrqst3.runstatus
+psprcsrqst3.rqstdttm
+psprcsrqst3.lastupddttm
+psprcsrqst3.begindttm
+psprcsrqst3.enddttm
+psprcsrqst3.runcntlid
+psprcsrqst3.prcsrtncd
+psprcsrqst3.continuejob
+psprcsrqst3.usernotified
+psprcsrqst3.initiatednext
+psprcsrqst3.outdesttype
+psprcsrqst3.outdestformat    
+psprcsrqst3.origprcsinstance
+psprcsrqst3.genprcstype
+psprcsrqst3.restartenabled
+psprcsrqst3.timezone  
+psprcsrqst3.psrf_folder_name
+psprcsrqst3.schedulename
+psprcsrqst3.retrycount
+psprcsrqst3.recurorigprcsinst
+psprcsrqst3.p_prcsinstance
+psprcsrqst3.diststatus  
+psprcsrqst3.prcscategory
+psprcsrqst3.prcscurrexpiredttm
+psprcsrqst3.runserveroption    ! new field in PT 8.48.09
+psprcsparms3.parmlist
+psprcsparms3.workingdir
+psprcsparms3.cmdline
+psprcsparms3.outdest 
+psprcsparms3.origparmlist 
+psprcsparms3.origoutdest
+psprcsparms3.prcsoutputdir
+psprcsparms3.prcsparmextflag
+psprcsparms3.prcsfilename
+psprcsque3.serverassign 
+psprcsque3.prcsprty
+psprcsque3.sessionidnum
+psprcsque3.recurdttm
+psprcsque3.email_web_rpt
+psprcsque3.email_log_flag
+psprcsque3.prcswinpop 
+psprcsque3.mcfren_url_id 
+psprcsque3.prcsstartdttm
+psprcsque3.runserveroption
+psprcsque3.tuxsvcid
+nvl(cdmlist3.content_descr,'  ')       &cdmlist3.content_descr
+nvl(cdmlist3.distnodename,'  ')        &cdmlist3.distnodename
+nvl(cdmlist3.admin_filename,'  ')      &cdmlist3.admin_filename
+nvl(cdmlist3.logfileonly_flag,'  ')    &cdmlist3.logfileonly_flag
+nvl(cdmlist3.filename,'  ')            &cdmlist3.filename
+nvl(cdmauth3.distid,'  ')              &cdmauth3.distid
+nvl(cdmauth3.distidtype,'  ')          &cdmauth3.distidtype
+
+   let $out_prcsinstance     = to_char(&psprcsrqst3.prcsinstance)
+   let #out_prcsinstance     = &psprcsrqst3.prcsinstance
+   let #out_prcsjobseq       = &psprcsrqst3.prcsjobseq
+   let $out_prcsjobname      = &psprcsrqst3.prcsjobname
+   let $out_prcstype         = &psprcsrqst3.prcstype
+   let $out_prcsname         = &psprcsrqst3.prcsname
+   let #out_prcsitemlevel    = &psprcsrqst3.prcsitemlevel
+   let $out_mainjobname      = &psprcsrqst3.mainjobname
+   let #out_mainjobseq       = &psprcsrqst3.mainjobseq 
+   let $out_runlocation      = &psprcsrqst3.runlocation
+   let $out_opsys            = &psprcsrqst3.opsys
+   let $out_dbtype           = &psprcsrqst3.dbtype
+   let $out_dbname           = &psprcsrqst3.dbname
+   let $out_servernamerqst   = &psprcsrqst3.servernamerqst
+   let $out_servernamerun    = &psprcsrqst3.servernamerun
+   let $out_rundttm          = &psprcsrqst3.rundttm
+   let $out_recurname        = &psprcsrqst3.recurname
+   let $out_oprid            = &psprcsrqst3.oprid
+   let #out_prcsversion      = &psprcsrqst3.prcsversion
+   let $out_runstatus        = &psprcsrqst3.runstatus
+   let $out_rqstdttm         = &psprcsrqst3.rqstdttm
+   let $out_lastupddttm      = &psprcsrqst3.lastupddttm
+   let $out_begindttm        = &psprcsrqst3.begindttm
+   let $out_enddttm          = &psprcsrqst3.enddttm
+   let $out_runcntlid        = &psprcsrqst3.runcntlid
+   let #out_prcsrtncd        = &psprcsrqst3.prcsrtncd
+   let #out_continuejob      = &psprcsrqst3.continuejob
+   let #out_usernotified     = &psprcsrqst3.usernotified
+   let #out_initiatednext    = &psprcsrqst3.initiatednext
+   let $out_outdesttype      = &psprcsrqst3.outdesttype
+   let $out_outdestformat    = &psprcsrqst3.outdestformat
+   let #out_origprcsinstance = &psprcsrqst3.origprcsinstance
+   let $out_genprcstype      = &psprcsrqst3.genprcstype
+   let $out_restartenabled   = &psprcsrqst3.restartenabled
+   let $out_timezone         = &psprcsrqst3.timezone
+   let $out_psrf_folder_name = &psprcsrqst3.psrf_folder_name
+   let $out_schedulename     = &psprcsrqst3.schedulename
+   let #out_retrycount       = &psprcsrqst3.retrycount
+   let #out_recurorigprcsinst = #psjob_mainjobinstance
+   let #out_p_prcsinstance   = &psprcsrqst3.p_prcsinstance
+   let $out_diststatus       = &psprcsrqst3.diststatus  
+   let $out_prcscategory     = &psprcsrqst3.prcscategory
+   let $out_prcscurrexpiredttm = &psprcsrqst3.prcscurrexpiredttm
+   let $out_runserveroption  = &psprcsrqst3.runserveroption
+   let $out_parmlist         = &psprcsparms3.parmlist
+   let $out_workingdir       = &psprcsparms3.workingdir
+   let $out_cmdline          = &psprcsparms3.cmdline
+   let $out_outdest          = &psprcsparms3.outdest
+   let $out_origparmlist     = &psprcsparms3.origparmlist
+   let $out_origoutdest      = &psprcsparms3.origoutdest
+   let $out_prcsoutputdir    = &psprcsparms3.prcsoutputdir
+   let $out_prcsparmextflag  = &psprcsparms3.prcsparmextflag
+   let $out_prcsfilename     = &psprcsparms3.prcsfilename
+   let $out_serverassign     = &psprcsque3.serverassign 
+   let #out_prcsprty         = &psprcsque3.prcsprty
+   let #out_sessionid        = &psprcsque3.sessionidnum
+   let $out_recurdttm        = &psprcsque3.recurdttm
+   let $out_email_web_rpt    = &psprcsque3.email_web_rpt
+   let $out_email_log_flag   = &psprcsque3.email_log_flag
+   let $out_prcswinpop       = &psprcsque3.prcswinpop 
+   let $out_mcfren_url_id    = &psprcsque3.mcfren_url_id 
+   let $out_prcsstartdttm    = &psprcsque3.prcsstartdttm 
+   let $out_runserveroption  = &psprcsque3.runserveroption
+   let $out_tuxsvcid         = &psprcsque3.tuxsvcid
+   let $out_content_descr    = &cdmlist3.content_descr
+   let $out_distnodename     = &cdmlist3.distnodename
+   let $out_admin_filename   = &cdmlist3.admin_filename
+   let $out_logfileonly_flag = &cdmlist3.logfileonly_flag
+   let $out_filename         = &cdmlist3.filename
+   let $out_distid           = &cdmauth3.distid
+   let $out_distidtype       = &cdmauth3.distidtype
+  
+   #debug9 show ' '
+   #debug9 show '========================='
+   #debug9 show 'In create-ps-job' 
+   #debug9 show 'Doing get-next-pi' 
+   do get-next-pi
+
+   ! When the new process instance is obtained for the first process !
+   ! in the group - which will be the psjob - display it in the      !
+   ! output. The batch.sh script greps out this display line to get  !
+   ! the process instance of the new job.                            !
+   ! Also, the process instance of the first process in the psjob    !
+   ! group will become the mainjobinstance of all processes in the   !
+   ! group. So save that value as well.                              !
+   ! And, the process instance of the first process in the psjob     !
+   ! group will become the jobinstance of all processes in the group !
+   ! EXCEPT if there is a subordinate psjob. So save that value also.!
+  
+   if $first_new_pi = 'Y'
+      display 'LAST PROCESS NUMBER: '  noline
+      display $out_lastprcsinstance
+      let $first_new_pi = 'N'
+      let #out_mainjobinstance  = #out_lastprcsinstance
+      let #out_jobinstance      = #out_lastprcsinstance
+      let #monitor_prcsinstance = #out_lastprcsinstance
+   end-if
+ 
+   ! For a process type of PSJob, there is no value in the parmlist  !  
+   ! field of the psprcparms record. So bypass the processing that   !
+   ! changes the parmlist field.                                     !
+   if $out_prcstype <> 'PSJob'
+      ! Find the process instance in the parmlist, and replace it    !
+      ! with the new process instance.                               !
+      display 'Parmlist before replacement: ' noline
+      display $out_parmlist 
+
+      let #len1 = length($out_prcsinstance)
+      let #len2 = length($out_lastprcsinstance)
+      let #len3 = 254
+
+      let #found = instr($out_parmlist, $out_prcsinstance, #foundx)
+
+      if #found > 0
+         let #found1 = #found - 1
+         let #next   = #found + #len1
+         let #totlen = #len3 - #found1 - #len1
+         let $out_parmlist1 = substr($out_parmlist, 1, #found1) || 
+                              $out_lastprcsinstance ||
+                              substr($out_parmlist,#next,#totlen)
+      else
+         display '**** ERROR >>>> NO STRING FOUND TO REPLACE...CANNOT OCCUR'
+         display '**** ERROR >>>> PATH : SQR PATH <<<< **** ERROR '           
+         let #return-status = 1
+         stop 
+      end-if
+
+      display 'Parmlist after replacement:  ' noline
+      display $out_parmlist1
+   else
+      display 'Prcs type of PSJob - no parmlist to modify'
+      let $out_parmlist1 = $out_parmlist
+   end-if
+
+   do set-prcsjobname
+   do get-next-contentid ! DXS, 06/02/07, added this to pull up log/trace 
+                         ! files from Process Monitor
+   do insert-prcsrqst
+   do insert-prcsparms
+   do insert-prcsque
+    #debug9 show '$out_prcstype ' $out_prcstype
+    #debug9 show '$out_prcsjobname ' $out_prcsjobname
+    #debug9 show '$out_prcsname ' $out_prcsname
+    #debug9 show '$out_outdesttype ' $out_outdesttype
+   if $out_prcstype <> 'PSJob' and $out_outdesttype = '6' ! DXS, 05/13/08
+      #debug9 show  'Doing insert-cdmlist'                ! Do this only if
+      do insert-cdmlist                                   ! child process is 
+      #debug9 show 'Doing insert-cdmauth'                 ! marked to run to WEB
+      do insert-cdmauth
+   end-if
+
+
+from psprcsrqst psprcsrqst3,
+     psprcsparms psprcsparms3,
+     psprcsque psprcsque3,
+     ps_cdm_list cdmlist3,
+     ps_cdm_auth cdmauth3
+where psprcsrqst3.mainjobinstance = #psjob_mainjobinstance
+  and psprcsrqst3.prcsinstance = psprcsque3.prcsinstance
+  and psprcsrqst3.prcsinstance = psprcsparms3.prcsinstance
+  and cdmlist3.prcsinstance(+) = psprcsrqst3.prcsinstance
+  and cdmauth3.prcsinstance(+) = psprcsrqst3.prcsinstance
+order by psprcsrqst3.prcsinstance
+                                                                 
+end-select
+end-if
+end-procedure
+
+!-------------------------------------------------------------------!
+begin-procedure set-prcsjobname
+! In the collection of processes that make up a psjob, there may be !
+! subordinate psjobs under the main psjob. These subordinate psjobs !
+! will have processes belonging to them. The jobinstance on the     !
+! process belonging to a subordinate psjob has to be set to the     !
+! value of the prcsinstance in the subordinate job row. This proc   !
+! figures that out.                                                 !
+!-------------------------------------------------------------------!
+
+  let $sql-statement = 'set-prcsjobname,select,psprcsrqst'
+
+begin-select on-error=sql-error
+psprcsrqst4.prcsinstance
+
+   let #out_jobinstance     = &psprcsrqst4.prcsinstance
+
+from psprcsrqst psprcsrqst4
+where psprcsrqst4.mainjobinstance  = #out_mainjobinstance 
+  and psprcsrqst4.prcsname = $out_prcsjobname 
+
+
+end-select
+
+end-procedure
+
+!-------------------------------------------------------------------!
+begin-procedure monitor-new-entry
+! Monitor the processing status of the psprcsrqst entry just created!
+! by this program. If the runstatus goes to success, exit this      !
+! procedure with an error code such that the program will end       !
+! gracefully. If the run status sits in queued or initiated for too !
+! long, exit with a bad error code. Any other runstatus exits with a!
+! bad error code immediately.                                       !
+! 5/15/2003 - "queued" and "initiated" are now treated as valid     !
+! states; the code to treat them as bad after a specified time is   !
+! left in place (commented out) for possibile future use.           !
+!-------------------------------------------------------------------!
+
+   let #init-count = 0
+   let #queue-count = 0
+   let $break-while = 'N'
+   let $sleep-cmd = '/usr/bin/sleep 15'
+
+   while 1 = 1
+      do get-runstatus
+      do get-current-datetime
+
+      evaluate $monitor-runstatus
+
+      when = '3'             !Error
+         display $SysDateTime noline
+         display ': Job ' noline
+         display $out_lastprcsinstance noline
+         display ' has abended. (runstatus ' noline
+         display $monitor-runstatus noline
+         display ')'
+         let $break-while = 'Y'
+         let $monitor-error = 'Y'
+         break
+      when = '5'             !Queued
+         display $SysDateTime noline
+         display ': Job ' noline
+         display $out_lastprcsinstance noline
+!         let #queue-count = #queue-count + 1
+!         if #queue-count < 20 
+!            display ' is still queued. (runstatus ' noline
+!            display $monitor-runstatus noline
+!            display ')'
+!            let $break-while = 'N'
+!         else
+!            display ' queued for five minutes. Gexbatch is abending.'
+!            let $break-while = 'Y'
+!            let $monitor-error = 'Y'
+!         end-if
+!         break
+!        Code to treat queued as valid
+         display ' is still queued. (runstatus ' noline
+         display $monitor-runstatus noline
+         display ')'
+         let $break-while = 'N'
+      when = '6'             !Initiated
+         display $SysDateTime noline
+         display ': Job ' noline
+         display $out_lastprcsinstance noline
+!         let #init-count = #init-count + 1
+!         if #init-count < 20 
+!            display ' is still initiated.  (runstatus ' noline
+!            display $monitor-runstatus noline
+!            display ')'
+!            let $break-while = 'N'
+!         else
+!            display ' initiated for five minutes. Gexbatch is abending.'
+!            let $break-while = 'Y'
+!            let $monitor-error = 'Y'
+!         end-if
+!         break
+!        Code to treat initiated as valid
+         display ' is still initiated. (runstatus ' noline
+         display $monitor-runstatus noline
+         display ')'
+         let $break-while = 'N'
+      when = '7'             !Processing
+         display $SysDateTime noline
+         display ': Job ' noline
+         display $out_lastprcsinstance noline
+         display ' is still processing. (runstatus ' noline
+         display $monitor-runstatus noline
+         display ')'
+         let $break-while = 'N'
+      when = '8'             !Cancelled
+         display $SysDateTime noline
+         display ': Job ' noline
+         display $out_lastprcsinstance noline
+         display ' has been cancelled. (runstatus ' noline
+         display $monitor-runstatus noline
+         display ')'
+         let $break-while = 'Y'
+         let $monitor-error = 'Y'
+         break
+      when = '9'             !Success
+         display $SysDateTime noline
+         display ': Job ' noline
+         display $out_lastprcsinstance noline
+         display ' is complete. (runstatus ' noline
+         display $monitor-runstatus noline
+         display ')'
+         let $break-while = 'Y'
+         let $monitor-error = 'N'
+         break
+      when = '10'            !Not successful
+         display $SysDateTime noline
+         display ': Job ' noline
+         display $out_lastprcsinstance noline
+         display ' is not successful. (runstatus ' noline
+         display $monitor-runstatus noline
+         display ')'
+         let $break-while = 'Y'
+         let $monitor-error = 'Y'
+         break
+      when = '17'             !Warning
+         display $SysDateTime noline
+         display ': Job ' noline
+         display $out_lastprcsinstance noline
+         display ' is complete with warnings. (runstatus ' noline
+         display $monitor-runstatus noline
+         display ')'
+         let $break-while = 'Y'
+         let $monitor-error = 'N'
+         break
+      when-other
+         display $SysDateTime noline
+         display ': Job ' noline
+         display $out_lastprcsinstance noline
+         display ' not found in psprcsrqst. Gexbatch is abending (runstatus ' noline
+         display $monitor-runstatus noline
+         display ')'
+         let $break-while = 'Y'
+         let $monitor-error = 'Y'
+         break
+
+      end-evaluate
+
+      if $break-while = 'Y'
+         break
+      end-if
+
+call system using $sleep-cmd #sleep-cmd-status
+
+   end-while
+
+end-procedure
+
+!-------------------------------------------------------------------!
+begin-procedure get-runstatus
+! Read the psprcsrqst table to get the runstatus of the new entry   !
+! created by this program. If the new entry is somehow gone, the    !
+! runstatus is set to xx.                                           !
+!-------------------------------------------------------------------!
+
+   let $monitor-runstatus = 'xx'
+   let $sql-statement = 'get-runstatus,select,psprcsrqst'
+
+begin-select on-error=sql-error
+rqst.runstatus
+
+   let $monitor-runstatus = &rqst.runstatus
+
+from psprcsrqst rqst
+where  rqst.prcsinstance = #monitor_prcsinstance
+end-select
+
+end-procedure
+
+#include 'reset.sqc'     ! end of program
+#include 'curdttim.sqc'  ! get-current-datetime procedure
+#include 'datetime.sqc'  ! routines for date and time formatting
+#include 'number.sqc'    ! routines to format numbers
+#include 'prcsapi.sqc'   ! update process request api
+#include 'prcsdef.sqc'   ! update process request variable declare
+#include 'tranctrl.sqc'  ! routines for platform database processing
+#include 'datemath.sqc'  ! does the date-math functions
+#include 'validdt.sqc'   ! validates native date
+#include 'stdapi.sqc'    ! get run control
+! #include 'gexfc.sqc'     ! To get oc_id_num

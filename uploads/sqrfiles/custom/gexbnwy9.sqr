@@ -1,0 +1,733 @@
+!***********************************************************************
+! GEXBNWY9:                                                            *
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module is the confidential and proprietary information of       *
+! Giant Eagle, Inc.; it is not to be copied, reproduced, or transmitted*
+! in any form, by any means, in whole or in part, nor is it to be used *
+! for any purpose other than that for which it is expressly provided   *
+! without the written permission of Giant Eagle.                       *
+!                                                                      *
+!                                                                      *
+!***********************************************************************
+!                         MODIFICATION HISTORY                         *
+!***********************************************************************
+!  ID#     INITIALS    DATE           DESCRIPTION OF THE CHANGE	       *
+!***********************************************************************
+!  GBNC031   DAH       06/04/1998     INITIAL CREATION                 *
+!                                     (used GEXBNWM4 as a template)    *
+!                                                                      *
+!            DAH       06/15/1998     Deleted the #week_hrs > 0 code.  *
+!                                     Added code to move COMPANY to    *
+!                                     $company.    Tagged as GEX001.   *
+!                                                                      *
+!            SXK       07/27/1998     Added code to retrieve last pay  *
+!				      end date for the year and use it *
+!				      as run control date. Also,changed*
+!				      code to get next pay begin dt    *
+!				      after the last pay end date for  *
+!				      the year and use it as the insert*
+!				      date. Deleted REHIRE process     *
+!                                                                      *
+!            GBD       08/14/2002     Added #Include 'gexbnah9.sqc'    *
+!                                                                      *
+!            AXL       10/01/2002     Prevent insert if CONFIG values  *
+!                                     do not change.                   *
+!                                                                      *
+!  HR-10418  AXL       10/28/2003     Allow the sqr to run after Dec   *
+!                                     31st.                            *
+!                                     Fix joins to EMPL_RCD to handle  *
+!                                     multi-job employees.             *
+!  GEX-MXT   MXT       09/11/2007     HCM 9.0 Upgrade                  *
+!  GEX-MXT     02/14/2007     Date format changes reverted back        *
+!***********************************************************************
+
+
+#include 'setenv.sqc' !Set environment
+
+begin-setup
+
+#include 'setup32a.sqc'
+
+declare-report Report-log
+Printer-Type=HPLASERJET
+  layout=DEFAULT
+end-declare
+
+end-setup
+
+!*********************************************************************
+!Initial processing, retrieving current dates and calls the main 
+!procedure to do the processing.                                     
+!*********************************************************************
+begin-report
+#debug9 show 'gexbnwy9.begin-report'
+
+!  use-report Report-log
+
+  do Init-DateTime
+  do Init-Number
+  do stdapi-init
+  
+  move 'GEXBNWY9' to $ReportID
+  move 'HBC Services Yearly Hrs-Based on Actual Hours Worked' to $ReportTitle
+  show '$ReportID=' $ReportID
+  show '$ReportTitle=' $ReportTitle 
+  
+  do Get-Current-DateTime
+  !let $testdt='31-DEC-2003' AXL temp remove before final swat
+  !let $testdt='02-JAN-2004' AXL temp remove before final swat
+  !let $reportdate = datetostr(strtodate($testdt,'DD-MON-YYYY'),'MM-DD-YYYY') AXL temp remove before final swat
+  let $reportdate = datetostr(strtodate($reportdate,'MM/DD/YY'),'MM-DD-YYYY') !GEX-MXT COMMENTED FOR UPGRADE 9.0 ON 09/11/2007  !GEX-MXT uncommented for upgrade
+  
+  show '$reportdate-test ' $reportdate
+  let $reportdate_mm = substr($reportdate,1,2)
+  let $reportdate_dd = substr($reportdate,4,2)
+  let $reportdate_yy = substr($reportdate,7,4)   !AXL 10/28/2003 Was 7,2
+  #debug8 show '$reportdate_mm=' $reportdate_mm 
+  #debug8 show '$reportdate_dd=' $reportdate_dd 
+  #debug8 show '$reportdate_yy=' $reportdate_yy 
+
+  !do MakeYear4Digits ($reportdate_yy)		!AXL 10/28/2003 Disable
+
+  !SXK 07/27/98 Added code to make it run as of last pay end date for 
+  !             the year and use next pay begin date as the date used
+  !             to do the insert
+
+  if $reportdate_mm = '01'
+     !let $prev_year = to_number($reportdate_yy) - 1			AXL 10/28/2003
+     let $prev_year = edit((to_number($reportdate_yy) - 1),'9999')  	!AXL 10/28/2003
+  else
+     let $prev_year = $reportdate_yy
+  end-if
+
+  do get-last-pay-end-dt
+
+  move $pay_end_dt to $curr_mm_dt_dbf
+  #debug8 show '$curr_mm_dt_dbf: ' $curr_mm_dt_dbf 
+  move $curr_mm_dt_dbf to $effdt_dbf
+
+  let $reportdate_ccyyyy = $reportdate_mm||'/'||$reportdate_dd||'/'||$reportdate_yy
+  #debug8 show '$reportdate_ccyyyy=' $reportdate_ccyyyy 
+
+  do format-datetime($reportdate_ccyyyy,$reportdate_ccyy,{DEFMDY},'','NATIVE') 
+  #debug8 show '$reportdate_ccyy=' $reportdate_ccyy
+
+  do Report
+
+  do Commit-Transaction                 	
+
+  date-time () hh:mi:ss &timeEnded
+  display 'Report Ended: ' noline
+  display &timeEnded
+  do stdapi-term
+
+end-report
+
+!*********************************************************************
+!If this Program is being executed through process scheduler, 
+!the run control parameters and calls the main processing procedure.
+!Otherwise, interrogates the user for the run control parameters and 
+!validates them. If the run control parameters are invalid, stops the
+!execution.
+!*********************************************************************
+begin-procedure Report
+#debug9 show 'gexbnwy9.report'
+
+  date-time () hh:mi:ss &timeBegan
+  display 'Report Began: ' noline
+  display &timeBegan
+
+  move 'N' to $Errorfound
+  move 6 to #clicker_count_max
+
+!if $prcs_process_instance = ''
+!    input $rnctl_date 'Enter Run Control Date({Prompt-Date}): ' type=char
+!    do format-datetime($rnctl_date,$rnctl_date_dbf,{prompt-mask},'','native')
+!else
+!    do Select-Parameters
+!    if $found = 'N'
+!        goto report-exit
+!    end-if
+!   move &RC.rnctl_date to $rnctl_Date
+!end-if
+
+  move $reportdate_ccyyyy to $rnctl_date
+
+  let $rnctl_mm = substr($rnctl_Date,1,2)
+  let $rnctl_dd = substr($rnctl_Date,4,2)
+  let $rnctl_yyyy = substr($rnctl_Date,7,4)       
+  let $rnctl_yy  = substr($rnctl_date,9,2)
+
+  !AXL 10/28/2003  New functionality to allow running after 12/31 - Begin
+  if $rnctl_mm = '01'
+     let $rnctl_yyyy = edit((to_number($rnctl_yyyy) -1),'9999')
+     let $rnctl_yy   = edit((to_number($rnctl_yy) -1),'99')
+  else
+     let $rnctl_yyyy = $rnctl_yyyy
+     let $rnctl_yy   = $rnctl_yy
+  end-if
+  !AXL 10/28/2003  New functionality to allow running after 12/31 - End
+  move $rnctl_yyyy to #rnctl_yyyy
+  move $rnctl_yy to #rnctl_yy
+
+  do process-employee-data
+Report-Exit:
+
+  date-time () hh:mi:ss &timeProcess
+  display #InputTran 99999 noline
+  display ' Transactions Processed: ' 
+  display #job_inserts 99999 noline
+  display ' Transactions Inserted into JOB: ' noline
+
+  display &timeProcess
+
+end-procedure
+
+!*********************************************************************
+!Prints the header information in the report log.
+!*********************************************************************
+
+begin-heading 8 for-reports=(report-log)
+#debug9 show 'gexbnwy9.begin-heading'
+
+do get-bp-description
+
+unstring $reporttitle by '(' into $reporttitle $temp_right
+
+concat '(' with $reporttitle
+concat $prev_bp_name with $reporttitle
+concat '-' with $reporttitle
+concat &DES.DESCR with $reporttitle
+concat ')' with $reporttitle
+ #Include 'stdhdg01.sqc'
+
+!  date-time () DD-MON-YYYY &curr_Date 
+!  print &curr_Date ()
+  position (-1)
+  print 'Report Log' () center bold
+
+  position (+3)
+  print 'Trans#' (,1) bold
+  print 'Emplid' (,18) bold
+  print 'Message' (,50) bold
+  print '-' (+1,1,127) fill
+ 
+
+end-heading
+
+!*********************************************************************
+!Prints the footer in the report log
+!*********************************************************************
+
+begin-footing 2 for-reports=(Report-log)
+#debug9 show 'gexbnwy9.begin-footing'
+
+page-number (1,108) 'Page '  
+last-page () ' of ' '.'
+
+end-footing
+
+!*********************************************************************
+!Determines previous month's number of weeks to find out the weekly 
+!hours worked for each employee. Calls the main benefits participation
+!logic
+!*********************************************************************
+
+Begin-Procedure Process-Employee-Data
+#debug9 show 'gexbnwy9.Process-Employee-Data'
+
+move 'N' to $errorfound
+move 'N' to $found
+!********************************************************
+!  01/07/98 - modification
+!  Company and Paygroup set here to use when querying the
+!  Pay Calendar to retrieve the correct check date rows.
+!  This is used for testing, but more SQL needs added to
+!  retrieve the correct Company and Paygroup from the 
+!  Elig Rules for the Ben Pgm instead of hardcoding the
+!  values here.  We could also select one EE that is enrolled
+!  in the current BP and use the Company & Paygroup from the
+!  EE's JOB record to query the calendar with.  This SQR will
+!  execute for more than GEMCO Retail Benefit Programs, but
+!  all BPs will be part of Retail - paid on Thursday.
+!********************************************************
+! move 'GEI' to $Co_Name   ! need to add some sql to get right company
+! move 'RET' to $Pay_Name
+
+
+!do determine-prev-month-pay-period
+
+!if ($errorfound = 'Y') or ($found = 'N')
+!   goto skip-processing
+!end-if
+
+!*******************************************
+!Added logic to go to GEX_SQR_PROCESS table and retrieves all the 
+!benefit programs that need to be run through this SQR
+!*******************************************
+
+  do Retrieve-benefit-pgms
+
+  if $ben_pgm_found = 'N'
+     display 'No Benefit Programs found for Process:GEXBNWY9'
+  end-if
+
+
+
+skip-processing:
+
+end-procedure
+
+!*********************************************************************
+!Retrieves each employee who participated in G01 Benefit Program and
+!calls necessary procedures to determine their weekly hours. 
+!********************************************************************* 
+
+begin-procedure process-benefit-partic
+#debug9 show 'gexbnwy9.process-benefit-partic'
+
+move 'N' to $errorfound
+move 'N' to $beninfo_found
+
+#debug8 show '$bp_name=' $bp_name
+if $log_printed = 'Y'
+   use-report report-log
+   new-page
+end-if
+move $bp_name to $prev_bp_name
+use-report report-log
+
+let #whse_seq = 5
+
+!CWB 01/02/2001 BEGIN 
+let $year_byte_string =  ' AND substr(D.ELIG_CONFIG2,4,7) in '||
+			'('||''''||'A'||&sqr.gex_init_byte||'00000'||''''||
+		','||''''||'A'||&sqr.gex_year_byte||'00000'||''''||
+                ','||''''||'C'||&sqr.gex_init_byte||'00000'||''''||
+		','||''''||'C'||&sqr.gex_year_byte||'00000'||''''||')'
+let $init_compare_string = 'A'||&sqr.gex_init_byte||'00000'
+let $init_compare_string_1 = 'C'||&sqr.gex_init_byte||'00000'
+let $year_compare_string = 'A'||&sqr.gex_year_byte||'00000'
+let $year_compare_string_1 = 'C'||&sqr.gex_year_byte||'00000' 
+show '$year_byte_string:      ' $year_byte_string
+show '$init_compare_string:   ' $init_compare_string
+show '$init_compare_string_1: ' $init_compare_string_1
+show '$year_compare_string:   ' $year_compare_string
+show '$year_compare_string_1: ' $year_compare_string_1
+
+
+let #insert_yy = to_number($rnctl_yyyy) + 1
+let $insert_yy = to_char(#insert_yy)
+let $insert_mmdd = '01/01/'
+let $insert_effdt = $insert_mmdd||$insert_yy
+do format-datetime($insert_effdt,$insert_effdt_dbf,{DEFMDY},'','NATIVE') 
+#debug8 show '$insert_effdt_dbf ' $insert_effdt_dbf
+
+!do get-contract-pay-end-dt
+
+let $skip_employee_processing = 'N'
+
+!CWB 01/02/2001 END 
+
+
+begin-select on-error=sql-error-found('process-benefit-partic')
+B.EMPLID  &emplid
+to_char(B.EFFDT,'MM/DD/YYYY') &b.effdt
+C.ERNCD_SPCL         
+C1.FIELDNAME
+C1.FIELDNAME2
+D.EMPL_RCD
+D.EFFDT
+D.EFFSEQ
+D.ELIG_CONFIG1
+D.ELIG_CONFIG2
+D.COMPANY
+D.DEPTID
+D.ACCT_CD
+D.JOBCODE
+D.GEX_VOLUN_LOW_HRS
+D.EMPL_STATUS 
+E.NAME
+
+ #debug7 show '***** Row from five table join ******'
+ #debug7 show '&EMPLID=' &EMPLID 
+ #debug7 show '&B.EFFDT=' &B.EFFDT  
+ #debug7 show '&C.ERNCD_SPCL=' &C.ERNCD_SPCL         
+ #debug7 show '&C1.FIELDNAME=' &C1.FIELDNAME 
+ #debug7 show '&C1.FIELDNAME2=' &C1.FIELDNAME2
+ #debug7 show '&D.EMPL_RCD=' &D.EMPL_RCD
+ #debug7 show '&D.EFFDT=' &D.EFFDT 
+ #debug7 show '&D.EFFSEQ='  &D.EFFSEQ
+ #debug7 show '&D.ELIG_CONFIG1=' &D.ELIG_CONFIG1 
+ #debug7 show '&D.ELIG_CONFIG2=' &D.ELIG_CONFIG2
+ #debug7 show '&D.COMPANY=' &D.COMPANY 
+ #debug7 show '&D.DEPTID=' &D.DEPTID 
+ #debug7 show '&D.ACCT_CD=' &D.ACCT_CD 
+ #debug7 show '&D.JOBCODE=' &D.JOBCODE 
+ #debug7 show '&D.GEX_VOLUN_LOW_HRS=' &D.GEX_VOLUN_LOW_HRS 
+ #debug7 show '&D.EMPL_STATUS=' &D.EMPL_STATUS  
+ #debug7 show '&E.NAME=' &E.NAME 
+         SHOW 'vendcxb EMPLID= ' &EMPLID  !VENDCXB
+
+   move 'Y' to $beninfo_found
+   move &emplid to $emplid
+!   display $emplid
+
+
+   if RTRIM(&C1.FIELDNAME,' ') <> ''
+!      display 'FIELDNAME ' noline
+!      display &c1.fieldname
+      Let $RelatedTo = 'Y'
+!      display '$RelatedTo ' noline
+!      display $RelatedTo 
+   else 
+      let $RelatedTo = 'N'
+   end-if
+
+   if RTRIM(&C1.FIELDNAME2,' ') <> ''
+!      display 'FIELDNAME2 ' noline
+!      display &c1.fieldname2
+      Let $RelatedTo2 = 'Y'
+!      display '$RelatedTo2 ' noline
+!      display $RelatedTo2 
+   else 
+      let $RelatedTo2 = 'N'
+   end-if
+
+   move 12 to #end_month
+   move $prev_year to $end_yy
+   move 1 to #start_month
+   
+
+   display 'Start Month:' noline
+   display #start_month
+   display 'End Month:' noline
+   display #end_Month
+   display 'End Year:' noline
+   display $end_YY
+
+! CWB 01/02/2001 BEGIN 
+!   show '$init_compare_string: ' $init_compare_string
+
+    let $skip_employee_processing = 'N'
+
+   if substr(&D.ELIG_CONFIG2,4,7) = $init_compare_string 
+
+      do get-job-effdt
+   show '$job_effdt_found: ' $job_effdt_found !vendcxb uncomment
+      if $job_effdt_found = 'Y'
+
+        do convert-to-dtu-date($job_effdt,$job_effdt_dtu)    
+        do convert-to-dtu-date($pay_end_dt,$pay_end_dt_dtu)
+     
+        do dtu-add-months($pay_End_Dt_dtu,-12,$prev_year_date)
+  
+        if $job_effdt_dtu > $prev_year_date
+           let $skip_employee_processing = 'Y'
+        end-if
+      else
+        let $skip_employee_processing = 'Y'
+        let $job_effdt_dtu = ' '
+      end-if
+   end-if
+ 
+   #debug7 display 'Job Effdt:' noline
+   #debug7 display $job_effdt_dtu
+   #debug7 display 'Prev Year Date:' noline
+   #debug7 display $prev_year_date
+   #debug7 display '$skip_employee_processing: ' noline
+   #debug7 display $skip_employee_processing
+            
+   if $skip_employee_processing = 'N'
+
+      let #rnctl_yyyy = to_number($rnctl_yyyy)
+
+      move $rnctl_yyyy to $start_yy
+      move $rnctl_yyyy to $end_yy      
+      
+      let #week_hrs = 0
+      let #sum_mtd_hrs = 0
+
+      move &D.COMPANY to $company              
+
+      if $start_yy = $end_yy
+         show 'going to calculate-sum-of-mtd-hrs-4' !vendcxb uncomment
+         do calculate-sum-of-mtd-hrs-4
+      else
+         show 'going to calculate-sum-of-mtd-hrs-in-range'  !vendcxb uncomment
+         do calculate-sum-of-mtd-hrs-in-range
+      end-if
+!  end-if
+
+!CWB 01/02/2000 END 
+
+   #debug8 show '#sum_mtd_hrs=' #sum_mtd_hrs
+
+   move #week_hrs to $week_hrs
+  if #week_hrs <= 0 
+   do error-found
+   move 'N' to $errorfound
+   print 'No MTD_HRS found in PS_EARNINGS_TBL' (,34)
+   print ':ERNCD=' ()
+   print &C.ERNCD_SPCL ()
+  end-if
+
+  
+
+!    if ($errorfound = 'N') and (#week_hrs > 0)   !GEX001-del
+    if ($errorfound = 'N')                        !GEX001-add
+         move 'N' to $atleast_one_found
+         add 1 to #inputtran
+         move $pay_end_dt to $curr_mm_dt_dbf
+!         move $curr_mm_dt_dbf to $effdt_dbf
+         move $insert_effdt_dbf to $effdt_dbf
+         do process-elig-rules
+         if $errorfound = 'N'
+            do evaluate-config-value
+         end-if
+     end-if
+  end-if 
+FROM PS_BEN_PROG_PARTIC B,
+     PS_SPCL_EARNS_TBL C,
+     PS_BEN_DEFN_PGM C1,
+     PS_JOB D,
+     PS_PERSONAL_DATA E
+WHERE B.BENEFIT_PROGRAM = $BP_name
+    !AND B.EMPLID ='156346406'  !VENDCXB Testing
+  AND B.EMPLID = D.EMPLID
+  AND B.EMPL_RCD = D.EMPL_RCD
+  AND D.EMPL_STATUS IN ('A','L','P')
+!  AND D.REG_TEMP = 'E'    ! Regular Part time          !not needed
+  AND substr(D.ELIG_CONFIG2,4,7) in ('AH00000','CH00000','AZ00000','CZ00000')
+  AND B.EMPLID = E.EMPLID
+  AND C1.BENEFIT_PROGRAM = B.BENEFIT_PROGRAM
+  AND C1.GEX_SPCL_ACCUM_CD = C.ERNCD_SPCL
+  AND B.EFFDT = (SELECT MAX(EFFDT)
+                   FROM PS_BEN_PROG_PARTIC
+                  WHERE EMPLID = B.EMPLID
+                    AND EMPL_RCD = B.EMPL_RCD
+                    AND EFFDT <= $curr_mm_dt_dbf)
+  AND C1.EFFDT = (SELECT MAX(EFFDT)
+                   FROM PS_BEN_DEFN_PGM
+                  WHERE BENEFIT_PROGRAM = $BP_name
+!                    AND GEX_SPCL_ACCUM_CD = C.ERNCD_SPCL
+                    AND EFFDT <= $curr_mm_dt_dbf)
+  AND C.EFFDT = (SELECT MAX(C3.EFFDT)
+                   FROM PS_SPCL_EARNS_TBL C3 
+                  WHERE C3.ERNCD_SPCL = C.ERNCD_SPCL
+                    AND C3.EFF_STATUS = 'A'
+                    AND C3.EFFDT <= $curr_mm_dt_dbf)
+  AND D.EFFDT = (SELECT MAX(EFFDT)
+                   FROM PS_JOB
+                  WHERE EMPLID = D.EMPLID
+                    AND EMPL_RCD = D.EMPL_RCD
+                    AND EFFDT <= $curr_mm_dt_dbf)
+  AND D.EFFSEQ = (SELECT MAX(EFFSEQ)
+                   FROM PS_JOB
+                  WHERE EMPLID = D.EMPLID
+                    AND EMPL_RCD = D.EMPL_RCD
+                    AND EFFDT = D.EFFDT)
+end-SELECT
+
+if $beninfo_found = 'N'
+   do error-found
+   print 'No Benefit Participation information found' (,34)
+end-if
+
+end-procedure
+
+!*********************************************************************
+!Compares the existing job table config2 field and the calculated field
+!and processes further
+!*********************************************************************
+
+begin-procedure Evaluate-config-value
+#debug9 show 'gexbnwy9.Evaluate-config-value'
+
+move &D.ELIG_CONFIG2 to $elig_config2_job
+move $ee_config2_val to $elig_config2
+
+let $ee_config2_val_nospaces = rtrim($ee_config2_Val,' ')
+let $ee_config2_job_nospaces = rtrim($elig_config2_job,' ')
+
+let $elig_config2_1to3 = substr($elig_config2_job,1,3)
+let $elig_config2_4to4 = substr($elig_config2_job,4,1)
+let $elig_config2_6to10 = substr($elig_config2_job,6,5)
+
+let $elig_config2_val_5to5 = substr($elig_config2,5,1)
+
+!For this warehouse elig config field2, the new byte value for elig rule
+!is in row seq#=5, but is placed in elig config field2 position 4 and 
+!an 'H' is placed in position 5
+let $elig_config2 = $elig_config2_1to3||$elig_config2_val_5to5||&Sqr.gex_year_byte
+                    ||$elig_config2_6to10
+
+#debug6 show 'Employee Evaluated config2=' $elig_config2 
+#debug6 show 'Job Config2 Value: $elig_config2_job=' $elig_config2_job
+
+! #debug6 show 'Pgm Config2 Value:' 
+! #debug6 show '$ee_config2_val_nospaces=' $ee_config2_val_nospaces 
+! #debug6 show '$ee_config2_val_nospaces=' $ee_config2_val_nospaces
+! #debug6 show '$ee_config2_job_nospaces=' $ee_config2_job_nospaces
+
+#debug6 show '$elig_config2_4to4='   $elig_config2_4to4 
+#debug6 show '$elig_config2_val_5to5=' $elig_config2_val_5to5 
+
+!if ($elig_config2_4to4 = 'A' and $elig_config2_val_5to5 = 'H')
+!   or
+!   ($elig_config2_4to4 = 'C' and $elig_config2_val_5to5 = 'H') 
+
+   if ($elig_config2_4to4 = 'A') or ($elig_config2_4to4 = 'C') 
+
+   !CWB 01/02/2001 BEGIN 
+   !move $pay_begin_dt to $curr_mm_dt_dbf
+   !move $curr_mm_dt_dbf to $effdt_dbf
+
+     let $effdt_dbf = $insert_effdt_dbf
+
+   !CWB 01/02/2001 END   
+   !AXL 10/1/2002  Prevent insert if CONFIG the same - Begin
+     if $elig_config2_job <> $elig_config2
+        do insert-procedure
+        add 1 to #job_inserts
+     end-if
+   !AXL 10/1/2002  Prevent insert if CONFIG the same - End
+
+   else
+
+   #debug6 show 'No Change necessary to Employee Eligibility. No action taken.'
+
+   end-if           
+
+end-procedure
+
+!*********************************************************************
+!Gets the last pay end date of the year
+!*********************************************************************
+
+Begin-Procedure get-last-pay-end-dt
+#debug9 show 'gexbnwy9.get-last-pay-end-dt'
+#debug9 show '$prev_year: ' $prev_year
+
+begin-select on-error=sql-error-found('Get-Last-Pay-End-Dt')
+PAY.PAY_END_DT
+
+  move &PAY.PAY_END_DT to $pay_end_Dt
+  do convert-to-dtu-date($pay_end_dt,$pay_end_dt_dtu)
+  do dtu-add-days($pay_end_Dt_dtu,1,$pay_begin_dt_dtu)
+  do convert-from-dtu-date($pay_begin_dt_dtu,$pay_begin_dt)
+  display 'Pay End Date:' noline
+  display $pay_end_Dt
+  display 'Pay begin dt:'  noline
+  display $pay_begin_dt 
+
+FROM PS_PAY_CALENDAR PAY
+
+WHERE PAY.COMPANY = 'GEI'
+  AND PAY.PAYGROUP = 'W03'
+  AND PAY.PAY_CONFIRM_RUN = 'Y'
+  AND PAY.PAY_OFF_CYCLE_CAL = 'N'
+  AND PAY.CHECK_DT = (SELECT MAX(CHECK_DT)
+   		      FROM PS_PAY_CALENDAR
+		     WHERE COMPANY = PAY.COMPANY
+		       AND PAYGROUP = PAY.PAYGROUP
+                       AND PAY_OFF_CYCLE_CAL = 'N'
+		       AND PAY_CONFIRM_RUN = 'Y'  
+		       AND substr(to_char(CHECK_DT,'MM/DD/YYYY'),7,4) = $prev_year)
+end-select
+
+end-procedure
+
+!CWB 01/02/2000 END 
+
+!*********************************************************************
+!Retrieves Maximum of AH00000 config2 row from JOB table where
+!employee first eligible to AH00000 from non-AH00000 config2
+!*********************************************************************
+
+Begin-Procedure Get-job-Effdt
+
+move 'N' to $job_effdt_found
+
+Begin-Select on-error=sql-error-found('Get-job-Effdt')
+HB.EFFDT
+
+  move 'Y' to $job_effdt_Found
+  move &HB.EFFDT to $job_effdt
+  exit-select
+
+FROM PS_JOB HB
+
+WHERE HB.EMPLID = $emplid
+  AND HB.EMPL_RCD = &D.empl_rcd  !AXL 10/28/2003 fix join to empl_rcd
+  AND HB.EFFDT = (SELECT MIN(EFFDT)
+		    FROM PS_JOB
+		   WHERE EMPLID = $emplid
+		     AND EMPL_RCD = &D.empl_rcd		!AXL 10/28/2003
+                     AND substr(ELIG_CONFIG2,4,7) = $init_compare_string   !'AI00000'
+		     AND EFFDT > (SELECT MAX(MN.EFFDT)
+                                     FROM PS_JOB MN
+                                    WHERE MN.EMPLID = $emplid
+                                      AND MN.EMPL_RCD = &D.empl_rcd	!AXL 10/28/2003
+                                      AND substr(MN.ELIG_CONFIG2,4,7) <> $init_compare_string !'AI00000'
+                                      AND MN.EFFDT <= $pay_end_Dt))
+end-select
+
+if $job_effdt_found = 'N'
+   do get-min-enroll-row
+   if $job_effdt_found = 'N'
+      do error-found
+     !SXK 07/26/1999 Begin 
+      print 'No previous ' (,34)
+      print $init_compare_string ()
+      print ' row found for Emplid:' ()
+     !SXK 07/26/1999 End
+      print $emplid ()
+   end-if
+end-if
+
+end-procedure
+
+!*********************************************************************
+!Retrieves Minimum AH00000 from Job
+!*********************************************************************
+
+Begin-Procedure Get-min-enroll-row
+
+Begin-Select on-error=sql-error-found('Get-Min-Enroll_row')
+HB1.EFFDT
+
+  move 'Y' to $job_effdt_Found
+  move &HB1.EFFDT to $job_effdt
+  exit-select
+
+FROM PS_JOB HB1
+
+WHERE HB1.EMPLID = $emplid
+  AND HB1.EMPL_RCD = &D.empl_rcd	!AXL 10/28/2003
+  AND HB1.EFFDT = (SELECT MIN(EFFDT)
+		    FROM PS_JOB
+		   WHERE EMPLID = $emplid
+		     AND EMPL_RCD = &D.empl_rcd		!AXL 10/28/2003
+                     AND substr(ELIG_CONFIG2,4,7) = $init_compare_string  !'AI00000'
+		     AND EFFDT <= $pay_end_Dt)
+end-select
+
+end-procedure
+
+!CWB 01/02/2000 END 
+  
+#Include 'tranctrl.sqc'  !Common Transaction Control Procedures
+!*#Include 'reset.sqc'     !Reset printer procedure
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'payrnctl.sqc'  !Select-Parameters
+#Include 'stdapi.sqc'    !Get_Run_Control Procedure
+#Include 'datemath.sqc'  !Does the date-math functions
+#Include 'readxlat.sqc'  !Read xlattable
+!#Include 'gexbnahp.sqc'  !retrieve init and year bytes from gex_sqr_process
+#Include 'gexbnah9.sqc'  !retrieve init and year bytes from gex_sqr_process

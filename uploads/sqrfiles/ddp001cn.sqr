@@ -1,0 +1,578 @@
+!************************************************************************
+!  DDP001CN:  Write Direct Deposit Transmittal file - CPA Standard      *
+!************************************************************************
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+!   This module contains confidential and proprietary information      *
+!   of Oracle; it is not to be copied, reproduced, or transmitted      *
+!   in any form, by any means, in whole or in part, nor is it to       *
+!   be used for any purpose other than that for which it is            *
+!   expressly provided under the applicable license agreement.         *
+!                                                                      *
+!   Copyright (C) 2008 Oracle. All Rights Reserved.                    *
+!***********************************************************************
+!                                                                      *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+!          $Date:  2008/04/03:12:11:41                                 !
+!       $Release:  HR9                                                 !
+!    $Resolution:  741852                                              !
+!                                                                      *
+!***********************************************************************
+
+#Include 'setenv.sqc'    !Set environment
+#Include 'setup31.sqc'   !Printer and page-size initialization
+#Include 'getcodta.sqc'  !Get-Company-Data procedure
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'payinit.sqc'   !Report Initialization and Timing
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'stdapi.sqc'    !Update Process API
+#Include 'payrnctl.sqc'  !Get-Run-Control procedure
+
+begin-report
+  do Init-Report
+  do Stdapi-Term
+end-report
+
+begin-procedure Init-Report
+  display 'Creating Canadian Direct Deposit Transmittal Files'
+
+  do Init-DateTime
+  do Init-Number
+  do Stdapi-Init
+
+  move 'N' to $CyclePrompts     !Don't prompt for On/Off cycle in PAYINIT
+  do Payroll-Report-Initialization
+end-procedure
+
+
+begin-PROCEDURE Report
+
+  if $Prcs_Process_Instance = ''
+    input $OrigSundryInfo 'Enter Description (15 character max)'
+  else
+    move $RC_PAYINIT.Text15 to $OrigSundryInfo
+  end-if
+
+  move '1' to $Year4
+  do Format-DateTime($AsOfToday, $Temp, {DEFCMP}, '', '')
+  do Get-Day-Number($Temp, $Year_Days, $Day_Number)
+  let  $CreateDt = '0' || $Day_Number
+
+  move  0  to #File_Count
+
+  if $SlctRunID <> '*'
+      move  'AA.RUN_ID = '''                to $DdovbankID
+      concat $SlctRunID                   with $DdovbankID
+      concat ''''                         with $DdovbankID
+  else
+      move  'AA.COMPANY = '''               to $DdovbankID
+      concat $SlctCompany                 with $DdovbankID
+      concat ''' AND AA.PAYGROUP = '''    with $DdovbankID
+      concat $SlctPayGroup                with $DdovbankID
+      concat ''' AND AA.PAY_END_DT = '''  with $DdovbankID
+      concat $SlctPayEndDt                with $DdovbankID
+      concat ''''                         with $DdovbankID
+  end-if
+
+begin-SELECT
+AA.COMPANY
+AA.PAYGROUP
+AA.PAY_END_DT
+AA.CHECK_DT
+BB.SRC_BANK_ID
+BB.DD_SRC_BANK_ID
+
+ if isblank(&BB.DD_Src_bank_id)
+    move &BB.Src_bank_id      to $Bank_ID
+    move 'B.SRC_BANK_ID'      to $Bank_ID_to_Use_B
+  else
+    move &BB.DD_Src_bank_id   to $Bank_ID
+    move 'B.DD_SRC_BANK_ID'   to $Bank_ID_to_Use_B
+  end-if
+
+
+ FROM PS_PAY_CALENDAR AA,
+      PS_PAYGROUP_TBL BB
+WHERE [$DdovbankID]
+  AND AA.PAYGROUP         = BB.PAYGROUP
+  AND AA.COMPANY          = BB.COMPANY
+  AND BB.EFFDT            =
+      (SELECT MAX(EFFDT)
+         FROM PS_PAYGROUP_TBL
+        WHERE COMPANY    = AA.COMPANY
+          AND PAYGROUP   = AA.PAYGROUP
+          AND EFF_STATUS = 'A'
+          AND EFFDT     <= AA.PAY_END_DT)
+  AND AA.PAY_CONFIRM_RUN  = 'Y'
+  AND AA.PAY_CHECKS_RUN   = 'N'
+ORDER BY AA.COMPANY,
+         AA.PAYGROUP,
+         AA.PAY_END_DT
+end-SELECT
+
+if isblank($Bank_ID_to_Use_B)
+  move '''''' to $Bank_ID_to_Use_B
+end-if
+
+begin-SELECT
+A.COMPANY
+A.PAYGROUP
+A.PAY_END_DT
+S.BANK_CD
+S.BRANCH_EC_CD      () on-break print=never procedure=Close-File
+S.ACCOUNT_EC_ID
+S.ROUTING_FORMAT
+C.COUNTRY_CD
+C.BANK_NM
+                               ! originating bank name
+
+  let $Bankdescr = &C.BANK_NM
+
+  if $Company <> &A.Company
+    move &A.Company to $Company
+    do Get-Company-Data
+  end-if
+
+  if &S.ROUTING_FORMAT = 'A'
+       let $Bank_Branch_cd = '0' || &S.BANK_CD || &S.BRANCH_EC_CD
+  end-if
+
+  if &S.ROUTING_FORMAT = 'B'
+       let $Bank_Branch_cd = '0' || &S.BRANCH_EC_CD || &S.BANK_CD
+  end-if
+
+  if &S.ROUTING_FORMAT = 'C'
+       let $Bank_Branch_cd = &S.BANK_CD || &S.BRANCH_EC_CD
+  end-if
+
+  if &S.ROUTING_FORMAT = 'D'
+       let $Bank_Branch_cd = &S.BRANCH_EC_CD || &S.BANK_CD
+  end-if
+
+  if $Bank_Branch_cd <> $priorTRANSIT_NUM
+     move $Bank_Branch_cd to $priorTRANSIT_NUM
+     do Open-File
+  end-if
+
+  do Get-Deposit-Data
+
+FROM PS_PAY_CALENDAR A,
+     PS_PAYGROUP_TBL B,
+     PS_BANK_EC_TBL  C,
+     PS_SRC_BANK     S
+WHERE [$SlctCalendar]
+  AND A.COMPANY          = B.COMPANY
+  AND A.PAYGROUP         = B.PAYGROUP
+  AND B.COUNTRY          = 'CAN'
+  AND B.EFFDT            =
+      (SELECT MAX(EFFDT)
+         FROM PS_PAYGROUP_TBL
+        WHERE COMPANY    = A.COMPANY
+          AND PAYGROUP   = A.PAYGROUP
+          AND EFF_STATUS = 'A'
+          AND EFFDT     <= A.PAY_END_DT)
+  AND A.PAY_CONFIRM_RUN  = 'Y'
+  AND A.PAY_CHECKS_RUN   = 'N'
+  AND S.SRC_BANK_ID      = [$Bank_ID_to_Use_B]
+  AND S.BANK_CD          = C.BANK_CD
+  AND C.COUNTRY_CD       = 'CAN'
+
+ORDER BY S.BANK_CD,
+         A.PAYGROUP
+
+end-SELECT
+
+  if RTRIM($filename, ' ') <> '' !file name created
+    do Close-File
+  end-if
+
+  if #File_Count = 0
+      display ' '
+      display 'No direct deposit output file has been generated.'
+      display ' '
+  end-if
+
+end-PROCEDURE  !Report
+
+
+begin-procedure Write-A-Record
+  move 'A'                    to $RecordType
+  move 1                      to #RecordCount
+  move 1                      to $RecordCount      099999999
+  move 0                      to $OriginatorID     0999999999
+  move 1                      to $Creation#        0999
+  move 0                      to #DestDataCentre
+  move ' '                    to $Reserved
+  move ' '                    to $Filler
+
+  move   $OriginatorID to   $OrigCtrlData
+  concat $Creation#    with $OrigCtrlData
+  do Format-Number(#DestDataCentre, $DestDataCentre, '09999')
+
+  write 1 from  $RecordType:1          -
+                $RecordCount:9         -
+                $OriginatorID:10       -
+                $Creation#:4           -
+                $CreateDt:6            -
+                $DestDataCentre:5      -
+                $Reserved:20           -
+                $Filler:1409
+end-procedure
+
+
+begin-procedure Get-Deposit-Data
+
+begin-SELECT
+B.EMPLID
+B.NAME
+B.CHECK_DT
+C.FORM_ID
+C.PAYCHECK_NBR
+C.ACCOUNT_NUM
+C.BANK_CD
+C.BRANCH_EC_CD
+C.DEPOSIT_AMOUNT
+
+  move &B.EmplID to $EmplID  xxxxxxxxxxxxxxxxxxx
+  move &B.Name to $Name  xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  move '1' to $Year4
+  do Format-DateTime(&B.Check_Dt, $Temp, {DEFCMP}, '', '')
+  do Get-Day-Number($Temp, $Year_Days, $Day_Number)
+  let  $AvailDt  = '0' || $Day_Number
+
+  move &C.ACCOUNT_NUM to $ACCOUNT_NUM  xxxxxxxxxxxx
+  if &S.ROUTING_FORMAT = 'A'
+     let $InstID_temp = '0' || rtrim(&C.BANK_CD, ' ') || rtrim(&C.BRANCH_EC_CD, ' ')
+  end-if
+
+  if &S.ROUTING_FORMAT = 'B'
+     let $InstID_temp = '0' || rtrim(&C.BRANCH_EC_CD, ' ') || rtrim(&C.BANK_CD, ' ')
+  end-if
+
+  if &S.ROUTING_FORMAT = 'C'
+     let $InstID_temp =  rtrim(&C.BANK_CD, ' ') || rtrim(&C.BRANCH_EC_CD, ' ')
+  end-if
+
+  if &S.ROUTING_FORMAT = 'D'
+     let $InstID_temp =  rtrim(&C.BRANCH_EC_CD, ' ') || rtrim(&C.BANK_CD, ' ')
+  end-if
+
+  move $InstID_temp to $InstID xxxxxxxxx
+
+  move &C.Deposit_Amount to #Amount
+  multiply 100 times #Amount                  !Remove decimal
+  do Format-Number(#Amount, $Amount, '0999999999')
+
+  add #Amount to #C_TotalAmount
+  add 1       to #C_Count
+
+  do Create-Segment
+
+ FROM PS_PAY_CHECK      B,
+      PS_PAY_DISTRIBUTN C
+WHERE B.COMPANY         = &A.Company
+  AND C.COMPANY         = &A.Company
+  AND B.PAYGROUP        = &A.PayGroup
+  AND C.PAYGROUP        = &A.PayGroup
+  AND B.PAY_END_DT      = &A.Pay_End_Dt
+  AND C.PAY_END_DT      = &A.Pay_End_Dt
+  AND C.PAGE_NUM           = B.PAGE_NUM
+  AND C.LINE_NUM           = B.LINE_NUM
+  AND C.OFF_CYCLE       = B.OFF_CYCLE
+  AND C.SEPCHK          = B.SEPCHK
+  AND C.ACCOUNT_TYPE    <> '$'            !not ISSUE CHECK
+ORDER BY C.FORM_ID,
+         C.PAYCHECK_NBR
+end-SELECT
+
+end-procedure
+
+
+begin-procedure Create-Segment
+  add 1 to #SegmentCount
+  move 'C'             to $RecordType       !Credit
+  move '200'           to $TransType        !Payroll Deposit
+  move ' '             to $ItemTrace#       xxxxxxxxxxxxxxxxxxxxxx
+  move 0               to $StoredTransType  099
+  move &CT.DescrShort  to $OrigShortName    xxxxxxxxxxxxxxx
+  move &CT.Descr       to $OrigLongName    xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  move &S.ACCOUNT_EC_ID to $OrigUserID       xxxxxxxxxx
+  move $EmplID         to $OrigXref#        xxxxxxxxxxxxxxxxxxx
+  move ' '             to $ReturnInstID     xxxxxxxxx
+  move ' '             to $ReturnAcct#      xxxxxxxxxxxx
+  move $OrigSundryInfo to $OrigSundryInfo   xxxxxxxxxxxxxxx
+  move ' '             to $Filler           xxxxxxxxxxxxxxxxxxxxxx
+  move ' '             to $SettlementCd     xx
+  move 0               to $InvalidElementID 09999999999
+
+  move   $TransType          to $Segment         !OK
+  concat $Amount           with $Segment         !OK
+  concat $AvailDt          with $Segment         !Check Dt?
+  concat $InstId           with $Segment         !OK
+  concat $ACCOUNT_NUM         with $Segment         !OK
+  concat $ItemTrace#       with $Segment         !??
+  concat $StoredTransType  with $Segment         !OK
+  concat $OrigShortName    with $Segment         !OK
+  concat $Name             with $Segment         !OK
+  concat $OrigLongName     with $Segment         !OK
+  concat $OrigUserID       with $Segment         !OK
+  concat $OrigXref#        with $Segment         !OK
+  concat $ReturnInstID     with $Segment         !??
+  concat $ReturnAcct#      with $Segment         !??
+  concat $OrigSundryInfo   with $Segment         !OK
+  concat $Filler           with $Segment         !OK
+  concat $SettlementCd     with $Segment         !??
+  concat $InvalidElementID with $Segment         !OK
+
+  evaluate #SegmentCount
+    when = 1
+      move $Segment to $Segment1
+    when = 2
+      move $Segment to $Segment2
+    when = 3
+      move $Segment to $Segment3
+    when = 4
+      move $Segment to $Segment4
+    when = 5
+      move $Segment to $Segment5
+    when = 6
+      move $Segment to $Segment6
+      do Write-C-Record
+      move 0 to #SegmentCount
+  end-evaluate
+
+end-procedure
+
+
+begin-procedure Write-C-Record
+  add  1                   to #RecordCount
+  do Format-Number(#RecordCount, $RecordCount, '099999999')
+
+  write 1 from  $RecordType:1           -         !OK
+                $RecordCount:9          -         !OK
+                $OrigCtrlData:14        -         !OK
+                $Segment1:240           -
+                $Segment2:240           -
+                $Segment3:240           -
+                $Segment4:240           -
+                $Segment5:240           -
+                $Segment6:240
+
+  move 0 to #SegmentCount
+  move ' ' to $Segment1
+  move ' ' to $Segment2
+  move ' ' to $Segment3
+  move ' ' to $Segment4
+  move ' ' to $Segment5
+  move ' ' to $Segment6
+end-procedure
+
+
+begin-procedure Write-Z-Record
+  move 'Z'                    to $RecordType
+  add 1                       to #RecordCount
+  do Format-Number(#RecordCount, $RecordCount, '099999999')
+  do Format-Number(#D_TotalAmount, $D_TotalAmount, '09999999999999')
+  do Format-Number(#D_Count, $D_Count, '09999999')
+  do Format-Number(#C_TotalAmount, $C_TotalAmount, '09999999999999')
+  do Format-Number(#C_Count, $C_Count, '09999999')
+  do Format-Number(#E_TotalAmount, $E_TotalAmount, '09999999999999')
+  do Format-Number(#E_Count, $E_Count, '09999999')
+  do Format-Number(#F_TotalAmount, $F_TotalAmount, '09999999999999')
+  do Format-Number(#F_Count, $F_Count, '09999999')
+
+  write 1 from  $RecordType:1            -
+                $RecordCount:9           -
+                $OrigCtrlData:14         -
+                $D_TotalAmount:14        -
+                $D_Count:8               -
+                $C_TotalAmount:14        -
+                $C_Count:8               -
+                $E_TotalAmount:14        -
+                $E_Count:8               -
+                $F_TotalAmount:14        -
+                $F_Count:8               -
+                $Filler:1352
+
+  move 0 to #D_TotalAmount
+  move 0 to #D_Count
+  move 0 to #C_TotalAmount
+  move 0 to #C_Count
+  move 0 to #E_TotalAmount
+  move 0 to #E_Count
+  move 0 to #F_TotalAmount
+  move 0 to #F_Count
+end-procedure
+
+
+begin-PROCEDURE Open-File
+
+begin-select
+FILE_CREATE_LAST
+FROM PS_INSTALLATION
+end-select
+
+
+  move &FILE_CREATE_LAST to #LastFile#
+
+  if #LastFile# <> 9999
+    add 1 to #LastFile#
+  else
+    move 1 to #LastFile#
+  end-if
+
+  do Format-Number(#LastFile#, $LastFile#, '0009')
+  do Format-Number(#LastFile#, $Creation#, '0009')
+
+#ifdef OS400
+  let $filename = 'DDPCN' || '(D' || $LastFile# || ')'
+#else
+#ifdef MVS
+  let $filename = 'DDPC' || $LastFile#
+#else
+  let $filename = 'DDP_' || $LastFile# || '.LIS'
+#endif
+#endif
+
+  let $filename = '{IMPORTPREFIX}' || $filename
+
+  open $filename as 1 for-writing record=1464:fixed
+
+  do Write-A-Record
+end-PROCEDURE
+
+
+begin-PROCEDURE Close-File
+
+  if #SegmentCount <> 0          !write last C record, if necessary
+    do Write-C-Record
+  end-if
+
+  do Write-Z-Record
+  close 1
+  move ' ' to $filename
+
+  begin-SQL
+  UPDATE PS_INSTALLATION SET FILE_CREATE_LAST = #LastFile#
+  end-SQL
+
+  add 1    to #File_Count
+
+end-PROCEDURE
+
+
+begin-procedure Ignore
+! dummy procedure to avoid SQL error message
+end-procedure
+
+
+begin-procedure Get-Day-Number($Date_In, :$YTD_Days, :$Day_Number)
+  do Date-BreakDown($Date_In, #Work_Year, #Work_Year2, #Work_Month, #Work_Day)
+  do Month-Days(#Work_Year, #Work_Month, #Work_Month_Days, #Work_YTD_Days)
+  let #YTD_Days = #Work_YTD_Days + #Work_Day
+  do Format-Number(#YTD_Days,  $YTD_Days,  '099')
+  do Format-Number(#Work_Year2, $Work_Year2,  '09')
+  let $Day_Number =  $Work_Year2 || $YTD_Days
+end-procedure
+
+
+begin-procedure Date-BreakDown($Date_In, :#Work_Year, :#Work_Year2, :#Work_Month, :#Work_Day)
+  let $Work_Year   = substr($Date_In, 1, 4)
+  let $Work_Year2  = substr($Date_In, 3, 2)
+  let $Work_Month  = substr($Date_In, 5, 2)
+  let $Work_Day    = substr($Date_In, 7, 2)
+
+  let #Work_Year   = $Work_Year
+  let #Work_Year2  = $Work_Year2
+  let #Work_Month  = $Work_Month
+  let #Work_Day    = $Work_Day
+end-procedure
+
+
+begin-procedure Month-Days(#Work_Year, #Work_Month, :#Work_Month_Days, :#Work_YTD_Days)
+  do Leap-Days(#Work_Year, #Work_Leap_Days)
+
+  evaluate #Work_Month
+      when =  1
+          move  31  to  #Work_Month_Days
+          move  00  to  #Work_YTD_Days
+      when =  2
+          move  28  to  #Work_Month_Days
+          move  31  to  #Work_YTD_Days
+          let #Work_Month_Days =  #Work_Month_Days + #Work_Leap_Days
+      when =  3
+          move  31  to  #Work_Month_Days
+          move  59  to  #Work_YTD_Days
+          let #Work_YTD_Days  =  #Work_YTD_Days + #Work_Leap_Days
+      when =  4
+          move  30  to  #Work_Month_Days
+          move  90  to  #Work_YTD_Days
+          let #Work_YTD_Days  =  #Work_YTD_Days + #Work_Leap_Days
+      when =  5
+          move  31  to  #Work_Month_Days
+          move 120  to  #Work_YTD_Days
+          let #Work_YTD_Days  =  #Work_YTD_Days + #Work_Leap_Days
+      when =  6
+          move  30  to  #Work_Month_Days
+          move 151  to  #Work_YTD_Days
+          let #Work_YTD_Days  =  #Work_YTD_Days + #Work_Leap_Days
+      when =  7
+          move  31  to  #Work_Month_Days
+          move 181  to  #Work_YTD_Days
+          let #Work_YTD_Days  =  #Work_YTD_Days + #Work_Leap_Days
+      when =  8
+          move  31  to  #Work_Month_Days
+          move 212  to  #Work_YTD_Days
+          let #Work_YTD_Days  =  #Work_YTD_Days + #Work_Leap_Days
+      when =  9
+          move  30  to  #Work_Month_Days
+          move 243  to  #Work_YTD_Days
+          let #Work_YTD_Days  =  #Work_YTD_Days + #Work_Leap_Days
+      when =  10
+          move  31  to  #Work_Month_Days
+          move 273  to  #Work_YTD_Days
+          let #Work_YTD_Days  =  #Work_YTD_Days + #Work_Leap_Days
+      when =  11
+          move  30  to  #Work_Month_Days
+          move 304  to  #Work_YTD_Days
+          let #Work_YTD_Days  =  #Work_YTD_Days + #Work_Leap_Days
+      when =  12
+          move  31  to  #Work_Month_Days
+          move 334  to  #Work_YTD_Days
+          let #Work_YTD_Days  =  #Work_YTD_Days + #Work_Leap_Days
+      when-other
+          move  00  to  #Work_Month_Days
+          move  00  to  #Work_YTD_Days
+  end-evaluate
+
+end-procedure
+
+
+begin-procedure Leap-Days(#Work_Year, :#work_leap_days)
+  let #leap_check = mod(#Work_Year, 4)
+
+  if #leap_check <>  0
+      move 0  to  #work_leap_days
+  else
+    let #leap_check = mod(#Work_Year, 100)
+
+      if #leap_check <>  0
+          move 1  to  #Work_leap_days
+      else
+          let #leap_check = mod(#Work_Year, 400)
+
+          if #leap_check <>  0
+            move 0  to  #Work_leap_days
+          else
+            move 1  to  #Work_leap_days
+          end-if
+      end-if
+  end-if
+
+end-procedure
+

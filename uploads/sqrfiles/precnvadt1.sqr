@@ -1,0 +1,205 @@
+! ***************************************************************!
+!  This software and related documentation are provided under a!
+!  license agreement containing restrictions on use and!
+!  disclosure and are protected by intellectual property!
+!  laws. Except as expressly permitted in your license agreement!
+!  or allowed by law, you may not use, copy, reproduce,!
+!  translate, broadcast, modify, license, transmit, distribute,!
+!  exhibit, perform, publish or display any part, in any form or!
+!  by any means. Reverse engineering, disassembly, or!
+!  decompilation of this software, unless required by law for!
+!  interoperability, is prohibited.!
+!  The information contained herein is subject to change without!
+!  notice and is not warranted to be error-free. If you find any!
+!  errors, please report them to us in writing.!
+!  !
+!  Copyright (C) 1988, 2011, Oracle and/or its affiliates.!
+!  All Rights Reserved.!
+! ***************************************************************!
+ 
+ 
+!                                                                    !
+!***********************************************************************
+! PRECNVADT1: DB Conversion PreAudit - Listing                         *
+!***********************************************************************
+!                                                                      *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+!                                                                      *
+!                                                                      *
+!                                                                      *
+!                                                                      *
+!***********************************************************************
+
+#include 'setenv.sqc' !Set environment
+
+#define CTABLENAME       1
+#define CCOLUMNNAME      2 
+#define CDATATYPE        3
+
+begin-setup
+#include 'ptset01.sqc'         ! Init printer and page size
+end-setup
+
+begin-report
+    do Initialize
+    do Report
+    do Terminate
+    do Commit-Transaction
+end-report
+
+begin-procedure Initialize            ! Get Source Database Information
+
+    move 'PRECNVADT1'                   to $ReportID
+    move ' Tables with Columns having Duplicate Length Constraints'  to $ReportTitle
+    let #TotalColumnCount = 0
+
+
+#ifdef debugx
+    SHOW 'Report Title: ' $ReportTitle
+    Show ' '
+    Show  ' This Report lists all of the Columns by Table with duplicate length'
+    Show  ' constraints. The total number of columns with duplicate length constraints'
+    Show  ' appears at the bottom of this report.'
+    Show  ' '
+    Show  'Tablename          Columnname                   Constraint '
+    Show  '------------------ ---------------------------- ---------- '
+#endif
+
+    do Get-Current-DateTime
+end-procedure
+
+begin-procedure Terminate
+
+#ifdef debugx
+    SHOW 'Report Title: ' $ReportTitle
+    show #TotalColumnCount
+    Show ' '
+#endif
+
+   Show 'Ending SQR.'
+
+   do Commit-Transaction
+
+end-procedure
+
+begin-heading 8
+   #include 'stdhdg01.sqc'
+   Print 'Tablename          Columnname          Constraint' (7,1)
+   print '-------------------------------------------------' (8,1)
+end-heading
+
+begin-procedure Report          ! Main report processing
+
+   do BuildDuplicateConstraintsTable  
+
+begin-SELECT
+A.TABLE_NAME      &P.TABLENAME
+A.COLUMN_NAME     &P.COLUMNNAME
+A.CONSTRAINT_NAME &P.CONSTRAINTNAME
+
+  print &P.TABLENAME        (,1)
+  print &P.COLUMNNAME      (,20 )
+  print &P.CONSTRAINTNAME   (,40 )
+  position (+1)  ! advance one line
+  do TallyTotals
+
+
+from DROP_CONSTRAINTS A
+ORDER BY 1,2
+end-SELECT
+
+   Print 'Total Duplicate Constraints:' (59,1)  
+   Print #TotalColumnCount (60,1)
+
+
+end-procedure
+
+begin-procedure TallyTotals          ! Tally subprocess
+  add +1 to #TotalColumnCount
+end-procedure
+
+
+begin-procedure BuildDuplicateConstraintsTable  ! Build intermediate selection table
+begin-SQL 
+!Modified - These table drops have been externalized.  precnvadt1a.sql
+!0 - Drop intermediate tables
+!drop table CHECK_CONSTRAINTS
+!; 
+!drop table DUPLICATE_CONSTRAINTS
+!; 
+!drop table DROP_CONSTRAINTS
+!; 
+
+!1 - Create table CHECK_CONSTRAINTS:
+create table CHECK_CONSTRAINTS (table_name, COLUMN_NAME, CONSTRAINT_NAME, SEARCH_CONDITION) AS
+SELECT ucc.table_name, ucc.column_name, ucc.constraint_name, to_lob(search_condition) AS search_condition 
+FROM user_constraints  ac, user_cons_columns ucc WHERE ac.constraint_name = ucc.constraint_name and 1=2
+;
+
+!ICE# 1468960002
+!Modified flipping user_cons_columns, and UCC_CONSTRAINT to imporve performance on Oracle 9i
+!2 - Insert all constraint names and search condition in CHECK_CONSTRAINTS:
+INSERT /*+ append leading(ac)*/ INTO CHECK_CONSTRAINTS 
+SELECT ucc.table_name, ucc.column_name, ucc.constraint_name, to_lob(search_condition) AS search_condition 
+FROM user_cons_columns ucc, user_constraints ac 
+WHERE ac.constraint_name = ucc.constraint_name
+;
+commit
+;
+
+! Original statement
+! 3 - Remove the NOT NULL constraints:
+!delete from CHECK_CONSTRAINTS where substr(to_char(search_condition),1,6) <> 'LENGTH'
+!;
+
+!ICE# 1468960002
+! Modified version to chack for anycase 'length' literal.
+delete from CHECK_CONSTRAINTS where substr(UPPER(to_char(search_condition)),1,6) <> 'LENGTH'
+;
+
+! 4 - Create a new table to hold tables that have dup constraints:
+!   - populate with rows identifying tables with duplicate constraints:
+create table DUPLICATE_CONSTRAINTS 
+as select table_name, column_name, count(constraint_name) as dupcount 
+from CHECK_CONSTRAINTS
+group by table_name, column_name
+having count(*) >1
+;
+
+! 5 - Create a new table to hold dup constraints to be dropped:
+!Original - This table create has been externalized
+!create table DROP_CONSTRAINTS as select table_name, column_name,constraint_name 
+!from CHECK_CONSTRAINTS where 1=2 
+!;
+!Modified - This table creation has been externalized. Only need to truncate it before use.
+truncate table DROP_CONSTRAINTS
+;
+
+! 6 - Identify dup constraints to be dropped:
+insert into DROP_CONSTRAINTS
+select a.table_name, a.column_name, a.constraint_name
+from CHECK_CONSTRAINTS a, DUPLICATE_CONSTRAINTS b
+WHERE a.table_name=b.table_name
+and a.column_name=b.column_name
+and a.constraint_name > (select min(c.constraint_name) 
+from CHECK_CONSTRAINTS c
+where c.table_name=b.table_name
+and c.column_name=b.column_name)
+;
+commit
+end-SQL
+end-procedure
+
+
+#include 'reset.sqc'            ! Reset printer
+#include 'curdttim.sqc'         ! Current Date and Time
+#include 'chgampus.sqc'         ! Change Ampersand to Underscore
+#Include 'datetime.sqc'         !Routines for date and time formatting
+#Include 'number.sqc'           !Routines to format numbers
+#include 'prcsapi.sqc'          !Update Process Request API
+#include 'prcsdef.sqc'          !Update Process Request variable declaration
+#include 'tranctrl.sqc'         ! Transaction control
+
+

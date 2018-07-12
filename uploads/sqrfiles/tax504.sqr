@@ -1,0 +1,753 @@
+!*********************************************************************
+!  TAX504:  Update Fed_Tax_Data Pension_Plan for W 2 Printing        *
+!*********************************************************************
+!***********************************************************************
+!                                                                      *
+!                                                                      *
+!                                                                      *
+!                                                                      *
+! This software and related documentation are provided under a         *
+! license agreement containing restrictions on use and                 *
+! disclosure and are protected by intellectual property                *
+! laws. Except as expressly permitted in your license agreement        *
+! or allowed by law, you may not use, copy, reproduce,                 *
+! translate, broadcast, modify, license, transmit, distribute,         *
+! exhibit, perform, publish or display any part, in any form or        *
+! by any means. Reverse engineering, disassembly, or                   *
+! decompilation of this software, unless required by law for           *
+! interoperability, is prohibited.                                     *
+! The information contained herein is subject to change without        *
+! notice and is not warranted to be error-free. If you find any        *
+! errors, please report them to us in writing.                         *
+!                                                                      *
+! Copyright (C) 1988, 2012, Oracle and/or its affiliates.              *
+! All Rights Reserved.                                                 *
+!                                                                      *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!          $Date:  2012/05/09:11:38:15                                 !
+!       $Release:  HR9                                                 !
+!    $Resolution:  872522                                              !
+!                                                                      *
+!***********************************************************************
+!
+!***********************************************************************
+! Modified for Education & Government                                  *
+! HP99999       Release 8 Technical Merge                              *
+! HP00001       Add PublicSector indicator                             *
+!***********************************************************************
+
+#include 'setenv.sqc' !Set environment
+#Include 'setup01.sqc'  !printer and page-size initialization
+
+begin-setup
+    declare-variable
+        date    $UPD_DATE_OF_ENTRY
+        date    $UPD_FORM_1001_SUBMT_DT
+        date    $UPD_FORM_1001_EXP_DT
+        date    $UPD_FORM_8233_SUBMT_DT
+        date    $UPD_FORM_8233_EXP_DT
+        date    $UPD_TREATY_EXP_DT
+        date    $UPD_FORM_1078_SUBMT_DT
+        date    $UPD_PY_FLAG_FOR_IRS_DT
+    end-declare
+end-setup
+
+begin-report
+  do Init-DateTime
+  do Init-Number
+  do Init-Report
+
+  do Get-Calendar-Year-Id
+  display ''
+  display 'Updating W2 Check Boxes on Fed Tax Data '
+  display '                         '
+  do Initialization
+  do Read-Run-Control
+  do Read-Plan-DedCd
+  do Read-Third-Party-Sick-Pay
+
+  if &RC.PY_YE_PROCESS = 'Y'
+        or &RC.UPDATE_FLAG = 'Y'
+    let $Empl_Status = ''
+  else
+    do Read-Empl-Status
+  end-if
+
+  do Process-Pension_Plans
+  do Stdapi-Term
+end-report
+
+
+begin-procedure Init-Report
+  move 'TAX504' to $ReportID
+  move 'TAX504' to $Program
+  move 'Retirement Plan and Third Party Sick Pay' to $ReportTitle
+
+  do Stdapi-Init
+end-procedure
+
+
+begin-heading 9
+   #Include 'stdhdg01.sqc'
+
+   print $TaxYear                                                 (3,)  center
+
+   if $Prev_Company <> ''
+      print 'Company:'            (+3, 1)
+      print $Prev_Co_Descr        (0, 10)
+      do Print-EE-Header
+   end-if
+
+end-heading
+
+
+begin-procedure Initialization
+  do Get-Current-DateTime
+  move '1' to $MMLZero
+  move '1' to $Year4
+  do Format-DateTime($AsOfToday, $910Date, {DEFYMD},'','')
+
+  move $910Date to $AsOfYear xxxx   !extract the current year
+  move $AsOfYear  to #AsOfYear
+  subtract 1    from #AsOfYear
+  do Get-Tax-Reporting-Run-Controls
+  if &TX.Balance_Year <> #AsOfYear and $Prcs_Process_Instance = ''
+    display ''
+    display 'Current Year is not one greater than Tax Reporting Year.'
+  end-if
+
+  move &TX.Balance_Year to $CalYear 9999
+  let $TaxYear = 'Tax Year ' || $CalYear
+
+  let $Pension_Plan_Found = 'N'
+  let $Deferred_Comp = 'N'
+  let $Third_Party_Sick = 'N'
+  let $Prev_Company = ''
+  let $Prev_Co_Descr = ''
+
+  let #RunCtl_LineCount = 0
+
+
+  create-array name=PlanTypeDedCd size=50 -
+    field=PlanType:char -
+    field=DedCode:char
+
+  create-array name=ThirdPartySick size=50 -
+    field=ThirdPartySickPay:char
+
+end-procedure
+
+
+begin-procedure Read-Run-Control
+
+begin-SELECT
+RC.UPDATE_FLAG
+RC.PY_YE_PROCESS
+RC.TAX_EFFDT
+
+  if RTRIM(&RC.UPDATE_FLAG, ' ') = 'N'
+    let $AsOfDate = &RC.TAX_EFFDT
+  else
+    move &TX.Company       to $Company  !TX.Company is the Transmitter
+    move &TX.Balance_Year to $CalYear 9999
+    let $AsOfDate = $CalYear || '1231'
+    do Format-DateTime($AsOfDate, $AsOfDate, {DEFCMP}, '', 'native')
+  end-if
+
+  print 'Update Existing Data:'              (+1, 1)
+  print &RC.UPDATE_FLAG                      (0, 30)
+
+  if RTRIM(&RC.UPDATE_FLAG, ' ') = 'N'
+    print 'Effective Date for Inserts:'          (+1, 1)
+    do Format-DateTime(&RC.TAX_EFFDT, $out, {DEFDATE}, '', '')
+    print $out                                   (0, 30)
+    print 'Year End Process:'                    (+1, 1)
+    print &RC.PY_YE_PROCESS                      (0, 30)
+  end-if
+
+FROM PS_RC_TAX504_PRCS RC
+WHERE RC.OPRID     = $Prcs_OprID
+AND RC.RUN_CNTL_ID = $Prcs_Run_Cntl_ID
+end-SELECT
+end-procedure
+
+
+begin-procedure Process-Pension_Plans
+
+begin-SELECT
+COMP.COMPANY
+COMP.DESCR
+
+  let $COMP.COMPANY = &COMP.COMPANY
+  do Read-Employee-Data
+
+FROM  PS_COMPANY_TBL COMP
+WHERE TAX_REPORT_TYPE = '2'  !W-2 Reporting Company
+  AND EFFDT =
+      (SELECT MAX(EFFDT)
+       FROM   PS_COMPANY_TBL
+       WHERE  COMPANY = COMP.COMPANY
+         AND  EFFDT  <= $AsOfDate)
+ORDER BY COMP.COMPANY
+end-SELECT
+
+end-procedure
+
+begin-procedure Read-Employee-Data
+
+
+begin-SELECT
+PERS.EMPLID
+PERS.DT_OF_DEATH
+F.COMPANY
+
+  LET $PERS.EMPLID = &PERS.EMPLID
+  let #ActiveEmplCount = 0
+  if RTRIM(&RC.PY_YE_PROCESS, ' ') = 'N'
+        and RTRIM(&RC.UPDATE_FLAG, ' ') = 'N'
+     do Select-Employees
+     move &ActiveEmplCount to #ActiveEmplCount
+  end-if
+
+  if RTRIM(&RC.PY_YE_PROCESS, ' ') = 'Y'
+     or (RTRIM(&RC.PY_YE_PROCESS, ' ') = 'N'
+                and #ActiveEmplCount = 0)
+
+    let $Company_Descr = &COMP.DESCR
+
+    if #PlanDedCount > 0
+      do Get-Deductions
+    end-if
+
+    if #ThirdPartyCount > 0
+      do Get-Third-Party-Sick-Pay
+    end-if
+
+    do Update-Pension_Plan
+
+  end-if
+
+FROM   PS_PERSONAL_DATA PERS, PS_FED_TAX_DATA F, PS_INSTALLATION IN1       !HP00001
+WHERE F.EMPLID        = PERS.EMPLID
+  AND F.COMPANY       = &COMP.Company
+  AND F.EFFDT =
+      (SELECT MAX(EFFDT)
+       FROM   PS_FED_TAX_DATA
+       WHERE  EMPLID  = F.EMPLID
+         AND  COMPANY = F.COMPANY
+         AND  EFFDT  <= $AsOfDate)
+  AND ( EXISTS
+    (SELECT 'x'
+    FROM PS_TAX_BALANCE TB1
+    WHERE TB1.COMPANY       = F.COMPANY
+      AND TB1.EMPLID        = F.EMPLID
+      AND (TB1.TAX_CLASS IN ('H','D','F','C')                            !HP99999
+           OR (IN1.PUBLIC_SECTOR = 'Y'                                   !HP00001
+               AND TB1.TAX_CLASS = 'A'))                                 !HP99999
+      AND TB1.BALANCE_YEAR = &TX.Balance_Year
+      AND TB1.BALANCE_ID    = $Calendar_Year_Id
+      AND TB1.BALANCE_PERIOD =
+          (SELECT MAX(BALANCE_PERIOD)
+           FROM   PS_TAX_BALANCE
+           WHERE  EMPLID        = TB1.EMPLID
+             AND  COMPANY       = TB1.COMPANY
+             AND  BALANCE_YEAR = TB1.BALANCE_YEAR
+             AND  BALANCE_ID    = TB1.BALANCE_ID
+             AND  STATE         = TB1.STATE
+             AND (LOCALITY      = TB1.LOCALITY
+              OR  LOCALITY IS NULL and TB1.LOCALITY IS NULL)
+             AND  TAX_CLASS     = TB1.TAX_CLASS)
+      AND (TB1.TXGRS_YTD > 0  OR  TB1.TAX_YTD > 0))
+    OR EXISTS
+      (SELECT 'X' FROM PS_EARNINGS_BAL EB1
+       WHERE EB1.COMPANY = F.COMPANY
+         AND EB1.EMPLID = F.EMPLID
+         AND EB1.BALANCE_YEAR = &TX.Balance_Year
+         AND EB1.BALANCE_ID = $Calendar_Year_Id
+         AND EB1.BALANCE_PERIOD =
+           (SELECT MAX(EB2.BALANCE_PERIOD)
+           FROM   PS_EARNINGS_BAL EB2
+           WHERE  EB2.EMPLID        = EB1.EMPLID
+             AND  EB2.COMPANY       = EB1.COMPANY
+             AND  EB2.BALANCE_YEAR = EB1.BALANCE_YEAR
+             AND  EB2.BALANCE_ID    = EB1.BALANCE_ID)
+         AND EB1.GRS_YTD > 0))
+ORDER BY F.COMPANY ASC, F.EMPLID ASC
+end-SELECT
+
+end-procedure
+
+
+begin-procedure Select-Employees
+
+begin-SELECT
+COUNT(*)        &ActiveEmplCount
+FROM PS_JOB J
+WHERE J.EMPLID = &PERS.EMPLID
+AND J.EFFDT =
+    (SELECT MAX(J1.EFFDT)
+     FROM PS_JOB J1
+     WHERE J1.EMPLID = J.EMPLID
+       AND J1.EMPL_RCD = J.EMPL_RCD
+       AND J1.EFFDT <= &RC.TAX_EFFDT)
+AND J.EFFSEQ =
+    (SELECT MAX(J2.EFFSEQ)
+     FROM PS_JOB J2
+     WHERE J2.EMPLID = J.EMPLID
+       AND J2.EMPL_RCD = J.EMPL_RCD
+       AND J2.EFFDT = J.EFFDT)
+[$Empl_Status]
+end-SELECT
+end-procedure
+
+
+begin-procedure Read-Plan-DedCd
+
+
+move 0 to #PlanDedCount
+
+
+begin-SELECT
+E.PLAN_TYPE
+E.DEDCD
+DT.DESCR
+
+     if #PlanDedCount = 0
+        do Print-PlanDed-Header
+     end-if
+
+     let #RunCtl_LineCount = #RunCtl_LineCount + 1
+     if #RunCtl_LineCount > 50
+        new-page
+        do Print-PlanDed-Header
+        let #RunCtl_LineCount = 0
+     end-if
+
+     print &E.PLAN_TYPE            (+1, 1)
+     move 'PLAN_TYPE' to $FieldName
+     move &E.PLAN_TYPE to $FieldValue
+     do Read-Translate-Table
+     print $XlatLongName           (0, 17)
+     print &E.DEDCD                (0, 49)
+     print &DT.DESCR               (0, 67)
+
+         add 1 to #PlanDedCount
+
+
+         PUT &E.PLAN_TYPE  INTO PLANTYPEDEDCD(#PLANDEDCOUNT) PLANTYPE
+         PUT &E.DEDCD  INTO PLANTYPEDEDCD(#PLANDEDCOUNT) DEDCODE
+
+FROM  PS_RC_TAX504 E, PS_DEDUCTION_TBL DT
+WHERE E.OPRID         = $Prcs_OprID
+  AND E.RUN_CNTL_ID   = $Prcs_Run_Cntl_ID
+  AND E.PLAN_TYPE <> ' '
+  AND DT.PLAN_TYPE = E.PLAN_TYPE
+  AND DT.DEDCD = E.DEDCD
+  AND DT.EFFDT =
+      (SELECT MAX(DT1.EFFDT)
+      FROM PS_DEDUCTION_TBL DT1
+      WHERE DT1.PLAN_TYPE = DT.PLAN_TYPE
+      AND DT1.DEDCD       = DT.DEDCD
+      AND DT1.EFFDT       <= &RC.TAX_EFFDT)
+ORDER BY E.PLAN_TYPE ASC, E.DEDCD ASC
+end-SELECT
+
+end-procedure
+
+begin-procedure Get-Deductions
+
+  move 'N' to $Pension_Plan_Found
+  move 'N' to $Deferred_Comp
+  move 1 to #NextPlanDed
+
+  while #NextPlanDed <= #PlanDedCount  and $Deferred_Comp = 'N'
+      get $PlanType $DedCode from PLANTYPEDEDCD(#NextPlanDed)
+      let $PlanType = RTRIM($PlanType,' ')
+      let $DedCode = RTRIM($DedCode,' ')
+      do Read-Balances
+
+      add 1 to #NextPlanDed
+  end-while
+end-procedure
+
+
+begin-procedure Read-Balances
+
+begin-SELECT
+
+#ifdef DB2ALL
+DECIMAL(SUM(DB.DED_YTD),15,3)   &DB.Ded_YTD
+#else
+SUM(DB.DED_YTD)         &DB.Ded_YTD
+#endif
+
+DB.DED_CLASS
+
+    if $Deferred_Comp <> 'Y'
+       if &DB.DED_CLASS = 'B'
+         move 'Y' to $Deferred_Comp
+       end-if
+       move 'Y' to $Pension_Plan_Found
+    end-if
+
+
+FROM  PS_DEDUCTION_BAL DB
+WHERE DB.COMPANY           = &COMP.Company
+  AND DB.PLAN_TYPE         = $PlanType
+  AND DB.DEDCD             = $DedCode
+  AND DB.EMPLID            = &PERS.EmplID
+  AND DB.BALANCE_YEAR     = &TX.Balance_Year
+  AND DB.BALANCE_ID       = $Calendar_Year_Id
+  AND DB.DED_YTD           > 0
+  AND DB.BALANCE_PERIOD           =
+      (SELECT MAX(BALANCE_PERIOD)
+       FROM   PS_DEDUCTION_BAL
+       WHERE  EMPLID            = DB.EMPLID
+         AND  COMPANY           = DB.COMPANY
+         AND  BALANCE_YEAR      = DB.BALANCE_YEAR
+         AND  BALANCE_ID        = DB.BALANCE_ID
+         AND  PLAN_TYPE         = DB.PLAN_TYPE
+         AND  BENEFIT_RCD_NBR   = DB.BENEFIT_RCD_NBR
+         AND  DEDCD             = DB.DEDCD
+         AND  DED_CLASS         = DB.DED_CLASS)
+GROUP BY DB.DED_CLASS
+end-SELECT
+end-procedure
+
+begin-procedure Update-Pension_Plan
+
+   let $Fed_Tax_Found = 'N'
+
+   if RTRIM(&RC.UPDATE_FLAG, ' ') = 'Y'
+     let $Where_Effdt = 'AND EFFDT <= ''' || $AsOfDate || ''' ) '
+   else
+     let $Where_Effdt = 'AND EFFDT = ''' || $AsOfDate || ''' ) '
+   end-if
+
+begin-SELECT
+X.COMPANY
+X.EMPLID
+X.EFFDT
+X.PENSION_PLAN
+X.DEFERRED_COMP
+X.THIRDPARTY_SICKPAY
+
+   let $Fed_Tax_Found = 'Y'
+FROM PS_FED_TAX_DATA X
+WHERE X.COMPANY       = &COMP.Company
+  AND X.EMPLID        = &PERS.EmplID
+  AND X.EFFDT =
+      (SELECT MAX(EFFDT)
+       FROM   PS_FED_TAX_DATA
+       WHERE  EMPLID  = X.EMPLID
+         AND  COMPANY = &COMP.Company
+[$Where_Effdt]
+end-SELECT
+
+  let $Print_Employee = 'N'
+  if $Fed_Tax_Found = 'Y'
+    if &X.PENSION_PLAN <> $Pension_Plan_Found
+                or &X.DEFERRED_COMP <> $Deferred_Comp
+                or &X.THIRDPARTY_SICKPAY <> $Third_Party_Sick
+      do Update-Fed-Tax-Data
+      let $Print_Employee = 'Y'
+    end-if
+  else
+     do Get-Fed-Tax-Data
+     do Insert-New-Fed-Row
+     do Get-State-Tax-Data
+     do Get-Local-Tax-Data
+     let $Print_Employee = 'Y'
+  end-if
+
+  if $Print_Employee = 'Y'
+    do Print-Audit
+  end-if
+
+end-procedure
+
+
+begin-procedure Print-Audit
+
+  if $Prev_Company <> &F.COMPANY
+     new-page
+     let $Prev_Company = &F.COMPANY
+     let $Prev_Co_Descr = $Company_Descr
+  end-if
+
+  print &PERS.EMPLID                 (+1, 1)
+  if $Fed_Tax_Found = 'Y'
+      do Format-DateTime(&X.EFFDT, $out, {DEFDATE}, '', '')
+  else
+      do Format-DateTime($AsOfDate, $out, {DEFDATE}, '', '')
+  end-if
+  print $out                          (0, 14)
+  print $Pension_Plan_Found           (0, 28)
+! print $Deferred_Comp                (0, 37)
+  print $Third_Party_Sick             (0, 47)
+
+  if $Fed_Tax_Found = 'Y'
+     print 'Existing employee tax data updated.'   (0, 60)
+  else
+     print 'New employee tax data inserted.'       (0, 60)
+  end-if
+
+  let $Pension_Plan_Found = 'N'
+  let $Deferred_Comp = 'N'
+  let $Third_Party_Sick = 'N'
+
+end-procedure
+
+begin-procedure Update-Fed-Tax-Data
+begin-SQL
+
+UPDATE PS_FED_TAX_DATA
+SET PENSION_PLAN   = $Pension_Plan_Found,
+    DEFERRED_COMP  = $Deferred_Comp,
+    THIRDPARTY_SICKPAY = $Third_Party_Sick,
+    LAST_ACTION    = 'C',
+    LAST_UPDATE_DATE = $AsOfToday
+WHERE COMPANY   = &X.Company
+  AND EMPLID    = &X.EmplID
+  AND EFFDT     = &X.EffDt
+
+end-SQL
+
+end-procedure
+
+begin-procedure Read-Third-Party-Sick-Pay
+
+
+move 0 to #ThirdPartyCount
+
+
+begin-SELECT
+EA.ERNCD
+ET.DESCR
+
+  if #ThirdPartyCount = 0
+     do Print-ThirdParty-Header
+  end-if
+
+  let #RunCtl_LineCount = #RunCtl_LineCount + 1
+  if #RunCtl_LineCount > 50
+     do Print-ThirdParty-Header
+     let #RunCtl_LineCount = 0
+  end-if
+
+  print &EA.ERNCD               (+1, 1)
+  print &ET.DESCR               (0, 17)
+
+         add 1 to #ThirdPartyCount
+
+         PUT &EA.ERNCD INTO THIRDPARTYSICK(#THIRDPARTYCOUNT) THIRDPARTYSICKPAY
+
+FROM  PS_RC_TAX504_ERN EA, PS_EARNINGS_TBL ET
+WHERE EA.OPRID         = $Prcs_OprID
+  AND EA.RUN_CNTL_ID   = $Prcs_Run_Cntl_ID
+  AND EA.ERNCD <> ' '
+  AND EA.ERNCD = ET.ERNCD
+  AND ET.EFFDT =
+      (SELECT MAX(ET1.EFFDT)
+      FROM PS_EARNINGS_TBL ET1
+      WHERE ET1.ERNCD = ET.ERNCD
+      AND ET1.EFFDT   <= &RC.TAX_EFFDT)
+ORDER BY EA.ERNCD ASC
+end-SELECT
+
+end-procedure
+
+begin-procedure Get-Third-Party-Sick-Pay
+
+
+  move 'N' to $Third_Party_Sick
+  move 1 to #NextThirdPartySick
+
+  while #NextThirdPartySick <= #ThirdPartyCount  and $Third_Party_Sick = 'N'
+      get $ThirdPartySickPay from THIRDPARTYSICK(#NextThirdPartySick)
+      let $ThirdPartySickPay = RTRIM($ThirdPartySickPay,' ')
+      do Read-Earnings-Balances
+
+      add 1 to #NextThirdPartySick
+  end-while
+end-procedure
+
+begin-procedure Read-Earnings-Balances
+
+begin-SELECT
+
+ER.GRS_YTD
+ER.HRS_YTD
+ER.ERNCD
+
+
+    if $Third_Party_Sick <> 'Y'
+
+       move 'Y' to $Third_Party_Sick
+
+    end-if
+
+
+FROM  PS_EARNINGS_BAL ER
+WHERE ER.COMPANY           = &COMP.Company
+  AND ER.ERNCD             = $ThirdPartySickPay
+  AND ER.EMPLID            = &PERS.EmplID
+  AND ER.BALANCE_YEAR     = &TX.Balance_Year
+  AND ER.BALANCE_ID       = $Calendar_Year_Id
+  AND (ER.HRS_YTD           > 0
+       OR ER.GRS_YTD        > 0)
+  AND ER.BALANCE_PERIOD           =
+      (SELECT MAX(BALANCE_PERIOD)
+       FROM   PS_EARNINGS_BAL
+       WHERE  EMPLID            = ER.EMPLID
+         AND  COMPANY           = ER.COMPANY
+         AND  BALANCE_YEAR      = ER.BALANCE_YEAR
+         AND  BALANCE_ID        = ER.BALANCE_ID
+         AND  ERNCD             = ER.ERNCD)
+
+end-SELECT
+end-procedure
+
+
+begin-procedure Read-Empl-Status
+
+  let #EEStatusCount = 0
+  let $First_Empl_Status = 'Y'
+  let $Empl_Status = 'AND J.EMPL_STATUS NOT IN ('
+
+begin-SELECT
+STAT.EMPL_STATUS
+
+  if $First_Empl_Status = 'Y'
+    let $Empl_Status = $Empl_Status || '''' || &STAT.EMPL_STATUS || ''''
+    let $First_Empl_Status = 'N'
+  else
+    let $Empl_Status = $Empl_Status || ', ''' || &STAT.EMPL_STATUS || ''''
+  end-if
+
+  if #EEStatusCount = 0
+     do Print-EESTatus-Header
+  end-if
+
+  add 1  to  #EEStatusCount
+
+  let #RunCtl_LineCount = #RunCtl_LineCount + 1
+  if #RunCtl_LineCount > 50
+     do Print-EEStatus-Header
+     let #RunCtl_LineCount = 0
+  end-if
+
+  move 'EMPL_STATUS' to $FieldName
+  move &STAT.EMPL_STATUS to $FieldValue
+  do Read-Translate-Table
+  print $XlatLongName                  (+1, 1)
+
+FROM PS_RC_TAX504_EE_ST STAT
+WHERE STAT.OPRID         = $Prcs_OprID
+  AND STAT.RUN_CNTL_ID   = $Prcs_Run_Cntl_ID
+end-SELECT
+
+  let $Empl_Status = $Empl_Status || ')'
+
+  if #EEStatusCount = 0
+    let $Empl_Status = ''
+  end-if
+
+end-procedure
+
+begin-procedure Emplid-Check-A
+!  Dummy Procedure
+end-procedure
+
+begin-procedure Emplid-Check-B
+!  Dummy Procedure
+end-procedure
+
+begin-procedure Print-PlanDed-Header
+
+  print 'Retirement Plan Deductions'     (+4, 1)
+  print 'Plan Type'          (+1, 1)
+  print 'Description'        (0, 17)
+  print 'Deduction Code'     (0, 49)
+  print 'Description'        (0, 67)
+  print ' '                  (+1, 1)
+
+end-procedure
+
+
+begin-procedure Print-ThirdParty-Header
+
+  print 'Third Party Sick Pay Earnings'  (+4, 1)
+  print 'Earnings Code'      (+1, 1)
+  print 'Description'        (0, 17)
+  print ' '                  (+1, 1)
+
+end-procedure
+
+
+begin-procedure Print-EEStatus-Header
+
+  print 'Payroll Status'     (+4, 1)
+  print ' '                  (+1, 1)
+
+end-procedure
+
+
+begin-procedure Print-EE-Header
+
+  print 'Effective'                (+2, 14)
+  print 'Pension'                  (0, 28)
+! print 'Deferred'                 (0, 37)
+  print 'Third Party'              (0, 47)
+
+  print 'Emplid'                   (+1, 1)
+  print 'Date'                     (0, 14)
+  print 'Plan'                     (0, 28)
+! print 'Comp'                     (0, 37)
+  print 'Sick'                     (0, 47)
+  print 'Action'                   (0, 60)
+  print ' '                        (+1, 1)
+
+end-procedure
+
+begin-procedure Found-Future
+!  Dummy Procedure
+end-procedure
+
+
+begin-procedure Fed-State-Sync
+!  Dummy Procedure
+end-procedure
+
+
+begin-procedure Percent-Not-Found
+!  Dummy Procedure
+end-procedure
+
+
+begin-procedure AlreadyUpdated
+!  Dummy Procedure
+end-procedure
+
+
+begin-procedure Effdt-is-Today
+!  Dummy Procedure
+end-procedure
+
+
+begin-procedure Process-State
+!  Dummy Procedure
+end-procedure
+
+#Include 'taxrnctl.sqc'  !Get-Tax-Reporting-Run-Controls procedure
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'getcodta.sqc'  !Get-Company-Data procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'stdapi.sqc'    !Update Process API
+#Include 'getbalid.sqc'  !Get-Calendar-Year-Id
+#Include 'readxlat.sqc'  !Read-Translate-Table procedure
+#include 'reset.sqc'     !Reset Printer
+#include 'gettxdta.sqc'  !Get Employee Tax Data for Update

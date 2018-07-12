@@ -1,0 +1,714 @@
+!***********************************************************************
+! GEXPY084:  This program produces a detail report of employees that have*    
+!	1. Either gross pay exceeds 2 times their comprate (if they are 
+!		salaried) or gross pay exceeds 2 times their standard hours
+!		times comprate (if they are hourly)
+!	2. Or total_Gross - Total Deductions - Total taxes <> Net Pay
+!       3. Reports hourly employees whose hourly rate > $100.00 
+!
+!	This report runs after pay calculation is done.
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module is the confidential and proprietary information of       *
+! Giant Eagle, Inc.; it is not to be copied, reproduced, or transmitted*
+! in any form, by any means, in whole or in part, nor is it to be used *
+! for any purpose other than that for which it is expressly provided   *
+! without the written permission of Giant Eagle.                       *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+!  $Date:: 03/03/99 09:00A      $                                      *
+!  $Revision:: 01               $                                      *
+!  $Workfile:: GEXPY084.SQR     $                                      *
+!                                                                      *
+!***********************************************************************
+!                         MODIFICATION HISTORY                         *
+!***********************************************************************
+!  ID#     INITIALS    DATE           DESCRIPTION OF THE CHANGE        *        
+!***********************************************************************
+!  GEXPY084  SXK    03/26/1999         INITIAL CREATION                *
+!            CWB    05/19/1999         Added logic to report those     *
+!                                      hourly employees whose hourly   *
+!                                      rate is greater than $100.00    *
+!                                      Changed limit from              *
+!                                        #base_pay * 2 to              *
+!                                        (#base_pay * 2) + 100         *       
+!            CWB    08/16/1999         Added RULE hint to select       *
+!								       *
+!         VENDTKK   11/27/2007       Modify PY084GRS to include payline*
+!				     		 rate and hours paid   *
+!          GEX-TLL   07/08/2008      ITG #51358 (Added Erncd 173)      *  
+!    	   ISDVSXP   10/03/2008      changed the heading coloumns and  *
+!                                    edit masks to print data correctly*
+!        VENDKXY   10/21/2008        Added EARN CODE 517 for S3 11603484*
+!                                                                      *
+!        VENDTKK   02/02/2009      Added INCLUDE GETPOSNM.SQC to pull  *
+!                  	           JOBTITLE from POSITION_DATA.DESCR   *
+!				   field instead of JOBCODE_TBL.DESCR  *
+!			           	                               *
+! ISDVVXK 05/12/2015 Changes related to V2020 Payroll Inefficiences Project
+! a) Report only the TMs whose base pay is 40 X 2 times X rate
+! b) Added new columns Enrcd, oth_hrs, oth_earns, Earnigns_End_Dt
+! c) The old version is called GEXPY084_old if you need to view the     *
+!    previous code, it is easier to read the program this way rather 
+!    than commenting out blocks/lines of codes that were affected by 
+!    these changes
+! GEX_SEC_REENG 2016-08-17 Vahini Katta                                 
+! Changes related to gex_emplid_mapp/7 digit emplid                     
+!***********************************************************************
+#include 'setenv.sqc' !Set environment
+
+Begin-Setup
+#include 'setup32a.sqc'
+
+
+declare-layout Large_Page
+  paper-size=(14,11)
+ 
+ ! orientation=(PAGEORIENTATION)
+  MAX-COLUMNS=220
+  max-lines=100
+  left-margin=1.0
+  TOP-margin=1.0
+ ! LINE-HEIGHT=(LINEHIEGHT)
+  !CHAR-WIDTH=(CHARWIDTH)
+end-declare
+                      
+! page-size 50 180
+
+Declare-report gross-report
+Printer-Type=HPLASERJET
+layout=default
+
+end-declare
+
+Declare-report Balance-Report
+Printer-Type=HPLASERJET
+layout=default
+end-declare
+
+Declare-report hrly-rate-report
+Printer-Type=HPLASERJET
+layout=default
+end-declare
+
+End-Setup
+
+!*********************************************************************
+!                                    
+!*********************************************************************
+begin-report
+
+  do Init-DateTime
+  do Init-Number
+  do stdapi-init
+
+  move 'GEXPY084' to $ReportID
+  move 'Gross out of balance' to $ReportTitle
+  display $ReportTitle
+
+  do Get-Current-DateTime
+  do payroll-report-initialization
+  do Commit-Transaction
+  date-time () hh:mi:ss &timeEnded
+  display 'Report Ended: ' noline
+  display &timeEnded
+  do stdapi-term
+  do reset
+end-report
+
+!*********************************************************************
+!If this Program is being executed through process scheduler, 
+!the run control parameters and calls the main processing procedure.
+!Otherwise, interrogates the user for the run control parameters and 
+!validates them. If the run control parameters are invalid, stops the
+!execution.
+!*********************************************************************
+begin-procedure Report 
+          
+  date-time () hh:mi:ss &timeBegan
+  display 'Report Began: ' noline
+  display &timeBegan
+
+  move 'N' to $Errorfound
+
+! do Get-Pay-End-Date
+ do process-employee-data
+
+Report-Exit:
+
+ date-time () hh:mi:ss &timeProcess
+  display #InputTran 99999 noline
+  display ' Transactions Processed' 
+  display #gross_count 99999 noline
+  display ' Records written into Gross Report'
+  display #balance_count 99999 noline
+  display ' Records written into Balance Report'
+  display &timeProcess
+
+end-procedure
+
+begin-heading 8 for-reports=(gross-report)
+ move 'PY084GRS' to $reportid
+ move 'Gross Exceeds Two Times Base Pay' to $ReportTitle
+ #Include 'stdhdg02.sqc'
+ if rtrim($pay_end_dt,' ') <> ''
+  Let $X000_temp_out = 'Report as of ' || $pay_end_dt
+  Print $X000_temp_out         (3,)  Center
+ end-if
+  if $PayGroup <> $priorPayGroup
+    do Get-PayGroup-Data
+    move $PayGroup to $priorPayGroup
+  end-if
+  print 'Pay Group'        (4,1)
+  print $PayGroup          (0,13)
+  print $PayGroupName      (0,17)
+
+  position (+1)
+
+  
+ print 'Dept'      (+1,1) bold 
+ print 'Job'       (,45) bold            
+ print 'Empl'      (,69) bold 
+ print 'Std'       (,78) bold 
+ print 'Calc'      (,92) bold  
+ print 'Earns'     (,165) bold
+ print 'ID'        (+1,1) bold           
+ print 'EmplID'    (,6) bold  
+ print 'Name'      (,16) bold    
+ print 'Code'      (,45) bold           
+ print 'JobTitle'  (,52) bold          
+ print 'Type'      (,69) bold        
+ print 'Hrs'       (,78) bold         
+ print 'Rate'      (,84) bold         
+ print 'BasePay'   (,92) bold         
+ print 'GrsPay'    (,103) bold         
+ print 'Diff'      (,115) bold   
+ print 'Erncd'     (,125) bold     
+ Print 'Descr'     (,132) bold
+ print 'Hours'     (,145) bold
+ Print 'Earns'     (,155) bold  
+ Print 'EndDt'     (,165) bold
+ print '-' (+1,1,176) fill   
+end-heading
+  
+begin-heading 8 for-reports=(Balance-report)
+ move 'PY084BAL' to $reportid
+ move 'Gross to Net Out of Balance' to $ReportTitle
+ #Include 'stdhdg02.sqc'
+  
+ if rtrim($pay_end_dt,' ') <> ''
+  Let $X000_temp_out = 'Report as of ' || $pay_end_dt
+  Print $X000_temp_out         (3,)  Center
+ end-if
+
+  if $PayGroup <> $priorPayGroup
+    do Get-PayGroup-Data
+    move $PayGroup to $priorPayGroup
+  end-if
+  print 'Pay Group'        (4,1)
+  print $PayGroup          (0,13)
+  print $PayGroupName      (0,17)
+
+  position (+1)
+
+  print 'Total'  (+1,126) bold
+
+  print 'Dept ID' (+1,1) bold
+  print 'Employee ID' (,10) bold
+  print 'Name' (,24) bold
+  print 'Acct Cd' (,57) bold
+  print 'Acct Desc' (,69) bold
+  print 'Job Code' (,83) bold
+  print 'Job Title' (,94) bold
+  print 'Total Gross'  (,109) bold
+  print 'Deductions' (,124) bold
+  print 'Total Taxes' (,136) bold
+  print 'Net Pay' (,150) bold
+  print 'Difference' (,163) bold
+
+  print '-' (+1,1,176) fill
+ 
+end-heading
+        
+!*************************************************************************
+! CWB  05/19/1999   Begin
+      
+begin-heading 8 for-reports=(hrly-rate-report)
+ move 'PY084HRS' to $reportid
+ move 'Hourly Rate Greater Than $100.00' to $ReportTitle
+ #Include 'stdhdg02.sqc'
+ if rtrim($pay_end_dt,' ') <> ''
+  Let $X000_temp_out = 'Report as of ' || $pay_end_dt
+  Print $X000_temp_out         (3,)  Center
+ end-if
+  if $PayGroup <> $priorPayGroup
+    do Get-PayGroup-Data
+    move $PayGroup to $priorPayGroup
+  end-if
+
+  position (+1)
+
+
+  print 'Dept ID' (+1,1) bold
+  print 'Employee ID' (,10) bold
+  print 'Name' (,24) bold
+  print 'Acct Cd' (,57) bold
+  print 'Acct Desc' (,69) bold
+  print 'Job Code' (,83) bold
+  print 'Job Title' (,94) bold
+  print 'Empl Type'  (,109) bold
+  print 'STD Hours' (,120) bold
+  print 'Comp Rate' (,135) bold
+
+  print '-' (+1,1,176) fill
+ 
+end-heading
+
+! CWB  05/19/1999   End
+!*********************************************************************
+
+
+!*********************************************************************
+begin-procedure Get-Pay-End-Date
+!*********************************************************************
+  #debug9 show 'Doing Get-Pay-End-Date'
+  if $SlctRunID <> '*'
+    move  'cal.RUN_ID = ''' to $cal_where
+    concat $SlctRunID     with $cal_where
+    concat ''''           with $cal_where
+  else
+    move  'cal.COMPANY = ''' to $cal_where
+    concat $SlctCompany    with $cal_where
+    concat ''' AND cal.PAYGROUP = '''    with $cal_where
+    concat $SlctPayGroup   with $cal_where
+    concat ''' AND cal.PAY_END_DT = '''  with $cal_where
+    concat $SlctPayEndDt   with $cal_where
+    concat '''' with $cal_where
+  end-if
+  
+  #debug9 show '$cal_where ' $cal_where
+begin-select DISTINCT 
+cal.pay_end_dt	
+
+	move &cal.pay_end_dt to $pay_end_dt
+
+FROM ps_pay_calendar cal
+WHERE [$cal_where]
+end-select 
+end-procedure 
+
+
+
+!*********************************************************************
+!Retrieves the employees with latest paychecks and with garnishment 
+!deductions.
+!*********************************************************************
+
+begin-procedure process-employee-data
+  
+	show 'Doing process-employee-data'
+	show '$SlctCalendar ' $SlctCalendar 
+  show '$SlctOffCycleA ' $SlctOffCycleA
+  show '$SlctOffCycleB ' $SlctOffCycleB 
+	show '$asoftoday ' $asoftoday                          
+
+move 'N' to $errorfound
+move 'N' to $empl_found
+move 'N' to $new_page
+let #inputtran = 0
+position (+1)
+  Let $Position_Nbr = ''	          
+
+begin-select ON-ERROR=SQL-Error-Found('Process-employee-data')
+B.COMPANY  () on-break level=1 print=never
+B.PAYGROUP () on-break level=2 print=never
+B.DEPTID   () on-break level=3 print=never after=dept-change
+C.NAME
+B.EMPLID
+B.EMPL_RCD
+B.ACCT_CD
+B.JOBCODE
+B.HOURLY_RT
+B.EMPL_TYPE
+B.EFFDT
+B.COMPRATE
+B.STD_HOURS
+c.TOTAL_GROSS
+c.PAY_END_DT     
+c.TOTAL_TAXES
+c.TOTAL_DEDUCTIONS
+c.NET_PAY
+c.TOTAL_GROSS - c.TOTAL_DEDUCTIONS - c.TOTAL_TAXES - c.NET_PAY &diff 
+B.Position_nbr 			
+ 
+
+  let $Company  = &B.COMPANY
+  let $Paygroup = &B.PAYGROUP
+  let $pay_end_dt = &c.PAY_END_DT      
+  let $emplid = &B.EMPLID	
+  Let $Position_Nbr = &B.Position_nbr	
+
+  show '========================='
+  show 'emplid ' &B.EMPLID
+
+!**************************************************
+!  CWB  05/19/1999    Begin
+
+  if &b.empl_type <> 'S'
+     let #hourly_rate = &b.hourly_rt
+      #debug9 show '#hourly_rate ' #hourly_rate
+     if  #hourly_rate > 100
+       add 1 to #rate_count
+		#debug9 show 'Doing print-hrly-rate-report'
+       do print-hrly-rate-report
+     end-if
+  end-if
+ 
+!  CWB  05/19/1999    End
+!**************************************************
+  show 'empl_type ' &b.empl_type
+
+  if &b.empl_type <> 'S'
+     let #base_pay = 40 * &b.comprate
+  else
+     let #base_pay = &b.comprate
+  end-if
+
+  show '&c.TOTAL_GROSS ' &c.TOTAL_GROSS
+  show '#base_pay ' #base_pay        
+!**************************************************
+ let #pay_diff = &c.TOTAL_GROSS -  #base_pay		!VENDTKK  ITG#32460    27-NOV-2007
+  
+  show '#pay_diff ' #pay_diff
+
+   let #limit = (#base_pay * 2) + 100
+   show '#limit :' #limit
+
+!**************************************************
+   show '&b.comprate ' &b.comprate
+   show '&c.total_gross' &c.total_gross
+  if &c.total_gross > #limit
+	#debug9 show 'Doing print-gross-report'
+     do print-gross-report
+     add 1 to #gross_count
+     add 1 to #dept_gross_count
+  end-if
+
+  move &diff to #diff
+ 
+ #debug9 show '#diff ' #diff
+
+  if #diff <> 0
+	#debug9 show 'Doing print-balance-report'
+     do print-balance-report
+     add 1 to #balance_count
+     add 1 to #dept_bal_count
+  end-if
+     
+  add 1 to #inputtran
+
+  move 'Y' to $empl_found
+
+FROM  PS_PAY_CALENDAR A,                                                      
+      PS_JOB B,                                                               
+      PS_PAY_CHECK C  
+WHERE [$SlctCalendar] 
+AND C.OFF_CYCLE IN ($SlctOffCycleA, $SlctOffCycleB)                           
+AND C.PAGE_NUM BETWEEN #SlctPageFrom AND #SlctPageThru                        
+AND A.COMPANY    = C.COMPANY                                                  
+AND C.PAYGROUP   = A.PAYGROUP                                                 
+AND C.PAY_END_DT = A.PAY_END_DT                                               
+And B.EMPLID = C.EMPLID                                                       
+And B.EMPL_RCD = C.EMPL_RCD                                                   
+And B.EFFDT = (select max(effdt)                                              
+		   from ps_job                                              
+		  where emplid = b.emplid                                     
+		    and empl_rcd = b.empl_Rcd                                 
+		    and effdt <= $asoftoday)
+And B.EFFSEQ = (select max(effseq)                                            
+		    from ps_job                                             
+		   where emplid = b.emplid                                    
+		     and empl_rcd = b.empl_rcd                                
+		     and effdt = b.effdt)     
+ORDER BY B.COMPANY, B.PAYGROUP, B.DEPTID, C.NAME                              
+end-select
+   #debug9 show '#gross_count ' #gross_count 
+   #debug9 show '#balance_count ' #balance_count 
+   #debug9 show '#rate_count ' #rate_count 
+   #debug9 show '$empl_found ' $empl_found 
+
+if #gross_count = 0			
+   use-report gross-report
+   print 'No Data Selected' (,34)
+end-if
+if #balance_count = 0		! DXS, Changed or to and
+   use-report balance-report
+   print 'No Data Selected' (,34)
+end-if  
+if #rate_count = 0			! DXS, Added $empl_found = 'N' and added "and" clause
+   use-report hrly-rate-report
+   print 'No Data Selected' (,34)
+end-if  
+end-procedure
+
+!*********************************************************************
+!Dept-change
+!*********************************************************************
+Begin-Procedure Dept-Change
+   #debug9 show 'Doing dept-change'
+  if #dept_gross_count > 0
+      #debug9 show 'Using gross-report ' #dept_gross_count 
+     use-report gross-report
+     new-page
+  end-if
+  if #dept_bal_count > 0
+     	#debug9 show 'Using balance-report ' #dept_bal_count
+	use-report balance-report
+     new-page
+  end-if
+  move 0 to #dept_gross_count
+  move 0 to #dept_bal_count
+end-procedure
+
+!*********************************************************************
+!Prints Gross Pay Exceeds 2 times base pay report
+!*********************************************************************
+   
+begin-procedure print-Gross-Report
+   
+  use-report gross-report
+
+  let $jobcode = &b.jobcode
+  do get-job-title
+  
+  Do Get-Position-Title			 !getposnm.sqc
+   IF $PosNameAbbrv = '' 
+  		Let $JobTitleabbrv = $JobTitleabbrv
+	 Else
+ 		Let $JobTitleabbrv = $PosNameAbbrv
+	 End-if
+ 	
+  let $acctcd = &b.acct_cd
+  do get-acct-cd-descr
+  
+  do get-bonus				   
+  do reset-variable
+end-procedure 
+
+
+Begin-Procedure reset-variable    
+
+  let $Erncd        = ' '
+  let #oth_earns    = ' '
+  let #oth_hrs      = ' '
+  let #pay_diff     = ' '
+  let $EarningsName = ' '
+End-Procedure
+  
+Begin-Procedure get-bonus			
+       	
+  show 'In get-bonus'
+	show 'Paygroup   ' $Paygroup
+	show 'Pay_end_dt ' $pay_end_dt
+	show 'Company    ' $Company
+	show 'Emplid     ' $emplid
+
+begin-select
+P.EMPLID
+P.EARNS_BEGIN_DT
+P.EARNS_END_DT
+O.ERNCD
+O.OTH_HRS
+O.OTH_EARNS
+	
+	Move &O.ERNCD          to $ErnCd
+	show '$ErnCd :' $ErnCd
+        Move &O.OTH_HRS        to #oth_hrs
+        Move &O.OTH_EARNS      to #oth_earns
+        Move &P.EARNS_BEGIN_DT to $Earns_Begin_Dt
+        Move &P.EARNS_END_DT   to $Earns_End_Dt
+	
+	do Get-Earnings-Name
+	
+     if &P.EMPLID <> $Prev_Emplid
+	print &B.DEPTID      (,1)				
+        print &B.EMPLID      (,6)     
+        print &C.NAME        (,16)         
+        print &B.ACCT_CD     (,46)                     
+        print $jobtitleabbrv (,52)                     
+        print &B.EMPL_TYPE   (,72)                     
+        print &B.STD_HOURS   (,78)   !edit 999.99     
+        print &B.COMPRATE    (,82)   edit 99999.99 !999.99 
+        print #base_pay      (,92)   edit 99999.99 
+        print &c.total_gross (,103)  edit 99999.99 !9999.99 
+        print #pay_diff      (,115)  edit 99999.99    !9999.99    
+        print $Erncd         (,125)                    
+        print $EarningsAbbrv (,132)                    
+        print #oth_hrs       (,145)  edit 9999.99 !9999.99     
+        print #oth_earns     (,155)  edit 99999.99 !9999.99	
+        print $Earns_End_Dt (,165)   edit mm/dd/yy
+        position (+1)
+     ELSE
+        print $Erncd         (,125)                    
+        print $EarningsAbbrv (,132)                    
+        print #oth_hrs       (,145)  edit 9999.99     
+        print #oth_earns     (,155)  edit 99999.99	
+        print $Earns_End_Dt (,165)   edit mm/dd/yy
+          position (+1)
+     end-if
+       Move &P.EMPLID to $Prev_Emplid
+	
+FROM PS_PAY_OTH_EARNS O ,
+     PS_PAY_EARNINGS P
+WHERE O.COMPANY = P.COMPANY
+     AND O.PAYGROUP = P.PAYGROUP
+     AND O.PAY_END_DT = P.PAY_END_DT
+     AND O.OFF_CYCLE = P.OFF_CYCLE
+     AND O.PAGE_NUM = P.PAGE_NUM
+     AND O.LINE_NUM = P.LINE_NUM
+     AND O.ADDL_NBR = P.ADDL_NBR
+     AND O.PAYGROUP= $Paygroup
+     AND O.PAY_END_DT = $pay_end_dt
+     AND O.COMPANY =  $Company
+     AND P.EMPLID = $emplid
+end-select
+End-Procedure
+!******************************************************************************         
+
+
+!*********************************************************************
+!  CWB  05/19/1999    Begin
+!*********************************************************************
+!Prints Employees with hourly rates that exceed $100.00
+!*********************************************************************
+   
+begin-procedure print-hrly-rate-report
+	
+  use-report hrly-rate-report
+
+  let $jobcode = &b.jobcode
+  do get-job-title
+  let $acctcd = &b.acct_cd
+  do get-acct-cd-descr
+
+  print &B.DEPTID (,3)
+  print &B.EMPLID (,10)
+  print &c.NAME (,24) 
+  print &B.ACCT_CD (,60)
+  print $acctnameabbrv (,69)
+  print &B.JOBCODE (,84) 
+  print $jobtitleabbrv (,94)
+  print &B.EMPL_TYPE (,113)
+  print &B.STD_HOURS (,120) EDIT 9,999.99
+  print &B.COMPRATE (,132) edit 9,999,999.99
+
+  position (+1)
+
+end-procedure 
+            
+!  CWB  05/19/1999    End
+!*********************************************************************
+         
+!*********************************************************************
+!Prints Gross to net out of Balance Report 
+!*********************************************************************
+   
+begin-procedure print-Balance-Report
+
+  use-report balance-report
+
+  let $jobcode = &b.jobcode
+  do get-job-title
+  let $acctcd = &b.acct_cd
+  do get-acct-cd-descr
+  print &B.DEPTID (,3)
+  print &B.EMPLID (,10)
+  print &c.NAME (,24) 
+  print &B.ACCT_CD (,60)
+  print $acctnameabbrv (,69)
+  print &B.JOBCODE (,84) 
+  print $jobtitleabbrv (,94)
+  print &c.TOTAL_GROSS (,107) edit 9,999,999.99
+  print &c.TOTAL_DEDUCTIONS (,120) EDIT 9,999,999.99
+  print &c.TOTAL_TAXES (,132) edit 9,999,999.99
+  print &c.NET_PAY (,145) edit 9,999,999.99
+  if #diff < 0 
+     let #diff = #diff * -1
+  end-if
+  print #diff (,160) edit 9,999,999.99
+
+  position (+1)
+  let #diff = 0
+
+end-procedure 
+
+!********************************************************************
+!This procedure displays in the error report if there are any sql erros
+!happened in the program
+!********************************************************************
+
+begin-procedure SQL-Error-Found($Proc_Name) 
+   #debug9 show 'Doing SQL-Error-Found'
+  use-report gross-report
+  do error-found
+  print 'SQL Error in ' (,34)
+  print $Proc_Name ()  
+  print $_sql-error () 
+  print 'sql-status:' ()
+  print #_sql-status () edit 99999 
+
+  use-report balance-report
+  do error-found
+  print 'SQL Error in ' (,34)
+  print $Proc_Name ()  
+  print $_sql-error () 
+  print 'sql-status:' ()
+  print #_sql-status () edit 99999 
+
+end-procedure
+
+!*********************************************************************
+!This procedure displays the error message for the records that are in
+!progress
+!*********************************************************************
+
+begin-procedure Error-Found
+	#debug9 show 'Doing Error-Found'
+  move 'Y' to $ErrorFound
+  do Format-Number(#InputTran, $out, '99999')
+!  print $out (+1,1)
+  if rtrim($emplid,' ') <> ''
+    ! GEX_SEC_REENG 2016-08-17 Vahini Katta Begins
+     !let $EmplId_1st3 = substr($EmplId,1,3)
+     !let $EmplId_mid2 = substr($EmplId,4,2)
+     !let $EmplId_last4 = substr($EmplId,6,4)
+ 
+     !String $EmplId_1st3 $EmplID_mid2 $EmplId_last4 by '-' into $EmplId11
+
+     !print $EmplID11 (,16)
+     print $EmplID (,16)
+   ! GEX_SEC_REENG 2016-08-17 Vahini Katta Ends  
+  end-if
+
+end-procedure
+
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'datemath.sqc'  !Does the date-math functions
+#Include 'getdatcd.sqc'  !Get-Date-Codes procedure
+#Include 'stdapi.sqc'    !Get_Run_Control Procedure
+#Include 'gexregtp.sqc'  !Get-Translate-Full-Part
+#Include 'getcodta.sqc'  !Get-Company-Data
+#Include 'getpgdta.sqc'  !Get-Paygroup-Data
+#include 'getjobtl.sqc'
+#include 'getactnm.sqc'
+#include 'geternnm.sqc'
+#include 'reset.sqc'
+#include 'payinit.sqc'
+#include 'payrnctl.sqc'
+#include 'getposnm.sqc'  !Get-Position-Title    VENDTKK ITG#56786   2-Feb-2009  

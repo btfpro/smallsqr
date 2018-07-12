@@ -1,0 +1,432 @@
+!********************************************************************** 
+! SQR Name:           adpweeks.sqc  
+! SQR Descr:          ADP Employment Tax, ADP Weeks worked calculation
+! Created by:         drmonroe 
+! Create date:        03/04/2010 
+! Last modified by:   drmonroe
+! Last modified date: 01/23/2014
+!*********************************************************************** 
+! adpweeks.sqc
+!   
+!  Purpose:  To replace the get-weeks routine delivered by PeopleSoft
+!            Called through the adhours.sqc
+!  Author:   Dan Monroe
+!  Date:     Feb 27, 2009
+!            Mar 02, 2009   -  made PeopleSoft version independent, ln, pg
+!            Mar 31, 2009   -  looks for CHECK_DT between  $Qtr_Start_Native... $Qtr_End_Native
+!            Apr 01, 2009   -  change debugging from print to show
+!            May 04, 2009   -  standard results as get-weeks from PeopleSoft
+!                           -  simplified... count the days related to checks in the quarter
+!                              if there are earnings on these checks, count the days
+!                              add performance monitoring code, select with ur...
+!            May 15, 2009   -  onsite testing
+!            May 20, 2009   -  count begin..end date from pay check not pay earnings
+!            Sep 29, 2009   -  Derivation client added
+!            Nov 12, 2009   -  Fix to main query order by pay end dt, pay begin dt, and only pull in on-cycles
+!            Mar 28, 2011   -  Fix to use QTD_Earnings when more than one pay earnings row is retrieved / pay line
+!            Apr 12, 2011   -  fix to use the Earnings for each check to determine if we should count the days
+!            Apr 20, 2011   -  For subtotaling by FEIN and ADP Compid... take that into account in the YTD query for 'MOH' credits
+!            Apr 29, 2011   -  bypass negative earnings situations
+!            May 19, 2011   -  round 1 thru 7 to 1 week
+!            Jun 02, 2011   -  if multiple earnings.. we were only picking up the last set of earnings for the check
+!                                and if there were no earnings, we were not picking up the days worked.
+!            Jul 07, 2011   -  option to include off-cycle checks in the query (ADPWEEKS_INCLUDE_OFF_CYCLE_CHECKS)
+!            Jan 03, 2012   -  AND B.PAYCHECK_NBR  <> 0   clause removed (VZN1) for speed
+!   ******************** Q3 2012 ***********************
+!            Oct 11, 2012      PROCESS_WEEKS_WITH_ZERO_EARNINGS option
+!            Jun 10, 2013      Change &C. to &CW.  (alias conflict w/pbzqtr.sqr)
+!            Jan 23, 2014      Add FORCE_NJ_FULL_QTR_WEEKS  #define FORCE_NJ_FULL_QTR_WEEKS  13
+!            Sep 18, 2014      BYPASS_WEEKS_CALC_FOR_ZERO_QTD_WAGES option added
+!-----------------------------------------------------------------------------------------------------------------------
+
+#define ADPWEEKS_Version adpweeks.sqc: Sept 18, 2014
+
+#ifdef DERIVATION_CLIENT
+ #define MaxWeeksPA      52      !Maximum qtr work weeks reported for PA
+ #define MaxWeeksMN      52      !Maximum qtr work weeks reported for MN
+ #define MaxWeeksOH      52      !Maximum qtr work weeks reported for OH
+#else
+ #define MaxWeeksPA      13      !Maximum qtr work weeks reported for PA
+ #define MaxWeeksMN      14      !Maximum qtr work weeks reported for MN
+ #define MaxWeeksOH      13      !Maximum qtr work weeks reported for OH
+#endif
+
+#if {SITE_ID} = 'TCN1'
+  #define ADPWEEKS_INCLUDE_OFF_CYCLE_CHECKS
+#endif
+
+#if {SITE_ID} = 'SPG1'
+  #define ADPWEEKS_INCLUDE_OFF_CYCLE_CHECKS
+#endif
+
+#if {SITE_ID} = 'FBI1'
+  #define BYPASS_WEEKS_CALC_FOR_ZERO_QTD_WAGES
+ ! #define PROCESS_WEEKS_WITH_ZERO_EARNINGS   !20141112 per client request
+  #define ADPWEEKS_INCLUDE_OFF_CYCLE_CHECKS
+#endif
+
+
+begin-procedure Get-Weeks
+
+#ifdef BYPASS_WEEKS_CALC_FOR_ZERO_QTD_WAGES
+ if #TaxBalance_Nlgrs_Qtd <= 0 
+  if $SelectEmplid <> ''
+    show 'ADP, Get-Weeks bypassing weeks calculation due to subject wages = ' #TaxBalance_Nlgrs_Qtd edit 999,999,999.99
+  end-if
+  goto BYPASS_WEEKS_CALC
+ end-if
+#endif
+
+#ifdef DERIVATION_CLIENT
+  let $ADP_WEEKS_Qtr_Start_Native = $Year_Start_Date_Native
+  let $ADP_WEEKS_Qtr_End_Native   = $Qtr_End_Native
+#else
+  let $ADP_WEEKS_Qtr_Start_Native = $Qtr_Start_Native
+  let $ADP_WEEKS_Qtr_End_Native   = $Qtr_End_Native
+#endif
+
+  if #adp-weeks-cnt < 1
+    show ''
+    #ifdef SUBTOTAL_ADP_COMPID_EXTRACT
+       show  'Get-Weeks {ADPWEEKS_Version} Emplid ' $Emplid  ', ADP_Comp ' $Current_ADP_Compid ' Check date range ' $ADP_WEEKS_Qtr_Start_Native  '...' $ADP_WEEKS_Qtr_End_Native    
+    #else
+      #ifdef SUBTOTAL_FEIN_EXTRACT
+        show  'Get-Weeks {ADPWEEKS_Version} Emplid ' $Emplid ', FEIN '     #Current_FEIN ' Check date range ' $ADP_WEEKS_Qtr_Start_Native  '...' $ADP_WEEKS_Qtr_End_Native      
+      #else
+        show  'Get-Weeks {ADPWEEKS_Version} Emplid ' $Emplid ', Company '  $Company ' Check date range ' $ADP_WEEKS_Qtr_Start_Native  '...' $ADP_WEEKS_Qtr_End_Native
+      #endif
+    #endif
+    #ifdef ADPWEEKS_INCLUDE_OFF_CYCLE_CHECKS
+     show 'ADPWEEKS_INCLUDE_OFF_CYCLE_CHECKS enabled'
+    #endif
+    add 1 to #adp-weeks-cnt
+  end-if
+
+
+  let #WeeksWorked = 0
+  let #DaysWorkedinQtr = 0
+  let #EarnPeriodDays = 0
+  do Process-Weeks
+
+  let $process_check_for_weeks = 'f'
+  if #QTD_Earnings > 0
+    let $process_check_for_weeks = 't'
+  else
+    #ifdef PROCESS_WEEKS_WITH_ZERO_EARNINGS 
+      let $process_check_for_weeks = 't'
+    #endif
+  end-if
+  
+  if $process_check_for_weeks = 't'
+    if #DaysWorkedinQtr >= 1 and #DaysWorkedinQtr < 7 and #RptYear >= 2011
+     let #WeeksWorked = 1         !5/18/2011
+    else
+     let #WeeksWorked = #DaysWorkedinQtr / 7
+    end-if
+  end-if
+  
+   let $RT_State = rtrim($State, ' ')
+   evaluate $RT_State
+      when = 'MN'
+         move  {MaxWeeksMN} to #MaxWeeks
+         break
+      when = 'OH'
+         move  {MaxWeeksOH} to #MaxWeeks
+         break
+      when = 'PA'
+         move  {MaxWeeksPA} to #MaxWeeks
+         break
+      when-other
+         move  14 to #MaxWeeks
+         break
+   end-evaluate
+   
+   #ifdef DERIVATION_CLIENT
+    evaluate #RptQtr 
+     when = 1
+      move  13 to #MaxWeeks
+      break
+     when = 2
+      move  26 to #MaxWeeks
+      break
+     when = 3
+      move  39 to #MaxWeeks
+      break
+     when = 4
+      move  52 to #MaxWeeks
+      break
+     when-other
+      break
+    end-evaluate          
+   #endif
+
+   if #WeeksWorked > #MaxWeeks
+      move #MaxWeeks to #WeeksWorked
+   end-if
+   
+  #ifdef FORCE_NJ_FULL_QTR_WEEKS
+     if ($RT_State = 'NJ') and (#WeeksWorked >= 12) and (#WeeksWorked <> {FORCE_NJ_FULL_QTR_WEEKS})
+       if $SelectEmplid <> ''
+         show 'ADP, Get-Weeks Cap for NJ. Calculated WeeksWorked = '  #WeeksWorked edit 99 ' setting to {FORCE_NJ_FULL_QTR_WEEKS}'
+       end-if
+       let #WeeksWorked = {FORCE_NJ_FULL_QTR_WEEKS}
+     end-if
+  #endif
+  
+  if $SelectEmplid <> ''
+    show 'ADP, Get-Weeks complete. MaxWeeks = ' #MaxWeeks edit 99 ', Total Earnings = ' #QTD_Earnings edit 999,999,999.99 ', Calculated WeeksWorked = '  #WeeksWorked edit 99
+  end-if
+
+BYPASS_WEEKS_CALC:  
+  
+end-procedure
+
+begin-procedure Process-Weeks
+
+ #ifdef  enable_performance_monitor
+    do Get-Current-Time
+    let $display_dt0 = $display_dt
+ #endif
+
+  let $prior_end_dt = ''
+  move 0 to #QTD_earnings
+
+
+begin-select
+A.COMPANY
+A.PAYGROUP
+A1.BALANCE_YEAR
+A1.BALANCE_PERIOD
+A.PAY_END_DT
+A.PAY_BEGIN_DT
+A.CHECK_DT
+B.EMPLID
+B.OFF_CYCLE
+B.{pg}
+B.{ln}
+B.SEPCHK
+
+ if &A.PAY_END_DT = $prior_end_dt
+    if $SelectEmplid <> ''
+     show  'Process Weeks, multiple checks, Emplid: '  $Emplid ' ' &A.COMPANY ' ' &A.PAYGROUP ' Pay_Begin_Dt = ' &A.PAY_BEGIN_DT ' Pay_End_Dt = ' &A.PAY_END_DT ' Check_Dt = ' &A.CHECK_DT
+    end-if
+ else
+
+  do Get-Pay-Earnings
+  if $SelectEmplid <> ''
+    show  'Process Weeks '  &A.COMPANY ' ' &A.PAYGROUP ' Pay_Begin_Dt = ' &A.PAY_BEGIN_DT ' Pay_End_Dt = ' &A.PAY_END_DT ' Check_Dt = ' &A.CHECK_DT ', Earnings = ' #Earnings
+  end-if
+
+  let $process_check_for_weeks = 'f'
+  if #Earnings > 0  !3/28/2011 changed from #Earnings
+    let $process_check_for_weeks = 't'
+  else
+   #ifdef PROCESS_WEEKS_WITH_ZERO_EARNINGS 
+     let $process_check_for_weeks = 't'
+     if $SelectEmplid <> ''
+       show  'Process Weeks Earnings = ' #Earnings ' PROCESS_WEEKS_WITH_ZERO_EARNINGS enabled, counting weeks with zero earnings'
+     end-if
+   #endif
+  end-if
+  
+  if $process_check_for_weeks = 't'
+    do Convert-To-DTU-Date(&A.PAY_BEGIN_DT,$C.Earns_Begin_Dt)
+    do Convert-To-DTU-Date(&A.PAY_END_DT,$C.Earns_End_Dt)
+    do DTU-Diff-Days($C.Earns_Begin_Dt, $C.Earns_End_Dt, #EarnPeriodDays)
+    let #DaysWorkedinQtr = #DaysWorkedinQtr + #EarnPeriodDays + 1
+
+    if $SelectEmplid <> ''
+      show  'Process Weeks $C.Earns_Begin_Dt: ' $C.Earns_Begin_Dt ' $C.Earns_End_Dt ' $C.Earns_End_Dt ' #EarnPeriodDays ' #EarnPeriodDays ' running days total = ' #DaysWorkedinQtr
+    end-if
+
+    let $prior_end_dt          = &A.PAY_END_DT
+
+  end-if
+ end-if
+ 
+ FROM  PS_PAY_CALENDAR A, PS_PAY_CAL_BAL_ID A1, PS_PAY_CHECK B
+        #ifdef SUBTOTAL_ADP_COMPID_EXTRACT
+         , PS_TF_COMPANY_XREF CT2
+        #else
+          #ifdef SUBTOTAL_FEIN_EXTRACT
+           , PS_COMPANY_TBL CT2
+          #endif
+        #endif
+
+ WHERE A.COMPANY        = A1.COMPANY 
+  AND A.PAYGROUP        = A1.PAYGROUP
+  AND A.PAY_END_DT      = A1.PAY_END_DT 
+  AND A1.BALANCE_ID     = $Calendar_Year_Id
+  AND B.EMPLID          = $Emplid
+  AND A.CHECK_DT       >= $ADP_WEEKS_Qtr_Start_Native        !for ADP
+  AND A.CHECK_DT       <= $ADP_WEEKS_Qtr_End_Native
+  AND B.COMPANY         = A.COMPANY
+  AND B.PAYGROUP        = A.PAYGROUP
+  AND B.PAY_END_DT      = A.PAY_END_DT
+  !AND B.PAYCHECK_NBR         <> 0                           !1/3/2012 (VZN1) for speed
+  AND B.PAYCHECK_STATUS IN ('F','R','A')
+  
+  #ifndef ADPWEEKS_INCLUDE_OFF_CYCLE_CHECKS
+   AND B.OFF_CYCLE       = 'N'
+  #endif
+  
+        !4/19/2011 - added for GE01 to pick up the YTD's for all the companies mapped to the current ADP Compid  
+        #ifdef SUBTOTAL_ADP_COMPID_EXTRACT
+           AND B.COMPANY = CT2.COMPANY
+           AND CT2.TF_COMPANY = $Current_ADP_Compid
+           AND CT2.EFFDT = (SELECT MAX(EFFDT)
+                FROM PS_TF_COMPANY_XREF 
+                WHERE COMPANY = CT2.COMPANY
+                  AND EFFDT  <= $ADP_WEEKS_Qtr_End_Native)
+        #else
+
+          !4/19/2011 - added for other clients rolling up by FEIN too
+          #ifdef SUBTOTAL_FEIN_EXTRACT
+             AND B.COMPANY = CT2.COMPANY
+             AND CT2.FEDERAL_EIN  = #Current_FEIN
+             AND CT2.EFFDT = (SELECT MAX(EFFDT)
+                  FROM PS_COMPANY_TBL 
+                  WHERE COMPANY = CT2.COMPANY
+                    AND EFFDT  <= $ADP_WEEKS_Qtr_End_Native)
+          #else
+             AND B.COMPANY = $Company
+          #endif
+
+        #endif
+        
+        ORDER BY A.PAY_END_DT, A.PAY_BEGIN_DT
+
+#ifdef SELECT_WITH_UR
+ with ur
+#end-if
+end-select
+  #ifdef  enable_performance_monitor
+     do Get-Current-Time
+     move 'Process-Weeks' to $debug-proc1
+     move 'PS_PAY_CHECK'    to $debug-table1
+     do log-delta-time
+  #endif
+
+  if $SelectEmplid <> ''
+    show  'Process Weeks Complete: DaysWorkedinQtr '  #DaysWorkedinQtr ', QTD Earnings = ' #QTD_Earnings
+  end-if
+
+end-procedure
+
+begin-procedure Get-Pay-Earnings
+
+  move '1' to $Year4
+  move '-' to $DDelimiter
+
+ #ifdef  enable_performance_monitor
+    do Get-Current-Time
+    let $display_dt0 = $display_dt
+ #endif
+
+ move 0 to #Earnings
+
+begin-SELECT
+                   !#i_Min is array element at which to start load of
+                   !earnings for a pay period
+
+                   !#i_Max is array element at which to end load of
+                   !earnings for a pay period
+
+                   !#EarnPeriodDays is the number of days in the earnings
+                   !period
+CW.EARNS_BEGIN_DT
+CW.EARNS_END_DT
+CW.ADDL_NBR
+CW.REG_HRLY_EARNS
+CW.OT_HRLY_EARNS
+CW.REG_EARNS
+
+  do Get-Other-Pay
+
+  let #C.REG_HRLY_EARNS = &CW.REG_HRLY_EARNS
+  let #C.OT_HRLY_EARNS  = &CW.OT_HRLY_EARNS
+  let #C.REG_EARNS      = &CW.REG_EARNS
+  if #C.REG_HRLY_EARNS < 0
+     let #C.REG_HRLY_EARNS = 0
+  end-if
+  if #C.OT_HRLY_EARNS < 0
+     let #C.OT_HRLY_EARNS = 0
+  end-if
+  if #C.REG_EARNS < 0
+     let #C.REG_EARNS = 0
+  end-if
+  
+  if $SelectEmplid <> ''
+   show  'Get-Pay-Earnings: '  &CW.EARNS_BEGIN_DT '...' &CW.EARNS_END_DT ', HRLY = ' #C.REG_HRLY_EARNS ', OT = ' #C.OT_HRLY_EARNS ', REG = ' #C.REG_EARNS ', Other = ' #OTH_EARNS
+  end-if
+
+  !6/2/2011, changed from --> let #Earnings = #C.REG_HRLY_EARNS + #C.OT_HRLY_EARNS + #C.REG_EARNS + #OTH_EARNS
+  let #Earnings =  #Earnings + #C.REG_HRLY_EARNS + #C.OT_HRLY_EARNS + #C.REG_EARNS + #OTH_EARNS
+  
+  add #Earnings to #QTD_earnings 
+  
+  FROM  PS_PAY_EARNINGS CW
+  WHERE CW.COMPANY   = &A.Company
+   AND CW.PAYGROUP   = &A.PayGroup
+   AND CW.PAY_END_DT = &A.Pay_End_Dt
+   AND CW.OFF_CYCLE  = &B.Off_Cycle
+   AND CW.{pg}       = &B.{pg}
+   AND CW.{ln}       = &B.{ln}
+   AND CW.SEPCHK     = &B.SepChk
+   AND CW.STATE      = $STATE
+  ORDER BY CW.ADDL_NBR
+
+#ifdef SELECT_WITH_UR
+ with ur
+#end-if
+end-select
+
+  #ifdef  enable_performance_monitor
+     do Get-Current-Time
+     move 'Get-Pay-Earnings' to $debug-proc1
+     move 'PS_PAY_EARNINGS'    to $debug-table1
+     do log-delta-time
+  #endif
+
+end-procedure
+
+begin-procedure Get-Other-Pay
+
+ move 0 to #OTH_EARNS
+
+ #ifdef  enable_performance_monitor
+    do Get-Current-Time
+    let $display_dt0 = $display_dt
+ #endif
+
+begin-SELECT
+
+O.OTH_EARNS
+
+  let #OTH_EARNS = #OTH_EARNS + &O.OTH_EARNS
+
+FROM  PS_PAY_OTH_EARNS O
+WHERE O.COMPANY    = &A.Company
+  AND O.PAYGROUP   = &A.PayGroup
+  AND O.PAY_END_DT = &A.Pay_End_Dt
+  AND O.OFF_CYCLE  = &B.Off_Cycle
+  AND O.{pg}       = &B.{pg}
+  AND O.{ln}       = &B.{ln}
+  AND O.SEPCHK     = &B.SepChk
+  AND O.ADDL_NBR   = &CW.ADDL_NBR
+  AND O.OTH_EARNS > 0
+#ifdef SELECT_WITH_UR
+ with ur
+#end-if
+end-select
+
+  #ifdef  enable_performance_monitor
+     do Get-Current-Time
+     move 'Get-Other-Pay' to $debug-proc1
+     move 'PS_PAY_OTH_EARNS' to $debug-table1
+     do log-delta-time
+  #endif
+
+end-procedure
+
+! ------------------------ end of adpweeks.sqc ---------------------------

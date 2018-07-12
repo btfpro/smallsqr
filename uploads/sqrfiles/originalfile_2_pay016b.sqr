@@ -1,0 +1,1012 @@
+
+!***********************************************************************
+!  PAY016B:  Bond Purchase Report and File                             *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+!                                                                      *
+! This module contains confidential and proprietary information        *
+! of Oracle; it is not to be copied, reproduced, or transmitted        *
+! in any form, by any means, in whole or in part, nor is it to         *
+! be used for any purpose other than that for which it is              *
+! expressly provided under the applicable license agreement.           *
+!                                                                      *
+! Copyright (C) 2007 Oracle. All Rights Reserved.                      *
+!                                                                      *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!          $Date:  2007/03/05:14:42:07                                 !
+!       $Release:  HR9                                                 !
+!    $Resolution:  698735                                              !
+!                                                                      *
+!***********************************************************************
+
+#include 'setenv.sqc' !Set environment
+#Include 'setup31.sqc'  !Printer and page-size initialization
+#Include 'usarpt.sqc'  !Get USA variables
+#Include 'getaddr.sqc' !Get Current Person Address
+
+begin-report
+  do Init-Report
+  do Process-Main
+  display ''
+  display 'PAY016B - Bond Purchase Report and File'
+  display ''
+
+  do Stdapi-Term
+end-report
+
+begin-procedure Init-Report
+  move 'PAY016B' to $ReportID
+  move 'Bond Purchase Report' to $ReportTitle
+
+  do Init-DateTime
+  do Init-Number
+  do Stdapi-Init
+  do Get-Current-DateTime
+
+  move 'N' to $EndInput
+  move 'N' to $DoFRB
+  move 'N' to $FRBCheck
+  move 'N' to $FileOpen
+
+  #ifdef OS400
+      open '{IMPORTPREFIX}BondFile{IMPORTSUFFIX}'     as 10 for-writing record=93:fixed
+  #else
+    #ifdef MVS
+      open '{IMPORTPREFIX}BondFile{IMPORTSUFFIX}'     as 10 for-writing record=93:fixed
+    #else
+      open '{IMPORTPREFIX}BondFile.out{IMPORTSUFFIX}' as 10 for-writing record=93:fixed
+    #endif
+  #endif
+
+  if $Prcs_Process_Instance = ''
+     input $SlctCheckDt 'Enter As of Date - i.e. Check Date ({Prompt-Date})' type=char
+     do Format-DateTime($SlctCheckDt, $SlctCheckDt, {Prompt-Mask}, '','Native')
+     move $SlctCheckDt to $AsOfDate
+
+     while $FormatOut = ''
+        input $FormatOut 'Enter Output Format - D = Diskette, T or C = Tape' type=char
+        uppercase $FormatOut
+        if INSTR('CTD',$FormatOut,1) = 0
+          display 'Invalid Output Format - Enter C, D, or T'
+          move '' to $FormatOut
+        end-if
+     end-while
+  else
+     do Select-Parameters
+     move $RC_PAY.Reporting_Medium  to  $FormatOut
+     move $RC_PAY.AsOfDate  to  $AsOfDate
+  end-if
+  do Format-DateTime($AsOfDate, $TempDate, {DEFYMD},'' ,'')
+  Extract $FileYR from $Tempdate 2 2
+  Extract $FileMO from $Tempdate 5 2
+end-procedure
+
+begin-heading 8
+#Include 'stdhdg01.sqc'
+#Include 'stdhdg09.sqc'
+  print 'Bond ID: '       (5,1)
+  print $HdgBondID        ()
+  print 'Denomination: '  (0,+3)
+  print $HdgDenom         ()
+  print 'Purchase Cost: ' (0,+3)
+  print $HdgCost          ()
+  print '                                             No.Of  Purchase    ' (+2,1)
+  print 'Bond Owner Name/'                                     ()
+  print 'Employee ID  Name                            Bonds    Date      ' (+1,1)
+  print 'Other Registrant Name               SSN      C/B'     ()
+end-heading
+
+
+begin-procedure Process-Main
+  move 'N' to $Bond_Purchase
+  move ' ' to $UDEmplid
+
+begin-SELECT
+B.COMPANY      () on-break print=never level=1 procedure=Company-Change
+B.PAYGROUP
+B.DEPTID
+B.NAME
+B.EMPLID
+B.CHECK_DT
+B.PAY_END_DT
+B.PAYCHECK_NBR
+B.FORM_ID
+I1.NATIONAL_ID
+D.BOND_ID      () on-break print=never level=2 procedure=Denom-Change
+D.BOND_OWNER_ID
+D.BOND_OTH_REG_TYPE
+D.BOND_OTH_REG_ID
+D.BOND_LOG_SEQ
+D.BOND_PURCH_UNITS
+D.BOND_DISBURSE_AMT
+D.CHECK_DT
+G.BOND_RDMPT_AMT
+G.BOND_PURCH_AMT
+G.DESCRSHORT
+
+  move ' ' to $address_type
+  move ' ' to $bond_dlvy_id
+  do get-bond-delivery-address
+
+  if &B.EmplID <> $UDEmplid
+    move &B.Company to $Company
+    move &B.EmplID  to $UDEmplid
+  end-if
+
+  move &G.Bond_Rdmpt_Amt    to $BDenom     09999.99
+  do Format-Number(&G.Bond_Rdmpt_Amt, $Denom, '09999')
+  move &G.Bond_Rdmpt_Amt    to $HdgDenom $$$,$$9
+  move &G.Bond_Purch_Amt    to $HdgCost  $$$,$$9
+  move &G.DescrShort        to $HdgBondID
+
+  if $FRBCheck = 'N'        ! First time through
+    do FRB-Check
+    do Setup-File-Bond-Type
+  end-if
+
+  move &B.EMPLID            to $ablEMPLID
+  move &D.BOND_ID           to $ablBOND_ID
+  move &D.BOND_OWNER_ID     to $ablBOND_OWNER_ID
+  move &D.BOND_OTH_REG_TYPE to $ablBOND_OTH_REG_TYPE
+  move &D.BOND_OTH_REG_ID   to $ablBOND_OTH_REG_ID
+  move &D.CHECK_DT          to $ablCHECK_DT
+
+  do Accumulate-Bond-Log-Amounts
+
+  if #Bond_Disburse_Amt <= #Bond_Collect_Amt
+    move &D.Bond_Purch_Units  to #AssocBonds
+    add  #AssocBonds          to #TotalBonds
+    do Bond-Purchase
+    do Mark-Bond-Log-Purchased
+  end-if
+
+FROM  PS_PAY_CHECK     B,
+      PS_BOND_LOG      D,
+      PS_BOND_TBL      G,
+      PS_PERS_NID      I1
+WHERE B.CHECK_DT        <= $AsOfDate
+  AND D.EMPLID           = B.EMPLID
+  AND B.EMPLID           = I1.EMPLID
+  AND I1.COUNTRY          = {NID_COUNTRY}
+  AND I1.NATIONAL_ID_TYPE = $PAYROLL_NID_TYPE
+  AND D.CHECK_DT         = B.CHECK_DT
+  AND D.PAYCHECK_NBR     = B.PAYCHECK_NBR
+  AND D.FORM_ID          = B.FORM_ID
+  AND D.BOND_LOG_STATUS  = 'R'  !Ready to Purchase
+  AND D.REVERSED         = 'N'  !Bond Reversal
+  AND D.BOND_PURCH_UNITS > 0
+  AND G.BOND_ID          = D.BOND_ID
+  AND G.EFFDT =
+      (SELECT MAX(EFFDT)
+       FROM   PS_BOND_TBL
+       WHERE  BOND_ID = G.BOND_ID
+         AND  EFFDT  <= D.CHECK_DT)
+ORDER BY B.COMPANY,
+         D.BOND_ID,
+         B.EMPLID,
+         B.NAME
+end-SELECT
+
+  if $Bond_Purchase = 'Y'
+    move 'Y' to $EndInput
+    do Company-Change
+  end-if
+
+  move 'Y' to $End_of_Report  !for Reset's begin-footing
+
+end-procedure
+
+
+!******************************************
+begin-procedure GET-BOND-DELIVERY-ADDRESS
+!******************************************
+BEGIN-SELECT
+BOND_SPEC.ADDRESS_TYPE
+BOND_SPEC.BOND_DLVY_ID
+
+  LET $address_type = &BOND_SPEC.ADDRESS_TYPE
+  LET $bond_dlvy_id = rtrim(ltrim(&BOND_SPEC.BOND_DLVY_ID, ' '), ' ')
+
+FROM PS_BOND_SPEC_DATA  BOND_SPEC
+WHERE BOND_SPEC.EMPLID            = &B.EMPLID
+AND   BOND_SPEC.COMPANY           = &B.COMPANY
+AND   BOND_SPEC.BOND_ID           = &D.BOND_ID
+AND   BOND_SPEC.BOND_OWNER_ID     = &D.BOND_OWNER_ID
+AND   BOND_SPEC.BOND_OTH_REG_TYPE = &D.BOND_OTH_REG_TYPE
+AND   BOND_SPEC.BOND_OTH_REG_ID   = &D.BOND_OTH_REG_ID
+AND   BOND_SPEC.EFFDT             = (SELECT MAX(BOND_SPEC1.EFFDT)
+                                     FROM PS_BOND_SPEC_DATA BOND_SPEC1
+                                     WHERE BOND_SPEC1.EMPLID            = &B.EMPLID
+                                     AND   BOND_SPEC1.COMPANY           = &B.COMPANY
+                                     AND   BOND_SPEC1.BOND_ID           = &D.BOND_ID
+                                     AND   BOND_SPEC1.BOND_OWNER_ID     = &D.BOND_OWNER_ID
+                                     AND   BOND_SPEC1.BOND_OTH_REG_TYPE = &D.BOND_OTH_REG_TYPE
+                                     AND   BOND_SPEC1.BOND_OTH_REG_ID   = &D.BOND_OTH_REG_ID
+                                     AND   BOND_SPEC1.EFFDT            <= &B.CHECK_DT)
+end-select
+end-procedure
+
+
+
+begin-procedure Accumulate-Bond-Log-Amounts
+  move 0 to #Bond_Disburse_Amt
+  move 0 to #Bond_Collect_Amt
+
+begin-SELECT
+#ifdef DB2ALL
+DECIMAL(SUM(BOND_DISBURSE_AMT),15,3) &Bond_Disburse_Amt
+#else
+SUM(BOND_DISBURSE_AMT) &Bond_Disburse_Amt
+#endif
+B1.EMPLID
+    move &Bond_Disburse_Amt to #Bond_Disburse_Amt
+    do Sum-Collected-Amounts
+
+FROM  PS_BOND_LOG      B1
+WHERE B1.EMPLID            = $ablEMPLID
+  AND B1.BOND_ID           = $ablBOND_ID
+  AND B1.BOND_OWNER_ID     = $ablBOND_OWNER_ID
+  AND B1.BOND_OTH_REG_TYPE = $ablBOND_OTH_REG_TYPE
+  AND B1.BOND_OTH_REG_ID   = $ablBOND_OTH_REG_ID
+  AND B1.CHECK_DT         <= $ablCHECK_DT
+  AND B1.REVERSED         = 'N'  !Bond Reversal
+GROUP BY B1.EMPLID
+end-SELECT
+end-procedure
+
+
+begin-procedure Sum-Collected-Amounts
+begin-SELECT
+#ifdef DB2ALL
+DECIMAL(SUM(BOND_COLLECT_AMT),15,3) &Bond_Collect_Amt
+#else
+SUM(BOND_COLLECT_AMT) &Bond_Collect_Amt
+#endif
+B2.EMPLID
+
+  move &Bond_Collect_Amt to #Bond_Collect_Amt
+
+FROM  PS_BOND_LOG B2
+WHERE B2.EMPLID            = $ablEMPLID
+  AND B2.BOND_ID           = $ablBOND_ID
+  AND B2.BOND_OWNER_ID     = $ablBOND_OWNER_ID
+  AND B2.BOND_OTH_REG_TYPE = $ablBOND_OTH_REG_TYPE
+  AND B2.BOND_OTH_REG_ID   = $ablBOND_OTH_REG_ID
+GROUP BY B2.EMPLID
+end-SELECT
+end-procedure
+
+
+begin-procedure Bond-Purchase
+
+  move 'Y' to $Bond_Purchase
+  do Print-Bond-Data
+  do Write-Purchase-Record
+
+  if $FileOpen = 'Y'
+    do Write-FRB-Record
+  end-if
+
+end-procedure
+
+
+begin-procedure Print-Bond-Data
+
+  if &D.Bond_Owner_ID = 'EE'  !Employee
+    move &B.Name to $Name
+    move &I1.NATIONAL_ID to $SSN
+  else
+    move &D.Bond_Owner_ID     to $DepBen
+    do Get-Dependent-Benef
+  end-if
+
+  move $Name     to $OwnerName
+  move $SSN      to $OwnerSSN
+  do Rotate-Name
+
+  print &B.EmplID              (1,1)
+  print &B.Name                (0,14,30)
+  print &D.Bond_Purch_Units    (0,46)  edit 999
+  do Format-DateTime(&D.Check_Dt, $Check_Dt, {DEFDATE}, '', '')
+  print $Check_Dt              (0,53)
+  print $Name                  (0,65,30)
+  print $SSN                   (0,97)  edit xxx-xx-xxxx
+
+  if &D.Bond_Oth_Reg_ID = 'NA'    !Not Applicable
+    move ' '     to $OthRegName
+    move ' '     to $OthRegSSN
+    move ' '     to $OthRegType
+  else
+    if &D.Bond_Oth_Reg_ID = 'EE'  !Employee
+      move &B.Name to $Name
+      move &I1.NATIONAL_ID  to $SSN
+    else
+      move &D.Bond_Oth_Reg_ID to $DepBen
+      do Get-Dependent-Benef
+    end-if
+
+    move $Name to $OthRegName
+    move $SSN  to $OthRegSSN
+    move &D.Bond_Oth_Reg_Type to $OthRegType
+    do Rotate-Name
+    print $Name                (2,65,30)
+    print $SSN                 (0,97)  edit xxx-xx-xxxx
+    print &D.Bond_Oth_Reg_Type (0,111)
+  end-if
+
+  next-listing skiplines=1 need=2
+
+end-procedure
+
+
+begin-procedure Get-Dependent-Benef
+
+  move ''    to $Name
+  move ' '   to $SSN
+
+begin-SELECT
+H.NAME
+H.COUNTRY
+H.ADDRESS1
+H.ADDRESS2
+H.CITY
+H.STATE
+H.POSTAL
+  move &H.Name          to $Name
+  move &H.Country       to $DepCountry
+  move &H.Address1      to $DepAddress1
+  move &H.Address2      to $DepAddress2
+  move &H.City          to $DepCity
+  move &H.State         to $DepState
+  move &H.Postal        to $DepPostal
+FROM  PS_DEPENDENT_BENEF H
+
+WHERE H.EMPLID           = &B.EmplID
+  AND H.DEPENDENT_BENEF  = $DepBen
+
+
+end-SELECT
+
+begin-SELECT
+HN.NATIONAL_ID
+  move &HN.NATIONAL_ID  to $SSN
+FROM  PS_DEP_BENEF_NID HN
+WHERE HN.EMPLID           = &B.EmplID
+  AND HN.DEPENDENT_BENEF  = $DepBen
+end-SELECT
+end-procedure
+
+begin-procedure Write-Purchase-Record
+
+  move &D.Bond_Purch_Units to $Bonds 099
+  do Format-DateTime(&D.Check_Dt, $PurchDt, {DEFCMP}, '', '')
+
+  let $PurchDt_MMDDYY = SUBSTR($PurchDt,5,2) || SUBSTR($PurchDt,7,2) ||
+                        SUBSTR($PurchDt,3,2)
+
+  write 10 from $Denom:5       -           !01
+                $Bonds:3       -           !07
+                $PurchDt_MMDDYY:6 -        !09
+                $OwnerName:30  -           !15
+                $OwnerSSN:9    -           !45
+                $OthRegName:30 -           !54
+                $OthRegSSN:9   -           !84
+                $OthRegType:1              !93
+
+end-procedure
+
+
+begin-procedure Write-FRB-Record
+
+  move 'B'        to $Record_Desig
+  move ' '        to $Address3
+
+  if $Bond_Dlvy_Id = 'EE'  !Employee
+     Do Get-Empl-Address ($UDEmplid,$Address_type, $AddressFound)
+     Let $COUNTRY  = $GETADDR_Country
+     let $ADDRESS1 = $GETADDR_Address1
+     let $ADDRESS2 = $GETADDR_Address2
+     let $CITY = $GETADDR_CITY
+     let $STATE =$GETADDR_STATE
+     let $POSTAL = $GETADDR_POSTAL
+  else
+     Let $COUNTRY  =  $DepCountry
+     let $ADDRESS1 =  $DepAddress1
+     let $ADDRESS2 =  $DepAddress2
+     let $CITY     =  $DepCity
+     let $STATE    =  $DepState
+     let $POSTAL   =  $DepPostal
+  end-if
+
+  move $Postal    to  $Zip
+
+  if $COUNTRY = 'USA'
+     move '0'        to $AddrLoc    !USA address
+  else
+     move '1'        to $AddrLoc    !Foreign country
+     do Get-Country-Name
+  end-if
+
+  move '0'        to $MailTo        !Mail to Bond Owner
+  move $OwnerName to $Name
+  do Rotate-Name
+  move $Name      to $FRBOwnerName
+
+  if $OthRegName <> '  '
+     move $OthRegName to $Name
+     do Rotate-Name
+     move $Name to $FRBOthRegName
+  end-if
+
+  move '   ' to $Benef_code
+
+  if $OthRegType = 'B'
+     move 'POD' to $Benef_code
+  end-if
+
+  if $OthRegType = 'C'
+     move 'OR ' to $Benef_code
+  end-if
+
+  if $BDenom = '00050.00'
+     move '2' to $Denom_code
+  end-if
+
+  if $BDenom = '00075.00'
+     move '3' to $Denom_code
+  end-if
+
+  if $BDenom = '00100.00'
+     move '4' to $Denom_code
+  end-if
+
+  if $BDenom = '00200.00'
+     move '5' to $Denom_code
+  end-if
+
+  if $BDenom = '00500.00'
+     move '6' to $Denom_code
+  end-if
+
+  if $BDenom = '01000.00'
+     move '7' to $Denom_code
+  end-if
+
+  if $BDenom = '05000.00'
+     move '8' to $Denom_code
+  end-if
+
+  if $BDenom = '10000.00'
+     move '9' to $Denom_code
+  end-if
+
+  move &D.Bond_Purch_Units to $FRBBonds   0999
+  let $EmplID = LPAD(&B.Emplid,9,'0')
+
+  unstring $EmplID by '-' into $str1 $str2 $str3
+  string $str1 $str2 $str3 '*' by '' into $NewEE
+  while INSTR($NewEE,' ',1) <> 0
+    let #Spaces = INSTR($NewEE,' ',1)
+    if #Spaces > 0
+      let $NewEE = SUBSTR($NewEE,1,(#Spaces - 1)) ||
+                      SUBSTR($NewEE,(#Spaces + 1),10)
+    end-if
+  end-while
+  find '*' in $NewEE 0 #loc
+  extract $EmplID from $NewEE 0 #loc
+
+  if $OwnerSSN <> ' '
+    if $EmplID = $OwnerSSN
+      let $Emplid = ' '
+    end-if
+  end-if
+
+  Uppercase $FRBOwnerName
+  Uppercase $Address1
+  Uppercase $Address2
+  Uppercase $Address3
+  Uppercase $City
+  Uppercase $State
+  Uppercase $FRBOthRegName
+
+  !--- looking for dash in a two part zip code   
+  find '-' in $Zip 0 #Zip_Pos
+  if #Zip_Pos < 0 
+     let $Plus4 = ' '
+  else
+     let $Plus4 = substr($Zip,(#zip_pos+2),4)
+  end-if
+  
+
+  if $FormatOut <> 'D'
+      write 1 from $Record_Desig:1   -
+                   $OwnerSSN:9       -
+                   $FRBOwnerName:33  -
+                   $AddrLoc:1        -
+                   $MailTo:1         -
+                   $Address1:33       -
+                   $Address2:33       -
+                   $Address3:33       -
+                   $City:20          -
+                   $State:2          -
+                   $Zip:5            -
+                   $Plus4:4          -
+                   $Benef_code:3     -
+                   $FRBOthRegName:28 -
+                   $Denom_code:1     -
+                   $FRBBonds:4       -
+                   $CompanyID:6      -
+                   $Filler:4         -
+                   '0000':4          -
+                   $Filler:6         -
+                   $EmplID:9         -
+                   $Filler:4         -
+                   $Filler:30        -
+                   $Filler:46
+  else
+      write 1 from $Record_Desig:1   -
+                   $OwnerSSN:9       -
+                   $FRBOwnerName:33  -
+                   $AddrLoc:1        -
+                   $MailTo:1         -
+                   $Address1:33       -
+                   $Address2:33       -
+                   $Address3:33       -
+                   $City:20          -
+                   $State:2          -
+                   $Zip:5            -
+                   $Plus4:4          -
+                   $Benef_code:3     -
+                   $FRBOthRegName:28 -
+                   $Denom_code:1     -
+                   $FRBBonds:4       -
+                   $EmplID:9         -
+                   $Filler:20
+  end-if
+
+end-procedure
+
+
+begin-procedure FRB-Check
+
+
+  move '000' to $FRB_District
+begin-SELECT
+C.FED_RSRV_BANK_ID
+C.FED_RSRV_BANK_DIST
+C.DESCR
+C.ADDRESS1
+C.CITY
+C.STATE
+C.POSTAL
+
+FROM PS_COMPANY_TBL C
+WHERE C.COMPANY = $Company
+  AND C.EFF_STATUS = 'A'
+  AND C.EFFDT =
+      (SELECT MAX(EFFDT)
+       FROM   PS_COMPANY_TBL CC
+       WHERE  CC.COMPANY = C.COMPANY
+         AND  CC.EFF_STATUS = C.EFF_STATUS
+         AND  CC.EFFDT <= $AsOfDate)
+end-SELECT
+
+if &C.Fed_Rsrv_Bank_ID <> ' '
+  move &C.Fed_Rsrv_Bank_ID    to $CompanyID
+  move &C.Fed_Rsrv_Bank_Dist  to $FRB_District 099
+  move &C.Descr               to $CompanyName
+  move &C.Address1            to $CoAddress
+  move &C.City                to $CoCity
+
+  LET $CoState = RTRIM(&C.State, ' ')
+  move &C.Postal              to $CoZip
+  extract $Zip5 from $CoZip 0 5
+  extract $Zip4 from $CoZip 6 4
+  do Open-Output
+  move 'Y' to $FRBCheck
+  do ARecord
+end-if
+
+end-procedure
+
+
+begin-procedure Close-Output
+  close 1
+  move 'N' to $FileOpen
+end-procedure
+
+
+begin-procedure Open-Output
+  if #FileNum <> 0
+      close 1
+  end-if
+  add 1 to #FileNum
+if $FormatOut = 'D'
+  do Format-Number(#FileNum, $FileNum, '9')
+#ifdef OS400
+     let $FileExt = '(D' || $FileNum ||')'
+     let $FileId = '{IMPORTPREFIX}' || 'FRBFILE' || $FileExt
+#else
+  #ifdef MVS
+     do Format-Number(#FileNum, $FileNum, '09')
+     let $FileId = '{IMPORTPREFIX}' || 'FRBFLE' || $FileNum
+  #else
+     let $FileId = '{IMPORTPREFIX}' || 'PSBOS.DA' || $FileNum
+  #endif
+#endif
+  open $FileID as 1 for-writing record=240:fixed
+else
+  do Format-Number(#FileNum, $FileNum, '009')
+#ifdef OS400
+    let $FileExt = '(T' || $FileNum ||')'
+    let $FileId = '{IMPORTPREFIX}' || 'FRBFILE' || $FileExt
+#else
+  #ifdef MVS
+    do Format-Number(#FileNum, $FileNum, '09')
+    let $FileId = '{IMPORTPREFIX}' || 'FRBFLE' || $FileNum
+  #else
+    let $FileId = '{IMPORTPREFIX}' || 'FRBFILE.' || $FileNum
+  #endif
+#endif
+  open $FileID as 1 for-writing record=320:fixed
+end-if
+
+  move 'Y' to $FileOpen
+end-procedure
+
+
+begin-procedure ARecord
+
+  extract $BondIDA from &D.Bond_ID 0 1
+  if $BondIDA = 'I'
+    let $BondSeries = 'I '
+  else
+    let $BondIDA = 'E'
+    let $BondSeries = 'EE'
+  end-if
+
+begin-SELECT
+Z.EMPLID
+Z.PAY_END_DT
+C.BOND_ID
+C.BOND_OWNER_ID
+C.BOND_OTH_REG_TYPE
+C.BOND_OTH_REG_ID
+C.CHECK_DT
+C.BOND_PURCH_UNITS
+D1.BOND_RDMPT_AMT
+D1.BOND_PURCH_AMT
+
+  move &Z.EMPLID            to $ablEMPLID
+  move &C.BOND_ID           to $ablBOND_OTH_REG_ID
+  move &C.BOND_OWNER_ID     to $ablBOND_OWNER_ID
+  move &C.BOND_OTH_REG_TYPE to $ablBOND_OTH_REG_TYPE
+  move &C.BOND_OTH_REG_ID   to $ablBOND_OTH_REG_ID
+  move &C.CHECK_DT          to $ablCHECK_DT
+
+  do Accumulate-Bond-Log-Amounts
+
+  if #Bond_Disburse_Amt <= #Bond_Collect_Amt
+
+    do AccumForARecord
+
+  end-if
+
+From  PS_PAY_CHECK Z,
+      PS_BOND_LOG C,
+      PS_BOND_TBL D1
+WHERE Z.COMPANY    = $Company
+  AND Z.CHECK_DT  <= $AsOfDate
+  AND C.EMPLID           = Z.EMPLID
+  AND C.CHECK_DT         = Z.CHECK_DT
+  AND C.PAYCHECK_NBR     = Z.PAYCHECK_NBR
+  AND C.FORM_ID          = Z.FORM_ID
+  AND C.BOND_LOG_STATUS  = 'R'  !Ready to Purchase
+  AND C.REVERSED         = 'N'  !Bond Reversal
+  AND C.BOND_PURCH_UNITS > 0
+  AND D1.BOND_ID          = C.BOND_ID
+  AND D1.EFFDT =
+      (SELECT MAX(EFFDT)
+       FROM   PS_BOND_TBL
+       WHERE  BOND_ID = D1.BOND_ID
+         AND  EFFDT  <= C.CHECK_DT)
+end-SELECT
+
+  do Format-DateTime(&Z.Pay_End_Dt, $Pay_End_Dt, {DEFCMP}, '', '')
+  let $PayEndDt = SUBSTR($Pay_End_Dt,5,2) || SUBSTR($Pay_End_Dt,7,2) ||
+                        SUBSTR($Pay_End_Dt,3,2)
+
+  move '0000      ' to $LocationID
+  move 'A'          to $Record_Desig
+  move '0'          to $Payroll
+  move #Tot50       to $Tot50 099999
+  move #Tot75       to $Tot75 099999
+  move #Tot100      to $Tot100 099999
+  move #Tot200      to $Tot200 099999
+  move #Tot500      to $Tot500 099999
+  move #Tot1000     to $Tot1000 099999
+  move #Tot5000     to $Tot5000 099999
+  move #Tot10000    to $Tot10000 099999
+  let  #TotalIssue = #TotalIssue * 100
+  move #TotalIssue  to $TotalIssue 0999999999
+  move ' '          to $Filler
+  move '0'          to $Zerofill
+
+  uppercase $CompanyName
+  uppercase $CoAddress
+  uppercase $CoCity
+
+  If $FormatOut <> 'D'
+      Write 1 from  $Record_Desig:1   -
+                    $FileMO:2         -
+                    $FileYR:2         -
+                    $CompanyID:6      -
+                    $Filler:4         -
+                     '0000':4         -
+                    $Filler:6         -
+                    $PayEndDt:6       -
+                    $CompanyName:33   -
+                    $CoAddress:33     -
+                    $CoCity:20        -
+                    $CoState:2        -
+                    $Zip5:5           -
+                    $Zip4:4           -
+                    $Filler:13        -
+                    $Payroll:1        -
+                    $Tot50:6          -
+                    $Tot75:6          -
+                    $Tot100:6         -
+                    $Tot200:6         -
+                    $Tot500:6         -
+                    $Tot1000:6        -
+                    $Tot5000:6        -
+                    $Tot10000:6       -
+                    $TotalIssue:10    -
+                    $FRB_District:3   -
+                    $Filler:30        -
+                    $BondSeries:2     -
+                    '000':3           -
+                    $Filler:82
+  else
+      Write 1 from  $Record_Desig:1   -
+                    $FileMO:2         -
+                    $FileYR:2         -
+                    $CompanyID:6      -
+                    $Filler:4         -
+                     '0000':4         -
+                    $Filler:6         -
+                    $PayEndDt:6       -
+                    $CompanyName:33   -
+                    $CoAddress:33     -
+                    $CoCity:20        -
+                    $CoState:2        -
+                    $Zip5:5           -
+                    $Zip4:4           -
+                    $Filler:13        -
+                    $Payroll:1        -
+                    $Tot50:6          -
+                    $Tot75:6          -
+                    $Tot100:6         -
+                    $Tot200:6         -
+                    $Tot500:6         -
+                    $Tot1000:6        -
+                    $Tot5000:6        -
+                    $Tot10000:6       -
+                    $TotalIssue:10    -
+                    $FRB_District:3   -
+                    $Filler:30        -
+                    $BondSeries:2     -
+                    '000':3           -
+                    $Filler:2
+  end-if
+
+end-procedure
+
+
+begin-procedure AccumForARecord
+
+  extract $ID_Series from &C.Bond_ID 0 1
+
+  if $ID_Series <> 'I'
+    let $ID_Series = 'E'
+  end-if
+
+  if $ID_Series = $BondIDA
+    move &D1.Bond_Rdmpt_Amt   to #Denom
+    move &D1.Bond_Purch_Amt   to #PurchIssue
+    move &C.Bond_Purch_Units to #AssocBonds
+
+    If #Denom = 50.00
+       add #AssocBonds to #Tot50
+    end-if
+
+    If #Denom = 75.00
+       add #AssocBonds to #Tot75
+    end-if
+
+    If #Denom = 100.00
+       add #AssocBonds to #Tot100
+    end-if
+
+    If #Denom = 200.00
+       add #AssocBonds to #Tot200
+    end-if
+
+    If #Denom = 500.00
+       add #AssocBonds to #Tot500
+    end-if
+
+    If #Denom = 1000.00
+       add #AssocBonds to #Tot1000
+    end-if
+
+    If #Denom = 5000.00
+       add #AssocBonds to #Tot5000
+    end-if
+
+    If #Denom = 10000.00
+       add #AssocBonds to #Tot10000
+    end-if
+
+    let #PurchIssue = #AssocBonds * #PurchIssue
+    add #PurchIssue to #TotalIssue
+  end-if
+
+end-procedure
+
+
+begin-procedure Company-Change
+
+  do Setup-File-Bond-Type
+  do CRecord
+
+  print 'Total '            (+2,12)
+  print $HdgDenom           ()
+  print ' Bonds Purchased:' ()
+  do Format-Number(#TotalBonds, $out, '99,999')
+  print $out        (0,43)
+  add #TotalBonds to #CompanyTotal
+  move 0 to #TotalBonds
+  print 'Total Bonds Purchased--All Denominations:' (+2,1)
+  do Format-Number(#CompanyTotal, $out, '999,999')
+  print $out                                (0,42)
+  print ' for Company: '                            ()
+  print $Company                                    ()
+  move 0 to #CompanyTotal
+  new-page
+
+  if $EndInput = 'N'
+    move &B.Company to $Company
+    move 0          to #Tot50
+    move 0          to #Tot75
+    move 0          to #Tot100
+    move 0          to #Tot200
+    move 0          to #Tot500
+    move 0          to #Tot1000
+    move 0          to #Tot5000
+    move 0          to #Tot10000
+    move 0          to #TotalIssue
+    do FRB-Check
+  end-if
+
+  move ' ' to $HdgCost
+  move ' ' to $HdgBondID
+  move ' ' to $HdgDenom
+
+end-procedure
+
+
+begin-procedure Setup-File-Bond-Type
+
+  extract $Series from &D.Bond_ID 0 1    !When processing 1ST record for a company,
+                                         !determine type of bonds - I or EE
+                                         ! --- that will be in the output file
+  if $Series = 'I'
+     let $NewSeries = $Series            !Blanks indicate Series EE Bond type
+  else                                   !Series EE Bond ID's are all numeric
+     move ' ' to $Series                 !values and precede Series I Bond records
+     move ' ' to $NewSeries
+  end-if
+
+end-procedure
+
+begin-procedure Denom-Change
+
+  print 'Total '            (+2,12)
+  print $HdgDenom           ()
+  print ' Bonds Purchased:' ()
+  do Format-Number(#TotalBonds, $out, '99,999')
+  print $out        (0,43)
+  add #TotalBonds to #CompanyTotal
+  move 0 to #TotalBonds
+
+  if $CompChg <> 'Y'
+    new-page
+  end-if
+
+  extract $Series from &D.Bond_ID 0 1
+
+  if $NewSeries <> $Series
+    if $Series = 'I'
+      let $NewSeries = $Series
+      if $FileOpen = 'Y'
+        do CRecord
+        do Open-Output
+        move 'Y' to $FRBCheck
+        move 0          to #Tot50
+        move 0          to #Tot75
+        move 0          to #Tot100
+        move 0          to #Tot200
+        move 0          to #Tot500
+        move 0          to #Tot1000
+        move 0          to #Tot5000
+        move 0          to #Tot10000
+        move 0          to #TotalIssue
+        do ARecord
+      end-if
+    end-if
+  end-if
+
+end-procedure
+
+
+begin-procedure CRecord
+  move '9999999999' to $EOF
+
+  if $FormatOut <> 'D'
+      Write 1 from $EOF:10
+                   $Filler:310
+  else
+      Write 1 from $EOF:10
+                   $Filler:230
+  end-if
+
+end-procedure
+
+
+begin-procedure Mark-Bond-Log-Purchased
+
+begin-SQL ON-ERROR=Ignore
+UPDATE PS_BOND_LOG
+  SET   BOND_LOG_STATUS = 'D'
+WHERE CHECK_DT <= $AsOfDate
+  AND BOND_LOG_STATUS = 'R'
+  AND REVERSED        = 'N'
+  AND BOND_PURCH_UNITS > 0
+  AND BOND_ID          = &D.BOND_ID
+  AND EMPLID          = &B.EMPLID
+  AND CHECK_DT        = &B.CHECK_DT
+  AND PAYCHECK_NBR          = &B.PAYCHECK_NBR
+  AND FORM_ID         = &B.FORM_ID
+end-SQL
+
+end-procedure
+
+begin-procedure Ignore
+!Dummy Procedure
+end-procedure
+
+begin-procedure Get-Country-Name
+
+begin-SELECT
+CC.DESCR
+  move &CC.Descr        to      $Address3
+FROM PS_COUNTRY_TBL CC
+WHERE CC.COUNTRY = $COUNTRY
+end-SELECT
+
+end-procedure
+
+#Include 'getcodta.sqc'  !Get-Company-Data procedure
+#Include 'rotname1.sqc'  !Rotate-Name procedure
+#Include 'reset.sqc'     !Reset printer procedure
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'stdapi.sqc'    !Update Process API
+#Include 'payrctl2.sqc'  !Get-Run-Control procedure

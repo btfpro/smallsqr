@@ -1,0 +1,1128 @@
+!***********************************************************************
+!  GEXPY101:  GENERAL DEDUCTION STOPS FOR REHIRES                      *
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module is the confidential and proprietary information of       *
+! Giant Eagle, Inc.; it is not to be copied, reproduced,or transmitted *
+! in any form, by any means, in whole or in part, nor is it to be used *
+! for any purpose other than that for which it is expressly provided   *
+! without the written permission of Giant Eagle.                       *
+!                                                                      *
+! Copyright (c) 1997-1998 Giant Eagle,Inc. All Rights Reserved         *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+! GEXPY101:             General Deduction Stops for Rehires            *
+!                                                                      *
+! Narrative:            This program will evaluate all hires/rehires   *
+!                        within the pay period and determine if they   *
+!                        are a rehire (termination as prior row).  All *
+!                        general deductions whose effective date       *
+!                        predates the pay begin date of the current    *
+!                        pay period will have an end date updated on   *
+!                        these rows corresponding to the pay end date  *
+!                        of the prior row.                             *
+!                                                                      *
+! #Debugx Used:         #debug9 paragraph trace                        *
+!                       #debug8 key variable values                    *
+!                       #debug7 data returned from sql calls           *
+!                                                                      *
+! SQL Tables:           PAY_CALENDAR                                   *
+!                       GENL_DEDUCTION                                 *
+!                       JOB                                            *
+!                                                                      *
+! Written by:           Jim Hutchison                                  *
+!                                                                      *
+! Normally Run:         Sunday, prior to first pay calc                *
+!                                                                      *
+! Control Parms:        None                                           *
+!                                                                      *
+!***********************************************************************
+!                         MODIFICATION HISTORY                         *
+!***********************************************************************
+!  INITIALS     DATE         DESCRIPTION OF THE CHANGE                 *
+!***********************************************************************
+!  JDH          10/05/99     Initial Creation                          *
+!  JNB          02/10/2000   Inserting a row for direct_deposit        *
+!                            & change status to inactive               *        
+!                            Added additional report                   *
+!  GBD          09/19/2002   v8.3 Upgrade - added and removed fields   *
+!                            from table select statements.             *
+!  CJH          02/19/2003   change logic to inactivate genl deds at   *
+!                            termination time rather than at HIR/REH.  *
+!                            The code will not inactivate multi-job EEs*
+!                            in the same company, since that would stop*
+!                            all genl deductions for the EE.  These EEs*
+!                            will be audited on the output report      *
+!                                                                      *
+!  GBD          09/04/2003   Add code to check whether a deduction has *
+!                            already been termed to keep the program   *
+!                            from inserting a new active deduction row.*
+!                                                                      *
+!  CWB          04/01/2005   Change ACTION_DT to EFFDT in the main     *
+!                            select to allow for future-dated term rows.
+!                            Logic added to not stop genl deductions   *
+!                            for employees with 2 job rows in the same * 
+!                            company, with the same effdt, and only one*
+!                            is a term.                                *
+!                                                                      *
+!  DXS		07/06/2006   ITG #35441. Modify GEXPY101 to inactivate *
+!			     Direct deposits on terms based on action  *
+!			     date. Changed where clause in             *
+!			     P200-Main-Process, J.ACTION_DT and        *
+!			     J.EFFEDT conditions.                      *
+!                                                                      *
+! GEX-MXT       07/07/2008   ITG# 43300 : To correct employee termed   *
+!                            with active direct deposit   
+! Vendaxg       10/27/2008   Added code to skip employees who has got  * 
+!                            active within the same period.            *  
+!***********************************************************************
+
+
+#include 'setenv.sqc'    !Set environment
+#Include 'setup32.sqc'   !Printer and Page-Size Initialization (Portrait)
+
+
+#define #column1     1
+#define #column2    11
+#define #column3    22
+#define #column4    31
+#define #column5    43
+#define #column6    57
+#define #column7    67
+#define #column8    75
+#define #column9    88
+#define #column10  100
+#define #column11  116
+#define #column12  130
+#define #column13  135
+
+
+Begin-Setup
+  Declare-Report DedEnd-Report
+Printer-Type=HPLASERJET
+    Layout=Default
+  End-Declare
+
+  Declare-Report DirDep-Report
+Printer-Type=HPLASERJET
+    Layout=Default
+  End-Declare
+End-Setup
+
+Begin-Heading 8 For-Reports=(DedEnd-Report)
+#debug9 Show 'Begin-Heading (DedEnd-Report)'
+
+  Let $ReportID      =   'PY101A'
+! CJH 02/19/2003 BEGIN
+!  Let $ReportTitle   =   'GENERAL DEDUCTION/DIR DEP STOPS FOR REHIRES'
+  Let $ReportTitle   =   'GENERAL DEDUCTION/DIR DEP STOPS FOR TERMS'
+! CJH 02/19/2003 END
+  Let $ReportTitle2  =   'DedEnd-Report'
+
+  #Include 'stdhdg01.sqc'
+ 
+  Print $rpt-hdr                   (3,)  Center 
+  Print $ReportTitle2              (4,)  Center
+
+  print 'PREVIOUS'             (6,{#column9})
+  print 'NEW'                  ( ,{#column10})
+
+
+  print 'TERM'                (7,{#column5})
+  print 'REHIRE'              ( ,{#column6})
+  print 'DEDCD'               ( ,{#column8})
+  print 'DEDUCTION'           ( ,{#column9})
+  print 'DEDUCTION'           ( ,{#column10})
+  print '      GOAL'          ( ,{#column11})
+  print '      GOAL'          ( ,{#column12})
+
+  print 'COMPANY'             (8,{#column1})
+  print 'PAYGROUP'            ( ,{#column2})
+  print 'DEPTID'              ( ,{#column3})
+  print 'EMPLID'              ( ,{#column4})
+  print 'DATE'                ( ,{#column5})
+  print 'DATE'                ( ,{#column6})
+  print 'DEDCD'               ( ,{#column7})
+  print 'EFFDT'               ( ,{#column8})
+  print 'END DATE'            ( ,{#column9})
+  print 'END DATE'            ( ,{#column10})
+  print '   BALANCE'          ( ,{#column11})
+  print '    AMOUNT'          ( ,{#column12})
+
+  print '-'                   (9,{#column1},7)   Fill
+  print '-'                   ( ,{#column2},8)   Fill
+  print '-'                   ( ,{#column3},6)   Fill
+  print '-'                   ( ,{#column4},9)   Fill
+  print '-'                   ( ,{#column5},8)   Fill
+  print '-'                   ( ,{#column6},8)   Fill
+  print '-'                   ( ,{#column7},6)   Fill
+  print '-'                   ( ,{#column8},8)   Fill
+  print '-'                   ( ,{#column9},9)   Fill
+  print '-'                   ( ,{#column10},10) Fill
+  print '-'                   ( ,{#column11},10) Fill
+  print '-'                   ( ,{#column12},10) Fill
+
+End-Heading
+
+Begin-Heading 8 For-Reports=(DirDep-Report)
+#debug9 Show 'Begin-Heading (DirDep-Report)'
+
+  Let $ReportID      =   'PY101B'
+! CJH 02/19/2003 BEGIN
+!  Let $ReportTitle   =   'GENERAL DEDUCTION/DIR DEP STOPS FOR REHIRES'
+  Let $ReportTitle   =   'GENERAL DEDUCTION/DIR DEP STOPS FOR TERMS'
+! CJH 02/19/2003 END
+  Let $ReportTitle2  =   'DirDep-Report'
+
+  #Include 'stdhdg01.sqc'
+
+  Print $rpt-hdr                   (3,)  Center 
+  Print $ReportTitle2              (4,)  Center
+
+  print 'PREVIOUS'             (6,{#column8})
+  print 'PREVIOUS'             ( ,{#column9})
+  print 'NEW'                  ( ,{#column10})
+  print 'NEW'                  ( ,{#column11})
+
+
+  print 'TERM'                (7,{#column5})
+  print 'REHIRE'              ( ,{#column6})
+  print 'DIRDEP'              ( ,{#column8})
+  print 'EFFECTIVE'           ( ,{#column9})
+  print 'EFFECTIVE'           ( ,{#column10})
+  print 'EFFECTIVE'           ( ,{#column11})
+  print 'MESSAGE'             ( ,{#column13})
+
+
+  print 'COMPANY'             (8,{#column1})
+  print 'PAYGROUP'            ( ,{#column2})
+  print 'DEPTID'              ( ,{#column3})
+  print 'EMPLID'              ( ,{#column4})
+  print 'DATE'                ( ,{#column5})
+  print 'DATE'                ( ,{#column6})
+  print 'EFFDT'               ( ,{#column8})
+  print 'STATUS'              ( ,{#column9})
+  print 'DATE'                ( ,{#column10})
+  print 'STATUS'              ( ,{#column11})
+
+  print '-'                   (9,{#column1},7)   Fill
+  print '-'                   ( ,{#column2},8)   Fill
+  print '-'                   ( ,{#column3},6)   Fill
+  print '-'                   ( ,{#column4},9)   Fill
+  print '-'                   ( ,{#column5},8)   Fill
+  print '-'                   ( ,{#column6},6)   Fill
+  print '-'                   ( ,{#column8},8)   Fill
+  print '-'                   ( ,{#column9},9)   Fill
+  print '-'                   ( ,{#column10},10) Fill
+  print '-'                   ( ,{#column11},11) Fill
+  print '-'                   ( ,{#column13},11) Fill
+
+
+End-Heading
+
+Begin-Report
+#debug9 Show 'Begin-Report'
+  Do P100-Initialization
+  Do P200-Main-Process
+  Do P300-Finalization
+End-Report
+
+
+Begin-Procedure P100-Initialization
+#debug9 Show 'P100-Initialization'
+  Do Init-DateTime           !datetime.sqc
+  Do Init-Number             !number.sqc
+  Do Get-Current-DateTime    !curdttim.sqc
+  Do Stdapi-Init             !stdapi.sqc
+
+  Let $ReportID      = 'GEXPY101'
+  Let $ReportTitle   = 'GENERAL DEDUCTION STOPS FOR TERMINATIONS'
+!  Let $ReportTitle   = 'GENERAL DEDUCTION STOPS FOR REHIRES'
+
+  Show '$ReportID    = ' $ReportID
+  Show '$ReportTitle = ' $ReportTitle
+
+   If $prcs_process_instance = ''     
+      Do Ask-As-Of-Date
+      Let $WHERE_SELECT_ASOFDATE = $AsOfDate
+   Else
+      Do GEXXX922-Select-Parameters
+      Let $AsOfDate = $GEX_RC_PAY.AsOfDate
+      Let $WHERE_SELECT_ASOFDATE = $GEX_RC_PAY.AsOfDate
+      If Rtrim ($GEX_RC_PAY.AsOfDate, ' ') = ''
+         Let $WHERE_SELECT_ASOFDATE = $AsOfToday
+      End-If
+   End-If                           
+
+
+  date-time () HH:MI:SS &timeBegan
+  date-time () MM/DD/YYYY &dateBegan
+  show ' '
+  show 'Report Began at ' &timeBegan ' on ' &dateBegan
+
+  Let $X000_Order_By = 'Company, Paygroup, DeptID'
+
+  Do P150-Get-Last-Sheeted-Pay
+
+  Let $rpt-hdr = 'Pay period from ' || $pay_begin_dt || ' to ' || $pay_end_dt
+
+  If $pay_calc_run = 'N'
+    Show ' '
+    Show $rpt-hdr
+    Show ' '
+  Else
+    Show ' '
+    Show $rpt-hdr ' is the last sheeted pay period,'
+    Show ' but pay calculation has already been run - USER ABEND TAKEN'
+    Show ' '
+    Stop
+  End-If
+ 
+End-Procedure
+
+Begin-Procedure P150-Get-Last-Sheeted-Pay
+#debug9 Show 'P150-Get-Last-Sheeted-Pay'
+Begin-Select Distinct
+PC.PAY_BEGIN_DT
+PC.PAY_BEGIN_DT-1 &prior_pay_end_dt
+PC.PAY_END_DT
+PC.PAY_END_DT+7 &next_pay_end_dt
+PC.PAY_CALC_RUN
+
+  Let $pay_begin_dt     = &PC.PAY_BEGIN_DT
+  Let $pay_end_dt       = &PC.PAY_END_DT
+  Let $prior_pay_end_dt = &prior_pay_end_dt
+  Let $pay_calc_run     = &PC.PAY_CALC_RUN
+  let $next_pay_end_dt = &next_pay_end_dt
+
+
+FROM   PS_PAY_CALENDAR PC
+
+WHERE  PC.COMPANY            = 'GEI'
+AND    PC.PAYGROUP           = 'OFF'
+AND    PC.PAY_SHEETS_RUN     = 'Y'
+
+AND    PC.PAY_END_DT         =
+      (SELECT MAX(PAY_END_DT)
+       FROM   PS_PAY_CALENDAR
+       WHERE  COMPANY        = 'GEI'
+       AND    PAYGROUP       = 'OFF'
+       AND    PAY_SHEETS_RUN = 'Y')
+End-Select
+End-Procedure
+
+
+Begin-Procedure P200-Main-Process
+#debug9 Show 'P200-Main-Process'
+
+Begin-Select
+J.EMPLID
+J.EMPL_RCD
+J.EFFDT
+J.COMPANY
+J.PAYGROUP
+J.DEPTID
+J.ACTION_DT 		!GEX-MXT added for ITG# 43300
+
+  Let $emplid   = &J.EMPLID
+  Let #empl_rcd = &J.EMPL_RCD
+  Let $effdt    = &J.EFFDT
+  Let $company  = &J.COMPANY
+  Let $paygroup = &J.PAYGROUP
+  Let $deptid   = &J.DEPTID
+  Let $Action_dt = &J.ACTION_DT 		!GEX-MXT added for ITG# 43300
+  !Vendaxg Added for the ITG#54209 on 10/27/2008 - Begin
+  Do Check-Latest-Status	
+  If $Active_row_Found = 'Y'
+  Goto Skip-Record
+  End-if
+  !Vendaxg Added for the ITG#54209 on 10/27/2008 - End
+  Add 1 To #hire-rows-found
+ 
+! CJH - 02/19/2003 Don't run a prior term proc..just the new paybegin/end date proc
+!  Do P210-Prior-Term-Row
+  do P205-check-multi-job
+  if $one_active_row = 'Y' 
+    do P206-write-warning
+  else
+    Let $term_dt = &J.EFFDT
+    Do P190-get-new-paybegin-end-date
+  end-if
+ 
+ Skip-Record:			!Vendaxg Added for the ITG#54209 on 10/27/2008 
+ 
+FROM   PS_PAY_CALENDAR  PC2,
+       PS_JOB           J
+
+! CJH 02/19/2003 BEGIN
+! WHERE  J.ACTION              IN ('HIR','REH')
+WHERE J.EMPL_STATUS            = 'T'
+and J.ACTION = 'TER'     !do not want to process subsequent term status rows or the TWP/TWB rows
+! CJH 02/19/2003 END
+AND    J.ACTION_DT      BETWEEN $pay_begin_dt AND $pay_end_dt   ! DXS, 07/06. Added this
+AND    J.EFFDT <= J.ACTION_DT				        ! DXS, 07/06. Added this
+AND    J.EFFDT                =
+      (SELECT MAX(EFFDT)
+       FROM   PS_JOB
+       WHERE  EMPLID          = J.EMPLID
+       AND    EMPL_RCD       = J.EMPL_RCD
+! CJH 02/19/2003 BEGIN
+!       AND    ACTION         IN ('HIR','REH')
+       AND EMPL_STATUS        = 'T' 
+       and ACTION = 'TER')
+! CJH 02/19/2003 END
+! CWB 04/01/2005 BEGIN
+!       AND    ACTION_DT BETWEEN $pay_begin_dt AND $pay_end_dt)
+!       AND    EFFDT BETWEEN $pay_begin_dt AND $pay_end_dt)
+! CWB 04/01/2005 END
+AND    J.EFFSEQ               =
+      (SELECT MAX(EFFSEQ)
+       FROM   PS_JOB
+       WHERE  EMPLID          = J.EMPLID
+       AND    EMPL_RCD       = J.EMPL_RCD
+       AND    EFFDT           = J.EFFDT
+! CJH 02/19/2003 BEGIN
+!       AND    ACTION         IN ('HIR','REH')
+       AND EMPL_STATUS        = 'T' 
+       and ACTION = 'TER' )
+! CJH 02/19/2003 BEGIN
+! CWB 04/01/2005 BEGIN
+!       AND    ACTION_DT BETWEEN $pay_begin_dt AND $pay_end_dt)
+!       AND    EFFDT BETWEEN $pay_begin_dt AND $pay_end_dt)
+! CWB 04/01/2005 END
+AND    PC2.COMPANY            = J.COMPANY
+AND    PC2.PAYGROUP           = J.PAYGROUP
+AND    PC2.PAY_END_DT         = $pay_end_dt
+!AND J.EMPLID IN ('167484675','174608631','201688039') !Vendaxg added for testing
+ORDER BY PC2.RUN_ID, J.COMPANY, J.PAYGROUP, J.DEPTID
+End-Select
+End-Procedure
+
+!######################################################################
+! CWB 04/01/2005 BEGIN
+! Logic added to not stop genl deductions for employees with 2 job rows
+! in the same company, with the same effdt, and only one is a term.
+! Issue a warning in the report. If direct deposit, don't stop 
+! and don't issue a warning.
+
+Begin-procedure P205-check-multi-job
+#debug9 show 'P205-check-multi-job'
+
+  let $one_active_row = 'N'
+
+Begin-select
+jj.emplid
+  let $one_active_row = 'Y'
+from ps_job jj
+where jj.emplid = $emplid
+and jj.company = $company
+and jj.empl_rcd <> #empl_rcd
+and jj.empl_status <> 'T'
+and jj.action <> 'TER'
+and jj.effdt = 
+      (select max(effdt)
+       from   ps_job 
+       where emplid   = jj.emplid
+       and empl_rcd   = jj.empl_rcd
+       and company    = jj.company)
+
+End-Select
+End-Procedure
+
+Begin-procedure P206-write-warning
+#debug9  Show 'P206-write-warning'
+
+  Use-Report DedEnd-Report
+
+  let $warn_1 = 'WARNING: Multi-jobs in the same company. Check deductions.'
+
+  Print $company              (+1,{#column1})
+  Print $paygroup             (  ,{#column2})
+  Print $deptid               (  ,{#column3})
+  Print $emplid               (  ,{#column4})
+!  Print $term_date            (  ,{#column5})
+  Print $warn_1               (  ,{#column5})
+  
+End-Procedure
+
+
+! CWB 04/01/2005 END
+!######################################################################
+
+
+! Begin-Procedure P210-Prior-Term-Row
+! #debug9 Show 'P210-Prior-Term-Row'
+!Begin-Select
+!J2.EFFDT &term_dt
+!
+!  Let $Data-Found-Flag = 'Y'
+!
+!  Let $term_dt = &term_dt
+!  Add 1 To #prior-term-rows-found
+!  Do P190-get-new-paybegin-end-date
+!
+!FROM   PS_JOB J2
+!
+!WHERE  J2.EMPLID           = $emplid
+!AND    J2.EMPL_RCD        = #empl_rcd
+!
+!AND    J2.EFFDT            =
+!      (SELECT MAX(EFFDT)
+!       FROM   PS_JOB
+!       WHERE  EMPLID       = J2.EMPLID
+!       AND    EMPL_RCD    = J2.EMPL_RCD
+!       AND    EFFDT       <= $effdt
+!       AND    EMPL_STATUS  = 'T')
+!
+!AND    J2.EFFSEQ           =
+!      (SELECT MAX(EFFSEQ)
+!       FROM   PS_JOB
+!       WHERE  EMPLID       = J2.EMPLID
+!       AND    EMPL_RCD    = J2.EMPL_RCD
+!       AND    EFFDT        = J2.EFFDT
+!       AND    EMPL_STATUS  = 'T')
+!
+!AND    J2.EMPL_STATUS      = 'T'
+!End-Select
+!End-Procedure
+
+Begin-Procedure P190-get-new-paybegin-end-date
+#debug9 Show 'P190-get-new-paybegin-end-date'
+
+Begin-Select Distinct
+PC1.COMPANY
+PC1.PAYGROUP
+PC1.PAY_BEGIN_DT &PC1.PAY_BEGIN_DT
+PC1.PAY_BEGIN_DT-1 &new_prior_pay_end_dt
+PC1.PAY_END_DT
+PC1.PAY_CALC_RUN
+
+  Let $new_pay_begin_dt     = &PC1.PAY_BEGIN_DT
+  Let $new_pay_end_dt       = &PC1.PAY_END_DT
+  Let $new_prior_pay_end_dt = &new_prior_pay_end_dt
+
+  SHOW 'EMPL ID......' $EMPLID
+  SHOW 'EFFDT........' $EFFDT
+  SHOW 'NEW PAY BEGIN DT ' $NEW_PAY_BEGIN_dT
+  SHOW 'NEW PAY END DT   ' $NEW_PAY_END_DT
+
+  Do P220-Check-DirDep-Row   
+  Do P230-Genl-Deduction
+  
+FROM   PS_PAY_CALENDAR PC1
+
+WHERE  PC1.COMPANY            = $company
+AND    PC1.PAYGROUP           = $paygroup
+
+AND    PC1.PAY_BEGIN_DT         =
+      (SELECT MAX(PAY_BEGIN_DT)
+       FROM   PS_PAY_CALENDAR
+       WHERE  COMPANY        = $company
+       AND    PAYGROUP       = $paygroup
+       AND    PAY_BEGIN_DT   <= $Action_dt)	!GEX-MXT added for ITG#43300
+       !AND    PAY_BEGIN_DT  <= $EFFDT)		!GEX-MXT commented for ITG#43300
+
+
+
+End-Select
+End-Procedure
+
+
+Begin-Procedure P220-Check-DirDep-Row    
+#debug9 Show 'P220-Check-DirDep-Row'
+
+Begin-Select 
+DP.EMPLID       
+!DP.EMPL_RCD
+DP.EFFDT           &dp.effdt
+DP.EFF_STATUS
+DP.SUPPR_DDP_ADVICE                                  !GBD 09/19/2002 v8.3 added
+ 
+  show 'dp.emplid     ' &dp.emplid
+  show 'dp.effdt      ' &dp.effdt
+  show 'dp.eff_status ' &dp.eff_status
+
+    let $year4 = '1'
+    Do format-DateTime(&dp.effdt, $dep_effdate, {DEFDATE}, '', '')
+    let $dep_effdate_yyyy =  substr($dep_effdate,7,4)
+    let $dep_effdate_mm   =  substr($dep_effdate,1,2)
+    let $dep_effdate_dd   =  substr($dep_effdate,4,2)
+    let $dep_effdate_yyyymmdd = $dep_effdate_yyyy||$dep_effdate_mm||$dep_effdate_dd   
+    show '$dep_effdate_yyyymmdd '$dep_effdate_yyyymmdd  
+ 
+    let $year4 = '1'
+    Do format-DateTime($effdt, $effdate, {DEFDATE}, '', '')
+    let $effdate_yyyy =  substr($effdate,7,4)
+    let $effdate_mm   =  substr($effdate,1,2)
+    let $effdate_dd   =  substr($effdate,4,2)
+    let $effdate_yyyymmdd = $effdate_yyyy||$effdate_mm||$effdate_dd   
+    show '$effdate_yyyymmdd ' $effdate_yyyymmdd
+
+
+  If &dp.eff_status = 'A'
+     If $dep_effdate_yyyymmdd < $effdate_yyyymmdd
+    
+  Add 1 to #dir-dep-rows-found 
+
+  Do P225-Check-Insert-DirDep-Row
+  show '$Found_flag   ' $Found_Flag
+  show '$pay_begin_dt ' $pay_begin_Dt
+  
+  If $Found_flag = 'Y'
+! CJH - 02/28/2003
+     Let $PAY_BEGIN_DT = $PRIOR_PAY_END_DT
+     Do P226-Insert-DirDep-Row
+     Add 1 to #dir-dep-rows-inserted
+  Else
+! CJH - 02/28/2003
+     Let $pay_begin_dt = &pc.PAY_BEGIN_DT
+     Do P226-Insert-DirDep-Row
+     Add 1 to #dir-dep-rows-inserted
+  End-If
+
+ SHOW ' '
+ SHOW 'INSERTED DIRECT DEPOSIT ROW '
+ SHOW '&DP.EMPLID           ' &DP.EMPLID
+ SHOW 'EFFEC DATE           ' $next_pay_end_dt
+ SHOW 'STATUS               ' 'I'
+ SHOW '&DP.SUPPR_DDP_ADVICE ' &DP.SUPPR_DDP_ADVICE  !GBD 09/19/2002
+ SHOW ' '
+
+    If $sql_error_found = 'N'
+       Let $status = 'I'
+       Do P255-Print-DirDep-Report
+    End-If
+  End-If
+ End-If
+
+
+FROM PS_DIRECT_DEPOSIT DP
+WHERE  DP.EMPLID            = $emplid
+!AND    DP.EMPL_RCD         = #empl_rcd             !GBD 09/19/2002
+AND    DP.EFFDT            =
+      (SELECT MAX(EFFDT)
+       FROM   PS_DIRECT_DEPOSIT
+       WHERE  EMPLID       = $EMPLID)
+!       AND    EMPL_RCD    = EMPL_RCD)              !GBD 09/19/2002
+    
+End-Select
+End-Procedure
+
+
+Begin-Procedure P225-Check-Insert-DirDep-Row    
+#debug9 Show 'P225-Check-Insert-DirDep-Row'
+
+  Let $Found_Flag = 'N'
+
+Begin-Select 
+DP1.EMPLID       
+!DP1.EMPL_RCD
+DP1.EFFDT           &dp1.effdt
+DP1.EFF_STATUS
+DP1.SUPPR_DDP_ADVICE                                !GBD 09/19/2002
+
+  Let $Found_Flag = 'Y'
+  
+FROM PS_DIRECT_DEPOSIT DP1
+WHERE  DP1.EMPLID            = $emplid
+!AND    DP1.EMPL_RCD         = #empl_rcd
+
+AND    DP1.EFFDT            =
+      (SELECT MAX(EFFDT)
+       FROM   PS_DIRECT_DEPOSIT
+       WHERE  EMPLID       = $EMPLID
+!       AND    EMPL_RCD    = #EMPL_RCD
+       AND    EFFDT       = $next_pay_end_dt)
+    
+End-Select
+End-Procedure
+
+
+Begin-Procedure P226-Insert-DirDep-Row     
+#debug9 Show 'P226-Insert-DirDep-Row'
+
+ Let $sql_error_found = 'N'
+
+Begin-SQL on-error=sql-error-found('P226-Insert-DirDep-Row')
+
+
+  Insert Into PS_DIRECT_DEPOSIT
+   Values (&dp.emplid,
+!           &dp.empl_rcd,
+           $next_pay_end_dt,
+           'I',
+           &dp.suppr_ddp_advice)
+End-SQL
+End-Procedure
+
+
+Begin-Procedure P230-Genl-Deduction
+#debug9 Show 'P230-Genl-Deduction'
+Begin-Select
+
+!CJH - 02/28/2003 - get all columns
+gd_A.EMPLID
+gd_A.COMPANY
+gd_A.DEDCD 
+gd_A.EFFDT
+gd_A.DED_CALC 
+gd_A.DEDUCTION_END_DT
+gd_A.DED_ADDL_AMT
+gd_A.DED_RATE_PCT
+gd_A.GOAL_AMT
+gd_A.GOAL_BAL
+gd_A.LOAN_INT_PCT
+gd_A.BAS_TAXABLE_BEN
+gd_A.DED_STOPPED
+gd_A.LAST_ACTION
+gd_A.LAST_UPDATE_DATE
+gd_A.PROCESS_DEDN
+gd_A.GVT_DED_DIST_CD
+gd_A.GVT_PYMNT_METHOD
+gd_A.GVT_CHK_NAME
+gd_A.GVT_ADDRESS1
+gd_A.GVT_ADDRESS2
+gd_A.GVT_ADDRESS_CITY
+gd_A.GVT_ADDRESS_STATE
+gd_A.GVT_ADDRESS_ZIP
+gd_A.GVT_ADDRESS_CNTRY
+gd_A.BANK_CD
+gd_A.ACCOUNT_NUM
+gd_A.ACCOUNT_TYPE
+gd_A.GVT_PAYEE_ID_NO
+gd_A.GVT_PAYEE_NAME
+gd_A.GVT_ALLOT_PB    
+
+ let $dedcd = &gd_a.dedcd
+ do process-deds
+
+FROM   PS_GENL_DEDUCTION GD_A
+WHERE  EMPLID            = $emplid
+AND    COMPANY = $company
+!AND    EMPL_RCD         = #empl_rcd
+AND    EFFDT   = 
+       (SELECT MAX(EFFDT)
+       FROM PS_GENL_DEDUCTION 
+       WHERE EMPLID    =  $EMPLID
+        AND COMPANY = $company
+!       AND   EMPL_RCD =  #EMPL_RCD
+       AND   DEDCD     =  GD_A.DEDCD) 
+AND  (GD_A.DEDUCTION_END_DT is null                 !GBD 09/04/2003
+ OR   GD_A.DEDUCTION_END_DT > $next_pay_end_dt)     !GBD 09/04/2003
+End-Select
+End-Procedure
+!*************************************************************************
+
+
+begin-procedure process-deds
+       Let $ded_end_dt = $pay_end_dt
+show 'Processing Genl Deductions for emplid ' $EMPLID
+SHOW 'DEDCD             ' &gd_A.DEDCD
+SHOW 'EFFDT             ' $pay_begin_dt
+SHOW 'DED END DT        ' $next_pay_end_dt
+SHOW '--------------------------------- ' 
+let $ded-row-found = 'N'
+Begin-Select
+!CJH - 02/28/2003 - get all columns
+gd1.EMPLID
+gd1.COMPANY
+gd1.DEDCD 
+gd1.EFFDT
+gd1.DED_CALC 
+gd1.DEDUCTION_END_DT
+gd1.goal_amt
+gd1.goal_bal
+
+! CJH - 02/28/2003  
+!       Let $ded_end_dt = $pay_begin_dt
+       Let $ded-row-found = 'Y'
+! CJH - 02/28/2003
+       Let $dedcd      = &GD1.DEDCD
+	 Let $ded_effdt  = &GD1.EFFDT
+	 Let #goal_bal   = &GD1.GOAL_BAL
+	 Let #goal_amt   = &GD1.GOAL_AMT
+	 Let $prev_ded_end_dt = &GD1.DEDUCTION_END_DT
+
+	   show '$dedcd      ' $dedcd 
+    Add 1 To #genl-deductions-found 
+	   show '$effdt      ' $effdt
+
+    let $year4 = '1'
+    Do format-DateTime($ded_effdt, $ded_effdate, {DEFDATE}, '', '')
+    let $ded_effdate_yyyy =  substr($ded_effdate,7,4)
+    let $ded_effdate_mm   =  substr($ded_effdate,1,2)
+    let $ded_effdate_dd   =  substr($ded_effdate,4,2)
+    let $ded_effdate_yyyymmdd = $ded_effdate_yyyy||$ded_effdate_mm||$ded_effdate_dd   
+    show '$ded_effdate_yyyymmdd '$ded_effdate_yyyymmdd  
+ 
+    let $year4 = '1'
+    Do format-DateTime($pay_begin_dt, $effdate, {DEFDATE}, '', '')
+    let $effdate_yyyy =  substr($effdate,7,4)
+    let $effdate_mm   =  substr($effdate,1,2)
+    let $effdate_dd   =  substr($effdate,4,2)
+    let $effdate_yyyymmdd = $effdate_yyyy||$effdate_mm||$effdate_dd   
+    show '$effdate_yyyymmdd ' $effdate_yyyymmdd
+
+          show 'DEDUCTION END DT UPDATED FOR THE EMPLOYEE ' $EMPLID
+          SHOW 'DEDCD             ' $DEDCD
+          SHOW 'DEDUCTION EFFDT  '  $pay_begin_dt
+          SHOW 'DEDUCTION END DT  ' $next_pay_end_dt
+          SHOW ' ' 
+
+        Do P240-Update-Genl-Deduction
+
+FROM   PS_GENL_DEDUCTION GD1
+WHERE  GD1.EMPLID            = $emplid
+  AND  GD1.COMPANY = $Company
+  AND  GD1.DEDCD = $DEDCD
+  and  GD1.EFFDT = $pay_begin_dt
+End-Select
+! CJH - 02/28/2003 - add a genl deduction row to turn off deds
+if $ded-row-found = 'N'
+          show 'DEDUCTION END DT INSERTED FOR THE EMPLOYEE ' $EMPLID
+          SHOW 'DEDCD             ' $DEDCD
+          SHOW 'DEDUCTION BEGIN DT (effdt) ' $pay_begin_dt
+          SHOW 'DEDUCTION END DT  ' $next_pay_end_dt
+
+          Do P241-Insert-Genl-Deduction
+end-if
+
+     Do P250-Print-DedEnd-Report 
+! CJH - 02/28/2003 
+End-Procedure
+
+
+Begin-Procedure P240-Update-Genl-Deduction
+#debug9 Show 'P240-Update-Genl-Deduction'
+
+Begin-SQL
+UPDATE ps_genl_deduction
+SET    deduction_end_dt = $next_pay_end_dt
+WHERE  emplid           = $emplid
+  AND    company        = &GD_A.company
+  AND    dedcd          = $dedcd
+  AND    effdt          = $pay_begin_dt
+End-SQL
+  Add 1 to #genl-deductions-updated
+End-Procedure
+
+! CJH - 02/28/2003 - add insert proc
+
+Begin-Procedure P241-insert-Genl-Deduction
+#debug9 Show 'P241-insert-Genl-Deduction'
+
+ show 'insert genl ded for: ' $emplid #empl_rcd $dedcd
+ 
+begin-select
+gd.EMPLID
+gd.COMPANY
+gd.DEDCD 
+gd.EFFDT
+gd.DED_CALC 
+gd.DEDUCTION_END_DT
+gd.DED_ADDL_AMT
+gd.DED_RATE_PCT
+gd.GOAL_AMT
+gd.GOAL_BAL
+gd.LOAN_INT_PCT
+gd.BAS_TAXABLE_BEN
+gd.DED_STOPPED
+gd.LAST_ACTION
+gd.LAST_UPDATE_DATE
+gd.PROCESS_DEDN
+gd.GVT_DED_DIST_CD
+gd.GVT_PYMNT_METHOD
+gd.GVT_CHK_NAME
+gd.GVT_ADDRESS1
+gd.GVT_ADDRESS2
+gd.GVT_ADDRESS_CITY
+gd.GVT_ADDRESS_STATE
+gd.GVT_ADDRESS_ZIP
+gd.GVT_ADDRESS_CNTRY
+gd.BANK_CD
+gd.ACCOUNT_NUM
+gd.ACCOUNT_TYPE
+gd.GVT_PAYEE_ID_NO
+gd.GVT_PAYEE_NAME
+gd.GVT_ALLOT_PB
+
+ show 'select prior to insert'
+ show &gd.emplid
+ show &gd.company
+ show &gd.DEDCD 
+ show $pay_begin_dt
+ show &gd.DED_CALC 
+ show $next_pay_end_dt
+ show &gd.DED_ADDL_AMT
+ show &gd.DED_RATE_PCT
+ show &gd.GOAL_AMT
+ show &gd.GOAL_BAL
+ 
+FROM   PS_GENL_DEDUCTION GD
+WHERE  GD.EMPLID            = $emplid
+and    GD.company           = &gd_a.company 
+AND    GD.DEDCD = $DEDCD
+AND    GD.EFFDT   = 
+       (SELECT MAX(EFFDT)
+       FROM PS_GENL_DEDUCTION GDD 
+       WHERE GDD.EMPLID    =  $EMPLID
+       AND   GDD.company = &gd_a.company
+       AND   GDD.DEDCD   = $DEDCD  )
+End-Select
+
+
+Begin-SQL
+insert into ps_genl_deduction (
+EMPLID
+,COMPANY
+,DEDCD 
+,EFFDT
+,DED_CALC 
+,DEDUCTION_END_DT
+,DED_ADDL_AMT
+,DED_RATE_PCT
+,GOAL_AMT
+,GOAL_BAL
+,LOAN_INT_PCT
+,BAS_TAXABLE_BEN
+,DED_STOPPED
+,LAST_ACTION
+,LAST_UPDATE_DATE
+,PROCESS_DEDN
+,GVT_DED_DIST_CD
+,GVT_PYMNT_METHOD
+,GVT_CHK_NAME
+,GVT_ADDRESS1
+,GVT_ADDRESS2
+,GVT_ADDRESS_CITY
+,GVT_ADDRESS_STATE
+,GVT_ADDRESS_ZIP
+,GVT_ADDRESS_CNTRY
+,BANK_CD
+,ACCOUNT_NUM
+,ACCOUNT_TYPE
+,GVT_PAYEE_ID_NO
+,GVT_PAYEE_NAME
+,GVT_ALLOT_PB)
+values (
+&gd.EMPLID,
+&gd.COMPANY,
+&gd.DEDCD ,
+$pay_begin_dt,         !gd.EFFDT
+&gd.DED_CALC ,
+$next_pay_end_dt,           !gd.DEDUCTION_END_DT
+&gd.DED_ADDL_AMT,
+&gd.DED_RATE_PCT,
+&gd.GOAL_AMT,
+&gd.GOAL_BAL,
+&gd.LOAN_INT_PCT,
+&gd.BAS_TAXABLE_BEN,
+&gd.DED_STOPPED,
+&gd.LAST_ACTION,
+&gd.LAST_UPDATE_DATE,
+&gd.PROCESS_DEDN,
+&gd.GVT_DED_DIST_CD,
+&gd.GVT_PYMNT_METHOD,
+&gd.GVT_CHK_NAME,
+&gd.GVT_ADDRESS1,
+&gd.GVT_ADDRESS2,
+&gd.GVT_ADDRESS_CITY,
+&gd.GVT_ADDRESS_STATE,
+&gd.GVT_ADDRESS_ZIP,
+&gd.GVT_ADDRESS_CNTRY,
+&gd.BANK_CD,
+&gd.ACCOUNT_NUM,
+&gd.ACCOUNT_TYPE,
+&gd.GVT_PAYEE_ID_NO,
+&gd.GVT_PAYEE_NAME,
+&gd.GVT_ALLOT_PB) 
+
+End-SQL
+  Add 1 to #genl-deductions-inserted
+End-Procedure
+
+! CJH - 02/28/2003 - end
+
+Begin-Procedure P250-Print-DedEnd-Report
+#debug9 Show 'P250-Print-DedEnd-Report'
+   
+  Use-Report DedEnd-Report
+  Let $DedEnd-Data-Found-Flag = 'Y'
+
+  Do Format-DateTime($term_dt, $term_date, {DEFDATE}, '', '')
+  Do Format-DateTime($effdt, $rehire_date, {DEFDATE}, '', '')
+  Do Format-DateTime($ded_effdt, $deduct_effdt, {DEFDATE}, '', '')
+  Do Format-DateTime($ded_end_dt, $deduct_end_dt, {DEFDATE}, '', '')
+  Do Format-DateTime($prev_ded_end_dt, $prev_ded_end_date, {DEFDATE}, '', '')
+  Do Format-DateTime($pay_begin_dt, $pay_begin_date, {DEFDATE}, '', '')
+
+  Print $company              (+1,{#column1})
+  Print $paygroup             (  ,{#column2})
+  Print $deptid               (  ,{#column3})
+  Print $emplid               (  ,{#column4})
+  Print $term_date            (  ,{#column5})
+! CJH 02/19/2003 BEGIN
+!  Print $rehire_date          (  ,{#column6})
+! CJH 02/19/2003 END
+  Print $dedcd                (  ,{#column7})
+  Print $deduct_effdt         (  ,{#column8})
+  Print $prev_ded_end_date    (  ,{#column9})
+  Print $pay_begin_date       (  ,{#column10})
+  Print #goal_bal             (  ,{#column11})  Edit 999,999.99
+  Print #goal_amt             (  ,{#column12})  Edit 999,999.99
+End-Procedure
+
+Begin-Procedure P255-Print-DirDep-Report
+#debug9 Show 'P255-Print-DirDep-Report'
+   
+  Use-Report DirDep-Report
+  Let $DirDep-Data-Found-Flag = 'Y'
+
+  Do Format-DateTime($term_dt, $term_date, {DEFDATE}, '', '')
+  Do Format-DateTime($effdt, $rehire_date, {DEFDATE}, '', '')
+  Do Format-DateTime(&dp.effdt, $dp_effdt, {DEFDATE}, '', '')
+  Do Format-DateTime($pay_begin_Dt, $pay_begin_date, {DEFDATE}, '', '')
+
+  Print $company              (+1,{#column1})
+  Print $paygroup             (  ,{#column2})
+  Print $deptid               (  ,{#column3})
+  Print $emplid               (  ,{#column4})
+  Print $term_date            (  ,{#column5})
+! CJH 02/19/2003 BEGIN
+!  Print $rehire_date          (  ,{#column6})
+! CJH 02/19/2003 END
+  Print $dp_effdt             (  ,{#column8})
+  Print &dp.eff_status        (  ,{#column9})
+  Print $pay_begin_date       (  ,{#column10})  
+  Print $status               (  ,{#column11})  
+  Print $message              (  ,{#column13})  
+
+End-Procedure
+
+Begin-Procedure P300-Finalization
+#debug9 Show 'P300-Finalization'
+    If $DirDep-Data-Found-Flag  <> 'Y'
+    Use-Report DirDep-Report
+    Print 'NO DATA SELECTED FOR THIS REPORT RUN'        (25,) Center
+  End-If
+
+  If $DedEnd-Data-Found-Flag <> 'Y'
+    Use-Report DedEnd-Report
+    Print 'NO DATA SELECTED FOR THIS REPORT RUN'        (25,) Center
+  End-If
+
+  Move #hire-rows-found          To $hire-rows-found          9,999,999
+  Move #prior-term-rows-found    To $prior-term-rows-found    9,999,999
+  Move #genl-deductions-found    To $genl-deductions-found    9,999,999
+  Move #genl-deductions-updated  To $genl-deductions-updated  9,999,999
+! CJH - 02/28/2003
+  Move #genl-deductions-inserted To $genl-deductions-inserted 9,999,999
+! CJH - 02/28/2003
+  Move #dir-dep-rows-found       To $dir-dep-rows-found       9,999,999 !JNB 01/13/00
+  Move #dir-dep-rows-inserted    To $dir-dep-rows-inserted    9,999,999 !JNB 01/13/00
+
+
+! CJH 02/19/2003 BEGIN
+!  Show '  Hire/Rehire rows found      : ' $hire-rows-found
+  Show '  Term rows found              : ' $hire-rows-found
+!  Show '  Prior term rows found       : ' $prior-term-rows-found
+! CJH 02/19/2003 END
+  Show '  Genl_deduction rows found   : ' $genl-deductions-found
+  Show '  Genl_deduction rows updated : ' $genl-deductions-updated
+! CJH - 02/28/2003
+  Show '  Genl_deduction rows inserted: ' $genl-deductions-inserted
+! CJH - 02/28/2003
+  Show '  Direct Deposit rows found   : ' $dir-dep-rows-found   !JNB 01/13/00
+  Show '  Direct Deposit rows inserted: ' $dir-dep-rows-inserted !JNB 01/13/00
+  Show ' '
+
+  date-time () HH:MI:SS &timeEnded
+  date-time () MM/DD/YYYY &dateEnded
+  show 'Report Ended at ' &timeEnded ' on ' &dateEnded
+
+
+  Do Stdapi-Term             !stdapi.sqc
+  Show 'Successful end of report'
+End-Procedure
+
+!********************************************************************
+!This procedure displays in the error report if there are any sql erros
+!happened in the program
+!********************************************************************
+
+begin-procedure SQL-Error-Found($Proc_Name) 
+
+#debug9 show 'gexpy101.SQL-Error-Found'
+  Let $message = '*** Unable to Stop - ***' 
+  Let $sql_error_found = 'Y'
+  do error-found
+  print 'SQL Error in ' (,34)
+  print $Proc_Name ()  
+  print $_sql-error () 
+  print 'sql-status:' ()
+  print #_sql-status () edit 99999 
+  print $message  () 
+
+end-procedure
+
+!*********************************************************************
+!This procedure displays the error message for the records that are in
+!progress
+!*********************************************************************
+
+begin-procedure Error-Found
+#debug9 show 'gexpy101.Error-Found'
+
+  Use-Report DirDep-Report
+  !GEX_SEC_REENG Vahini Katta 09/18/2016 Begins
+  !let $EmplId_1st3 = substr($EmplId,1,3)
+  !let $EmplId_mid2 = substr($EmplId,4,2)
+  !let $EmplId_last4 = substr($EmplId,6,4)
+ 
+  !String $EmplId_1st3 $EmplID_mid2 $EmplId_last4 by '-' into $EmplId11
+
+  !print $EmplID11 (,16)
+  print $EmplID (,16)
+   !GEX_SEC_REENG Vahini Katta 09/18/2016 Ends
+end-procedure
+
+
+!Vendaxg Added for ITG#54209 on 10/27/2008 - Begin
+!*********************************************************************
+!Procedure to check if the employee has been hired or rehired or 
+!empl status is active after he has been terminated in the same week.
+!*********************************************************************
+Begin-Procedure Check-Latest-Status
+
+Let $Active_row_Found = 'N' 
+Begin-Select
+JOB.EMPLID
+
+	Let $Active_row_Found = 'Y'
+	
+FROM PS_JOB JOB 
+WHERE JOB.EMPLID = $emplid
+AND JOB.EMPL_RCD = &J.EMPL_RCD
+AND JOB.EFFDT = (SELECT MAX(JOB1.EFFDT) FROM PS_JOB JOB1 WHERE JOB.EMPLID = JOB1.EMPLID
+		AND JOB.EMPL_RCD = JOB1.EMPL_RCD 
+		AND JOB1.EFFDT <= $Pay_end_dt)
+AND JOB.EFFSEQ = (SELECT MAX(JOB2.EFFSEQ) FROM PS_JOB JOB2 WHERE JOB2.EMPLID = JOB.EMPLID 
+		AND JOB2.EMPL_RCD = JOB.EMPL_RCD
+		AND JOB2.EFFDT = JOB.EFFDT)
+AND JOB.EMPL_STATUS IN ('A','L','P','S')
+End-Select 
+
+End-Procedure Check-Latest-Status
+!Vendaxg Added for ITG#54209 on 10/27/2008 - End
+
+
+#Include 'stdapi.sqc'    !Process Scheduler Interface
+#Include 'curdttim.sqc'  !Get-Current-DateTime Procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'datemath.sqc'  !Routines for date math
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'gexxx922.sqc'  !Run Control parameters from GEX_RC_PAY record
+#include 'askaod.sqc'    !Ask-As-Of-Date procedure

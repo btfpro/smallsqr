@@ -1,0 +1,673 @@
+!***********************************************************************
+! GEXPY204:  This SQR process calculates vacation hours for employees  *
+!            in the Akron-Canton and Cleveland Stores (Local 880) who  *
+!            have attained one year of service.  Vacation hours earned *
+!            are based on the average number of hours worked in the    *
+!            last 12 months of employment.  If the average number of   *
+!            hours worked is => 37, then the employeee is awarded 40   *
+!            hours of vacation.  Otherwise, the employee receives      *
+!            vacation hours equal to average number of hours worked.   *
+!                                                                      *
+!            This SQR process awards vacation hours to employees on    *
+!            their anniversary date only. Therefore, this process MUST *
+!            RUN DAILY in order to process employees attaining one year*
+!            of service.                                               *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module is the confidential and proprietary information of       *
+! Giant Eagle, Inc.; it is not to be copied, reproduced, or transmitted*
+! in any form, by any means, in whole or in part, nor is it to be used *
+! for any purpose other than that for which it is expressly provided   *
+! without the written permission of Giant Eagle.                       *
+!                                                                      *
+!***********************************************************************
+!                         MODIFICATION HISTORY                         *
+!***********************************************************************
+!  ID#     INITIALS    DATE           DESCRIPTION OF THE CHANGE        *        
+!***********************************************************************
+!  COD011    MRP       12/19/2000     INITIAL CREATION                 *
+!                                                                      * 
+!            CJH       04/03/2001     Add CE1 union code               *
+!                                                                      *
+!  HR10123   AXL       03/20/2002     Add run cntl logic to handle     *
+!                                     union_cd selection from panel.   *
+!                                     Exclude Independants and gather  *
+!                                     hours from all cmpys worked at   *
+!                                     during given year.               *
+!            PSR       07/31/2002     Modified to have UNION_CD from   *
+!                                     JOB - 8.3 Upgrade                * 
+!            PSR       08/27/2002     EMPL_RCD is now part of the key  *
+!                                     for PS_EARNINGS_BAL - Upgrade 8.3* 
+!                                                                      *
+!  HR10334   GBD       10/08/2002     Added default value to Business  *
+!                                     Unit field on Addl_Pay_Data.     *
+!                                                                      *
+!  HR10306   GBD       11/19/2002     Added Record_Source field to     *
+!                                     ADDL_PAY_DATA/EFFDT/ERNCD inserts*
+!                                                                      *
+!  HR11075   NPK       10/27/2006     Modified to select based on      *
+!                                     Vacation Seniority Dt if Vacation*
+!                                     senior Dt exists.                *
+!                                     Modified the runcontrol to       * 
+!                                     include Indpndt Companies.       *    
+!                                     If Vacation senior dt exists then*
+!                                     hours awarded is calculated for  *
+!                                     all the companies employee worked*
+!                                                                      *
+!  HR11075   NPK       11/01/2006     Modified after testing to        *
+!                                     calculate the hours awarded for  *
+!                                     all the companies employee worked*
+!                                                                      *
+!  HR11075   NPK       11/06/2006     Commented the STOP after         *
+!                                     testing so that program doesnot  *
+!                                     abort even if it is run for      *
+!                                     already run dates                *
+!                                                                      *
+! GEX-AXG   AXG        02/06/2008     Added Code to display the name   *
+!        			      in the lastname,firstname format.*
+!								       *
+!***********************************************************************
+
+#include 'setenv.sqc' !Set environment
+#include 'setup32.sqc'
+
+begin-setup
+  declare-report Vacation-Detail-Report
+Printer-Type=HPLASERJET
+    layout=DEFAULT
+  end-declare
+
+  declare-report Report-log
+Printer-Type=HPLASERJET
+    layout=DEFAULT
+  end-declare
+end-setup
+
+
+begin-heading 6 for-reports=(report-log)
+  LET $REPORTID = 'PY204LOG'
+  move 'Vacation Calculation for Local 880 - Report Log' to $ReportTitle
+
+ #Include 'stdhdg01.sqc'
+
+  position          (+2)
+  print 'Trans#'    (,1)
+  print 'Emplid'    (,18)
+  print 'Message'   (,50)
+  print '-'         (+1,1,174) fill
+end-heading
+
+
+begin-heading 7 for-reports=(Vacation-Detail-Report)
+  move 'GEXPY204' to $ReportID
+  move 'Vacation Calculation for Local 880 - Daily Update' to $ReportTitle
+
+ #Include 'stdhdg02.sqc'
+  Let $X000_temp_out = 'Report as of ' || $X000_REPORT_HEADING_ASOFDATE
+
+  Print $X000_temp_out            (3,)  center
+  print 'Dept'                    (6,1)
+  print 'Acct'                    (,15)
+  print 'Awarded'                 (,168)
+  print 'Full/Part'               (,114)
+  print 'Hrs Worked'              (,146)
+
+  print 'Code'                    (+1,1)
+  print 'Description'             (,15)
+  print 'Name'                    (,32)
+  print 'Emplid'                  (,69)
+  print 'Pay Group'               (,84)
+  print 'Job Code'                (,98)
+  print 'Time Ind'                (,114)
+  print 'Hire Date'               (,129)
+  print '   YTD   '               (,146)
+  print 'Vacation Hrs'            (,163)
+  print '-'                       (+1,1,174) fill
+end-heading
+
+
+begin-report
+  use-report Vacation-Detail-Report
+
+  do Init-DateTime
+  do Init-Number
+  do Get-Current-DateTime
+  do Stdapi-Init
+
+  Let $GEXXX913_UNION_CD_Alias = 'A.UNION_CD'  !AXL 03/20/2002
+  Let $GEXXX900_Company_Alias  = 'J.COMPANY'   !ISDVNPK 10/27/2006
+
+  If $prcs_process_instance = ''
+    Do Ask-As-Of-Date
+
+     ! ISDVNPK 10/27/2006 New (Begin)
+     Let $CompanyString = ''''
+     Display 'Enter Company or leave blank to exit.'
+     While 1=1
+       Input $In-Company Maxlen=3 'Company'
+       Uppercase $In-Company
+       If Rtrim($In-Company, ' ') = ''
+         Concat '''' With $CompanyString
+         Break
+       End-If
+       If $CompanyString <> ''''
+         Concat ''',''' With $CompanyString
+       End-If
+       Concat $In-Company With $CompanyString
+     End-While
+
+     If $CompanyString = ''''''
+       Let $GEXXX900_INCLUDE_COMPANY_CRITERIA  = '1=1'
+       Let $GEXXX900_INCLUDE_COMPANY_DISPLAY_CRITERIA = 'ALL'
+     Else
+       Let $GEXXX900_INCLUDE_COMPANY_CRITERIA  = $GEXXX900_Company_Alias || ' In (' || $CompanyString || ')'
+       Let $GEXXX900_INCLUDE_COMPANY_DISPLAY_CRITERIA = $GEXXX900_INCLUDE_COMPANY_CRITERIA
+     End-If
+     !ISDVNPK 10/27/2006 New (end)
+
+    !AXL 03/20/2002 New (Begin)
+    Let $UnionCdString = ''''
+    Display 'Enter Union Code or leave blank to exit.'
+    While 1=1
+      Input $In-UnionCd Maxlen=3 'Union Code'
+      Uppercase $In-UnionCd
+      If Rtrim($In-UnionCd, ' ') = ''
+        Concat '''' With $UnionCdString
+        Break
+      End-If
+      If $UnionCdString <> ''''
+        Concat ''',''' With $UnionCdString
+      End-If
+      Concat $In-UnionCd With $UnionCdString
+    End-While
+    If $UnionCdString = ''''''
+      Let $GEXXX913_INCLUDE_UNION_CD_CRITERIA = '1=1'
+      Let $GEXXX913_INCLUDE_UNION_CD_DISPLAY_CRITERIA = 'ALL'
+    Else
+      Let $GEXXX913_INCLUDE_UNION_CD_CRITERIA = $GEXXX913_Union_CD_Alias || ' In (' || $UnionCdString || ')'
+      Let $GEXXX913_INCLUDE_UNION_CD_DISPLAY_CRITERIA = $GEXXX913_INCLUDE_UNION_CD_CRITERIA
+    End-If
+    !AXL 03/20/2002 New (end)
+
+  Else
+    Do GEXXX922-Select-Parameters
+    Let $AsOfDate = $GEX_RC_PAY.ASOFDATE
+    If Rtrim($AsOfDate,' ') = ''
+      Let $AsOfDate = $AsOfToday
+    End-If
+
+    Do GEXXX913-Select-UNION-CD-Parameters
+    Do GEXXX900-Select-Company-Parameters    !ISDVNPK 10/27/2006
+
+  End-If
+  
+  ! ISDVNPK 10/27/2006 New (Begin)
+  show '$AsOfDate                                      = ' $AsOfDate
+  show '$GEXXX913_INCLUDE_UNION_CD_CRITERIA            = ' $GEXXX913_INCLUDE_UNION_CD_DISPLAY_CRITERIA   
+  show '$GEXXX900_INCLUDE_COMPANY_CRITERIA             = ' $GEXXX900_INCLUDE_COMPANY_DISPLAY_CRITERIA  
+  ! ISDVNPK 10/27/2006 New (end)
+  
+  let $Year4   = '1'
+  Do Format-DateTime($AsOfDate, $X000_REPORT_HEADING_ASOFDATE, {DEFMDY}, '', '')
+
+  date-time () HH:MI:SS &timeBegan
+  date-time () MM/DD/YYYY &dateBegan
+  show 'Report Began at ' &timeBegan ' on ' &dateBegan
+  show ' '
+
+  Do Convert-To-DTU-Date($AsOfDate,$AsofDate_dtu)
+  Do dtu-add-days($AsOfDate_dtu,-1, $AsOfDateMinus1_dtu)
+  Do Convert-From-DTU-Date($AsOfDateMinus1_dtu,$AsOfDateMinus1)
+
+  do Gexregtp_Init_Strings
+  do Get-Date-Codes
+  do Convert-To-DTU-Date($AsOfDate, $AsOfDate_dtu)
+
+  move $AsOfYYYY to #AsOfYYYY
+  let #prev_year = #AsOfYYYY - 1
+  let $prev_year = to_char(floor(#prev_year))
+
+  do GEXREGTP_Init_Strings
+
+  move 'N' to $found
+  let #inputtran = 0
+  do Select-Employees
+  
+Report-Exit:
+
+  date-time () HH:MI:SS &timeEnded
+  date-time () MM/DD/YYYY &dateEnded
+
+  show ' '
+  show 'Report Ended at ' &timeEnded ' on ' &dateEnded
+  show ' '
+
+  display #InputTran 999,999 noline
+  display ' Transactions Processed'
+
+  do Commit-Transaction
+
+  do Stdapi-Term
+end-report
+
+
+begin-procedure Select-Employees
+#debug9 Show 'Select-Employees'
+  move 'N' to $found
+  move 'N' to $Empl_found
+
+begin-select ON-ERROR=SQL-Error-Found
+A.COMPANY   ()  ON-BREAK  LEVEL=1  PRINT=NEVER
+
+A.DEPTID    ()  ON-BREAK  LEVEL=2  PRINT=NEVER
+                                   SAVE=$previous_deptid
+                                   BEFORE=Before-Deptid-Change
+                                   AFTER=After-Deptid-Change
+A.JOBCODE
+A.PAYGROUP
+A.EMPLID
+A.EMPL_RCD
+A.REG_TEMP
+A.HOURLY_RT
+A.ACCT_CD
+A.UNION_CD
+B.GEX_VCN_SENIOR_DT
+B.HIRE_DT
+B.REHIRE_DT
+B.SERVICE_DT
+
+  let $Company = &A.company
+  move &A.EMPLID to $emplid
+  move 'Y' to $Empl_found
+  move 'N' to $skip_record
+  move 0 to #hrs_worked
+  move 0 to #vac_hrs_awarded
+    
+  #ifdef debug8 
+    show 'emplid: ' $emplid
+    show '  Company:                  ' $Company
+  #endif
+  
+  ! ISDVNPK 11/01/2006 New (Begin)
+  ! let $VAC_SENIOR_DT = datetostr(&B.GEX_VCN_SENIOR_DT,'dd-mon-yyyy')
+   
+  ! ISDVNPK 10/23/2006 Added the below
+  ! If rtrim(datetostr(&B.GEX_VCN_SENIOR_DT,'dd-mon-yyyy'),' ') = ''
+  !   let $company_criteria = 'AND J.COMPANY > ' ||'''' || '900' ||''''
+  ! else
+  !   let $company_criteria = 'AND (J.COMPANY > ' ||'''' || '900' ||'''' || ' or ' || $GEXXX900_INCLUDE_COMPANY_CRITERIA || ')'
+  ! End-If
+  ! ISDVNPK 10/23/2006 Added the above
+  ! ISDVNPK 11/01/2006 New (End)
+  
+  let $balance_year_criteria = 'AND    J.BALANCE_YEAR     IN (' || $prev_year || ',' || $AsOfYYYY || ')'
+  do Hours-Worked
+
+ 
+  if #hrs_worked <= 0
+    move 'Y' to $skip_record
+  end-if
+
+  if $skip_record = 'N'
+    add 1 to #inputtran             
+    let #avg_weekly_hrs_worked = #hrs_worked / 52
+
+    evaluate #avg_weekly_hrs_worked
+      when >= 37
+        let #vac_hrs_awarded = 40
+        break
+      when < 37
+        let #vac_hrs_awarded = #avg_weekly_hrs_worked
+        break
+    end-evaluate
+
+    #debug8 show ' '
+    #debug8 show 'emplid  = ' $emplid
+    #debug8 show '     hours        = ' #avg_weekly_hrs_worked
+    #debug8 show '     hours worked = ' #hrs_worked
+    #debug8 show ' #vac_hrs_awarded = ' #vac_hrs_awarded   ! ISDVNPK 10/05/2006 Added this
+    #debug8 show ' '
+
+    do Check-Existing-Vac-Erncd
+    do Insert-Addl-Pay-Data
+    If $Insert_Err = 'N' ! ISDVNPK 11/06/2006
+      do Print-Detail-Report
+    end-if               ! ISDVNPK 11/06/2006
+  end-if
+    
+FROM  PS_JOB A,
+      PS_EMPLOYMENT B 
+WHERE  A.EMPLID           = B.EMPLID
+   AND A.EMPL_RCD        = B.EMPL_RCD  
+   !AND A.UNION_CD      IN ('CE3','CE2','CE1')
+   !AXL 03/20/2002 Union Codes now supplied via panel - Begin
+   AND  [$GEXXX913_INCLUDE_UNION_CD_CRITERIA]
+   !AXL 03/20/2002 Union Codes now supplied via panel - End
+   AND A.EMPL_STATUS NOT IN ('T','R','U','Q')
+   AND A.EFFDT            =
+      (SELECT MAX(EFFDT)
+       FROM   PS_JOB
+       WHERE  EMPLID     = A.EMPLID
+          AND EMPL_RCD  = A.EMPL_RCD
+          AND EFFDT     <= $AsOfDate)
+   AND A.EFFSEQ           =
+      (SELECT MAX(EFFSEQ)
+       FROM   PS_JOB 
+       WHERE  EMPLID      = A.EMPLID
+          AND EMPL_RCD   = A.EMPL_RCD
+          AND EFFDT       = A.EFFDT)
+  ! ISDVNPK 10/27/2006 Modifed this to select based on VACATION SENIOR DT
+   AND ((add_months(B.SERVICE_DT,12) = $AsOfDate and B.gex_vcn_senior_dt is Null) 
+        or (add_months(B.gex_vcn_senior_dt,12) = $AsOfDate and B.gex_vcn_senior_dt is not Null))
+  ! ISDVNPK 10/27/2006 Modifed this to select based on VACATION SENIOR DT
+!***********************************************
+!  The following code was used for testing
+!***********************************************
+      !and a.emplid in ('189609876')
+!     02368','168361081',
+!    '170623452','173621455','173683606',
+!    '173685108','174621881','174682511',
+!    '178587209','180681755','183267984',
+!    '183341868','185327537','185340194')
+
+!   ('174621881','173685108','183341868','183267984',
+!    '196589251','182528797','293708108',
+!    '167621860','173645650','195440456',
+!    '203602110','192585891','192682844','199543179',
+!    '160605301','186786582','179666176','190368313',
+!    '236190869','186640321','161388294','409590871',
+!    '166689112','188627779','464156950')
+!***********************************************
+!  End of test code
+!***********************************************
+ORDER BY A.COMPANY, A.DEPTID, A.EMPLID
+end-select
+
+   if $Empl_found = 'N'
+      Print 'NO DATA SELECTED FOR THIS REPORT RUN'	(25,) Center
+   end-if
+end-procedure
+
+
+begin-procedure Before-Deptid-Change
+#debug9 Show 'Before-Deptid-Change'
+  let $DeptID = &A.DEPTID
+  do Get-Department-Name
+end-procedure
+
+
+begin-procedure After-Deptid-Change
+#debug9 Show 'After-Deptid-Change'
+  if #detail_count > 0
+    new-page
+    move 0 to #detail_count
+  end-if
+  let $DeptName = ''
+end-procedure
+
+
+begin-procedure Hours-Worked
+#debug9 Show 'Hours-Worked'
+begin-select on-error=SQL-Error-Found
+SUM(J.HRS_YTD) &J.HRS_YTD
+
+  add &J.HRS_YTD To #hrs_worked
+
+FROM   PS_EARNINGS_BAL J
+WHERE  J.EMPLID            = &A.EMPLID
+   !AXL 03/20/2002 Credit prev company no matter where except if IND
+   !AND J.COMPANY           = &A.COMPANY
+   !AND J.COMPANY > '900'		!AXL 03/20/2002   !ISDVNPK 10/27/2006 commented this and added dynamic where clause
+   ! [$company_criteria]                ! ISDVNPK 11/01/2006 commented this and modified as below
+   AND (J.COMPANY 	   > '999'	or [$GEXXX900_INCLUDE_COMPANY_CRITERIA]) 
+   AND J.BALANCE_ID        = 'CY'
+   AND J.EMPL_RCD          = &A.EMPL_RCD       
+   [$balance_year_criteria]
+   AND J.BALANCE_PERIOD    =
+      (SELECT MAX(BALANCE_PERIOD)
+       FROM   PS_EARNINGS_BAL
+       WHERE  EMPLID       = J.EMPLID
+          AND COMPANY      = J.COMPANY
+          AND BALANCE_ID   = J.BALANCE_ID
+          AND BALANCE_YEAR = J.BALANCE_YEAR
+          AND SPCL_BALANCE = J.SPCL_BALANCE
+          AND EMPL_RCD     = J.EMPL_RCD 
+          AND ERNCD        = J.ERNCD)
+   AND J.SPCL_BALANCE      = 'Y'
+   AND J.ERNCD             = 'TOT'
+end-select
+end-procedure
+
+
+!*********************************************************************
+!This procedure tries to find if the Vacation Earnings Code (513) is
+!defined in ADDL_PAY_ERNCD table. If there is, inserts a row in 
+!ADDL_PAY_EFFDT with AsofDate as the effective date. Otherwise,
+!inserts the earning code 513 in the ADDL_PAY_ERNCD and also a row with
+!effective date equal to AsofDate in ADDL_PAY_EFFDT.
+!*********************************************************************
+   
+begin-procedure Check-Existing-Vac-Erncd
+#debug9 Show 'Check-Existing-Vac-Erncd'
+  move 'N' to $found
+  move 'N' to $Insert_Err  ! ISDVNPK 11/06/2006
+
+begin-select on-error=SQL-Error-Found
+'K'
+  move 'Y' to $found
+  do Insert-New-Effdt
+
+FROM   PS_ADDL_PAY_ERNCD K
+WHERE  K.EMPLID    = &A.EMPLID
+   AND K.EMPL_RCD = &A.EMPL_RCD
+   AND K.ERNCD     = '513'
+end-select
+
+  if $found = 'N'
+    do Insert-Vac-Erncd
+    do Insert-New-Effdt
+  end-if
+end-procedure
+
+
+begin-procedure Insert-Vac-Erncd
+#debug9 Show 'Insert-Vac-Erncd for Emplid: ' &a.emplid
+  begin-sql on-error=SQL-Error-Found
+    INSERT INTO PS_ADDL_PAY_ERNCD
+               (EMPLID,
+                EMPL_RCD,
+                ERNCD,
+                RECORD_SOURCE)                      !GBD 11/19/2002
+        VALUES (&A.EMPLID,
+                &A.EMPL_RCD,
+                '513',
+                'O')                                !GBD 11/19/2002
+  end-sql
+end-procedure
+
+
+begin-procedure Insert-New-Effdt
+#debug9 Show 'Insert-New-Effdt for Emplid: ' &a.emplid
+ begin-sql on-error=SQL-Error-Found
+    INSERT INTO PS_ADDL_PAY_EFFDT
+               (EMPLID,
+                EMPL_RCD,
+                ERNCD,
+                EFFDT,
+                RECORD_SOURCE)                      !GBD 11/19/2002
+        VALUES (&A.EMPLID,
+                &A.EMPL_RCD,
+                '513',
+                $AsOfDate,
+                'O')                                !GBD 11/19/2002
+  end-sql
+end-procedure
+
+
+begin-procedure Insert-Addl-Pay-Data
+#debug9 Show 'Insert-Addl-Pay-Data for Emplid: ' &a.emplid
+ begin-sql on-error=SQL-Error-Found
+    INSERT INTO PS_ADDL_PAY_DATA
+               (EMPLID,
+                EMPL_RCD,
+                ERNCD,
+                EFFDT,
+                ADDL_SEQ,
+                DEPTID,
+                JOBCODE,
+                POSITION_NBR,
+                ACCT_CD,
+                GL_PAY_TYPE,
+                ADDL_PAY_SHIFT,
+                OTH_HRS,
+                HOURLY_RT,
+                OTH_PAY,
+                ADDLPAY_REASON,
+                SEPCHK,
+                EARNINGS_END_DT,
+                GOAL_AMT,
+                GOAL_BAL,
+                OK_TO_PAY,
+                DISABLE_DIR_DEP,
+                PRORATE_ADDL_PAY,
+                PRORATE_CUI_WEEKS,
+                PAY_PERIOD1,
+                PAY_PERIOD2,
+                PAY_PERIOD3,
+                PAY_PERIOD4,
+                PAY_PERIOD5,
+                STATE,
+                LOCALITY,
+                TAX_PERIODS,
+                TAX_METHOD,
+                ADDL_PAY_FREQUENCY,
+                DED_TAKEN,
+                DED_SUBSET_ID,
+                DED_TAKEN_GENL,
+                DED_SUBSET_GENL,
+                PLAN_TYPE,
+                BUSINESS_UNIT,
+                COMP_RATECD,
+                RECORD_SOURCE)            !GBD 11/19/2002
+        VALUES (&A.EMPLID,
+                &A.EMPL_RCD,
+                '513',
+                $AsOfDate,
+                1,
+                ' ',
+                ' ',
+                ' ',
+                ' ',
+                ' ',
+                ' ',
+                #vac_hrs_awarded,
+                0,
+                0,
+                ' ',
+                0,
+                '',
+                0,
+                0,
+                'N',
+                ' ',
+                ' ',
+                ' ',
+                'N',
+                'N',
+                'N',
+                'N',
+                'N',
+                ' ',
+                ' ',
+                0,
+                ' ',
+                ' ',
+                ' ',
+                ' ',
+                ' ',
+                ' ',
+                ' ',
+                'STDBU',                  !GBD 10/08/2002 - default value
+                ' ',
+                'O')                      !GBD 11/19/2002
+  end-sql
+end-procedure
+
+
+begin-procedure Print-Detail-Report
+#debug9 Show 'Print-Detail-Report'
+use-report Vacation-Detail-Report
+
+  add 1 to #detail_count
+
+  let $Acctcd = &A.ACCT_CD
+  Do Get-Acct-cd-descr
+  Do Get-Employee-Name
+
+  print &A.DEPTID                   (+1,1)
+  print $AcctNameAbbrv              (,15)
+  print $Name                       (,32)
+  print &A.EMPLID                   (,69)
+  print &A.PAYGROUP                 (,84)
+  print &A.JOBCODE                  (,98)
+
+  move &A.REG_TEMP to $GEXREGTP_ftpt_code
+  do GEXREGTP_translate_code
+  print $GEXREGTP_ftpt_code_return  (,118)
+
+  let $Year4   = '1'
+  do Format-DateTime(&B.HIRE_DT,$HireDate,{DEFMDY},'','')
+  print $HireDate                   (,129)
+
+  print #hrs_worked                 (,145)   edit 99,999.99
+  print #vac_hrs_awarded            (,166)   edit 99,999.99
+end-procedure
+
+
+begin-procedure SQL-Error-Found
+#debug9 Show 'SQL-Error-Found'
+  move $EmplId to $Format_EmplId xxx-xx-xxxx
+  move 'Y' to $ErrorFound
+  do Format-Number(#InputTran, $out, '99999')
+
+  move 'Y' to $Insert_Err  ! ISDVNPK 11/06/2006
+  
+  use-report report-log
+
+  print $out         (+1,1)
+  print &A.EMPLID    (,18)
+  print $sql-error   (,35) 
+
+!GBD 11/19/2002
+  display $out noline 
+  display '    ' noline 
+  display &A.EMPLID
+  display $sql-error
+  display 'Program stopped by user request.'
+  !STOP  ! ISDVNPK 11/06/2006
+!GBD 11/19/2002
+
+end-procedure
+
+
+#Include 'gexxx922.sqc'  !Get GEX_RC_PAY run control parameters
+#include 'gexxx913.sqc'  !Get Union code multiple row table
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'getdatcd.sqc'  !Retrieves the asofyear, asofmonth etc.,
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#include 'askaod.sqc'    !Ask-As-Of-Date routine
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'stdapi.sqc'    !Get_Run_Control Procedure
+#Include 'datemath.sqc'  !Does the date-math functions
+#include 'gexregtp.sqc'  !Translates the REG_TEMP to Full_Part_time
+#include 'getdptnm.sqc'  !Get department name
+#include 'getactnm.sqc'  !Get account name
+#include 'getcodta.sqc'  !Get company data
+!GEX-AXG Added for Upgrade 9.0 on 02/06/08 - Begin
+!#Include 'getempnm.sqc'  !Get-Employee-Name
+#Include 'gexempnm.sqc'  !Get-Employee-Name
+!GEX-AXG Added for Upgrade 9.0 on 02/06/08 - End
+#include 'gexxx900.sqc'  !Company

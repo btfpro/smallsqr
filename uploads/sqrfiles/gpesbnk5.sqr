@@ -1,0 +1,1403 @@
+!----------------------------------------------------------------------!
+! Report Name: GPESBNK5.SQR  Bank File Generator                       !
+!----------------------------------------------------------------------!
+!                                                                      !
+! Confidentiality Information:                                         !
+!                                                                      !
+!                                                                      !
+! This module contains confidential and proprietary information        *
+! of Oracle; it is not to be copied, reproduced, or transmitted        *
+! in any form, by any means, in whole or in part, nor is it to         *
+! be used for any purpose other than that for which it is              *
+! expressly provided under the applicable license agreement.           *
+!                                                                      *
+! Copyright (C) 2006 Oracle. All Rights Reserved.                      *
+!                                                                      *
+!----------------------------------------------------------------------!
+!                                                                      !
+!          $Date:  2006/09/13:02:03:23                                 !
+!       $Release:  HR9                                                 !
+!      $Revision:  103                                                 !
+!                                                                      !
+!----------------------------------------------------------------------!
+
+#include 'setenv.sqc'    !Set environment
+
+Begin-Setup
+#include 'setupdb.sqc'               ! Database specific setup
+!#Include 'ptset02.sqc'   !Printer and page-size initialization
+End-Setup
+
+
+begin-report
+
+do Init-DateTime
+do Init-Number
+do Get-Current-DateTime
+do Init-Report
+do Process-Main
+do Stdapi-Term
+
+end-report
+
+
+begin-heading 7
+!#Include 'stdhdgtr.sqc'
+
+end-heading
+
+
+!************************************************************************
+! Procedure Init-Report
+!************************************************************************
+begin-procedure Init-Report
+move 'GPESBNK5' to $ReportID
+move 'EFT - File Generation' to $ReportTitle
+display $ReportTitle
+
+do Stdapi-Init
+
+if $prcs_process_instance = ''
+      !No Prompt
+else
+      Do Get-values
+end-if
+end-procedure
+
+
+!************************************************************************
+! Procedure Get-Values
+!************************************************************************
+begin-procedure Get-Values
+!No values
+end-procedure
+
+
+!************************************************************************
+! Procedure Process-Main
+!************************************************************************
+begin-procedure Process-Main
+#debug do Fin-Debug-Msg('Process-Main')
+
+   do Get-Run-Control-Parameters
+   do EFT-File-Generation
+
+end-procedure
+
+
+!************************************************************************
+! Procedure Get-Run-Control-Parameters
+!************************************************************************
+begin-procedure Get-Run-Control-Parameters
+#debug do Fin-Debug-Msg('Get-Run-Control-Parameters')
+ 
+#debugd show 'Operator Id:    ' $prcs_oprid
+#debugd show 'Run Control Id: ' $prcs_run_cntl_id
+
+let $sql-statement = 'GPESNK5.SQR,Get-Run-Control-Parameters,Select,PS_GPES_RC_BNK'
+begin-select on-error=SQL-Error
+CAL_RUN_ID
+PAY_ENTITY
+GPES_FILE_NAME
+  let $fill               =  ' '
+  let $CAL_RUN_ID         =  &CAL_RUN_ID
+  let $PAY_ENTITY         =  &PAY_ENTITY
+  let $GPES_FILE_NAME     =  &GPES_FILE_NAME
+
+FROM PS_GPES_RC_BNK
+WHERE OPRID = $prcs_oprid
+ AND  RUN_CNTL_ID = $prcs_run_cntl_id
+end-select
+
+end-procedure
+
+
+!************************************************************************
+! Procedure EFT-File-Generation
+!************************************************************************
+begin-procedure EFT-File-Generation
+#debug do Fin-Debug-Msg('EFT-File-Generation')
+
+#define PMT_STATUS  'F'    !'F'inalized / 'P'repared / 'T'ransferred
+
+let $sql-statement = 'GPESNK5.SQR,EFT-File-Generation,Select,PS_GP_PAYMENT'
+BEGIN-SELECT on-error=SQL-Error
+C.COMPANY
+D.SRC_BANK_ID
+MAX(D.DEBIT_DT)   &D.DEBIT_DT
+MAX(B.PYMT_DT)  &B.PYMT_DT
+  LET $COMPANY_Cd = RTRIM(&C.COMPANY, ' ')
+  LET $SOURCE_Cd = RTRIM(&D.SRC_BANK_ID, ' ')
+  do GET-COMPANY-DATA
+  do Get-Source-Bank-data
+
+  do create-file
+  do Write-CSB34-Batch-Header-Record
+  Let $Domestic-Transfer = 'Y'   !-Domestic Transfer
+  do Process-Transfers
+  Let $Domestic-Transfer = 'N'   !-International Transfer
+  do Process-Transfers
+  Let $Domestic-Transfer = 'S'   !-Special Transfer
+  do Process-Transfers
+  do Write-CSB34-Batch-Trailer-Record
+  Close 100
+
+FROM PS_JOB C,
+     PS_GP_CALENDAR B,
+     PS_GP_PAYMENT D,
+     PS_FAST_SQR_SEC_VW FAST_SEC
+WHERE C.EMPLID = D.EMPLID
+  AND C.EMPL_RCD = D.EMPL_RCD
+  AND C.EFFDT = (SELECT MAX(EFFDT) FROM PS_JOB
+                  WHERE EMPLID = C.EMPLID AND EMPL_RCD = C.EMPL_RCD
+                    AND EFFDT <= D.DEBIT_DT)
+  AND C.EFFSEQ = (SELECT MAX(EFFSEQ) FROM PS_JOB
+                   WHERE EMPLID = C.EMPLID AND EMPL_RCD = C.EMPL_RCD
+                     AND EFFDT = C.EFFDT)
+  AND D.PAY_ENTITY = $PAY_ENTITY
+  AND D.CAL_RUN_ID = $CAL_RUN_ID
+  AND D.PMT_STATUS = {PMT_STATUS}
+  AND D.PAYMENT_MTHD = 'T'
+  AND D.GP_PAYGROUP = B.GP_PAYGROUP 
+  AND D.CAL_ID = B.CAL_ID
+  AND FAST_SEC.OPRID = $prcs_oprid
+  AND D.EMPLID = FAST_SEC.EMPLID
+  AND D.EMPL_RCD = FAST_SEC.EMPL_RCD
+GROUP BY C.COMPANY, D.SRC_BANK_ID
+end-select
+
+#debugd show 'Pay Entity:        ' $PAY_ENTITY
+#debugd show 'Calendar Group ID: ' $CAL_RUN_ID
+
+end-procedure
+
+
+!************************************************************************
+! Procedure GET-COMPANY-DATA
+!************************************************************************
+begin-procedure GET-COMPANY-DATA
+#debug do Fin-Debug-Msg('GET-COMPANY-DATA')
+
+let $sql-statement = 'GPESBNK5.SQR,GET-COMPANY-DATA,Select,PS_COMPANY_TBL'
+BEGIN-SELECT on-error=SQL-Error
+CT.COMPANY
+CT.DESCR
+CT.ADDRESS1
+CT.ADDR_FIELD2
+CT.CITY
+CT.POSTAL
+CT.FISCAL_ID_CD
+
+  let $CompanyName   =  rtrim(&CT.Descr,' ')
+  let $Compadd1      =  rtrim(&CT.Address1,' ')
+  let $Compnum       =  rtrim(&CT.Addr_field2,' ')
+  let $Compadd1      =  $Compadd1 || ',' || $Compnum
+  let $CompanyCITY   =  rtrim(&CT.CITY,' ')
+  let $CompanyPOSTAL =  rtrim(&CT.POSTAL,' ')
+  Let $Letra = {PS-SUBSTR}(&CT.FISCAL_ID_CD, 1, 1)
+  Let $Numero = {PS-SUBSTR}(&CT.FISCAL_ID_CD, 2, 10)
+  let $CompanyFISCAL1 =  rtrim($Numero,' ')
+  let $CompanyFISCAL2 = Ltrim($CompanyFISCAL1,'-')
+  
+  let $CompanyFISCAL = $Letra||LPAD($CompanyFISCAL2, 8, '0')
+  
+  
+
+FROM  PS_COMPANY_TBL CT
+WHERE CT.COMPANY = $company_cd
+  AND CT.EFFDT = (SELECT MAX(EFFDT) FROM PS_COMPANY_TBL
+                   WHERE COMPANY = $company_cd
+                     AND EFFDT <= $asoftoday)
+end-select
+
+#debugd show 'Company ID:   ' $company_cd
+#debugd show 'As of Date:   ' $asoftoday
+#debugd show 'Company Name: ' $CompanyName
+#debugd show 'NIF ' $CompanyFISCAL
+#debugd show 'NIF1 ' $CompanyFISCAL1
+#debugd show 'NIF2 ' $CompanyFISCAL2
+#debugd SHOW 'lETRA '$Letra
+#debugd SHOW 'NUMERO '$Numero 
+
+end-procedure
+
+
+!************************************************************************
+! Procedure Get-Source-Bank-data
+!************************************************************************
+begin-procedure Get-Source-Bank-data
+#debug do Fin-Debug-Msg('Get-Source-Bank-data')
+
+Let $BANK_CD_SRC     =  ''
+Let $BRANCH_CD_SRC   =  ''
+Let $CHECK_DIGIT_SRC =  ''
+Let $ACCOUNT_ID_SRC  =  ''
+
+let $sql-statement = 'GPESBNK5.SQR,Get-Source-Bank-Data,Select,PS_SRC_BANK'
+BEGIN-SELECT on-error=SQL-Error
+BB.BANK_CD
+BB.BRANCH_EC_CD
+BB.CHECK_DIGIT
+BB.ACCOUNT_EC_ID
+
+  let $BANK_CD_SRC     =  rtrim(&BB.BANK_CD ,' ')
+  let $BRANCH_CD_SRC   =  rtrim(&BB.BRANCH_EC_CD ,' ')
+  let $CHECK_DIGIT_SRC =  rtrim(&BB.CHECK_DIGIT ,' ')
+  let $ACCOUNT_ID_SRC  =  rtrim(&BB.ACCOUNT_EC_ID ,' ')
+
+FROM PS_SRC_BANK BB
+WHERE BB.SRC_BANK_ID = $SOURCE_CD
+END-SELECT
+
+#debugd show 'Source Bank ID: ' $SOURCE_CD
+#debugd show 'Bank:           ' $BANK_CD_SRC
+#debugd show 'Branch:         ' $BRANCH_CD_SRC
+#debugd show 'Check Digit:    ' $CHECK_DIGIT_SRC
+#debugd show 'Account Nbr:    ' $ACCOUNT_ID_SRC
+
+END-PROCEDURE
+
+
+!************************************************************************
+! Procedure create-file
+!************************************************************************
+begin-procedure create-file
+#debug do Fin-Debug-Msg('create-file')
+
+#debugd show 'Company:    ' $company_cd
+#debugd show 'As of Date: ' $asoftoday
+#debugd show 'Original File Name: ' $GPES_FILE_NAME
+
+let $CSB34_FILE = rtrim($GPES_FILE_NAME,' ')
+Let #LENGTH = Length($CSB34_FILE)
+Let #DOT = 0
+Let #SLASH = 0
+Let #I = 1
+While #i <= #LENGTH
+   Let $Literal = Substr($CSB34_FILE, #i, 1)
+   Evaluate $Literal
+   When = '.'
+      Let #DOT = #i
+   When = '/'
+   When = '\'
+      Let #SLASH = #i
+      Let #DOT = 0
+   End-Evaluate
+
+   Let #i = #i + 1
+End-While
+
+if #dot = 0
+   let $CSB34_FILE = $CSB34_FILE || $company_Cd || $SOURCE_Cd || '.TXT'
+else
+   extract $Filename from $CSB34_FILE 0 #dot
+   ! let #dot = #dot + 1
+   EXTRACT $EXTENSION FROM $CSB34_FILE #DOT 3
+   LET $CSB34_FILE =  $FILENAME || $COMPANY_CD || $SOURCE_Cd || '.' || $EXTENSION
+END-IF
+  
+#debugd show 'Changed File Name: ' $CSB34_FILE
+OPEN $CSB34_FILE AS 100 FOR-WRITING record=72:FIXED status=#filestat
+
+if #filestat != 0
+    display 'Error opening file: ' noline
+    display $CSB34_FILE            noline
+    display '   RC= '              noline
+    display #filestat
+END-IF
+
+end-procedure
+
+
+!************************************************************************
+! Procedure Process-Transfers
+!************************************************************************
+BEGIN-PROCEDURE  Process-Transfers
+#debug do Fin-Debug-Msg('Process-Transfers')
+
+#debugd show 'Transfer block flag: ' $Domestic-Transfer
+
+let $Block-Header-Flag = 'N'
+
+let $sql-statement = 'GPESNK5.SQR,Process-Transfers,Select,PS_GP_PAYMENT'
+begin-select on-error=SQL-Error
+PMNT.EMPLID
+PMNT.EMPL_RCD
+PMNT.INSTANCE
+PMNT.GP_PMT_AMT           &GP_PMT_AMT
+PMNT.CURRENCY_CD
+PMNT.RECIPIENT_ID
+PMNT.PMT_TYPE
+PMNT.PIN_NUM
+PMNT.RECIPIENT_TAG
+CAL.RUN_TYPE
+
+  let $emplid     =  rtrim(&PMNT.EMPLID ,' ')
+  let $recipient  =  rtrim(&PMNT.RECIPIENT_ID ,' ')
+
+  let $PMT_TYPE   =  rtrim(&PMNT.PMT_TYPE, ' ')
+  Evaluate $PMT_TYPE
+    When = '01'
+      Do Get-Bank-Account
+      Do Get-Beneficiary-Name
+      break
+    When = '02'
+      Do Get-General-Rcp-Bank-Acct
+      break
+    When = '03'
+      Do Get-Individual-Rcp-Bank-Acct
+      Do Get-Beneficiary-Name
+      break
+  End-Evaluate
+
+  #debugd show 'Target bank country: ' $BANK_COUNTRY
+
+  if ($BANK_COUNTRY = 'ESP' and $Domestic-Transfer = 'Y')
+       or ($BANK_COUNTRY <> 'ESP' and ($Domestic-Transfer = 'N'
+                                    or $Domestic-Transfer = 'S'))
+
+    if $Block-Header-Flag = 'N'
+      do Write-CSB34-EFT-Block-Header-Record
+      let $Block-Header-Flag = 'Y'
+    end-if
+
+    DO Get-National-Id-Data
+
+    LET #EMP_AMOUNT =  &GP_PMT_AMT
+    LET #INSTANCE   =  &PMNT.INSTANCE
+ !   if $PMT_TYPE <> '01'
+ !     do get-deduction-data
+ !   else
+ !     do get-payee-data
+ !   end-if
+  Evaluate $PMT_TYPE
+    When = '01'
+      do get-payee-data
+      break
+    When = '02'
+    When = '03'
+      do get-deduction-data
+      break
+  End-Evaluate
+
+ 
+    let $CSB34_pymnt_id             =  {PS-SUBSTR}($nid, 1, 10)
+    LET $CSB34_EMP_pymnt_amt        =   edit(#EMP_AMOUNT * 100,'000000000009')
+    let $CSB34_EMP_bank_id          =  {PS-SUBSTR}($BANK_CD, 1, 4)
+    let $CSB34_EMP_branch_id        =  {PS-SUBSTR}($BRANCH_CD, 1, 4)
+    let $CSB34_EMP_bank_account_num =  {PS-SUBSTR}($ACCOUNT_ID, 1, 10)
+    let $CSB34_EMP_check_digit      =  {PS-SUBSTR}($CHECK_DIGIT, 1, 2)
+    LET $CSB34_EMP_name             =  {PS-SUBSTR}($BENEFICIARY, 1, 30)
+
+    let $CSB34_reg_code = '06'
+    Evaluate $Domestic-Transfer
+    When = 'Y'
+      let $CSB34_opr_code = '56'
+      do Write-CSB34-Domestic-Payment-Record
+    When = 'N'
+      let $CSB34_opr_code = '60'
+      do Write-CSB34-International-Payment-Record
+    When = 'S'
+      let $CSB34_opr_code = '61'
+      do Write-CSB34-Special-Payment-Record
+    End-Evaluate
+    DO UPDATE-GP-PAYMENT
+  end-if
+  
+FROM PS_JOB JOB,
+     PS_GP_PAYMENT PMNT,
+     PS_GP_CALENDAR CAL,
+     PS_FAST_SQR_SEC_VW FAST_SEC
+WHERE JOB.EMPLID = PMNT.EMPLID
+  AND JOB.EMPL_RCD = PMNT.EMPL_RCD
+  AND JOB.EFFDT = (SELECT MAX(EFFDT) FROM PS_JOB
+                    WHERE EMPLID = JOB.EMPLID
+                     AND  EMPL_RCD = JOB.EMPL_RCD
+                     AND  EFFDT <= &D.DEBIT_DT)
+  AND JOB.EFFSEQ = (SELECT MAX(EFFSEQ) FROM PS_JOB
+                     WHERE EMPLID = JOB.EMPLID
+                      AND  EMPL_RCD = JOB.EMPL_RCD
+                      AND  EFFDT = JOB.EFFDT)
+  AND JOB.COMPANY = $COMPANY_Cd
+  AND PMNT.SRC_BANK_ID = $SOURCE_Cd
+  AND PMNT.PAY_ENTITY = $PAY_ENTITY
+  AND PMNT.CAL_RUN_ID = $CAL_RUN_ID
+  AND PMNT.PMT_STATUS = {PMT_STATUS}
+  AND PMNT.PAYMENT_MTHD = 'T'
+  AND CAL.GP_PAYGROUP = PMNT.GP_PAYGROUP 
+  AND CAL.CAL_ID = PMNT.CAL_ID
+  AND PMNT.GP_PMT_AMT > 0
+  AND (($Domestic-Transfer = 'Y')
+   OR  ($Domestic-Transfer = 'N' AND PMNT.GP_PMT_AMT < 12500)
+   OR  ($Domestic-Transfer = 'S' AND PMNT.GP_PMT_AMT >= 12500))
+  AND FAST_SEC.OPRID = $prcs_oprid
+  AND PMNT.EMPLID = FAST_SEC.EMPLID
+  AND PMNT.EMPL_RCD = FAST_SEC.EMPL_RCD
+ORDER BY PMNT.EMPLID,PMNT.PMT_TYPE
+End-select
+
+if $Block-Header-Flag = 'Y'
+  let $CSB34_reg_code = '08'
+  Evaluate $Domestic-Transfer
+  When = 'Y'
+    let $CSB34_opr_code = '56'
+  When = 'N'
+    let $CSB34_opr_code = '60'
+  When = 'S'
+    let $CSB34_opr_code = '61'
+  End-Evaluate
+  do Write-CSB34-EFT-Block-Trailer-Record
+end-if
+
+end-procedure
+
+
+!************************************************************************************
+BEGIN-PROCEDURE Get-Bank-Account
+!************************************************************************************
+#debug do Fin-Debug-Msg('Get-Bank-Account')
+
+Let $Run_Type     =  ''
+Let $BANK_COUNTRY =  ''
+Let $BANK_CD      =  ''
+Let $BRANCH_CD    =  ''
+Let $CHECK_DIGIT  =  ''
+Let $ACCOUNT_ID   =  ''
+Let $IBAN         =  ''
+
+let $sql-statement = 'GPESNK5.SQR,Get-Bank-Account,Select,PS_GP_NET_DIST'
+BEGIN-SELECT on-error=SQL-Error
+NDST.RUN_TYPE
+NDST.DEFAULT_IND
+
+   If &NDST.RUN_TYPE = &CAL.RUN_TYPE
+     Let $Run_Type = &CAL.RUN_TYPE
+     EXIT-SELECT
+   Else
+     If &NDST.DEFAULT_IND = 'Y'
+       Let $Run_Type = &NDST.RUN_TYPE
+     End-if
+   End-if
+
+FROM PS_GP_NET_DIST NDST 
+WHERE NDST.EMPLID = &PMNT.EMPLID
+  AND NDST.EMPL_RCD = &PMNT.EMPL_RCD
+END-SELECT
+
+
+let $sql-statement = 'GPESNK5.SQR,Get-Bank-Account,Select,PS_PYE_BANKACCT'
+BEGIN-SELECT on-error=SQL-Error
+C.COUNTRY_CD
+C.BANK_CD
+C.BRANCH_EC_CD
+C.CHECK_DIGIT
+C.ACCOUNT_EC_ID
+C.INTL_BANK_ACCT_NBR
+
+   let $BANK_COUNTRY =  rtrim(&C.COUNTRY_CD, ' ')
+   let $BANK_CD      =  rtrim(&C.BANK_CD ,' ')
+   let $BRANCH_CD    =  rtrim(&C.BRANCH_EC_CD ,' ')
+   let $CHECK_DIGIT  =  rtrim(&C.CHECK_DIGIT ,' ')
+   let $ACCOUNT_ID   =  rtrim(&C.ACCOUNT_EC_ID ,' ')
+   let $IBAN         =  rtrim(&C.INTL_BANK_ACCT_NBR,' ')
+   
+   If $Domestic-Transfer <> 'Y'
+     do Get-Country
+     do Get-Bank
+   End-if
+
+FROM PS_GP_NET_DIST_DTL B 
+  , PS_PYE_BANKACCT C
+ ! , PS_GP_PAYMENT PS_GP_PAYMENT
+WHERE B.EMPLID = &PMNT.EMPLID
+  AND B.EMPL_RCD = &PMNT.EMPL_RCD
+  AND B.RUN_TYPE = $Run_Type
+  AND B.EFFDT = ( SELECT MAX(EFFDT) FROM PS_GP_NET_DIST_DTL
+                   WHERE EMPLID = B.EMPLID 
+                    AND  RUN_TYPE = B.RUN_TYPE 
+                    AND  EFFDT <= $asoftoday ) 
+  AND B.INSTANCE = &PMNT.INSTANCE
+  AND C.EMPLID = B.EMPLID 
+  AND C.ACCOUNT_ID = B.ACCOUNT_ID 
+  AND C.EFF_STATUS ='A' 
+END-SELECT
+
+#debugd show 'Employee ID:            ' $emplid
+#debugd show 'As of Date:             ' $asoftoday
+#debugd show 'EE Bank Country:        ' $BANK_COUNTRY
+#debugd show 'EE Bank Code:           ' $BANK_CD
+#debugd show 'EE Bank Branch:         ' $BRANCH_CD
+#debugd show 'EE Account Check Digit: ' $CHECK_DIGIT
+#debugd show 'EE Account ID:          ' $ACCOUNT_ID
+#debugd show 'EE IBAN:                ' $IBAN
+
+END-PROCEDURE
+
+
+!************************************************************************************
+BEGIN-PROCEDURE Get-General-Rcp-Bank-Acct
+!************************************************************************************
+#debug do Fin-Debug-Msg('Get-General-Rcp-Bank-Acct')
+
+Let $BANK_COUNTRY =  ''
+Let $BANK_CD      =  ''
+Let $BRANCH_CD    =  ''
+Let $CHECK_DIGIT  =  ''
+Let $ACCOUNT_ID   =  ''
+Let $IBAN         =  ''
+Let $ACCOUNT      =  ''
+let $BENEFICIARY  =  ''
+
+let $sql-statement = 'GPESNK3.SQR,Get-General-Rcp-Bank-Acct,Select,PS_RECIPIENT'
+BEGIN-SELECT on-error=SQL-Error
+GRCP.COUNTRY_CD
+GRCP.BANK_CD
+GRCP.BRANCH_EC_CD
+GRCP.CHECK_DIGIT
+GRCP.ACCOUNT_EC_ID
+GRCP.INTL_BANK_ACCT_NBR
+GRCP.ACCOUNT_NAME
+
+   let $BANK_COUNTRY =  rtrim(&GRCP.COUNTRY_CD, ' ')
+   let $BANK_CD      =  rtrim(&GRCP.BANK_CD ,' ')
+   let $BRANCH_CD    =  rtrim(&GRCP.BRANCH_EC_CD ,' ')
+   let $CHECK_DIGIT  =  rtrim(&GRCP.CHECK_DIGIT ,' ')
+   let $ACCOUNT_ID   =  rtrim(&GRCP.ACCOUNT_EC_ID ,' ')
+   let $IBAN         =  rtrim(&GRCP.INTL_BANK_ACCT_NBR,' ')
+   let $ACCOUNT_NAME =  rtrim(&GRCP.ACCOUNT_NAME,' ')
+   let $BENEFICIARY  =  rtrim(&GRCP.ACCOUNT_NAME,' ')
+   
+   If $Domestic-Transfer <> 'Y'
+     do Get-Country
+     do Get-Bank
+   End-if
+
+FROM PS_RECIPIENT GRCP
+
+WHERE GRCP.RECIPIENT_ID = $Recipient
+  AND GRCP.EFF_STATUS <> 'I' 
+END-SELECT
+
+#debugd show 'Recipient ID:                  ' $Recipient
+#debugd show 'Recipient Bank Country:        ' $BANK_COUNTRY
+#debugd show 'Recipient Bank Code:           ' $BANK_CD
+#debugd show 'Recipient Bank Branch:         ' $BRANCH_CD
+#debugd show 'Recipient Account Check Digit: ' $CHECK_DIGIT
+#debugd show 'Recipient Account ID:          ' $ACCOUNT_ID
+#debugd show 'Recipient IBAN:                ' $IBAN
+#debugd show 'Recipient Name:                ' $ACCOUNT_NAME
+
+END-PROCEDURE
+
+
+!************************************************************************************
+BEGIN-PROCEDURE Get-Individual-Rcp-Bank-Acct
+!************************************************************************************
+#debug do Fin-Debug-Msg('Get-Individual-Rcp-Bank-Acct')
+
+Let $BANK_COUNTRY =  ''
+Let $BANK_CD      =  ''
+Let $BRANCH_CD    =  ''
+Let $CHECK_DIGIT  =  ''
+Let $ACCOUNT_ID   =  ''
+Let $IBAN         =  ''
+Let $ACCOUNT      =  ''
+let $BENEFICIARY  =  ''
+
+let $sql-statement = 'GPESNK3.SQR,Get-Individual-Rcp-Bank-Acct,Select,PS_GP_RCP_PYE_DTL'
+BEGIN-SELECT on-error=SQL-Error
+IRCP.COUNTRY_CD
+IRCP.BANK_CD
+IRCP.BRANCH_EC_CD
+IRCP.CHECK_DIGIT
+IRCP.ACCOUNT_EC_ID
+IRCP.INTL_BANK_ACCT_NBR
+IRCP.ACCOUNT_NAME
+
+   let $BANK_COUNTRY =  rtrim(&IRCP.COUNTRY_CD, ' ')
+   let $BANK_CD      =  rtrim(&IRCP.BANK_CD ,' ')
+   let $BRANCH_CD    =  rtrim(&IRCP.BRANCH_EC_CD ,' ')
+   let $CHECK_DIGIT  =  rtrim(&IRCP.CHECK_DIGIT ,' ')
+   let $ACCOUNT_ID   =  rtrim(&IRCP.ACCOUNT_EC_ID ,' ')
+   let $IBAN         =  rtrim(&IRCP.INTL_BANK_ACCT_NBR,' ')
+   let $ACCOUNT_NAME =  rtrim(&IRCP.ACCOUNT_NAME,' ')
+   let $BENEFICIARY  =  rtrim(&GRCP.ACCOUNT_NAME,' ')
+   
+   If $Domestic-Transfer <> 'Y'
+     do Get-Country
+     do Get-Bank
+   End-if
+
+FROM PS_GP_RCP_PYE_DTL IRCP
+
+WHERE IRCP.EMPLID = &PMNT.EMPLID
+  AND IRCP.EMPL_RCD = &PMNT.EMPL_RCD 
+  AND IRCP.PIN_NUM = &PMNT.PIN_NUM 
+  AND IRCP.RECIPIENT_TAG = &PMNT.RECIPIENT_TAG
+  AND IRCP.EFFDT = ( SELECT MAX(EFFDT) FROM PS_GP_RCP_PYE_DTL
+                    WHERE EMPLID = IRCP.EMPLID 
+                     AND  EMPL_RCD = IRCP.EMPL_RCD
+                     AND  PIN_NUM = IRCP.PIN_NUM
+                     AND  RECIPIENT_TAG = IRCP.RECIPIENT_TAG
+                     AND  EFFDT <= $asoftoday ) 
+END-SELECT
+
+#debugd show 'Employee ID:                   ' $emplid
+#debugd show 'As of Date:                    ' $asoftoday
+#debugd show 'Recipient Bank Country:        ' $BANK_COUNTRY
+#debugd show 'Recipient Bank Code:           ' $BANK_CD
+#debugd show 'Recipient Bank Branch:         ' $BRANCH_CD
+#debugd show 'Recipient Account Check Digit: ' $CHECK_DIGIT
+#debugd show 'Recipient Account ID:          ' $ACCOUNT_ID
+#debugd show 'Recipient IBAN:                ' $IBAN
+#debugd show 'Recipient Name:                ' $ACCOUNT_NAME
+
+END-PROCEDURE
+
+
+!************************************************************************************
+BEGIN-PROCEDURE Get-Country
+!************************************************************************************
+#debug do Fin-Debug-Msg('Get-Country')
+
+Let $Country-2Char = ''
+
+let $sql-statement = 'GPESNK5.SQR,Get-Country,Select,PS_COUNTRY_TBL'
+BEGIN-SELECT on-error=SQL-Error
+COUNTRY_2CHAR
+  Let $Country-2Char = &COUNTRY_2CHAR
+
+FROM PS_COUNTRY_TBL
+WHERE COUNTRY = $BANK_COUNTRY
+END-SELECT
+
+#debugd show 'Bank code: ' $BANK_COUNTRY
+#debugd show 'Bank country ISO: ' $Country-2Char
+
+END-PROCEDURE
+
+
+!************************************************************************************
+BEGIN-PROCEDURE Get-Bank
+!************************************************************************************
+#debug do Fin-Debug-Msg('Get-Bank')
+
+Let $Bank-SWIFT_BIC = ''
+
+let $sql-statement = 'GPESNK5.SQR,Get-Bank,Select,PS_BANK_EC_TBL'
+BEGIN-SELECT on-error=SQL-Error
+BANK_ID_CODE
+  Let $Bank-SWIFT_BIC = &BANK_ID_CODE
+
+FROM PS_BANK_EC_TBL
+WHERE COUNTRY = $BANK_COUNTRY
+ AND  BANK_CD = $BANK_CD
+END-SELECT
+
+#debugd show 'Bank country:             ' $BANK_COUNTRY
+#debugd show 'Bank code:                ' $BANK_CD
+#debugd show 'Bank Identification Code: ' $Bank-SWIFT_BIC
+
+END-PROCEDURE
+
+
+!************************************************************************************
+BEGIN-PROCEDURE Get-National-Id-Data
+!************************************************************************************
+let $sql-statement = 'GPESNK5.SQR,Get-National-Id-Data,Select,PS_PERSONAL_DT_FST'
+
+Let $NID = ''
+
+begin-select on-error=SQL-Error
+B.NATIONAL_ID          &B.NATIONAL_ID
+  let $NID = rtrim(&B.NATIONAL_ID, ' ')
+
+FROM  PS_PERS_NID B
+WHERE B.EMPLID = $EMPLID
+ AND  PRIMARY_NID = 'Y'
+END-SELECT
+
+#debug show 'Employee ID:       ' $EMPLID
+#debug show 'Primary NID Value: ' $NID
+
+END-PROCEDURE
+
+
+!************************************************************************************
+BEGIN-PROCEDURE Get-Beneficiary-Name
+!************************************************************************************
+#debug do Fin-Debug-Msg('Get-Beneficiary-Name')
+
+Let $BENEFICIARY = ''
+
+let $sql-statement = 'GPESNK5.SQR,Get-Beneficiary-Name,Select,PS_PERSON_NAME'
+BEGIN-SELECT on-error=SQL-Error
+NAME          
+  LET $BENEFICIARY = RTRIM(&NAME,' ')
+
+FROM PS_PERSON_NAME 
+WHERE  EMPLID = $EMPLID
+END-SELECT
+
+#debug show 'Employee ID: ' $EMPLID
+#debug show 'Recipient Name:     ' $BENEFICIARY
+
+END-PROCEDURE
+
+
+!************************************************************************
+! Procedure get-deduction-data
+!************************************************************************
+begin-procedure get-deduction-data
+#debug do Fin-Debug-Msg('get-deduction-data')
+
+let $CSB34_EMP_address1 =  ''
+let $CSB34_EMP_city     =  ''
+let $CSB34_EMP_postal   =  ''
+let $CSB34_EMP_STATE    =  ''
+
+let $sql-statement = 'GPESNK5.SQR,get-deduction-data,Select,PS_RECIPIENT'
+begin-select on-error=SQL-Error
+d.ADDR_FIELD1
+d.ADDRESS1
+d.ADDR_FIELD2
+d.CITY
+d.POSTAL
+e.DESCR
+   let $dedadd1   =  rtrim(&d.Addr_field1,' ')
+   let $dedadd2   =  rtrim(&d.Address1,' ')
+   let $dedadd3   =  rtrim(&d.Addr_field2,' ')
+   let $dedadd    =  $dedadd1 || ' ' || $dedadd2 || ',' || $dedadd3
+   let $dedCITY   =  rtrim(&d.CITY,' ')
+   let $dedpostal =  rtrim(&d.postal,' ')
+   let $dedstate  =  rtrim(&e.descr,' ')
+   
+   let $CSB34_EMP_address1 =  {PS-SUBSTR}($dedadd, 1, 35)
+   let $CSB34_EMP_city     =  {PS-SUBSTR}($dedcity, 1, 30)
+   let $CSB34_EMP_postal   =  {PS-SUBSTR}($dedPOSTAL,1,5)
+   let $CSB34_EMP_STATE    =  {PS-SUBSTR}($dedSTATE, 1, 30)
+   
+FROM PS_RECIPIENT d,  PS_STATE_NAMES_TBL e
+WHERE d.EFF_STATUS = 'A'
+AND d.RECIPIENT_ID = $recipient
+AND e.COUNTRY = d.COUNTRY
+AND e.STATE = d.STATE
+end-select
+
+#debugd show 'Recipient ID: ' $recipient
+#debugd show 'Address:      ' $CSB34_EMP_address1
+#debugd show 'City:         ' $CSB34_EMP_city
+#debugd show 'Postal Code   ' $CSB34_EMP_postal
+#debugd show 'State:        ' $CSB34_EMP_STATE
+
+end-procedure
+
+
+!************************************************************************
+! Procedure get-payee-data
+!************************************************************************
+begin-procedure get-payee-data
+#debug do Fin-Debug-Msg('get-payee-data')
+
+let $CSB34_EMP_address1 =  ''
+let $CSB34_EMP_city     =  ''
+let $CSB34_EMP_postal   =  ''
+let $CSB34_EMP_STATE    =  ''
+
+let $sql-statement = 'GPESNK5.SQR,get-payee-data,Select,PS_PERSON_ADDRESS'
+begin-select on-error=SQL-Error
+A.ADDR_FIELD1
+A.ADDRESS1
+A.ADDR_FIELD2
+A.CITY
+A.POSTAL
+B.DESCR
+   let $Empadd1   =  rtrim(&A.Addr_field1,' ')
+   let $Empadd2   =  rtrim(&a.Address1,' ')
+   let $Empadd3   =  rtrim(&A.Addr_field2,' ')
+   let $empadd    =  $Empadd1 || ' ' || $Empadd2 || ',' || $Empadd3
+   let $empCITY   =  rtrim(&a.CITY,' ')
+   let $emppostal =  rtrim(&a.postal,' ')
+   let $empstate  =  rtrim(&b.descr,' ')
+   
+   let $CSB34_EMP_address1 =  {PS-SUBSTR}($EMPadd, 1, 35)
+   let $CSB34_EMP_city     =  {PS-SUBSTR}($EMPcity, 1, 30)
+   let $CSB34_EMP_postal   =  {PS-SUBSTR}($EMPPOSTAL,1,5)
+   let $CSB34_EMP_STATE    =  {PS-SUBSTR}($EMPSTATE, 1, 30)
+
+FROM PS_PERSON_ADDRESS A,  PS_STATE_NAMES_TBL B
+WHERE A.EMPLID = $emplid
+  AND B.COUNTRY = A.COUNTRY
+  AND B.STATE = A.STATE
+  AND A.ADDRESS_TYPE = 'HOME'
+end-select
+end-procedure
+
+
+!************************************************************************************
+BEGIN-PROCEDURE UPDATE-GP-PAYMENT
+!************************************************************************************
+let $sql-statement = 'GPESNK5.SQR,UPDATE-GP-PAYMENT,Update,PS_GP_PAYMENT'
+begin-SQL on-error=SQL-Error
+UPDATE PS_GP_PAYMENT
+SET PMT_STATUS = 'T'
+WHERE CAL_RUN_ID   = $CAL_RUN_ID
+  AND PAY_ENTITY   = $PAY_ENTITY
+  AND EMPLID       = $EMPLID
+  AND SRC_BANK_ID  = $SOURCE_CD
+  AND INSTANCE     = #INSTANCE
+  AND PAYMENT_MTHD = 'T'
+  AND PMT_STATUS   = {PMT_STATUS}
+end-SQL
+
+end-procedure
+
+
+!************************************************************************
+! Procedure Write-CSB34-Batch-Header-Record
+!************************************************************************
+Begin-Procedure  Write-CSB34-Batch-Header-Record
+#debug do Fin-Debug-Msg('Write-CSB34-Batch-Header-Record')
+
+!-- Intialize trailing records counters
+ let #CSB34_tot_rec_cnt   =  0
+ let #CSB34_tot_payee_cnt =  0
+ let #CSB34_tot_pay_amt   =  0
+
+
+!-- Set header variables......
+ do Format-DateTime(&D.DEBIT_DT, $DEBIT_DT, {DEFCMP}, '', '')
+ do Format-DateTime(&B.PYMT_DT, $PAY_DT, {DEFCMP}, '', '')
+ let $CSB34_creation_dt      = {PS-SUBSTR}($DEBIT_DT,7,2)
+                            || {PS-SUBSTR}($DEBIT_DT,5,2)
+                            || {PS-SUBSTR}($DEBIT_DT,3,2)
+
+
+ let $CSB34_pymnt_dt         = {PS-SUBSTR}($PAY_DT,7,2)
+                            || {PS-SUBSTR}($PAY_DT,5,2)
+                            || {PS-SUBSTR}($PAY_DT,3,2)
+
+ let $CSB34_fiscal_cd        =  $CompanyFISCAL
+ let $CSB34_bank_id          = {PS-SUBSTR}($BANK_CD_SRC, 1, 4)
+ let $CSB34_branch_id        = {PS-SUBSTR}($BRANCH_CD_SRC, 1, 4)
+ let $CSB34_bank_account_num = {PS-SUBSTR}($ACCOUNT_ID_SRC, 1, 10)
+ let $CSB34_check_digit      = {PS-SUBSTR}($CHECK_DIGIT_SRC, 1, 2)
+ let $CSB34_payer_name       = {PS-SUBSTR}($CompanyName, 1, 30)
+ let $CSB34_payer_address1   = {PS-SUBSTR}($Compadd1, 1, 35)
+ let $CSB34_payer_city       = {PS-SUBSTR}($Companycity, 1, 30)
+ let $CSB34_payer_postal     = {PS-SUBSTR}($CompanyPOSTAL,1,5)
+
+ let $CSB34_reg_code = '03'
+ let $CSB34_opr_code = '62'
+
+!-- Batch Header Record: Payer Bank Details 
+ WRITE 100 from
+   $CSB34_reg_code:2            !- Register Code
+   $CSB34_opr_code:2            !- Operation Code
+   $CSB34_fiscal_cd:9           !- Company ID (CIF)
+   '000'                        !- Suffix
+   $fill:12                     !- Free
+   '001'                        !- Data Code
+   $CSB34_creation_dt:6         !- File creation date
+   $CSB34_pymnt_dt:6            !- Payment Date
+   $CSB34_bank_id:4             !- Bank Id Number (CISB)
+   $CSB34_branch_id:4           !- Bank Office no         - Payers Bank
+   $CSB34_check_digit:2         !- Bank Chenk Digit       - Payers Bank
+   $CSB34_bank_account_num:10   !- Bank Acc/No            - Payers Bank
+   '0'                          !- 0=EFT(no remittance),1=Cheque(Remittance)
+   $fill:8                      !- Free
+ let #csb34_tot_rec_cnt = #csb34_tot_rec_cnt + 1
+
+!-- Batch Header Record: Payer Bank Name
+ WRITE 100 from
+   $CSB34_reg_code:2            !- Register Code
+   $CSB34_opr_code:2            !- Operation Code
+   $CSB34_fiscal_cd:9           !- Company ID (CIF)
+   '000'                        !- Suffix
+   $fill:12                     !- Free
+   '002'                        !- Data Code
+   $CSB34_payer_name:36         !- Name
+   $fill:5                      !- Free
+ let #CSB34_tot_rec_cnt = #CSB34_tot_rec_cnt + 1
+
+!-- Batch Header Record: Payer Bank Address Line 1
+ WRITE 100 from
+   $CSB34_reg_code:2            !- Register Code
+   $CSB34_opr_code:2            !- Operation Code
+   $CSB34_fiscal_cd:9           !- Company ID (CIF)
+   '000'                        !- Suffix
+   $fill:12                     !- Free
+   '003'                        !- Data Code
+   $CSB34_payer_address1:36     !- Address Line 1
+   $fill:5                      !- Free
+ let #CSB34_tot_rec_cnt = #CSB34_tot_rec_cnt + 1
+
+!-- Batch Header Record: Payer Bank Address City
+ WRITE 100 from
+   $CSB34_reg_code:2            !- Register Code
+   $CSB34_opr_code:2            !- Operation Code
+   $CSB34_fiscal_cd:9           !- Company ID (CIF)
+   '000'                        !- Suffix
+   $fill:12                     !- Free
+   '004'                        !- Data Code
+   $CSB34_payer_postal:5        !- Postal
+   $CSB34_payer_city:31         !- City
+   $fill:5                      !- Free
+let #csb34_tot_rec_cnt = #csb34_tot_rec_cnt + 1
+
+End-Procedure
+
+
+!************************************************************************
+! Procedure Write-CSB34-EFT-Block-Header-Record
+!************************************************************************
+Begin-Procedure  Write-CSB34-EFT-Block-Header-Record
+#debug do Fin-Debug-Msg('Write-CSB34-EFT-Block-Header-Record')
+
+ let $CSB34_reg_code = '04'
+ Evaluate $Domestic-Transfer
+ When = 'Y'
+   let $CSB34_opr_code = '56'
+ When = 'N'
+   let $CSB34_opr_code = '60'
+ When = 'S'
+   let $CSB34_opr_code = '61'
+ End-Evaluate
+
+!-- Intialize trailing records counters
+ let #CSB34_block_rec_cnt   =  0
+ let #CSB34_block_payee_cnt =  0
+ let #CSB34_block_pay_amt   =  0
+
+!-- Block Header Record
+ WRITE 100 from
+   $CSB34_reg_code:2            !- Register Code
+   $CSB34_opr_code:2            !- Operation Code
+   $CSB34_fiscal_cd:9           !- Company ID (CIF)
+   '000'                        !- Suffix
+   $fill:12                     !- Free
+   $fill:3                      !- Free
+   $fill:41                     !- Free
+ let #csb34_Block_rec_cnt = #csb34_Block_rec_cnt + 1
+
+End-Procedure
+
+
+!************************************************************************
+! Procedure Write-CSB34-Domestic-Payment-Record
+!************************************************************************
+Begin-Procedure  Write-CSB34-Domestic-Payment-Record
+#debug do Fin-Debug-Msg('Write-CSB34-Domestic-Payment-Record')
+
+
+!-- Payees Bank info
+ WRITE 100 from
+   $CSB34_reg_code:2               !- Registered Code
+   $CSB34_opr_code:2               !- EFT Payment Type
+   $CSB34_fiscal_cd:9              !- Company ID (CIF)
+   '000'                           !- Suffix
+   $CSB34_pymnt_id:12              !- Payment ID
+   '010'                           !- Data Code
+   $CSB34_EMP_pymnt_amt:12         !- Amount
+   $CSB34_EMP_bank_id:4            !- Bank Id Number (CISB)
+   $CSB34_EMP_branch_id:4          !- Bank Office no         - Payees Bank
+   $CSB34_EMP_check_digit:2        !- Bank Acc Control Digits- Payees Bank
+   $CSB34_EMP_bank_account_num:10  !- Bank Acc/No            - Payees Bank
+   '1'                             !- 1=Payer, 2=Payee
+   '1'                             !- 1=Salary,8=Pension,9=Other
+   '1'                             !- 1=Yes, 2=No
+   $fill:6                         !- Free
+ let #CSB34_Block_rec_cnt   = #csb34_Block_rec_cnt + 1
+
+ let #CSB34_Block_payee_cnt = #csb34_Block_payee_cnt + 1
+ let #CSB34_Block_pay_amt   = #csb34_Block_pay_amt + &GP_PMT_AMT
+
+!-- Payees Name info
+ WRITE 100 from
+   $CSB34_reg_code:2               !- Registered Code
+   $CSB34_opr_code:2               !- EFT Payment Type
+   $CSB34_fiscal_cd:9              !- Company ID (CIF)
+   '000'                           !- Suffix
+   $CSB34_pymnt_id:12              !- Payment ID
+   '011'                           !- Data Code
+   $CSB34_EMP_name:36              !- Payees name
+   $fill:5                         !- Free
+ let #CSB34_Block_rec_cnt   = #csb34_Block_rec_cnt + 1
+
+!-- Payees Address Info
+ WRITE 100 from
+   $CSB34_reg_code:2               !- Registered Code
+   $CSB34_opr_code:2               !- EFT Payment Type
+   $CSB34_fiscal_cd:9              !- Company ID (CIF)
+   '000'                           !- Suffix
+   $CSB34_pymnt_id:12              !- Payment ID
+   '012'                           !- Data Code
+   $CSB34_emp_address1:36          !- Address Line 1
+   $fill:5                         !- Free
+ let #CSB34_Block_rec_cnt   = #csb34_Block_rec_cnt + 1
+
+!-- Payees Zip Code/City Info
+ WRITE 100 from
+   $CSB34_reg_code:2               !- Registered Code
+   $CSB34_opr_code:2               !- EFT Payment Type
+   $CSB34_fiscal_cd:9              !- Company ID (CIF)
+   '000'                         !- Suffix
+   $CSB34_pymnt_id:12              !- Payment ID
+   '014'                           !- Data Code
+   $CSB34_emp_postal:5             !- Postal code (Zip Code)
+   $CSB34_emp_city:31              !- City
+   $fill:5                         !- Free
+ let #CSB34_Block_rec_cnt   = #csb34_Block_rec_cnt + 1
+
+!-- Payees state Info
+ WRITE 100 from
+   $CSB34_reg_code:2               !- Registered Code
+   $CSB34_opr_code:2               !- EFT Payment Type
+   $CSB34_fiscal_cd:9              !- Company ID (CIF)
+   '000'                         !- Suffix
+   $CSB34_pymnt_id:12              !- Payment ID
+   '015'                           !- Data Code
+   $CSB34_emp_state:36             !- Postal code (Zip Code)
+   $fill:5                         !- Free
+ let #CSB34_Block_rec_cnt   = #csb34_Block_rec_cnt + 1
+
+End-Procedure
+
+
+!************************************************************************
+! Procedure Write-CSB34-International-Payment-Record
+!************************************************************************
+Begin-Procedure  Write-CSB34-International-Payment-Record
+#debug do Fin-Debug-Msg('Write-CSB34-International-Payment-Record')
+
+
+!-- Payees Bank info
+ WRITE 100 from
+   $CSB34_reg_code:2               !- Registered Code
+   $CSB34_opr_code:2               !- EFT Payment Type
+   $CSB34_fiscal_cd:9              !- Company ID (CIF)
+   '000'                         !- Suffix
+   $CSB34_pymnt_id:12              !- Payment ID
+   '033'                           !- Data Code
+    $IBAN:34                  !- IBAN 
+ !  $CSB34_EMP_bank_id:4            !- Bank Id Number (CISB)
+ !  $CSB34_EMP_branch_id:4          !- Bank Office no         - Payees Bank
+ !  $CSB34_EMP_check_digit:2        !- Bank Acc Control Digits- Payees Bank
+ !  $CSB34_EMP_bank_account_num:10  !- Bank Acc/No            - Payees Bank
+ !  '1'                             !- 1=Salary,8=Pension,9=Other
+   '1'                             !- 1=Yes, 2=No
+   $fill:6                         !- Free
+ let #CSB34_Block_rec_cnt   = #csb34_Block_rec_cnt + 1
+ let #CSB34_Block_payee_cnt = #csb34_Block_payee_cnt + 1
+
+!-- Payees Bank info
+ WRITE 100 from
+   $CSB34_reg_code:2               !- Registered Code
+   $CSB34_opr_code:2               !- EFT Payment Type
+   $CSB34_fiscal_cd:9              !- Company ID (CIF)
+   '000'                           !- Suffix
+   $CSB34_pymnt_id:12              !- Payment ID
+   '034'                           !- Data Code
+   $CSB34_EMP_pymnt_amt:12         !- Amount
+   '1'                             !- Expenses code: 1=Expenses paid by Payer
+                                   !-                2=Expenses paid by Payee
+                                   !-                3=Expenses shared by both 
+   $Country-2Char:2                !- Payee Country ISO Code
+   $fill:6                         !- Free
+   $Bank-SWIFT_BIC                 !- Target entity code
+   $fill:9                         !- Free
+ let #CSB34_Block_rec_cnt   = #csb34_Block_rec_cnt + 1
+ let #CSB34_Block_pay_amt   = #csb34_Block_pay_amt + &GP_PMT_AMT
+
+!-- Payees Name info
+ WRITE 100 from
+   $CSB34_reg_code:2               !- Registered Code
+   $CSB34_opr_code:2               !- EFT Payment Type
+   $CSB34_fiscal_cd:9              !- Company ID (CIF)
+   '000'                         !- Suffix
+   $CSB34_pymnt_id:12              !- Payment ID
+   '035'                           !- Data Code
+   $CSB34_EMP_name:36              !- Payees name
+   $fill:5                         !- Free
+ let #CSB34_Block_rec_cnt   = #csb34_Block_rec_cnt + 1
+
+!-- Payees Address Info
+ WRITE 100 from
+   $CSB34_reg_code:2               !- Registered Code
+   $CSB34_opr_code:2               !- EFT Payment Type
+   $CSB34_fiscal_cd:9              !- Company ID (CIF)
+   '000'                         !- Suffix
+   $CSB34_pymnt_id:12              !- Payment ID
+   '036'                           !- Data Code
+   $CSB34_emp_address1:36          !- Address Line 1
+   $fill:5                         !- Free
+ let #CSB34_Block_rec_cnt   = #csb34_Block_rec_cnt + 1
+
+!-- Payees Zip Code/City Info
+ WRITE 100 from
+   $CSB34_reg_code:2               !- Registered Code
+   $CSB34_opr_code:2               !- EFT Payment Type
+   $CSB34_fiscal_cd:9              !- Company ID (CIF)
+   '000'                         !- Suffix
+   $CSB34_pymnt_id:12              !- Payment ID
+   '038'                           !- Data Code
+   $CSB34_emp_postal:5             !- Postal code (Zip Code)
+   $CSB34_emp_city:31              !- City
+   $fill:5                         !- Free
+ let #CSB34_Block_rec_cnt   = #csb34_Block_rec_cnt + 1
+
+!-- Payees state Info
+ WRITE 100 from
+   $CSB34_reg_code:2               !- Registered Code
+   $CSB34_opr_code:2               !- EFT Payment Type
+   $CSB34_fiscal_cd:9              !- Company ID (CIF)
+   '000'                         !- Suffix
+   $CSB34_pymnt_id:12              !- Payment ID
+   '039'                           !- Data Code
+   $CSB34_emp_state:36             !- Postal code (Zip Code)
+   $fill:5                         !- Free
+ let #CSB34_Block_rec_cnt   = #csb34_Block_rec_cnt + 1
+
+End-Procedure
+
+
+!************************************************************************
+! Procedure Write-CSB34-Special-Payment-Record
+!************************************************************************
+Begin-Procedure  Write-CSB34-Special-Payment-Record
+#debug do Fin-Debug-Msg('Write-CSB34-Special-Payment-Record')
+
+
+!-- Payees Bank info
+ WRITE 100 from
+   $CSB34_reg_code:2               !- Registered Code
+   $CSB34_opr_code:2               !- EFT Payment Type
+   $CSB34_fiscal_cd:9              !- Company ID (CIF)
+   '000'                         !- Suffix
+   $CSB34_pymnt_id:12              !- Payment ID
+   '043'                           !- Data Code
+   $IBAN:34                        !- IBAN 
+ !  $CSB34_EMP_bank_id:4            !- Bank Id Number (CISB)
+ !  $CSB34_EMP_branch_id:4          !- Bank Office no         - Payees Bank
+ !  $CSB34_EMP_check_digit:2        !- Bank Acc Control Digits- Payees Bank
+ !  $CSB34_EMP_bank_account_num:10  !- Bank Acc/No            - Payees Bank
+ !  '1'                             !- 1=Salary,8=Pension,9=Other
+   '1'                             !- 1=Yes, 2=No
+   $fill:6                         !- Free
+ let #CSB34_Block_rec_cnt   = #csb34_Block_rec_cnt + 1
+ let #CSB34_Block_payee_cnt = #csb34_Block_payee_cnt + 1
+
+!-- Payees Bank info
+ WRITE 100 from
+   $CSB34_reg_code:2               !- Registered Code
+   $CSB34_opr_code:2               !- EFT Payment Type
+   $CSB34_fiscal_cd:9              !- Company ID (CIF)
+   '000'                         !- Suffix
+   $CSB34_pymnt_id:12              !- Payment ID
+   '044'                           !- Data Code
+   $CSB34_EMP_pymnt_amt:12         !- Amount
+   '1'                             !- Expenses code: 1=Expenses paid by Payer
+                                   !-                2=Expenses paid by Payee
+                                   !-                3=Expenses shared by both 
+   $Country-2Char:2                !- Payee Country ISO Code
+   $fill:6                         !- Free
+   $Bank-SWIFT_BIC                 !- Target entity code
+   $fill:9                         !- Free
+ let #CSB34_Block_rec_cnt   = #csb34_Block_rec_cnt + 1
+ let #CSB34_Block_pay_amt   = #csb34_Block_pay_amt + &GP_PMT_AMT
+
+!-- Payees Name info
+ WRITE 100 from
+   $CSB34_reg_code:2               !- Registered Code
+   $CSB34_opr_code:2               !- EFT Payment Type
+   $CSB34_fiscal_cd:9              !- Company ID (CIF)
+   '000'                         !- Suffix
+   $CSB34_pymnt_id:12              !- Payment ID
+   '045'                           !- Data Code
+   $CSB34_EMP_name:36              !- Recipient name
+   $fill:5                         !- Free
+ let #CSB34_Block_rec_cnt   = #csb34_Block_rec_cnt + 1
+
+!-- Payees Address Info
+ WRITE 100 from
+   $CSB34_reg_code:2               !- Registered Code
+   $CSB34_opr_code:2               !- EFT Payment Type
+   $CSB34_fiscal_cd:9              !- Company ID (CIF)
+   '000'                         !- Suffix
+   $CSB34_pymnt_id:12              !- Payment ID
+   '046'                           !- Data Code
+   $CSB34_emp_address1:36          !- Address Line 1
+   $fill:5                         !- Free
+ let #CSB34_Block_rec_cnt   = #csb34_Block_rec_cnt + 1
+
+!-- Payees Zip Code/City Info
+ WRITE 100 from
+   $CSB34_reg_code:2               !- Registered Code
+   $CSB34_opr_code:2               !- EFT Payment Type
+   $CSB34_fiscal_cd:9              !- Company ID (CIF)
+   '000'                         !- Suffix
+   $CSB34_pymnt_id:12              !- Payment ID
+   '048'                           !- Data Code
+   $CSB34_emp_postal:5             !- Postal code (Zip Code)
+   $CSB34_emp_city:31              !- City
+   $fill:5                         !- Free
+ let #CSB34_Block_rec_cnt   = #csb34_Block_rec_cnt + 1
+
+!-- Payees state Info
+ WRITE 100 from
+   $CSB34_reg_code:2               !- Registered Code
+   $CSB34_opr_code:2               !- EFT Payment Type
+   $CSB34_fiscal_cd:9              !- Company ID (CIF)
+   '000'                         !- Suffix
+   $CSB34_pymnt_id:12              !- Payment ID
+   '049'                           !- Data Code
+   $CSB34_emp_state:36             !- Postal code (Zip Code)
+   $fill:5                         !- Free
+ let #CSB34_Block_rec_cnt   = #csb34_Block_rec_cnt + 1
+
+!-- Payment description
+ WRITE 100 from
+   $CSB34_reg_code:2               !- Registered Code
+   $CSB34_opr_code:2               !- EFT Payment Type
+   $CSB34_fiscal_cd:9              !- Company ID (CIF)
+   '000'                         !- Suffix
+   $CSB34_pymnt_id:12              !- Payment ID
+   '053'                           !- Data Code
+   'Pago de Nomina':36             !- Description International payment
+   $fill:5                         !- Free
+ let #CSB34_Block_rec_cnt   = #csb34_Block_rec_cnt + 1
+
+!-- 
+ WRITE 100 from
+   $CSB34_reg_code:2               !- Registered Code
+   $CSB34_opr_code:2               !- EFT Payment Type
+   $CSB34_fiscal_cd:9              !- Company ID (CIF)
+   '000'                           !- Suffix
+   $CSB34_pymnt_id:12              !- Payment ID
+   '055'                           !- Data Code
+   '02':2                          !- Payment Type 01=Merchandise, 02=No-Merchandise
+   $fill:6                         !- Payment Statistical code
+   $Country-2Char:2                !- Payee Country ISO Code   
+   $CSB34_fiscal_cd:9              !- Company ID (CIF)
+   $fill:8                         !- NOF
+   $fill:12                        !- ISIN Code
+   $fill:2                         !- Free
+ let #CSB34_Block_rec_cnt   = #csb34_Block_rec_cnt + 1
+
+End-Procedure
+
+
+!************************************************************************
+! Procedure Write-CSB34-EFT-Block-Trailer-Record
+!************************************************************************
+begin-procedure Write-CSB34-EFT-Block-Trailer-Record
+#debug do Fin-Debug-Msg('Write-CSB34-EFT-Block-Trailer-Record')
+
+ let $CSB34_Block_payees  =  edit(#CSB34_Block_payee_cnt,'00000009')
+ let #CSB34_Block_rec_cnt =  #CSB34_Block_rec_cnt + 1
+ let $CSB34_Block_records =  edit(#CSB34_Block_rec_cnt,'0000000009')
+ let $CSB34_Block_amt     =  edit(#CSB34_Block_pay_amt * 100,'000000000009')
+
+ display 'Payment date YYYYMMDD ' noline
+ display $PAY_DT
+ display '$CSB34_Block_payees ' noline
+ display $CSB34_Block_payees
+ display '$CSB34_Block_records ' noline
+ display $CSB34_Block_records
+ display '$CSB34_Block_amt ' noline
+ display $CSB34_Block_amt
+ display '-------------------------------------------------------'
+
+ WRITE 100 from 
+   $CSB34_reg_code:2            !- Register Code
+   $CSB34_opr_code:2            !- Operation Code
+   $CSB34_fiscal_cd:9           !- Company ID (CIF)
+   '000'                        !- Suffix
+   $fill:12                     !- Free
+   $fill:3                      !- Free
+   $CSB34_Block_amt:12          !- Total Amount
+   $CSB34_Block_payees:8        !- Total Number of Payees
+   $CSB34_Block_records:10      !- Total Number of transactions
+   $fill:6                      !- Free
+   $fill:5                      !- Free
+
+ let #CSB34_Tot_payee_cnt =  #CSB34_Tot_payee_cnt + #CSB34_Block_payee_cnt
+ let #CSB34_Tot_rec_cnt   =  #CSB34_Tot_rec_cnt + #CSB34_Block_rec_cnt
+ let #CSB34_Tot_pay_amt   =  #CSB34_Tot_pay_amt + #CSB34_Block_pay_amt
+
+End-Procedure
+
+
+!************************************************************************
+! Procedure Write-CSB34-Batch-Trailer-Record
+!************************************************************************
+begin-procedure Write-CSB34-Batch-Trailer-Record
+#debug do Fin-Debug-Msg('Write-CSB34-Batch-Trailer-Record')
+
+ let $CSB34_reg_code = '09'
+ let $CSB34_opr_code = '62'
+
+ let $CSB34_tot_payees  =  edit(#CSB34_tot_payee_cnt,'00000009')
+ let #CSB34_tot_rec_cnt =  #CSB34_tot_rec_cnt + 1
+ let $CSB34_tot_records =  edit(#CSB34_tot_rec_cnt,'0000000009')
+ let $CSB34_tot_amt     =  edit(#CSB34_tot_pay_amt * 100,'000000000009')
+
+
+    display 'Payment date YYYYMMDD ' noline
+    display $PAY_DT
+    display '$CSB34_tot_payees ' noline
+    display $CSB34_tot_payees
+    display '$CSB34_tot_records ' noline
+    display $CSB34_tot_records
+    display '$CSB34_tot_amt ' noline
+    display $CSB34_tot_amt
+    display '-------------------------------------------------------'
+
+ WRITE 100 from 
+   $CSB34_reg_code:2            !- Register Code
+   $CSB34_opr_code:2            !- Operation Code
+   $CSB34_fiscal_cd:9           !- Company ID (CIF)
+   '000'                        !- Suffix
+   $fill:12                     !- Free
+   $fill:3                      !- Free
+   $CSB34_tot_amt:12            !- Total Amount
+   $CSB34_tot_payees:8          !- Total Number of Payees
+   $CSB34_tot_records:10        !- Total Number of transactions
+   $fill:6                      !- Free
+   $fill:5                      !- Free
+
+End-Procedure
+
+
+!************************************************************************
+! Procedure Fin-Debug-Msg
+!************************************************************************
+begin-procedure Fin-Debug-Msg($procedure_name)
+  display ' '
+  display '----------------------------------'
+  display $procedure_name
+#debugt date-time () {Native-DateTime} &SysDateTime
+#debugt move &SysDateTime to $SysDateTime
+#debugt show 'TIMING, ' $procedure_name ', ' $SysDateTime
+  display ' '
+end-procedure
+
+
+
+
+#include 'stdapi.sqc'    !Routines to update run status
+!#include 'hrrnctl1.sqc'  ! GET RUN CONTROL PARAMETER VALUES
+!#include 'hrgetval.sqc'  ! GET VALUES MASK ROUTINES
+
+#Include 'sqlerr.sqc'
+#Include 'reset.sqc'     !Reset printer procedure
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'useprntr.sqc'
+#Include 'sqrtrans.sqc'
+#Include 'useprntr.sqc'
+#Include 'datemath.sqc'
+
+
+

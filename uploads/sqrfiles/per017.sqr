@@ -1,0 +1,1050 @@
+!***************************************
+!  PER017:  EEO-1 Job Analysis         *
+!***************************************
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+!                                                                      *
+! This module contains confidential and proprietary information        *
+! of Oracle; it is not to be copied, reproduced, or transmitted        *
+! in any form, by any means, in whole or in part, nor is it to         *
+! be used for any purpose other than that for which it is              *
+! expressly provided under the applicable license agreement.           *
+!                                                                      *
+! Copyright (C) 2006 Oracle. All Rights Reserved.                      *
+!                                                                      *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!                $Date:  2006/01/17:20:00:19                           !
+!             $Release:  HR9                                           !
+!            $Revision:  101                                           !
+!                                                                      *
+!***********************************************************************
+!
+!***********************************************************************
+! Modified for Education & Government                                  *
+! HP99999       Release 8 Technical Merge                              *
+!***********************************************************************
+
+! Uncomment the following line the have debug values put into the sqr.log
+! #DEFINE DEBUGPER017
+
+#include 'setenv.sqc'   !Set environment
+#include 'hrhl01.sqc'   !Landscape Confidential Header
+
+!----------------------------------------------------------------------
+!---------Program------------------------------------------------------
+!----------------------------------------------------------------------
+!----------------------------------------------------------------------
+Begin-Program
+
+#IFDEF DEBUGPER017
+  DISPLAY 'FLOW: Run Control Establishment: ' NOLINE
+#ENDIF
+
+  DO Use-Standard-Layout
+  do Init-DateTime
+  do Init-Number
+  do Get-Current-DateTime
+  do Init-Report
+  do Init-Workforce-Array
+  DO Reset-Array
+
+  ! Set the confidential flag
+  !------------------------------------------------------------
+  LET $Confidential = 'YES'
+
+  LET #i = 0
+
+  IF $OutputCSV  = 'Y'
+      do Open-CSV-File
+  END-IF
+
+  ! If they want it to run for a single establishment
+  !------------------------------------------------------------
+  IF $ReportChoice = '2'
+     LET $Where-Clause = 'AND ET.ESTABID = ' || $Quote || $Estab || $Quote
+     DO Get-Establishment-Info
+     DO Process-Main
+     DO Print-Report
+     IF $OutputCSV  = 'Y'
+        DO Write-To-CSV
+     END-IF
+     DO Reset-Array
+     new-page
+  ELSE
+  ! Otherwise, grab the appropriate estabs and process for each
+  !------------------------------------------------------------
+     DO Get-Number-Of-Establishments
+
+     WHILE #i < #estab_count
+         LET $Estab = EstablishmentIDs.theEstab(#i)
+
+         DISPLAY '   $Estab: ' NOLINE
+         DISPLAY $Estab
+
+
+         DO Get-Establishment-Info
+         LET $Where-Clause =   'AND ET.ESTABID = ' || $Quote || $Estab || $Quote
+         DO Process-Main
+         DO Print-Report
+         IF $OutputCSV  = 'Y'
+            DO Write-To-CSV
+         END-IF
+         DO Reset-Array
+         new-page
+         ADD 1 to #i
+         IF #i < #count
+         END-IF
+     END-WHILE
+  END-IF
+
+  do Stdapi-Term
+End-Program
+
+!----------------------------------------------------------------------
+!---------Init-Report--------------------------------------------------
+!----------------------------------------------------------------------
+! We need to either ask for the calendar year, or get the information
+! from the process instance (run control panel)
+!----------------------------------------------------------------------
+
+Begin-Procedure Init-Report
+
+#IFDEF DEBUGPER017
+  DISPLAY 'FLOW: Init-Report'
+#ENDIF
+
+
+  MOVE 'PER017' to $ReportID
+  MOVE 'EEO-1 Job Analysis Report' to $ReportTitle
+
+
+  DISPLAY $ReportTitle
+
+#IFDEF DEBUGPER017
+  DISPLAY 'Report ID: ' NOLINE
+  DISPLAY $ReportID
+#ENDIF
+
+  DO Stdapi-Init
+
+  IF $prcs_process_instance = ''
+     DISPLAY ''
+     DISPLAY 'REPORT CAN NOT BE EXECUTED OUTSIDE OF PEOPLESOFT,PLEASE USE PROCESS SCHEDULER.'
+     DISPLAY ''
+     STOP QUIET
+  ELSE
+     DO Select-Parameters
+     if $ReportYear = ''
+        do Format-DateTime($ThruDate,  $Report_YMD, {DEFYMD}, '', '')
+        let #ReportYear = {ps-substr}($Report_YMD,1,4)
+     end-if
+     do Format-Number(#ReportYear, $ReportYear, '9999')
+  END-IF
+
+#IFDEF DEBUGPER017
+  DISPLAY '          Establishment from Run Control Panel:      ' NOLINE
+  DISPLAY $Estab
+
+!***************Begin Resolution 569888****************************************
+ DISPLAY '          Start Date: ' NOLINE
+  DISPLAY $FromDate
+  DISPLAY '          End Date: ' NOLINE
+  DISPLAY $ThruDate
+! DISPLAY '          As Of  Date: ' NOLINE
+! DISPLAY $AsOfDate
+!**************End Resolution 569888*******************************************
+#ENDIF
+
+
+End-Procedure
+
+!----------------------------------------------------------------------
+!---------Init-Workforce-Array-----------------------------------------
+!----------------------------------------------------------------------
+! Creates an array to temporarily hold department and jobcode totals
+!
+! This array will hold the jobcodes from one department, which will
+!   then be printed and the array will be cleared to be used for the
+!   next DEPT
+!----------------------------------------------------------------------
+begin-procedure Init-Workforce-Array
+#IFDEF DEBUGPER017
+  DISPLAY 'FLOW: Init-Workforce-Array'
+#ENDIF
+
+CREATE-ARRAY
+   NAME = Workforce-Array
+   SIZE = 20
+   FIELD = LABEL:char
+   FIELD = TOTAL_EMPLOYEES:integer
+   FIELD = TOTAL_MINORITIES:integer
+   FIELD = COLUMN:integer:10
+
+
+LET Workforce-Array.LABEL(0) = 'Officials & Managers'
+LET Workforce-Array.LABEL(1) = 'Professionals'
+LET Workforce-Array.LABEL(2) = 'Technicians'
+LET Workforce-Array.LABEL(3) = 'Sales Workers'
+LET Workforce-Array.LABEL(4) = 'Office & Clerical'
+LET Workforce-Array.LABEL(5) = 'Craft Workers'
+LET Workforce-Array.LABEL(6) = 'Operatives'
+LET Workforce-Array.LABEL(7) = 'Laborers'
+LET Workforce-Array.LABEL(8) = 'Service Workers'
+LET Workforce-Array.LABEL(9) = 'Total'
+
+end-procedure Init-Workforce-Array
+
+!----------------------------------------------------------------------
+!---------Get-Values---------------------------------------------------
+!----------------------------------------------------------------------
+! Fetch run control parameters
+!----------------------------------------------------------------------
+begin-procedure Get-Values
+#IFDEF DEBUGPER017
+  DISPLAY 'FLOW: Get-Values'
+#ENDIF
+!***************Begin Resolution 569888****************************************
+   DO Get-From-Thru-Date
+  !Do Get-As-Of-Date
+!***************End Resolution 569888******************************************
+   DO Get-Run-Scope
+   DO Get-CTL_ESTABID
+   DO Get-Company
+   DO Get-Establishment
+   DO Get-Report-Type
+   LET $Quote = ''''
+
+   LET $EntityName = $Company
+
+end-procedure Get-Values
+
+!----------------------------------------------------------------------
+!---------Get-Number-Of-Establishments---------------------------------
+!----------------------------------------------------------------------
+! Returns the number of Establishments in the ESTAB_TBL
+!
+! This will fetch them in correct printing order - an HQ unit followed
+! by the establishments it controls
+!----------------------------------------------------------------------
+begin-procedure Get-Number-Of-Establishments
+
+#IFDEF DEBUGPER017
+  DISPLAY 'FLOW: Get-Number-Of-Establishments'
+#ENDIF
+
+! If they want only those controlled by one headquarters, then we need
+! to only get back those that are controlled by the supplied value
+!----------------------------------------------------------------------
+!**************Begin Incident 1451539001***************
+IF $ReportChoice = '3'
+  LET $Estab-Where = 'AND Z1.CTL_ESTABID = ' || $Quote || $CtlEstabID || $Quote
+!LET $Estab-Where = 'AND Z.CTL_ESTABID = ' || $Quote || $CtlEstabID || $Quote  
+!**************End Incident 1451539001***************
+ELSE
+  IF $ReportChoice = '1'
+     LET $Estab-Where = ' AND Z.COMPANY = ' || $Quote || $Company || $Quote
+  ELSE
+     LET $Estab-Where = ''
+  END-IF
+END-IF
+
+
+
+
+CREATE-ARRAY
+    NAME = EstablishmentIDs
+!--------- begin resolution 588677
+!    SIZE = 100
+    SIZE = 200
+!--------- end resolution 588677
+    FIELD = theEstab:char
+
+let #estab_count = 0
+BEGIN-SELECT DISTINCT
+
+Y.ESTABID
+    PUT &Y.ESTABID into EstablishmentIDs(#estab_count)
+    ADD 1 to #estab_count
+Z.HQUNIT
+Z.COMPANY
+!**************Begin Incident 1451539001***************
+Z1.CTL_ESTABID
+!Z.CTL_ESTABID
+!**************End Incident 1451539001***************
+FROM PS_ESTAB_US_VW Y,
+     PS_ESTAB_TBL  Z,
+     PS_ESTAB_TBL_USA Z1 !***********Incident 1451539001*************
+WHERE Y.ESTABID = Z.ESTABID
+  AND Z.REG_REGION = 'USA'
+  AND Z.ESTABID = Z1.ESTABID !***********Incident 1451539001*************
+  AND Z.EFFDT = Z1.EFFDT !***********Incident 1451539001*************
+[$Estab-Where]
+
+!**************Begin Incident 1451539001***************
+ORDER BY Z1.CTL_ESTABID, Z.HQUNIT desc, Z.COMPANY, Y.ESTABID
+!ORDER BY Z.CTL_ESTABID, Z.HQUNIT desc, Z.COMPANY, Y.ESTABID
+!**************End Incident 1451539001***************
+END-SELECT
+
+End-Procedure Get-Number-Of-Establishments
+
+!----------------------------------------------------------------------
+!---------Get-Establishment-Info---------------------------------------
+!----------------------------------------------------------------------
+! Retrieves name and address information for the specific location
+!----------------------------------------------------------------------
+
+Begin-Procedure Get-Establishment-Info
+
+#IFDEF DEBUGPER017
+  DISPLAY 'FLOW: Get-Establishment-Info'
+#ENDIF
+
+
+BEGIN-SELECT
+Q.DESCR
+Q.ADDRESS1
+Q.ADDRESS2
+Q.ADDRESS3
+Q.ADDRESS4
+Q.NUM1
+Q.NUM2
+Q.CITY
+Q.STATE
+Q.POSTAL
+Q.COUNTRY
+Q.IN_CITY_LIMIT
+Q.GEO_CODE
+Q.HOUSE_TYPE
+
+    LET $NAME = &Q.DESCR
+    LET $ADDRESS1 = &Q.ADDRESS1
+    LET $ADDRESS2 = &Q.ADDRESS2
+    LET $ADDRESS3 = &Q.ADDRESS3
+    LET $ADDRESS4 = &Q.ADDRESS4
+    LET $NUM1 = &Q.NUM1
+    LET $NUM2 = &Q.NUM2
+    LET $HOUSE_TYE = &Q.HOUSE_TYPE
+
+    LET $CITY = &Q.CITY
+    LET $COUNTRY = &Q.COUNTRY
+
+    LET $STATE = &Q.STATE
+
+    LET $POSTAL = &Q.POSTAL
+
+    LET $GEO_CODE = &Q.GEO_CODE
+    LET $IN_CITY_LIMIT = &Q.IN_CITY_LIMIT
+
+FROM PS_ESTAB_TBL Q
+WHERE Q.ESTABID = $Estab
+
+
+END-SELECT
+End-Procedure Get-Establishment-Info
+
+!----------------------------------------------------------------------
+!---------Get-Company-Info---------------------------------------------
+!----------------------------------------------------------------------
+! Retrieves name and address information for the specific company
+!----------------------------------------------------------------------
+
+Begin-Procedure Get-Company-Info
+
+#IFDEF DEBUGPER017
+  DISPLAY 'FLOW: Get-Company-Info'
+#ENDIF
+
+
+BEGIN-SELECT
+U.DESCR
+U.ADDRESS1
+U.ADDRESS2
+U.ADDRESS3
+U.ADDRESS4
+U.NUM1
+U.NUM2
+U.CITY
+U.STATE
+U.POSTAL
+U.COUNTRY
+U.IN_CITY_LIMIT
+U.GEO_CODE
+U.HOUSE_TYPE
+
+    LET $NAME = &U.DESCR
+    LET $ADDRESS1 = &U.ADDRESS1
+    LET $ADDRESS2 = &U.ADDRESS2
+    LET $ADDRESS3 = &U.ADDRESS3
+    LET $ADDRESS4 = &U.ADDRESS4
+    LET $NUM1 = &U.NUM1
+    LET $NUM2 = &U.NUM2
+    LET $HOUSE_TYE = &U.HOUSE_TYPE
+
+    LET $CITY = &U.CITY
+    LET $COUNTRY = &U.COUNTRY
+
+    LET $STATE = &U.STATE
+
+    LET $POSTAL = &U.POSTAL
+
+    LET $GEO_CODE = &U.GEO_CODE
+    LET $IN_CITY_LIMIT = &U.IN_CITY_LIMIT
+
+FROM PS_COMPANY_TBL U
+WHERE U.COMPANY = $Company
+END-SELECT
+
+End-Procedure Get-Company-Info
+
+
+!----------------------------------------------------------------------
+!---------Process-Main-------------------------------------------------
+!----------------------------------------------------------------------
+! This routine will be run for the establishment selected in the
+! run control panel, or for ALL of them if none is specified.
+!----------------------------------------------------------------------
+begin-procedure Process-Main
+
+! Debugging stuff
+!----------------------------------------------------
+#IFDEF DEBUGPER017
+  DISPLAY 'FLOW: Process-Main'
+
+   Display '   Establishment: ' NOLINE
+   Display $Estab
+#ENDIF
+
+Begin-SELECT
+ET.DESCR,
+JT.EEO1CODE,
+P.SEX,
+ETH.ETHNIC_GROUP
+COUNT(*)         &Count
+
+      LET $Ethnicity = RTRIM(&ETH.ETHNIC_GROUP,' ')
+      LET $Sex =       RTRIM(&P.SEX,' ')
+      LET $Code =      RTRIM(&JT.EEO1CODE,' ')
+
+      IF $Sex = 'M'
+         LET #Sex = 0
+      ELSE
+         LET #Sex = 5
+      END-IF
+
+      LET #Ethnicity = TO_NUMBER($Ethnicity)
+      LET #Row = TO_NUMBER($Code) - 1
+      !***************Begin Resolution - 619239 ****************
+      IF $Ethnicity = '7'
+         LET #Ethnicity = 4
+      END-IF
+      !***************End Resolution - 619239 ******************
+      LET #Column = (#Sex + #Ethnicity) - 1
+         ARRAY-ADD &Count to Workforce-Array(#Row) COLUMN(#Column)
+         ARRAY-ADD &Count to Workforce-Array(#Row) TOTAL_EMPLOYEES
+         ARRAY-ADD &Count to Workforce-Array(9) COLUMN(#Column)
+
+         IF $Ethnicity != '1'
+            ARRAY-ADD &Count to Workforce-Array(#Row) TOTAL_MINORITIES
+         END-IF
+FROM  PS_PERS_DATA_MAX P,
+      PS_ESTAB_TBL ET,
+      PS_EMPLOYMENT E,
+      PS_JOB J,
+      PS_JOBCODE_TBL JT,
+      PS_DIVERS_ETHNIC  DVR,
+      PS_ETHNIC_GRP_TBL ETH
+WHERE J.PER_ORG = 'EMP'
+  AND P.EMPLID=DVR.EMPLID
+  AND E.EMPLID     = P.EMPLID
+  AND J.EMPLID     = E.EMPLID
+  AND J.EMPL_RCD   = E.EMPL_RCD
+  AND J.REG_TEMP   = 'R'
+  AND J.EFFDT =
+               (SELECT MAX(J1.EFFDT)
+                FROM PS_JOB J1
+                WHERE J1.EMPLID  = J.EMPLID
+                AND J1.EMPL_RCD = J.EMPL_RCD
+                AND J1.EFFDT <= 
+!**************Begin Resolution 569888****************************
+!$AsOfDate
+$ThruDate)
+!**************End Resolution 569888******************************
+  AND J.EFFSEQ =
+                (SELECT MAX(J2.EFFSEQ)
+                 FROM  PS_JOB J2
+                 WHERE J2.EMPLID    = J.EMPLID
+                   AND J2.EMPL_RCD = J.EMPL_RCD
+                   AND J2.EFFDT     = J.EFFDT)
+! AND J.EMPL_RCD = (SELECT MIN(J3.EMPL_RCD)
+!                     FROM PS_JOB J3
+!                     WHERE J3.EMPLID = J.EMPLID)
+  AND J.JOB_INDICATOR = 'P'
+
+!***************Begin Resolution 569888****************************************
+!   AND ((J.EMPL_STATUS = 'A'
+!          AND J.EFFDT <= $AsOfDate)
+!        OR (J.EMPL_STATUS ='P'
+!          AND J.EFFDT <= $AsOfDate)
+!        OR (J.EMPL_STATUS ='W'
+!          AND J.EFFDT <= $AsOfDate))
+  AND ((J.EMPL_STATUS IN('A','P','S','L','W')
+           AND J.EFFDT <= $ThruDate)
+OR (J.EMPL_STATUS IN ('R','Q','T','U') AND (J.EFFDT BETWEEN $FromDate AND $ThruDate)
+         and EXISTS (SELECT S.EMPLID FROM PS_JOB S
+                        WHERE S.EMPLID = J.EMPLID 
+                        AND S.EMPL_RCD = J.EMPL_RCD
+                        AND S.EFFDT = (SELECT MAX(L.EFFDT) FROM PS_JOB L
+                                       WHERE L.EMPLID  = S.EMPLID 
+                                       AND L.EMPL_RCD = S.EMPL_RCD
+                                       AND L.EFFDT <= $FromDate
+                                       )
+                        AND S.EFFSEQ = (SELECT MAX(M.EFFSEQ) FROM PS_JOB M
+                                       WHERE M.EMPLID  = S.EMPLID 
+                                       AND M.EMPL_RCD = S.EMPL_RCD
+                                       AND M.EFFDT = S.EFFDT
+                                       )
+                        AND S.EMPL_STATUS IN('A','P','S','L','W')
+                       )
+              )
+        )
+
+!***************End Resolution 569888****************************************        
+  AND JT.JOBCODE   = J.JOBCODE
+  AND JT.SETID = J.SETID_JOBCODE
+  AND JT.EFFDT =
+                (SELECT MAX(JT1.EFFDT)
+                 FROM  PS_JOBCODE_TBL JT1
+                 WHERE JT1.JOBCODE = J.JOBCODE
+                 AND JT1.SETID = J.SETID_JOBCODE
+                 AND JT1.EFFDT  <=
+!**************Begin Resolution 569888****************************
+!$AsOfDate
+$ThruDate)
+!**************End Resolution 569888******************************  
+    AND DVR.PRIMARY_INDICATOR = 'Y' 
+    AND DVR.SETID = ETH.SETID 
+    AND DVR.ETHNIC_GRP_CD = ETH.ETHNIC_GRP_CD 
+    AND ETH.EFFDT = (SELECT MAX(E2.EFFDT) FROM PS_ETHNIC_GRP_TBL E2 
+                    WHERE E2.SETID = ETH.SETID 
+                    AND E2.ETHNIC_GRP_CD = ETH.ETHNIC_GRP_CD 
+                    AND E2.EFFDT <= 
+!**************Begin Resolution 569888****************************
+!$AsOfDate
+$ThruDate)
+!**************End Resolution 569888****************************** 
+  AND ETH.ETHNIC_GROUP <> '6'                 !Not Applicable
+  AND J.EEO_CLASS    <> 'E'                   !Exclude from counts
+  AND JT.EEO1CODE    <> 'N'                   !Not counted for EEO reporting
+  AND ET.ESTABID = J.ESTABID
+  AND ET.EFFDT =
+      (SELECT MAX(EFFDT)
+       FROM PS_ESTAB_TBL ET1
+       WHERE ET1.ESTABID = J.ESTABID
+         AND ET1.EFFDT <=  
+!**************Begin Resolution 569888****************************
+!$AsOfDate
+$ThruDate)
+!**************End Resolution 569888******************************
+[$Where-Clause]
+GROUP BY JT.EEO1CODE, P.SEX, ETH.ETHNIC_GROUP, ET.DESCR
+
+end-SELECT
+
+LET #Row = 0
+WHILE #Row < 9
+   GET #count FROM Workforce-Array(#Row) TOTAL_EMPLOYEES
+   ARRAY-ADD #count TO Workforce-Array(9) TOTAL_EMPLOYEES
+   GET #count FROM Workforce-Array(#Row) TOTAL_MINORITIES
+   ARRAY-ADD #count TO Workforce-Array(9) TOTAL_MINORITIES
+ADD 1 to #Row
+END-WHILE
+
+end-procedure
+
+!----------------------------------------------------------------------
+!---------Open-CSV-File------------------------------------------------
+!----------------------------------------------------------------------
+! This routine will open a file to be used as our output file
+!----------------------------------------------------------------------
+begin-procedure Open-CSV-File
+
+Open '{IMPORTPREFIX}PER017.CSV' As 1
+                              For-Writing
+                              Record=750:Vary
+                              Status=#FileStatus
+IF #FileStatus = -1
+    DISPLAY 'Error opening CSV file'
+    ! Turn off file output, but run report as usual...
+    !------------------------------------------------
+    LET $OutputCSV = 'N'
+END-IF
+
+
+! Print Column Headers if appropriate
+!------------------------------------------------------
+
+IF $IncludeHeaders = 'Y'
+!*********Begin Resolution - 619239 ****************
+    !STRING 'Establishment ID' 'Establishment Name' 'EEO Category' 'Total Employees' 'Total Minorities'  'White Males'
+    !       'Black Males' 'Hispanic Males' 'Asian Males' 'Native American Males'
+    !       'White Females' 'Black Females' 'Hispanic Females' 'Asian Females' 'Native American Females'
+    !        by ',' into $ColumnHeaders
+    
+    STRING 'Establishment ID' 'Establishment Name' 'EEO Category' 'Total Employees' 'Total Minorities'  'White Males'
+               'Black Males' 'Hispanic Males' 'Asian or PcIs Males' 'Native American Males'
+               'White Females' 'Black Females' 'Hispanic Females' 'Asian or PcIs Females' 'Native American Females'
+                by ',' into $ColumnHeaders
+!*********End Resolution - 619239 ******************
+
+   WRITE 1 FROM $ColumnHeaders STATUS=#WriteStatus
+   IF #WriteStatus != 0
+       DISPLAY 'Error writing to CSV file.'
+       STOP
+   END-IF
+END-IF
+
+end-procedure Open-CSV-File
+
+!----------------------------------------------------------------------
+!---------Reset-Array--------------------------------------------------
+!----------------------------------------------------------------------
+! Resets both establishment-level arrays
+!----------------------------------------------------------------------
+begin-procedure Reset-Array
+#IFDEF DEBUGPER017
+  DISPLAY 'FLOW: Reset-Array'
+#ENDIF
+! We don't want to overwrite the labels, so loop through this one
+! manually
+!----------------------------------------------------------------
+MOVE 0 TO #ResetRow            !Reset array
+
+WHILE #ResetRow < 10
+    MOVE 0 to #ResetColumn
+    WHILE #ResetColumn < 10
+       PUT 0 INTO Workforce-Array(#ResetRow)  COLUMN(#ResetColumn)
+       ADD 1 TO #ResetColumn
+    END-WHILE
+    PUT 0 INTO Workforce-Array(#ResetRow)  TOTAL_EMPLOYEES
+    PUT 0 INTO Workforce-Array(#ResetRow)  TOTAL_MINORITIES
+    ADD 1 TO #ResetRow
+END-WHILE
+
+End-Procedure Reset-Array
+
+
+!----------------------------------------------------------------------
+!---------Print-Report-------------------------------------------------
+!----------------------------------------------------------------------
+! Resets arrays
+!----------------------------------------------------------------------
+begin-procedure Print-Report
+#IFDEF DEBUGPER017
+  DISPLAY 'FLOW: Print-Report'
+#ENDIF
+
+   ALTER-PRINTER
+        font=4
+        point-size = 7
+    ! Horizontal Line above column headings
+    !-------------------------------------------
+    GRAPHIC (+1,1,104) HORZ-LINE
+
+    ! Column Headings
+    !------------------------------------------------
+
+
+    PRINT 'Total'                               (+1,20) BOLD
+    PRINT 'Total'                               (,28)   BOLD
+    PRINT 'MALE'                                (,52)   BOLD
+    PRINT 'FEMALE'                              (,86)   BOLD
+
+    PRINT 'EEO Category'                        (+1,1)  BOLD
+    PRINT 'Employees'                           (,20)   BOLD
+    PRINT 'Minorities'                          (,28)   BOLD
+
+
+    ! Smaller type for race columns
+    !---------------------------------
+    ALTER-PRINTER
+        point-size = 6
+
+    PRINT 'White'                               (,43)   BOLD
+    PRINT 'Black'                               (,47)   BOLD
+    PRINT 'Hisp.'                               (,51)   BOLD
+    !**********Begin Resolution - 619239 ****************
+    !PRINT 'Asian'                               (,55)   BOLD
+    PRINT 'Asn/PcIs'                               (,54)   BOLD
+    !**********End Resolution - 619239 ******************
+    PRINT 'Nat. Am'                             (,59)   BOLD
+    
+
+
+
+    PRINT 'White'                               (,78)   BOLD
+    PRINT 'Black'                               (,82)   BOLD
+    PRINT 'Hisp.'                               (,86)   BOLD
+    !**********Begin Resolution - 619239 ****************
+    !PRINT 'Asian'                               (,90)   BOLD
+    PRINT 'Asn/PcIs'                               (,89)   BOLD
+    !**********End Resolution - 619239 ******************
+    PRINT 'Nat. Am'                             (,94)   BOLD
+    
+
+
+    ! Back to regular type size
+    !---------------------------------
+    ALTER-PRINTER
+        point-size = 7
+
+    ! Horizontal Line below column headings
+    !-------------------------------------------
+
+    GRAPHIC (,1,104) HORZ-LINE
+
+   POSITION                                      (+1,,)
+
+   LET #Row = 0
+
+   WHILE #Row < 10
+
+   IF #Row = 9
+      GRAPHIC (,1,104) HORZ-LINE 12
+   END-IF
+
+   ! Gray Background on every other line
+   !--------------------------------------------
+   IF #Row%2 = 0
+      GRAPHIC (+1,1,104) box 3 0 15
+   ELSE
+      POSITION (+1,,)
+   END-IF
+
+   ! Print Label
+   !--------------------------------------------
+   GET $Out FROM Workforce-Array(#Row) LABEL
+   PRINT $Out                                    (,1)
+
+   ! Print Columns
+   !--------------------------------------------
+   GET #Total_Emps FROM Workforce-Array(#Row) TOTAL_EMPLOYEES
+   LET $Out = TO_CHAR(#Total_Emps)
+   PRINT $Out                                    (,20) EDIT 99999
+   GET #Total_Min FROM Workforce-Array(#Row) TOTAL_MINORITIES
+   LET $Out = TO_CHAR(#Total_Min)
+   PRINT $Out                                    (,28) EDIT 99999
+
+
+   LET #Column = 0
+   WHILE #Column < 10
+
+      GET #Col_Total FROM Workforce-Array(9) COLUMN(#Column)
+
+      ! Set Column Position
+      !-----------------------------
+      EVALUATE #Column
+         WHEN = 0
+            LET #Pos = 44
+            BREAK
+         WHEN = 1
+            LET #Pos = 48
+            BREAK
+         WHEN = 2
+            LET #Pos = 52
+            BREAK
+         WHEN = 3
+            LET #Pos = 56
+            BREAK
+         WHEN = 4
+            LET #Pos = 60
+            BREAK
+         WHEN = 5
+            LET #Pos = 79
+            BREAK
+         WHEN = 6
+            LET #Pos = 83
+            BREAK
+         WHEN = 7
+            LET #Pos = 87
+            BREAK
+         WHEN = 8
+            LET #Pos = 91
+            BREAK
+         WHEN = 9
+            LET #Pos = 95
+            BREAK
+      END-EVALUATE
+
+      ! Print actual value
+      !-----------------------------
+      GET #Out FROM Workforce-Array(#Row) COLUMN(#Column)
+
+
+      LET $Out = TO_CHAR(#Out)
+      PRINT $Out                                 (,#Pos) EDIT 9999
+
+      ADD 1 to #Column
+   END-WHILE
+
+   PRINT '% of Row'                              (+1,5)
+
+   ! Employee Total divided by Employee Total is always 100
+   !---------------------------------
+   LET #Row_Total = 100
+   LET $Out = TO_CHAR(#Row_Total)
+   PRINT $Out                                    ( ,20) EDIT 888.88
+
+   IF #Total_Min != 0
+      Let #Row_Total = (#Total_Min/#Total_Emps) * 100
+
+   ELSE
+      LET #Row_Total = 0
+   END-IF
+
+   LET $Out = TO_CHAR(#Row_Total)
+   PRINT $Out                                    (,28) EDIT 888.88
+
+
+   LET #Column = 0
+   WHILE #Column < 10
+
+      GET #Col_Total FROM Workforce-Array(9) COLUMN(#Column)
+
+      ! Set Column Position
+      !-----------------------------
+      EVALUATE #Column
+         WHEN = 0
+            LET #Pos = 43
+            BREAK
+         WHEN = 1
+            LET #Pos = 47
+            BREAK
+         WHEN = 2
+            LET #Pos = 51
+            BREAK
+         WHEN = 3
+            LET #Pos = 55
+            BREAK
+         WHEN = 4
+            LET #Pos = 59
+            BREAK
+         WHEN = 5
+            LET #Pos = 78
+            BREAK
+         WHEN = 6
+            LET #Pos = 82
+            BREAK
+         WHEN = 7
+            LET #Pos = 86
+            BREAK
+         WHEN = 8
+            LET #Pos = 90
+            BREAK
+         WHEN = 9
+            LET #Pos = 94
+            BREAK
+      END-EVALUATE
+
+      ! Print %Row value
+      !-----------------------------
+      GET #Out FROM Workforce-Array(#Row) COLUMN(#Column)
+
+      ! Avoid division by zero
+      !-----------------------------
+      IF #Total_Emps != 0
+        LET #Row_Percent = (#Out/#Total_Emps) * 100
+      ELSE
+        LET #Row_Percent = 0
+      END-IF
+      LET $Out = TO_CHAR(#Row_Percent)
+      PRINT $Out                                 (,#Pos) EDIT 999.99
+
+      ADD 1 to #Column
+   END-WHILE
+
+
+
+
+   PRINT '% of Column'                              (+1,5)
+
+   ! Employee Total divided by Employee Total is always 100
+   !---------------------------------
+   GET #All_Emps FROM Workforce-Array(9) TOTAL_EMPLOYEES
+
+   IF #All_Emps != 0
+      LET #Row_Total = (#Total_Emps / #All_Emps) * 100
+   ELSE
+      LET #Row_Total = 0
+   END-IF
+   LET $Out = TO_CHAR(#Row_Total)
+   PRINT $Out                                    ( ,20) EDIT 888.88
+
+   GET #All_Min FROM Workforce-Array(9) TOTAL_MINORITIES
+
+   IF #ALL_Min != 0
+      Let #Row_Total = (#Total_Min / #All_Min) * 100
+   ELSE
+      LET #Row_Total = 0
+   END-IF
+
+   LET $Out = TO_CHAR(#Row_Total)
+   PRINT $Out                                    (,28) EDIT 888.88
+
+
+   LET #Column = 0
+   WHILE #Column < 10
+
+      GET #Col_Total FROM Workforce-Array(9) COLUMN(#Column)
+
+      ! Set Column Position
+      !-----------------------------
+      EVALUATE #Column
+         WHEN = 0
+            LET #Pos = 43
+            BREAK
+         WHEN = 1
+            LET #Pos = 47
+            BREAK
+         WHEN = 2
+            LET #Pos = 51
+            BREAK
+         WHEN = 3
+            LET #Pos = 55
+            BREAK
+         WHEN = 4
+            LET #Pos = 59
+            BREAK
+         WHEN = 5
+            LET #Pos = 78
+            BREAK
+         WHEN = 6
+            LET #Pos = 82
+            BREAK
+         WHEN = 7
+            LET #Pos = 86
+            BREAK
+         WHEN = 8
+            LET #Pos = 90
+            BREAK
+         WHEN = 9
+            LET #Pos = 94
+            BREAK
+      END-EVALUATE
+
+      GET #Out FROM Workforce-Array(#Row) COLUMN(#Column)
+
+      ! Avoid division by zero
+      !-----------------------------
+      IF #Col_Total != 0
+         LET #Row_Percent = (#Out/#Col_Total) * 100
+      ELSE
+         LET #Row_Percent = 0
+      END-IF
+      LET $Out = TO_CHAR(#Row_Percent)
+      PRINT $Out                                 (,#Pos) EDIT 999.99
+
+      ADD 1 to #Column
+   END-WHILE
+
+
+   ADD 1 to #Row
+END-WHILE
+
+GRAPHIC (,1,104) HORZ-LINE 12
+
+end-procedure Print-Report
+
+!----------------------------------------------------------------------
+!---------Write-To-CSV-------------------------------------------------
+!----------------------------------------------------------------------
+
+!----------------------------------------------------------------------
+begin-procedure Write-To-CSV
+
+LET $Output = ''
+
+LET #CSVRow = 0
+WHILE #CSVRow < 10
+
+   LET $Output = EstablishmentIDs.theEstab(#i)
+   LET $Output = $Output || ',' || $NAME
+
+   GET $Out FROM Workforce-Array(#CSVRow) LABEL
+   LET $Output = $Output || ',' || $Out
+
+   GET #Out FROM Workforce-Array(#CSVRow) TOTAL_EMPLOYEES
+   LET $Out = TO_CHAR(#Out)
+   LET $Output = $Output || ',' || $Out
+
+   GET #Out FROM Workforce-Array(#CSVRow) TOTAL_MINORITIES
+   LET $Out = TO_CHAR(#Out)
+   LET $Output = $Output || ',' || $Out
+
+   LET #CSVCol = 0
+   WHILE #CSVCol < 10
+      GET #Out FROM Workforce-Array(#CSVRow) COLUMN (#CSVCol)
+      LET $Out = TO_CHAR(#Out)
+      LET $Output = $Output || ',' || $Out
+
+   ADD 1 to #CSVCol
+   END-WHILE
+
+WRITE 1 FROM $Output STATUS=#WriteStatus
+IF #WriteStatus != 0
+    DISPLAY 'Error writing to CSV file.'
+    STOP
+END-IF
+
+ADD 1 to #CSVRow
+END-WHILE
+
+
+
+end-procedure Write-To-CSV
+!----------------------------------------------------------------------
+!---------Strip-Char---------------------------------------------------
+!----------------------------------------------------------------------
+! Description:
+! This procedure is called in 'Check-Variables. It loops through all
+! characters in the value string provided and removes all occurrences
+! of ANY CHARACTER in $strip. This is used to remove characters like
+! dashes, periods etc. Note: This function is also provided in the
+! ECBUSDOC.SQC under the name Process-Strip-Char()
+!----------------------------------------------------------------------
+begin-procedure Strip-Char($invalue,:$outvalue,$strip)
+
+  let #val_len = {PS-length}($invalue)
+  let #i = 1
+  let $cur_char = ''
+  let $outvalue = ''
+
+  while #i <= #val_len
+
+     let $cur_char = {PS-substr}($invalue,#i,1)
+
+     if instr($strip, $cur_char, 1) = 0
+
+        let $outvalue = $outvalue || $cur_char
+
+     end-if
+
+     add 1 to #i
+  end-while
+
+end-procedure Strip-Char
+
+!----------------------------------------------------------------------
+!---------SQCs---------------------------------------------------------
+!----------------------------------------------------------------------
+#include 'stdapi.sqc'      !Routine to update run status
+#include 'rgrnctl1.sqc'    !Get run control parameter values
+#include 'rggetval.sqc'    !Get values mask routines
+#include 'askcalyr.sqc'    !Ask Calendar Year input
+#Include 'curdttim.sqc'    !Get-Current-DateTime procedure
+#Include 'datetime.sqc'    !Routines for date and time formatting
+#Include 'number.sqc'      !Routines to format numbers

@@ -1,0 +1,804 @@
+! ***************************************************************!
+!  This software and related documentation are provided under a!
+!  license agreement containing restrictions on use and!
+!  disclosure and are protected by intellectual property!
+!  laws. Except as expressly permitted in your license agreement!
+!  or allowed by law, you may not use, copy, reproduce,!
+!  translate, broadcast, modify, license, transmit, distribute,!
+!  exhibit, perform, publish or display any part, in any form or!
+!  by any means. Reverse engineering, disassembly, or!
+!  decompilation of this software, unless required by law for!
+!  interoperability, is prohibited.!
+!  The information contained herein is subject to change without!
+!  notice and is not warranted to be error-free. If you find any!
+!  errors, please report them to us in writing.!
+!  !
+!  Copyright (C) 1988, 2011, Oracle and/or its affiliates.!
+!  All Rights Reserved.!
+! ***************************************************************!
+ 
+ 
+!                                                                    !
+!***********************************************************************
+!                                                                      *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+!                                                                      *
+!                                                                      *
+!                                                                      *
+!                                                                      *
+!***********************************************************************
+
+!This guards against the SQC being #included twice...
+#ifndef PTGBLTME-INCLUDED
+
+#define PTGBLTME-INCLUDED
+
+!***********************************************************************
+begin-procedure GetTimeZones
+! The purpose if this procedure is to retrieve the Base TimeZone from
+! PSOptions.  $BSE_TIMEZONE and $CLT_TIMEZONE is a global variables.
+! Only $BSE_TIMEZONE and $CLT_TIMEZONE should be used for Global TimeZone
+! processing.
+!***********************************************************************
+#ifdef debugx
+    show 'Entering PTGBLTME.SQC: GetTimeZones'
+#end-if
+
+begin-select On-Error=SQL-Error
+BSE.BSE_TIMEZONE
+    let $BSE_TIMEZONE = rtrim(&BSE.BSE_TIMEZONE,' ')
+FROM PSOPTIONS BSE
+end-select
+
+if #prcs_process_instance > 0
+
+begin-SELECT On-Error=SQL-Error
+CLT.TIMEZONE
+    let $CLT_TIMEZONE = rtrim(&CLT.TIMEZONE,' ')
+FROM PSPRCSRQST CLT
+WHERE PRCSINSTANCE = #prcs_process_instance
+end-SELECT
+
+else    ! if #prcs_process_instance = 0, then set Client Timezone to Base
+    let $CLT_TIMEZONE = $BSE_TIMEZONE
+end-if
+
+#ifdef debugx
+    show 'Exiting PTGBLTME.SQC: GetTimeZones'
+    #ifdef debugy
+        show ' $BSE_TimeZone: ' $BSE_TIMEZONE
+    #end-if
+#end-if
+end-procedure
+
+!***********************************************************************
+begin-procedure GetCurrentClientDateTime LOCAL
+!  This procedure will get the Current DateTime Stamp and convert it from
+!  the BaseTimeZone to the ClientTimeZone.  In order for this routine to
+!  return anything other than the base timezone, the following must occur
+!  before calling this routine:
+!    1)  A Process Instance is being used
+!    2)  A record exists for that process instance in PSPRCSRQST
+!    3)  This routine is called after the call to Get-Run-Control-Parms
+!
+!  The way this procdure determines if the above steps have been called are
+!  based on the vlaues in $BSE_TIMEZONE and $CLT_TIMEZONE
+!
+!  If you are not using a process instance, then you can either format
+!  those 2 global variables and call this procedure
+!  or
+!  Get the Current DateTime and call FormatGlobalTime directly
+!
+!  Why define as a LOCAL procedure?  To allow for declaration of variables
+!  used by this routine only.  All Global variable are identified with
+!  the leading underscore after the $,#, and & (Example: $_SysDateTime)
+!***********************************************************************
+    declare-variable
+        date    $tempdatetime
+    end-declare
+
+#ifdef debugx
+  show 'Entering PTGBLTME.SQC: GetCurrentClientDateTime'
+#end-if
+
+    if Isnull($_BSE_TIMEZONE)
+        do GetTimeZones
+    end-if
+
+    do Get-Current-DateTime
+
+    if $_CLT_TIMEZONE <> $_BSE_TIMEZONE        !Only convert if times zones are different
+        do FormatGlobalTime($_SysDateTime, $_BSE_TIMEZONE, $_CLT_TIMEZONE, $_ClientDateTime)
+    else
+        let $_ClientDateTime = $_SysDateTime
+    end-if
+
+    let $tempdatetime     = strtodate($_ClientDateTime,{Native-DateTimeMask})
+    let $_ClientAsOfToday = datetostr($tempdatetime,{Native-DateMask})
+    let $_ClientAsOfNow   = datetostr($tempdatetime,{Native-TimeMask})
+
+#ifdef debugx
+  show 'Exiting PTGBLTME.SQC: GetCurrentClientDateTime'
+  #ifdef debugy
+    show ' Output Parameters '
+        show ' $ClientDateTime : ' $_ClientDateTime
+        show ' $ClientAsOfToday: ' $_ClientAsOfToday
+        show ' $ClientAsOfNow  : ' $_ClientAsOfNow
+  #end-if
+#end-if
+
+end-Procedure
+
+!***********************************************************************
+begin-procedure FormatGlobalTime($DateTimeIn, $SourceTimeZone, $TargetTimeZone, :$DateTimeOut)
+! This procedure convert the DATETIMEIN to the specified target timezone.
+! In this procedure, the '_S' at the begining of the Variables refers to
+! the SourceTimeZone.  While the '_T' refers to the Target
+!
+! $DateTimeIn MUST be in Native DateTime Format
+! $DateTimeOut will be returned in Native DateTime Format
+!***********************************************************************
+declare-variable
+    date    $TempDate
+    date    $SourceTempDate
+    date    $TargetTempDate
+end-declare
+
+#ifdef debugx
+    show 'Entering PTGBLTME.SQC: FormatGlobalTime'
+    #ifdef debugy
+        show ' Input Parameters '
+        show ' $DateTimeIn    : ' $DateTimeIn
+        show ' $SourceTimeZone: ' $SourceTimeZone
+        show ' $TargetTimeZone: ' $TargetTimeZone
+    #end-if
+#end-if
+
+! Convert DateTimeIn into SQR Date Variable $tempdate
+    let $SourceTempDate = strtodate($DateTimeIn,{Native-DateTimeMask})
+
+! Remove trailing blanks from input timezones
+    let $SourceTimeZone = rtrim($SourceTimeZone, ' ')
+    let $TargetTimeZone = rtrim($TargetTimeZone, ' ')
+
+! Format TimeZone working variables
+    do FormatTimeZoneInfo($SourceTimeZone, $TargetTimeZone)
+
+! Get the basic difference in the Offsets
+    let #Offset = #_TUTCOffset - #_SUTCOffset
+    let #OffsetDST = 0
+
+! Calculate New Date based on basic offsets
+    let $TargetTempDate = dateadd($SourceTempDate,'minute',#Offset)
+
+! Now Adjust for DST
+    if $_TObserveDST = {Yes}
+        do IsDayLightSavings($TargetTempDate, $_TDSTStart, $_TDSTEnd, $TargetDST)
+        let $_TDSTSameDay = $_DSTSameDay
+        if $TargetDST = {Yes}
+            let #OffsetDST = #_TDSTOffset
+        end-if
+    end-if
+
+    if $_SObserveDST = {Yes}
+        do IsDayLightSavings($SourceTempDate, $_SDSTStart, $_SDSTEnd, $SourceDST)
+        if $SourceDST = {Yes}
+            let #OffsetDST = #OffsetDST - #_SDSTOffset
+        end-if
+    end-if
+
+!Check if #OffsetDST changes the Target DST Status
+    if $_TDSTSameDay = {Yes}   !Target Day falls on DST Day
+        let $TempDate = dateadd($TargetTempDate,'minute',#OffsetDST)
+        do IsDayLightSavings($TempDate, $_TDSTStart, $_TDSTEnd, $TempDST)
+        if $TargetDST != $TempDST     !#OffsetDST changed the DST Flag - Reverse the Offset from Target
+            let #OffsetDST = #OffsetDST - #_TDSTOffset
+        end-if
+    end-if
+
+! Calculate $DateTimeOut
+    if #OffsetDST <> 0
+        let $TargetTempDate = dateadd($TargetTempDate,'minute',#OffsetDST)
+    end-if
+
+    let $DateTimeOut = datetostr($TargetTempDate,{Native-DateTimeMask})
+
+#ifdef debugx
+    show 'Exiting PTGBLTME.SQC: FormatGlobalTime'
+
+    #ifdef debugy
+        show ' $DateTimeOut   : ' $DateTimeOut
+        show ' #Offset        : ' #Offset
+        show ' #OffsetDST     : ' #OffsetDST
+        show ' $T_DSTSameDay  : ' $T_DSTSameDay
+        show ' $SourceTempDate: ' $SourceTempDate edit {Native-DateTimeMask}
+        show ' $TargetTempDate: ' $TargetTempDate edit {Native-DateTimeMask}
+        show ' $TempDate      : ' $TempDate edit {Native-DateTimeMask}
+    #end-if
+#end-if
+
+end-procedure
+
+!***********************************************************************
+begin-procedure FormatTimeZoneInfo (:$SourceTZ, :$TargetTZ)
+! This procedure formats the variables required to convert a date from
+! one Time Zone to another.  if a TimeZone that is sent to this
+! procedure is NOT valid, then the Base TimeZone will be used instead and
+! the TimeZone parameter will be updated to reflect the change.
+!***********************************************************************
+#ifdef debugx
+    show 'Entering PTGBLTME.SQC: FormatTimeZoneInfo'
+    #ifdef debugy
+        show ' Input Parameters '
+        show ' $SourceTZ      : ' $SourceTZ
+        show ' $TargetTZ      : ' $TargetTZ
+    #end-if
+#end-if
+
+move {OK}  to $Status
+move {No}  to $SetToBase_S
+move {No}  to $SetToBase_T
+
+! Process Source TimeZone
+#ifdef debugx
+    show 'Process Source TimeZone'
+#end-if
+
+SourceTimeZone:
+move {No} to $Found
+move 0 to #n
+while #n < #_TZCurSize
+    get $_STZ $_STZStdLbl $_STZDSTLbl #_SUTCOffset $_SObserveDST #_SDSTOffset $_SDSTStart $_SDSTend
+      from timezone(#n) arTZ arTZStdLbl arTZDSTLbl arUTCOffset arObserveDST arDSTOffset arDSTStart arDSTend
+    if $_STZ = $SourceTZ
+        move {Yes} to $Found
+        break
+    end-if
+    add 1 to #n
+end-while
+
+
+if $Found = {No}
+    do AddTimeZoneRecord ($SourceTZ,$FoundTZ)
+    if $FoundTZ = {No}
+        if $SetToBase_S = {No}        !FirstTime in Loop
+            Move {Yes} to $SetToBase_S
+            Move $_BSE_TIMEZONE to $SourceTZ
+        else                         !BSE_TimeZone was not Found in Array - Error
+            Move 'ERROR' to $Status
+            Goto TargetTimeZone            !Goto Next Label
+        end-if
+    end-if
+    Goto SourceTimeZone  ! Go back to retrieve values from the Array
+end-if
+
+! Process Target TimeZone
+#ifdef debugx
+    show 'Process Target TimeZone'
+#end-if
+
+TargetTimeZone:
+move {No} to $Found
+move 0 to #n
+while #n < #_TZCurSize
+    get $_TTZ $_TTZStdLbl $_TTZDSTLbl #_TUTCOffset $_TObserveDST #_TDSTOffset $_TDSTStart $_TDSTend
+      from timezone(#n) arTZ arTZStdLbl arTZDSTLbl arUTCOffset arObserveDST arDSTOffset arDSTStart arDSTend
+    if $_TTZ = $TargetTZ
+        move {Yes} to $Found
+        break
+    end-if
+    add 1 to #n
+end-while
+
+if $Found = {No}
+    do AddTimeZoneRecord ($TargetTZ,$FoundTZ)
+    if $FoundTZ = {No}
+        if $SetToBase_T = {No}        !FirstTime in Loop
+            Move {Yes} to $SetToBase_T
+            Move $_BSE_TIMEZONE to $TargetTZ
+        else                         !BSE_TimeZone was not Found in Array - Error
+            Move 'ERROR' to $Status
+            Goto endTimeZone            !Goto Next Label
+        end-if
+    end-if
+    Goto targetTimeZone  ! Go back to retrieve values from the Array
+end-if
+
+endTimeZone:
+
+#ifdef debugx
+    show 'Exiting PTGBLTME.SQC: FormatTimeZoneInfo'
+    #ifdef debugy
+        show ' Output Parameters '
+        show ' $SourceTZ            : ' $SourceTZ
+        show ' $SourceTZ set to Base: ' $SetToBase_S
+        show ' $TargetTZ            : ' $TargetTZ
+        show ' $TargetTZ set to Base: ' $SetToBase_T
+        show ' $Status              : ' $Status
+        #ifdef debugz
+            show '   Source TimeZone Variables'
+            show '   $_STZ        : ' $_STZ
+            show '   $_STZStdlbl  : ' $_STZStdlbl
+            show '   $_STZDSTLbl  : ' $_STZDSTLbl
+            show '   #_SUTCOffset : ' #_SUTCOffset
+            show '   $_SObserveDST: ' $_SObserveDST
+            show '   #_SDSTOffset : ' #_SDSTOffset
+            show '   $_SDSTStart  : ' $_SDSTStart
+            show '   $_SDSTend    : ' $_SDSTend
+            show '   Target TimeZone Variables'
+            show '   $_TTZ        : ' $_TTZ
+            show '   $_TTZStdlbl  : ' $_TTZStdlbl
+            show '   $_TTZDSTLbl  : ' $_TTZDSTLbl
+            show '   #_TUTCOffset : ' #_TUTCOffset
+            show '   $_TObserveDST: ' $_TObserveDST
+            show '   #_TDSTOffset : ' #_TDSTOffset
+            show '   $_TDSTStart  : ' $_TDSTStart
+            show '   $_TDSTend    : ' $_TDSTend
+        #end-if
+    #end-if
+#end-if
+
+end-Procedure
+
+!***********************************************************************
+begin-procedure AddTimeZoneRecord ($GetTimeZone, :$Found)
+!***********************************************************************
+#ifdef debugx
+    show 'Entering PTGBLTME.SQC: AddTimeZoneRecord'
+    #ifdef debugy
+        show ' Input Parameters '
+        show ' $GetTimeZone : ' $GetTimeZone
+    #end-if
+#end-if
+
+let $Found = {No}
+
+begin-select
+TIMEZONE
+TIMEZONESTDLBL
+TIMEZONEDSTLBL
+UTCOFFSET
+OBSERVEDST
+DSTOFFSET
+DSTSTART
+DSTEND
+    let $Found = {Yes}
+    let $TIMEZONE = rtrim(&TIMEZONE, ' ')
+    let $TIMEZONESTDLBL = rtrim(&TIMEZONESTDLBL, ' ')
+    let $TIMEZONEDSTLBL = rtrim(&TIMEZONEDSTLBL, ' ')
+    let $OBSERVEDST = rtrim(&OBSERVEDST, ' ')
+    let $DSTSTART = rtrim(&DSTSTART, ' ')
+    let $DSTend = rtrim(&DSTend, ' ')
+    put $TIMEZONE
+        $TIMEZONESTDLBL
+        $TIMEZONEDSTLBL
+        &UTCOffset
+        $OBSERVEDST
+        &DSTOffset
+        $DSTSTART
+        $DSTend
+    into timezone(#_TZCurSize)
+    let #_TZCurSize = #_TZCurSize + 1
+
+! if Observe Daylight Saving Flag ($OBSERVEDST) = {Yes}, then check DSTTime Array for DSTSTART and DSTend
+    if $OBSERVEDST = {Yes}
+        do AddDSTRecord ($DSTSTART,$FoundDST)
+        do AddDSTRecord ($DSTend,$FoundDST)
+    end-if
+FROM PSTIMEZONEDEFN
+WHERE TIMEZONE = $GetTimeZone ORDER BY DSTSTART
+end-select
+
+#ifdef debugx
+    show 'Exiting PTGBLTME.SQC: AddTimeZoneRecord'
+    #ifdef debugy
+        show ' Output Parameters '
+        show ' $Found       : ' $Found
+    #end-if
+#end-if
+
+end-Procedure
+
+!***********************************************************************
+begin-procedure AddDSTRecord ($GetDST,:$Found)
+! This procedure adds new Daylight Savings Time Records
+!***********************************************************************
+#ifdef debugx
+    show 'Entering PTGBLTME.SQC: AddDSTRecord'
+    #ifdef debugy
+        show ' Input Parameters '
+        show ' $GetDST : ' $GetDST
+    #end-if
+#end-if
+
+! First Check for existance
+move 0 to #n
+move {No} to $Found
+while #n < #_DSTCurSize
+    get $arDSTID from DSTtime(#n) arDSTID
+    if $arDSTID = $GetDST
+        move {Yes} to $Found
+        break
+    end-if
+    add 1 to #n
+end-while
+
+if $Found = {No}
+
+begin-select
+DSTID
+DSTABSOLUTE
+DSTMONTH
+DSTDAY
+DSTDAYOFWEEK
+DSTHOUR
+DSTMINUTE
+    let $Found = {Yes}
+    let $DSTID = rtrim(&DSTID, ' ')
+    let $DSTABSOLUTE = rtrim(&DSTABSOLUTE, ' ')
+    let #DSTMONTH = to_number(rtrim(&DSTMONTH, ' '))
+    let #DSTDOW = to_number(rtrim(&DSTDAYOFWEEK, ' '))
+    put $DSTID
+        $DSTABSOLUTE
+        #DSTMONTH
+        &DSTDAY
+        #DSTDOW
+        &DSTHOUR
+        &DSTMINUTE
+    into DSTtime(#_DSTCurSize)
+    let #_DSTCurSize = #_DSTCurSize + 1
+FROM PSDSTTIME
+WHERE DSTID = $GetDST
+end-select
+
+end-if
+
+#ifdef debugx
+    show 'Exiting PTGBLTME.SQC: AddDSTRecord'
+    #ifdef debugy
+        show ' Output Parameters '
+        show ' $Found       : ' $Found
+    #end-if
+#end-if
+
+end-Procedure
+
+!***********************************************************************
+begin-procedure IsDaylightSavings($DateTime,$DSTStart,$DSTEnd,:$Return)
+!***********************************************************************
+declare-variable
+    date    $DateTime
+    integer #month
+    integer #day
+    integer #hour
+    integer #minute
+    integer #sDSTMonth
+    integer #eDSTMonth
+    integer #sDSTDay
+    integer #eDSTDay
+    integer #sDSTDOW
+    integer #eDSTDOW
+    integer #sDSTHour
+    integer #eDSTHour
+    integer #sDSTMinute
+    integer #eDSTMinute
+end-declare
+
+#ifdef debugx
+    show 'Entering PTGBLTME.SQC: IsDaylightSavings'
+    #ifdef debugy
+        show ' Input Parameters '
+        show ' $DateTime : ' $DateTime edit {Native-DateTimeMask}
+        show ' $DSTStart : ' $DSTStart
+        show ' $DSTEnd   : ' $DSTEnd
+    #end-if
+#end-if
+
+! set flag to determine if the Date passed in is the same day as DST
+let $_DSTSameDay = {No}
+
+! Formate Month/Day/Hour/Minute from $DateTime
+let #month = to_number(edit($DateTime,'MM'))
+let #day = to_number(edit($DateTime,'DD'))
+let #hour = to_number(edit($DateTime,'HH'))
+let #minute = to_number(edit($DateTime,'MI'))
+
+! Retrieve Values for the Start DST Record
+move 0 to #n
+while #n < #_DSTCurSize
+    get $sDSTID $sDSTAbsolute #sDSTMonth #sDSTDay #sDSTDOW #sDSTHour #sDSTMinute
+       from DSTtime(#n) arDSTID arDSTAbsolute arDSTMonth arDSTDay arDSTDOW arDSTHour arDSTMinute
+    if $sDSTID = $DSTStart
+        break
+    end-if
+    add 1 to #n
+end-while
+
+! Retrieve Values for the End DST Record
+move 0 to #n
+while #n < #_DSTCurSize
+    get $eDSTID $eDSTAbsolute #eDSTMonth #eDSTDay #eDSTDOW #eDSTHour #eDSTMinute
+       from DSTtime(#n) arDSTID arDSTAbsolute arDSTMonth arDSTDay arDSTDOW arDSTHour arDSTMinute
+    if $eDSTID = $DSTEnd
+        break
+    end-if
+    add 1 to #n
+end-while
+
+! Deterime if DST or not.  If $Return = {Yes} then DST.
+if #sDSTmonth > #eDSTmonth           ! DST is in the Winter
+
+    if (#month > #sDSTMonth OR #month < #eDSTMonth)
+        move {Yes} to $Return
+            goto EndDST                  ! skip to the end of the procedure
+    else
+        if (#month < #sDSTMonth AND #month > #eDSTMonth)
+            move {No} to $Return
+                goto EndDST              ! skip to the end of the procedure
+        else
+            if (#month = #sDSTMonth)
+                goto EqualStartMonth ! Skip to EqualStartMonth Label
+            else                     ! Must be = to #eDSTMonth
+                goto EqualEndMonth   ! Skip to EqualEndMonth Label
+            end-if
+        end-if
+    end-if
+
+else                                 ! DST is in the Summer
+
+    if (#month > #eDSTMonth OR #month < #sDSTMonth)
+        move {No} to $Return
+            goto EndDST                  ! skip to the end of the procedure
+    else
+        if (#month > #sDSTMonth AND #month < #eDSTMonth)
+            move {Yes} to $Return
+                goto EndDST              ! skip to the end of the procedure
+        else
+            if (#month = #sDSTMonth)
+                goto EqualStartMonth ! Skip to EqualStartMonth Label
+            else                     ! Must be = to #eDSTMonth
+                goto EqualEndMonth   ! Skip to EqualEndMonth Label
+            end-if
+        end-if
+    end-if
+
+end-if
+
+EqualStartMonth:
+If ($sDSTAbsolute = {No})
+! Call GetDSDay procedure.  DS is short for DaylightSavings
+    do GetDSDay($DateTime, #sDSTDOW, #sDSTDay, #sDSTMonth, #DSDay)
+    if #day > #DSDay
+        move {Yes} to $Return
+        goto EndDST              ! skip to the end of the procedure
+    else
+        if #day < #DSDay
+            move {No} to $Return
+            goto EndDST
+        else
+            let $_DSTSameDay = {Yes}
+            if #hour > #sDSTHour
+                move {Yes} to $Return
+                goto EndDST
+            else
+                if #hour < #sDSTHour
+                    move {No} to $Return
+                    goto EndDST
+                else
+                    if #minute >= #DSTMinute
+                        move {Yes} to $Return
+                        goto EndDST
+                    else
+                        move {No} to $Return
+                        goto EndDST
+                    end-if
+                end-if
+            end-if
+        end-if
+    end-if
+else   ! It is an Absolute Day
+    if #day > #sDSTDay
+        move {Yes} to $Return
+        goto EndDST              ! skip to the end of the procedure
+    else
+        if #day < #sDSTDay
+            move {No} to $Return
+            goto EndDST
+        else
+            let $_DSTSameDay = {Yes}
+            if #hour > #sDSTHour
+                move {Yes} to $Return
+                goto EndDST
+            else
+                if #hour < #sDSTHour
+                    move {No} to $Return
+                    goto EndDST
+                else
+                    if #minute >= #DSTMinute
+                        move {Yes} to $Return
+                        goto EndDST
+                    else
+                        move {No} to $Return
+                        goto EndDST
+                    end-if
+                end-if
+            end-if
+        end-if
+    end-if
+end-if
+
+! If equal to DST End Month
+EqualEndMonth:
+If ($eDSTAbsolute = {No})
+! Call GetDSDay procedure.  DS is short for DaylightSavings
+    do GetDSDay($DateTime, #eDSTDOW, #eDSTDay, #eDSTMonth, #DSDay)
+    if #day < #DSDay
+        move {Yes} to $Return
+        goto EndDST              ! skip to the end of the procedure
+    else
+        if #day > #DSDay
+            move {No} to $Return
+            goto EndDST
+        else
+            let $_DSTSameDay = {Yes}
+            if #hour < #sDSTHour
+                move {Yes} to $Return
+                goto EndDST
+            else
+                if #hour > #sDSTHour
+                    move {No} to $Return
+                    goto EndDST
+                else
+                    if #minute <= #DSTMinute
+                        move {Yes} to $Return
+                        goto EndDST
+                    else
+                        move {No} to $Return
+                        goto EndDST
+                    end-if
+                end-if
+            end-if
+        end-if
+    end-if
+else   ! It is an Absolute Day
+    if #day < #sDSTDay
+        move {Yes} to $Return
+        goto EndDST              ! skip to the end of the procedure
+    else
+        if #day > #sDSTDay
+            move {No} to $Return
+            goto EndDST
+        else
+            let $_DSTSameDay = {Yes}
+            if #hour < #sDSTHour
+                move {Yes} to $Return
+                goto EndDST
+            else
+                if #hour > #sDSTHour
+                    move {No} to $Return
+                    goto EndDST
+                else
+                    if #minute <= #DSTMinute
+                        move {Yes} to $Return
+                        goto EndDST
+                    else
+                        move {No} to $Return
+                        goto EndDST
+                    end-if
+                end-if
+            end-if
+        end-if
+    end-if
+end-if
+
+
+EndDST:
+
+#ifdef debugx
+  show 'Exiting PTGBLTME.SQC: IsDaylightSavings'
+  #ifdef debugy
+    show ' Output Parameters '
+        show ' $Return   : ' $Return
+    #ifdef debugz
+         show ' #month     : ' #month
+         show ' #sDSTMonth : ' #sDSTMonth
+         show ' #eDSTMonth : ' #eDSTMonth
+         show ' #DSDay     : ' #DSDay
+         show ' $DSTSameDay: ' $_DSTSameDay
+    #end-if
+  #end-if
+#end-if
+
+end-procedure
+
+!***********************************************************************
+begin-procedure GetDSDay($DateTime,#DSTDOW,#DSTDay,#DSTMonth,:#DSDay)
+!***********************************************************************
+declare-variable
+    date    $DateTime
+    integer #month
+    integer #day
+    integer #year
+    integer #DSTMonth
+    integer #DSTDay
+    integer #DSTDOW
+    integer #DSDay
+    integer #DOW
+    integer #1stDay
+    integer #1stDOM
+    integer #1stDXIM
+    integer #NODIM
+    integer #LeapYear
+end-declare
+
+
+#ifdef debugx
+    show 'Entering PTGBLTME.SQC: GetDaylightSavingsDay'
+    #ifdef debugy
+        show ' Input Parameters '
+            show ' $DateTime : ' $Datetime
+        show ' #DSTDOW   : ' #DSTDOW
+        show ' #DSTDay   : ' #DSTDay
+        show ' #DSTMonth : ' #DSTMonth
+    #end-if
+#end-if
+
+! Formate Month/Day/Year/ from $DateTime
+let #month = to_number(edit($DateTime,'MM'))
+let #day = to_number(edit($DateTime,'DD'))
+let #year = to_number(edit($DateTime,'YYYY'))
+
+! Determine if it is a leap year.  1 = LeapYear
+if ((#Year % 4 = 0) AND (#Year % 100 != 0 OR #Year % 400 = 0))
+    move 1 to #LeapYear
+else
+    move 0 to #LeapYear
+end-if
+
+! Calculate Day of Week
+let #DOW = to_number(edit($DateTime,'D')) - 1  ! DOW assumes Sunday = 0, SQR returns 1 for Monday
+
+let #1stDay = #day % 7
+if #1stDay = 0
+    let #1stDay = #1stDay + 7
+end-if
+
+let #1stDOM = #DOW + 1 - #1stDay           ! Format First Day of Month
+if #1stDOM < 0
+    let #1stDOM = #1stDOM + 7
+end-if
+
+let #1stDXIM = #DSTDOW - #1stDOM + 1         ! Format First Day X in Month
+if #1stDXIM < 1
+    let #1stDXIM = #1stDXIM + 7
+end-if
+
+let #DSDay = #1stDXIM + ((#DSTDay - 1) * 7)
+
+get #NODIM from DaysInMonth(#DSTMonth) dim(#LeapYear) ! Format # of Day in Month
+
+if #DSDay > #NODIM
+    let #DSDay = #DSDay - 7
+end-if
+
+#ifdef debugx
+    show 'Exiting PTGBLTME.SQC: GetDaylightSavingsDay'
+    #ifdef debugy
+        show ' Output Parameters '
+        show ' #DSDay       : ' #DSDay
+        #ifdef debugz
+            show ' #DOW         : ' #DOW
+            show ' #1stDay      : ' #1stDay
+            show ' #1stDOM      : ' #1stDOM
+            show ' #1stDXIM     : ' #1stDXIM
+            show ' #NODIM       : ' #NODIM
+            show ' #LeapYear 1=Y: ' #LeapYear
+        #end-if
+    #end-if
+#end-if
+
+end-procedure
+
+#end-if         !if PTGBLTME-Included

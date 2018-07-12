@@ -1,0 +1,483 @@
+!***********************************************************************
+!  TAX810NH:  Qtrly Wage List - Tape - NEW HAMPSHIRE                   *
+!                                                                      *
+!             NOTE: "#IFDEF TAXTEST" in main SELECT is used for        *
+!                   testing this report against DEMO database          *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module contains confidential and proprietary information        *
+! of Oracle; it is not to be copied, reproduced, or transmitted        *
+! in any form, by any means, in whole or in part, nor is it to         *
+! be used for any purpose other than that for which it is              *
+! expressly provided under the applicable license agreement.           *
+!                                                                      *
+! Copyright (C) 2006 Oracle. All Rights Reserved.                      *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+!          $Date:  2006/07/20:06:45:51                                 !
+!       $Release:  HR9                                                 !
+!      $Revision:  101                                                 !
+!                                                                      *
+!***********************************************************************
+
+#include 'setenv.sqc' !Set environment
+#include 'setup31.sqc' !Printer and page-size initialization
+#include 'usarpt.sqc'  ! NID_COUNTRY defined
+
+begin-report
+  do Init-Report
+
+! These variables are used by rptsmmry.sqc
+  Let $Prnt_CoTxGrs = 'N'
+  Let $Prnt_CoExGrs = 'N'
+
+  do Process-Main
+
+  close 10
+  if $RecordWritten = 'Y'
+    display ''
+    display 'Upon successful conclusion of this program, one or more'
+    display 'files will have been created, as follows:'
+    display ''
+    display '  TAX810NH '
+    display '               The file contains 47-char records in the format'
+    display '               required for magnetic tape reporting of quarterly'
+    display '               wages to the New Hampshire Employment Security'
+    display '               Department.'
+    display ''
+    display '     or '
+    display ''
+    display '  TAX810NH.nnn  where "nnn" represents a volume number '
+    display '               The file contains 47-char records in the format'
+    display '               required for diskette reporting of quarterly'
+    display '               wages to the New Hampshire Employment Security'
+    display '               Department.'
+    display ''
+    display 'Follow directions provided by the department for labeling and'
+    display 'submission of tapes or diskettes.'
+    display ''
+  else
+    do Print-Summary-Data('NoData')
+  end-if
+
+  do Stdapi-Term
+
+end-report
+
+begin-procedure Init-Report
+
+  do Init-DateTime
+  do Init-Number
+
+  do Get-Current-DateTime
+
+  do Get-Calendar-Year-Id
+  do Stdapi-Init
+
+  do Initialization
+  move 'TAX810NH' to $ReportID
+
+ if $FileType = 'D'
+  move 'New Hampshire Quarterly UI Wage Report - Diskette' to $ReportTitle
+  display ''
+  display 'Creating Diskette File for New Hampshire UI Wage Reporting'
+ else
+  move 'New Hampshire Quarterly UI Wage Report - Tape' to $ReportTitle
+  display ''
+  display 'Creating Tape File for New Hampshire UI Wage Reporting'
+ end-if
+
+end-procedure
+
+begin-procedure Initialization
+#ifdef TAXTEST
+  move 'CA'              to $State
+#else
+  move 'NH'              to $State
+#endif
+
+  do Get-Tax-Reporting-Run-Controls
+  move &TX.Balance_Year to $RptYear 9999
+  move $RptYear          to $ReportYear
+  move $RptYear          to $RptYear ~~xx
+  move $PeriodEndDate    to $AsOfDate
+
+  move &TX.Blocking_Factor to $BlockingFactor 09
+
+  display ' '
+  display 'Processing balances for '   noline
+  display $RptQtrYr
+
+  move 47 to #RecordLength
+  add 2 to #RecordLength
+
+  if $PRCS_Process_Instance = ''
+     do Prompts
+     do Get-Signature
+  else
+     do Select-Parameters
+     do Convert-Parameters
+  end-if
+  do Evaluate-File-Type
+  do Calculate-Diskette-Capacity
+  do Open-File
+end-procedure
+
+begin-procedure Open-File
+
+if $FileType = 'D'
+   move 0 to #RecordCount
+   if #FileExtension <> 0
+      close 10
+   end-if
+   add 1 to #FileExtension
+   move #FileExtension to $FileExtension 099
+#ifdef OS400
+   let $FileExtension = '(D' || $FileExtension || ')'
+   let $FileID = '{IMPORTPREFIX}' || 'TAX810NH' || $FileExtension
+#else
+   let $FileID = '{IMPORTPREFIX}' || 'TAX810NH.' || $FileExtension
+#endif
+
+
+   open $FileID as 10 for-writing record=47:fixed
+ else
+   open '{IMPORTPREFIX}TAX810NH{IMPORTSUFFIX}' as 10 for-writing record=47:fixed
+end-if
+end-procedure
+
+begin-procedure Process-Main
+begin-SELECT
+TEMP_SSN_MASK
+FROM PS_INSTALLATION
+end-SELECT
+
+begin-SELECT
+A.COMPANY
+A.DESCR
+A.FEDERAL_EIN
+A.ADDRESS1
+A.CITY
+A.STATE
+A.POSTAL
+A.COUNTRY
+
+  move &A.Company to $Company
+
+  move '' to $priorEmplID
+  do Read-Employee-Data
+
+FROM  PS_COMPANY_TBL A
+WHERE A.EFF_STATUS = 'A'
+  AND A.TAX_REPORT_TYPE = '2'
+  AND A.EFFDT =
+  (SELECT MAX(EFFDT)
+     FROM PS_COMPANY_TBL
+     WHERE  COMPANY = A.COMPANY
+       AND  EFFDT  <= $AsOfDate)
+ORDER BY COMPANY
+end-SELECT
+  if #Count_F > 0
+   do Print-Summary-Data('FileTotal')
+  end-if
+end-procedure
+
+begin-procedure Read-Employee-Data
+begin-SELECT
+C.COMPANY    () on-break print=never before=Before-Company
+                                     AFTER=AFTER-COMPANY
+C.EMPLID
+C.STATE
+C.TXGRS_QTD
+C.NLGRS_QTD
+D1.NATIONAL_ID
+D.FIRST_NAME
+D.LAST_NAME
+D.MIDDLE_NAME
+D.NAME_SUFFIX
+
+  if &C.NlGrs_QTD > 0
+    do Process-Employee
+  else
+    do Print-Summary-Data('NegWage')
+  end-if
+
+FROM  PS_TAX_BALANCE C, PS_PERSON_NAME D, PS_PERS_NID D1
+WHERE C.COMPANY       = $Company
+  AND D.EMPLID        = C.EMPLID
+  AND C.TAX_CLASS     = 'U'
+  AND C.BALANCE_ID    = $Calendar_Year_Id
+  AND C.BALANCE_YEAR  = &TX.Balance_Year
+  AND C.BALANCE_QTR   = &TX.Balance_Qtr
+#ifdef TAXTEST
+  AND C.STATE         = 'CA'
+#else
+  AND C.STATE         = 'NH'
+#endif
+  AND C.LOCALITY      = ' '
+  AND C.BALANCE_PERIOD  =
+      (SELECT MAX(BALANCE_PERIOD)
+       FROM   PS_TAX_BALANCE
+       WHERE  EMPLID        = C.EMPLID
+         AND  COMPANY       = C.COMPANY
+         AND  BALANCE_ID    = C.BALANCE_ID
+         AND  BALANCE_YEAR  = C.BALANCE_YEAR
+         AND  BALANCE_QTR   = C.BALANCE_QTR
+         AND  STATE         = C.STATE
+         AND  LOCALITY      = C.LOCALITY
+         AND  TAX_CLASS     = C.TAX_CLASS)
+  AND D.EMPLID            = D1.EMPLID
+  AND D1.COUNTRY          = {NID_Country}
+  AND D1.NATIONAL_ID_TYPE = $Payroll_NID_Type
+ORDER BY D1.NATIONAL_ID
+end-SELECT
+end-procedure
+
+begin-procedure Process-Employee
+  move &D1.NATIONAL_ID to $S123 xxx       !isolate first 3 digits
+  if $S123 = &Temp_SSN_Mask or RTRIM(&D1.NATIONAL_ID, ' ') = ''
+    move '000000000'   to $NATIONAL_ID
+  else
+    move &D1.NATIONAL_ID        to $NATIONAL_ID
+  end-if
+
+  move &D.FIRST_NAME         to $First_Name
+  uppercase $First_Name
+  let $First_Name   = rtrim(ltrim($First_Name,' '),' ')
+  let $First_Name_h = TRANSLATE($First_Name,'-','')
+  move $First_Name_h to  $First_Name
+
+  move &D.LAST_NAME         to $Last_Name
+  uppercase $Last_Name
+  let  $Last_Name   = rtrim(ltrim($Last_Name,' '),' ')
+  let  $Last_Name_h = TRANSLATE($Last_Name,'-','')
+  move $Last_Name_h to  $Last_Name
+
+  move &D.MIDDLE_NAME         to $Middle_Name
+  uppercase $Middle_Name
+  let $Middle_Name = rtrim(ltrim($Middle_Name,' '),' ')
+
+  move &D.NAME_SUFFIX         to $Name_Suffix_p
+  let $Name_Suffix  = TRANSLATE($Name_Suffix_p,'.','')
+  uppercase $Name_Suffix
+
+  if $Middle_Name = ' ' or $Middle_Name = ''
+      let $Name =   $Last_Name||' '||$First_Name||' '||$Name_Suffix
+  else
+      let $Name =   $Last_Name||' '||$First_Name||' '||$Middle_Name||' '||$Name_Suffix
+  end-if
+
+
+  move &C.NlGrs_QTD to #NlGrs_QTD
+  add #NlGrs_QTD to #Co_NlGrs_QTD
+  multiply 100 times #NlGrs_QTD
+  let #max_amt_NLG = 999999999
+  let #NlGrs_orig = #NlGrs_QTD
+  add 1 to #Count_S
+  let $done1 = 'N'
+  while $done1 <> 'Y'
+    do split-s-record (#NlGrs_orig,#NlGrs_QTD,#max_amt_NLG,$done1)
+    do Format-Number(#NlGrs_QTD,  $NlGrs_QTD,  '099999999')
+    do write-s-record
+    add 1 to #Count_R
+  end-while
+end-procedure
+
+
+begin-procedure Before-Company
+  do Get-Company-Data
+#ifdef TAXTEST
+  move 'CA' to $State
+#else
+  move 'NH' to $State
+#endif
+  do Get-State-Tax-Data             !Employer ID
+  if RTRIM(&Employer_ID_SUT,' ') = ''
+    display '*** State Unemployment ID missing in Company State Tax Table ***'
+    display '*********************** Processing stopped *********************'
+    display 'Company ' noline
+    display $Company
+    stop
+  end-if
+
+
+  let $StateEIN = EDIT(RTRIM(&Employer_ID_SUT,' '),'099999999')
+
+  do  Is-String-Numeric ($StateEIN, #Return_Value)
+  if #Return_Value = 0
+    do Invalid-SUT-ID
+  end-if
+
+
+end-procedure
+
+begin-procedure After-Company
+  if #Count_S > 0
+    do Print-Summary-Data('CoTotal')
+
+    add #Co_NlGrs_QTD to #Tot_NlGrs_QTD
+    add #Count_S to #Count_F
+    add #Count_R to #Count_R_Total
+
+    move 0 to #Co_NlGrs_QTD
+    move 0 to #Count_S
+    move 0 to #Count_R
+    new-page
+  end-if
+end-procedure
+
+begin-procedure Write-S-Record
+
+  if $FileType = 'D'
+    do Write-Disk-1W
+
+    if #RecordCount >= #MaxRecordsPerDiskette
+      do Open-File
+    end-if
+  else
+    do Write-Tape-S
+  end-if
+  add 1 to #Count_T
+  move 'Y' to $RecordWritten
+
+  move '' to $NlGrs_QTD
+  move 0  to #NlGrs_QTD
+end-procedure
+
+begin-procedure Write-Tape-S
+
+
+  write 10 from $NATIONAL_ID:9
+                       $Name:20
+                  $NlGrs_QTD:9
+                   $StateEIN:9
+end-procedure
+
+begin-procedure Write-Disk-1W
+
+  write 10 from $NATIONAL_ID:9
+                       $Name:20
+                  $NlGrs_QTD:9
+                   $StateEIN:9
+
+   add 1 to #RecordCount
+end-procedure
+
+
+begin-procedure Prompts
+
+  while $FileType = ''
+    input $FileType 'Tape, cartridge or diskette file? (T, C, D or Q to quit)'
+    uppercase $FileType
+    if INSTR('TDCQ',$FileType,1) = 0
+      display ' '
+      display '***** Enter T, D, C or Q *****'
+      display ' '
+      move '' to $FileType
+    end-if
+  end-while
+end-procedure
+
+begin-procedure Get-Signature
+
+  display '  '
+ while $SignatureName = ''
+  display 'Enter the name of the person who has signature responsibility'
+  display 'for the accuracy of the data submitted.'
+  input $SignatureName 'Enter first name mi last name '
+  uppercase $SignatureName
+ end-while
+
+  display '  '
+  display 'Enter this person''s title, if available.  (Spaces are acceptable)'
+  input $SignatureTitle 'Enter title up to 40 characters '
+  uppercase $SignatureTitle
+
+end-procedure
+
+begin-procedure Convert-Parameters
+
+  move $RC_QTR_UI.Reporting_Medium to $FileType
+  move $RC_QTR_UI.Diskette_Type to $DisketteType
+  move $RC_QTR_UI.Contact_Person to $SignatureName
+  move $RC_QTR_UI.Contact_Sig_Title to $SignatureTitle
+  uppercase $SignatureName
+end-procedure
+
+begin-procedure Evaluate-File-Type
+
+  evaluate $FileType
+    when = 'Q'
+      stop
+
+    when = 'D'
+      if $Prcs_Process_Instance = ''
+         do Get-Diskette-Format
+      end-if
+      move &TX.Recording_Cd to $Recording_Cd
+      break
+
+    when = 'T'
+      move &TX.Tape_Density      to $Density
+      move &TX.Recording_Cd      to $Recording_Cd
+      move 'SL'                  to $Tape_Label
+      move &TX.Computer_Mfr      to $Computer_Mfr
+      move 'MT'                  to $FilingType
+      move '09'                  to $Tracks
+      break
+
+    when = 'C'
+      move &TX.Recording_Cd      to $Recording_Cd
+      move 'SL'                  to $Tape_Label
+      move &TX.Computer_Mfr      to $Computer_Mfr
+      move 'MC'                  to $FilingType
+
+  end-evaluate
+end-procedure
+
+begin-procedure Invalid-SUT-ID
+  display ''
+  display 'Invalid SUT ID number -- process terminating'
+  display 'For Company: ' noline
+  display  $Company
+  display 'State ID number is: ' noline
+  display  &Employer_ID_SUT noline
+  display ''
+  display 'NEW HAMPSHIRE ID should be entered as: 999999999'
+  display ''
+  stop
+end-procedure
+
+begin-procedure Is-String-Numeric ($Test_String, :#Return_Value)
+  let #Max_Lngth = length ($Test_String)
+  let #Return_Value  =  1
+  let #Char_Pos  =  1
+
+  while #Char_Pos <= #Max_Lngth
+    let $Test_Char = substr ($Test_String, #Char_Pos, 1)
+    let #Which_Digit = instr ('0123456789', $Test_Char, 1)
+    if  #Which_Digit = 0
+      let #Return_Value  =  0
+      break
+    end-if
+    add 1 to #Char_Pos
+  end-while
+end-procedure
+
+#Include 'taxrnctl.sqc'  !Get-Tax-Reporting-Run-Controls procedure
+#Include 'getcodta.sqc'  !Get-Company-Data procedure
+#Include 'getstdta.sqc'  !Get-State-Tax-Data procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'getfrmat.sqc'  !Get-Diskette-Format procedure
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'rptsmmry.sqc'  !Print-Summary-Data procedure
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'getbalid.sqc'  !Get-Calendar-Year-Id
+#Include 'stdapi.sqc'    !Update Process API
+#Include 'txrnctl1.sqc'  !Process Scheduler Run Controls
+#Include 'txovrflw.sqc'  !Split-S-Record Procedure
+

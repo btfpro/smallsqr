@@ -1,0 +1,1313 @@
+!***********************************************************************
+!  FSA003CN:  Flexible Spending Account Check Print Module             *
+!             for Canadian Customers                                   *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+!                                                                      *
+! This module contains confidential and proprietary information        *
+! of Oracle; it is not to be copied, reproduced, or transmitted        *
+! in any form, by any means, in whole or in part, nor is it to         *
+! be used for any purpose other than that for which it is              *
+! expressly provided under the applicable license agreement.           *
+!                                                                      *
+! Copyright (C) 2006 Oracle. All Rights Reserved.                      *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+!                $Date:  2006/04/11:17:59:39                           !
+!             $Release:  HR9                                           !
+!            $Revision:  101                                           !
+!                                                                      *
+!***********************************************************************
+!
+!***********************************************************************
+! Modified for Education & Government                                  *
+! HP99999       Release 8 Technical Merge                              *
+!***********************************************************************
+!This program accomplishes the following:
+!  1.  Accesses PS_Pay_Form_Tbl to retrieve Form_ID
+!      Note:  During FSA Check Preparation (program FSA003CN),
+!      the operator will be prompted
+!      for a Form_ID to be used for the check stock.  Each check stock
+!      to be used currently requires a separate execution of FSA003CN (the
+!      check preparation program), although two calendar years and multiple
+!      Benefit Programs can be processed with one execution of FSA003CN on
+!      a single check stock.
+!  2.  The program then selects all PS_FSA_RunCtl records which use the
+!      Form_ID above and which have their FSA_Run_Status
+!      indicators set to "C" (for "Calculated").  The program will use the
+!      FSA_Run_ID in each of these run control records to locate matching
+!      values in one or more PS_Ben_Defn_Pgm records, and process the
+!      resulting Benefit_Program(s) as a group.  The processing programs
+!      will also use Calendar_Year in the retrieved PS_FSA_RunCtl record(s)
+!      to select only those claims for that particular Calendar_Year.
+!  3.  Retrieves all recently updated-for-payment FSA Claims for the
+!      control elements above.
+!  4.  PS_FSA_RunCtl is updated to signify the run has finished.
+!
+!This program acts on all claims with FSA_PayMt_Status of "R" (Pay This Run).
+!At the conclusion of the program, FSA_PayMt_Status is set to "F" (for
+!"Fully Paid") or "P" (for "Pended") based on whether or not the claim
+!has been paid in full or not.  All "Pended" claims are available for
+!payment during subsequent runs if sufficient balance and minimum-check
+!conditions are met.
+!
+!Check Numbers are assigned in program FSA002CN to result in the following
+!order for printing:
+!
+!  Form ID
+!    Calendar Year
+!      Run ID
+!        Benefit Program
+!          Plan Type (Health Care, Dependent Day Care)
+!            Benefit Plan
+!              Employee ID
+!
+!Within a particular check, the line items are ordered by Claim ID.
+!
+!Consequently, the following results:
+!
+! All checks for a particular calendar year are grouped together.
+! All Benefit Programs with the same Run_ID are grouped together, but
+!   separately within the Run_ID.
+! All checks for a particular Plan_Type (e.g., Health Care) are grouped
+!   together within the "parent" Benefit_Program.
+! All checks for a particular Benefit_Plan are grouped within the Plan_Type;
+!   however, there will typically be just a single Benefit_Plan for a
+!   customer installation.
+! Lastly, all checks for one participant will be grouped together within
+!   tha Plan_Type/Benefit_Plan.
+!***********************************************************************
+
+#Include 'setenv.sqc'  !Set Database Environment
+#include 'canrpt.sqc'  !Get Canadian-specific variables
+
+Begin-Setup
+  #Include 'ptpsp125.sqc'
+End-Setup
+
+!#Define  PROCESS-PAYROLL  'YES'
+
+!***************************************************************************
+begin-program
+!***************************************************************************
+
+  do Init-Report
+
+  if $FormID <> ''
+    do Process-Main
+  end-if
+
+  do StdAPI-Term
+
+end-program
+
+
+!***************************************************************************
+begin-procedure Init-Report
+!***************************************************************************
+
+  do Init-DateTime
+  do Init-Number
+!  do Load-NumberLits-Array  !load literals for converting Net Pay to words
+!  do Load-FraNumLits-Array  !load French-equivalent literals
+
+  move 'FSA003CN' to $ReportID
+
+  do StdAPI-Init
+
+  do Get-Report-Language   ! Procedure that decides the report language
+                           ! and then calls 'Report-Translation' procedure
+                           ! that reads the language dep. text.
+  move $Fsa003cn_ReportTitle to $ReportTitle
+  display $ReportTitle
+
+  if $prcs_process_instance = ''
+    do Ask-Values
+  else
+    do Get-Values
+  end-if
+
+end-procedure
+
+!***************************************************************************
+begin-procedure Ask-Values
+!***************************************************************************
+  do Ask-FormID
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Ask-FormID
+!***************************************************************************
+
+  display ''
+  display 'Please enter the Form Identifier for the FSA check stock'
+  display 'you are using for this run.'
+  display ''
+
+  while 1 = 1
+    input $FormID maxlen=6 'Enter Form Identifier'
+    display ''
+
+    if $FormID = ''
+      break
+    end-if
+
+    uppercase $FormID
+    do Edit-FormID
+
+    if Rtrim(&Z.Form_ID, ' ') = $FormID
+      break
+    else
+      display 'Invalid Form Identifier.'
+      display 'Enter a valid identifier or leave blank to terminate'
+      display 'this program.'
+      display ''
+    end-if
+
+  end-while
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Edit-FormID
+!***************************************************************************
+
+begin-SELECT
+Z.FORM_ID
+FROM  PS_PAY_FORM_TBL Z
+WHERE FORM_ID = $FormID
+end-SELECT
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Get-Values
+!***************************************************************************
+  do Select-Parameters
+  do Get-FormID
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Process-Main
+!***************************************************************************
+
+  let $Checks_Were_Printed = 'N'
+
+begin-SELECT
+A.FORM_ID,
+A.LAST_FORM_USED,
+B.CALENDAR_YEAR,
+B.FSA_RUN_ID,
+B.CHECK_DT
+
+  let $Checks_Were_Printed = 'F'
+
+  move  &B.Calendar_Year to $tmp
+  let $in = $tmp ||'0101'
+  do Format-DateTime($in, $YearBegin, {DEFCMP},'','native')
+  let $in = $tmp ||'1231'
+  do Format-DateTime($in, $YearEnd, {DEFCMP},'','native')
+
+  do Retrieve-Benefit-Table-Records
+
+FROM  PS_PAY_FORM_TBL A,
+      PS_FSA_RUNCTL   B
+WHERE A.FORM_ID        = $FormID
+  AND B.FORM_ID        = A.FORM_ID
+  AND B.FSA_RUN_STATUS = 'C'  !Calculated
+ORDER BY A.FORM_ID,
+         B.CALENDAR_YEAR,
+         B.FSA_RUN_ID
+end-SELECT
+
+  if $Checks_Were_Printed = 'Y'           !At least one check printed
+     do Update-FSA_RunCtl
+  end-if
+  if $Checks_Were_Printed = 'N'           !Form ID invalid
+     Display 'Form ID ('  noline
+     Display $FormID     noline
+     Display ') not Found in either FSA_RunCtl or Pay_Form_Tbl.'
+     Display '>>> Correct and Retry'
+  end-if
+  if $Checks_Were_Printed = 'F'           !Form found but no checks
+     Display 'No checks found for the Form ID ('   noline
+     Display $FormID                               noline
+     Display ') entered.'
+     Display '>>> Correct and Retry'
+  end-if
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Retrieve-Benefit-Table-Records
+!***************************************************************************
+begin-SELECT
+C.BENEFIT_PROGRAM,
+C.DESCR,
+C.DESCRSHORT,
+D.PLAN_TYPE,
+D.BENEFIT_PLAN,
+O.SETID,
+O.BALANCE_ID
+
+  do Get-BalanceID-Date-Range
+  if &D.Plan_Type = '65'
+    do Print-Checks-65
+  else
+    if &D.Plan_Type = '66'
+      do Print-Checks-66
+    end-if
+  end-if
+
+FROM  PS_BEN_DEFN_PGM    C,
+      PS_BEN_DEFN_OPTN   D,
+      PS_FSA_BENEF_TBL   O
+WHERE C.EFFDT =
+      (SELECT MAX(EFFDT)
+       FROM   PS_BEN_DEFN_PGM
+       WHERE  BENEFIT_PROGRAM = C.BENEFIT_PROGRAM
+         AND  EFFDT          <= $YearEnd)
+  AND C.EFF_STATUS      = 'A'
+  AND C.FSA_RUN_ID      = &B.FSA_Run_ID
+  AND D.BENEFIT_PROGRAM = C.BENEFIT_PROGRAM
+  AND D.EFFDT           = C.EFFDT
+  AND D.PLAN_TYPE    LIKE '6%'
+  AND D.OPTION_TYPE     = 'O'
+  AND O.PLAN_TYPE = D.PLAN_TYPE
+  AND O.BENEFIT_PLAN = D.BENEFIT_PLAN
+  AND O.EFFDT <= (SELECT MAX(O1.EFFDT)
+                     FROM PS_FSA_BENEF_TBL O1
+                     WHERE O1.PLAN_TYPE = O.PLAN_TYPE
+                       AND O1.BENEFIT_PLAN = O.BENEFIT_PLAN
+                       AND O1.EFFDT <= C.EFFDT)
+ORDER BY C.BENEFIT_PROGRAM,
+         D.PLAN_TYPE,
+         D.BENEFIT_PLAN
+end-SELECT
+end-procedure
+
+
+!****************************************
+begin-procedure Get-BalanceID-Date-Range
+!****************************************
+
+begin-SELECT
+MIN(P.BEGIN_DT)      &BeginDt,
+MAX(P.END_DT)        &EndDt,
+
+   let $YearBegin = &BeginDt
+   let $YearEnd = &EndDt
+
+FROM  PS_BALANCE_ID_DEF P
+WHERE P.SETID = &O.Setid
+  AND P.BALANCE_ID = &O.Balance_ID
+  AND P.BALANCE_YEAR = &B.Calendar_Year
+end-SELECT
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Print-Checks-65
+!***************************************************************************
+#ifdef DebugF
+  display 'FLOW : Print-Checks'
+  display '       =============================================='
+#end-if
+
+begin-SELECT  distinct
+G.PAYCHECK_NBR,
+G.CHECK_DT,
+G.FSA_CHECK_AMT,
+G.EMPLID,
+G.EMPL_RCD,
+G.PLAN_TYPE,
+G.BENEFIT_PLAN,
+G.FORM_ID,
+G.FSA_PAYMENT_STATUS,
+L.NAME,
+L.LANG_CD,
+JOB.COMPANY,
+JOB.EMPLID,
+JOB.PAYGROUP,
+JOB.EFFDT,
+JOB.EMPL_STATUS
+
+#ifdef DebugD
+  display 'DATA : CHECK: '     noline
+  display &b.calendar_year     noline
+  display '  '                 noline
+  display &c.benefit_program   noline
+  display '  '                 noline
+  display &d.plan_type         noline
+  display '  '                 noline
+  display &d.benefit_plan      noline
+  display '  '                 noline
+  display &g.emplid            noline
+  display '  '                 noline
+  display &g.PAYCHECK_NBR
+#end-if
+
+  move &G.PAYCHECK_NBR         to #GPAYCHECK_NBR
+  move &G.Check_Dt       to $GCheck_Dt
+  move &G.FSA_Check_Amt  to #GFSA_Check_Amt
+  move &G.EmplID         to $GEmplID
+  move &G.EMPL_RCD       to #GEMPL_RCD
+  move &G.Plan_Type      to $GPlan_Type
+  move &G.Benefit_Plan   to $GBenefit_Plan
+  move &G.Form_ID        to $GForm_ID
+  move &L.Name           to $LName
+
+  do Get-Empl-Address (&G.EMPLID,$AddrType, $AddressFound)
+
+  move $GETADDR_Address1       to $LAddress1
+  move $GETADDR_Address2       to $LAddress2
+  move $GETADDR_City           to $LCity
+  move $GETADDR_State          to $LState
+  move $GETADDR_Postal         to $LZip
+
+  move &JOB.PAYGROUP     to $PAYGROUP
+  do Get-Employee-NID
+
+  let $Emp_Preferred_Lang = rpad(&L.LANG_CD, 3, ' ')
+
+  if $prcs_language_option = 'R'                           ! check for recipient level
+
+     if $Emp_Preferred_Lang <> ''
+        if $Emp_Preferred_Lang <> $SQR_Report_Language
+           let $StringFound = 'N'
+           do Check-Lang-Strings                           ! check if using multiple languages
+           if $StringFound = 'Y'
+              move $Emp_Preferred_Lang to $SQR_Report_Language
+              do Repopulate-Array
+           else
+              if $SQR_Report_Language <> $Language_Cd      ! reload if most recent language
+                 move $Language_Cd to $SQR_Report_Language ! is not base language.
+                 do Repopulate-Array
+              end-if
+           end-if
+        end-if
+     else
+        ! if language code is not defined for the recipient level, then use the system
+        ! default - installation language LANGUAGE_CD from PSOPTIONS
+        move $language_cd to $SQR_Report_Language
+        do Repopulate-Array
+     end-if
+
+  end-if
+
+
+#IFDEF PROCESS-PAYROLL
+!debug
+  display 'PROCESS-PAYROLL'
+!debug
+  do Check-Pay-Period
+
+  if (((&JOB.EMPL_STATUS ='') or
+      (&JOB.EMPL_STATUS ='') or
+      (&JOB.EMPL_STATUS ='')) and
+     ($Paysheets_Ready = 'Y'))
+
+    do Process-For-Payroll
+
+  else
+#END-IF  !--------------- Process Payroll Code ---------------
+
+    do Print-Claim-Payment
+    do Get-Claim-Detail
+
+    if $AmtPended = 'Y'
+       print $Fsa003cn_Pended_Txt                                      (+1,1)
+      move '' to $AmtPended
+    end-if
+
+    NEW-PAGE
+
+#IFDEF PROCESS-PAYROLL
+  end-if
+#END-IF  !--------------- Process Payroll Code ---------------
+
+  do Update-Claim-Status-Flags
+
+  let $Checks_Were_Printed = 'Y'
+
+FROM  PS_FSA_PAYMENT     G,
+      PS_PERSONAL_DT_FST L,
+      PS_PRIMARY_JOBS    PJ,
+      PS_PER_ORG_ASGN    EM,
+      PS_JOB             JOB
+WHERE G.FORM_ID            = $FormID
+  AND G.FSA_PAYMENT_STATUS = 'R'  !Pay This Run
+  AND G.CALENDAR_YEAR      = &B.Calendar_Year
+  AND G.PLAN_TYPE          = &D.Plan_Type
+  AND G.BENEFIT_PLAN       = &D.Benefit_Plan
+  AND G.BENEFIT_PROGRAM    = &C.Benefit_Program
+  AND L.EMPLID             = G.EMPLID
+  AND EM.EMPLID            = G.EMPLID
+  AND EM.BENEFIT_RCD_NBR   = G.EMPL_RCD          !Yes - this is correct.
+  AND PJ.EMPLID            = EM.EMPLID           !Determine "Primary" job within
+  AND PJ.EMPL_RCD          = EM.EMPL_RCD         !This Benefit Record group
+  AND PJ.PRIMARY_JOB_APP   = 'BN'
+  AND PJ.PRIMARY_JOB_IND   = 'Y'
+  AND PJ.EFFDT = (SELECT MAX(PJ1.EFFDT)
+                    FROM PS_PRIMARY_JOBS PJ1
+                   WHERE PJ1.EMPLID          = PJ.EMPLID
+                     AND PJ1.EMPL_RCD        = PJ.EMPL_RCD
+                     AND PJ1.PRIMARY_JOB_APP = 'BN'
+                     AND PJ1.EFFDT          <= $AsOfToday)
+  AND JOB.EMPLID     = EM.EMPLID
+  AND JOB.EMPL_RCD   = PJ.EMPL_RCD
+  AND JOB.EFFDT = (SELECT MAX(JOB1.EFFDT)
+                 FROM PS_JOB JOB1
+                 WHERE JOB1.EMPLID   = JOB.EMPLID
+                   AND JOB1.EMPL_RCD = JOB.EMPL_RCD
+                   AND JOB1.EFFDT   <= $AsOfToday)
+  AND JOB.EFFSEQ = (SELECT MAX(JOB2.EFFSEQ)
+                  FROM PS_JOB JOB2
+                  WHERE JOB2.EMPLID    = JOB.EMPLID
+                    AND JOB2.EMPL_RCD  = JOB.EMPL_RCD
+                    AND JOB2.EFFDT     = JOB.EFFDT)
+ORDER BY G.PAYCHECK_NBR
+end-SELECT
+
+end-procedure
+
+
+!**********************************
+begin-procedure Get-Employee-NID
+!**********************************
+
+Begin-SELECT
+L1.NATIONAL_ID
+
+FROM PS_PERS_NID L1
+WHERE L1.EMPLID      = $GEmplID
+  AND L1.COUNTRY     = {NID_COUNTRY}
+  AND L1.NATIONAL_ID_TYPE  = $PAYROLL_NID_TYPE
+End-SELECT
+
+  move &L1.NATIONAL_ID   to $SIN
+
+end-procedure
+
+!***************************************************************************
+begin-procedure Print-Checks-66
+!***************************************************************************
+
+  if $Language_Cd <> $SQR_Report_Language
+     move $Language_Cd to $SQR_Report_Language            !always use base language
+     do Repopulate-Array
+  end-if
+
+begin-SELECT
+G6.PAYCHECK_NBR,
+G6.CHECK_DT,
+G6.FSA_CHECK_AMT,
+G6.EMPLID,
+G6.EMPL_RCD,
+G6.PLAN_TYPE,
+G6.BENEFIT_PLAN,
+G6.FORM_ID,
+L6.NAME1,
+A6.ADDRESS1,
+A6.ADDRESS2,
+A6.CITY,
+A6.STATE,
+A6.POSTAL
+
+#ifdef DebugD
+  display 'DATA : CHECK: '     noline
+  display &b.calendar_year     noline
+  display '  '                 noline
+  display &c.benefit_program   noline
+  display '  '                 noline
+  display &d.plan_type         noline
+  display '  '                 noline
+  display &d.benefit_plan      noline
+  display '  '                 noline
+  display &g6.emplid           noline
+  display '  '                 noline
+  display &g6.PAYCHECK_NBR
+#end-if
+
+  move &G6.PAYCHECK_NBR   to #GPAYCHECK_NBR
+  move &G6.Check_Dt       to $GCheck_Dt
+  move &G6.FSA_Check_Amt  to #GFSA_Check_Amt
+  move &G6.EmplID         to $GEmplID
+  move &G6.EMPL_RCD       to #GEMPL_RCD
+  move &G6.Plan_Type      to $GPlan_Type
+  move &G6.Benefit_Plan   to $GBenefit_Plan
+  move &G6.Form_ID        to $GForm_ID
+  move &L6.Name1          to $LName
+  move &A6.Address1       to $LAddress1
+  move &A6.Address2       to $LAddress2
+  move &A6.City           to $LCity
+  move &A6.State          to $LState
+  move &A6.Postal         to $LZip
+
+  do Print-Claim-Payment
+  do Get-Claim-Detail
+
+  if $AmtPended = 'Y'
+    print $Fsa003cn_Pended_Txt                                      (+1,1)
+    move 'N' to $AmtPended
+  end-if
+
+  NEW-PAGE
+
+  let $Checks_Were_Printed = 'Y'
+
+  do Update-Claim-Status-Flags
+
+FROM  PS_FSA_PAYMENT  G6,
+      PS_VENDOR       L6,
+      PS_VENDOR_ADDR  A6
+
+WHERE G6.FORM_ID            = $FormID
+  AND G6.FSA_PAYMENT_STATUS = 'R'  !Pay This Run
+  AND G6.CALENDAR_YEAR      = &B.Calendar_Year
+  AND G6.PLAN_TYPE          = &D.Plan_Type
+  AND G6.BENEFIT_PLAN       = &D.Benefit_Plan
+  AND G6.BENEFIT_PROGRAM    = &C.Benefit_Program
+  AND L6.SETID              = G6.SETID
+  AND L6.VENDOR_ID          = G6.VENDOR_ID
+  AND A6.SETID              = L6.SETID
+  AND A6.VENDOR_ID          = L6.VENDOR_ID
+  AND A6.ADDRESS_SEQ_NUM    = L6.REMIT_ADDR_SEQ_NUM
+  AND A6.EFFDT =
+          (SELECT MAX (EFFDT)
+             FROM PS_VENDOR_ADDR
+            WHERE SETID     = A6.SETID
+              AND VENDOR_ID = A6.VENDOR_ID
+              AND ADDRESS_SEQ_NUM = A6.ADDRESS_SEQ_NUM
+              AND EFFDT    <= $AsOfToday)
+
+ORDER BY G6.PAYCHECK_NBR
+end-SELECT
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Print-Claim-Payment
+!***************************************************************************
+
+  move #GFSA_Check_Amt to #NetPay
+  if $SQR_Report_Language = 'FRA' or
+       $SQR_Report_Language = 'CFR'
+     do Net-Pay-In-French   !convert numbers to French words
+  else
+     do Net-Pay-In-English  !convert numbers to English words
+  end-if
+  let $Name = RTrim($LName,' ')
+
+!Print those fields for the Check itself
+  do Format-DateTime($GCheck_Dt, $out, {DEFDATE}, '', '')
+  print $out       (8,84)
+  do Format-Number(#GPAYCHECK_NBR, $out, '099999999999999')
+  print $out   (0,106)
+  print $Name              (14,25)
+
+  print  $LAddress1        (+1,25)
+
+  if RTRIM($LAddress2, ' ') <> ''
+    print  $LAddress2      (+1,25)
+  end-if
+
+  let $city = RTRIM($LCity, ' ')
+  print  $city            (+1,25)
+  print  ','               (0,0)
+  print  $LState          (0,+2)
+  print  $LZip            (0,+2)
+
+  do Format-Number(#NetPay, $out, '$$$,$$$,$$$,$$9.99')
+  print $out   (17,90)
+  print $NetInWords        (21,25)
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Get-Claim-Detail
+!***************************************************************************
+
+#ifdef DebugF
+  display 'FLOW : Get-Claim-Detail'
+  display '       =============================================='
+#end-if
+
+  Let $Detail_Headers  = 'Y'
+
+begin-SELECT
+J.SVC_TYPE,
+J.SVC_FROM_DT
+J.SVC_TO_DT
+J.SVC_PROVIDER,
+J.CLAIMID,
+J.FSA_CLAIM_SUB_AMT,
+J.FSA_CLAIM_APR_AMT,
+J.FSA_CLAIM_PD_TO_DT,
+I.FSA_CLAIM_AMT_PD,
+X.FIELDVALUE
+X.FIELDNAME
+
+#ifdef DebugD
+  display 'DATA : CLAIM: '     noline
+  display &j.claimid           noline
+  display '  '                 noline
+  display &j.svc_from_dt
+#end-if
+
+  let $FieldName = &X.FIELDNAME
+  let $FieldValue = &X.FIELDVALUE
+  do Read-Translate-Table
+  move $XlatShortName to $Print_Shortname        !This is only our fallback
+  If $Language_Cd <> $SQR_Report_Language
+     move &J.SVC_TYPE to $Service_Type
+     move &J.SVC_TO_DT to $Service_Date
+     do Get-Other-Name
+  end-if
+
+  if $Detail_Headers = 'Y'
+    do Print-Headers
+    Let $Detail_Headers = 'N'
+  end-if
+
+  do Print-Line-Item
+
+FROM  PS_FSA_PAYMT_CLAIM I,
+      PS_FSA_CLAIM       J,
+      PSXLATITEM         X
+WHERE I.FORM_ID          = $FormID
+  AND I.PAYCHECK_NBR           = #GPAYCHECK_NBR
+  AND I.CHECK_DT         = $GCheck_Dt
+  AND I.PLAN_TYPE        = &D.Plan_Type
+  AND I.BENEFIT_PLAN     = &D.Benefit_Plan
+  AND J.CLAIMID          = I.CLAIMID
+  AND J.PLAN_TYPE        = I.PLAN_TYPE
+  AND J.BENEFIT_PLAN     = I.BENEFIT_PLAN
+  AND J.EMPLID           = $GEmplID
+  AND J.PLAN_TYPE        = $GPlan_Type
+  AND J.BENEFIT_PLAN     = $GBenefit_Plan
+  AND J.FSA_CLAIM_STATUS IN ('P','F')  !Pended or Fully Processed
+  AND J.SVC_FROM_DT BETWEEN $YearBegin AND $YearEnd
+  AND X.FIELDNAME        = 'SVC_TYPE'
+  AND X.FIELDVALUE       = J.SVC_TYPE
+  AND X.EFFDT =
+      (SELECT MAX(EFFDT)
+       FROM   PSXLATITEM
+       WHERE  FIELDNAME  = X.FIELDNAME
+         AND  FIELDVALUE = X.FIELDVALUE
+         AND  EFFDT     <= J.SVC_TO_DT)
+  AND X.EFF_STATUS = 'A'
+end-SELECT
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Print-Headers
+!***************************************************************************
+
+  print $Fsa003cn_Check_Date               (36,1)
+  do Format-DateTime($GCheck_Dt, $out, {DEFMDY},'','')
+  print $out                               (0,+2)
+  print $Fsa003cn_Check_No                 (0,+4)
+  print #GPAYCHECK_NBR                           (0,+2) edit 099999999999999
+  print $Name                              (0,+2)
+  print $Fsa003cn_Emp_Id                   (0,+2)
+  print $GEmplID                           (,+1)
+
+  evaluate &D.Plan_Type
+  when = '60'
+    print $Fsa003cn_Reimburse1              (+2,1)
+  when = '61'
+    print $Fsa003cn_Reimburse2              (+2,1)
+  when = '65'
+    print $Fsa003cn_Reimburse3              (+2,1)
+  when = '66'
+    print $Fsa003cn_Reimburse4              (+2,1)
+  end-evaluate
+
+  print &B.Calendar_Year                    (0,+1) edit xxxx
+  print $Fsa003cn_Service_Txt                                           (+2,11)
+  print $Fsa003cn_Group_Txt1                                            (,+22)
+  print $Fsa003cn_Group_Txt2                                            (+1,1)
+  print $Fsa003cn_Group_Txt3                                            (,+9)
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Print-Line-Item
+!***************************************************************************
+
+  print &J.ClaimID           (+1,1)
+  print &J.Svc_Type          (0,10)
+  print '-'                  ()
+  print $Print_Shortname     ()
+  do Format-DateTime(&J.Svc_From_Dt, $out, {DEFMDY},'','')
+  print $out                               (0,23)
+  do Format-DateTime(&J.Svc_To_Dt, $out, {DEFMDY},'','')
+  print $out                    (0,34)
+  print &J.Svc_Provider         (0,45)
+  print &J.FSA_Claim_Sub_Amt    (0,62)  edit 99,999.99
+  print &J.FSA_Claim_Apr_Amt    (0,72)  edit 99,999.99
+  print &J.FSA_Claim_Pd_To_Dt   (0,82)  edit 99,999.99
+  print &I.FSA_Claim_Amt_Pd     (0,92)  edit 99,999.99
+
+  if &J.FSA_Claim_Apr_Amt > &J.FSA_Claim_Pd_To_Dt
+    print '*'                   (0,91)
+    move 'Y' to $AmtPended
+  end-if
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Update-Claim-Status-Flags
+!***************************************************************************
+
+let $sql-statement = 'FSA003CN.SQR,Update-Claim-Status-Flags,FSA_Payment,Update'
+begin-SQL on-error=SQL-Error
+UPDATE PS_FSA_PAYMENT
+  SET FSA_PAYMENT_STATUS = 'P'                        !Paid
+WHERE FSA_PAYMENT_STATUS = 'R'                        !Pay This Run
+  AND PAYCHECK_NBR       = #GPAYCHECK_NBR
+  AND CHECK_DT           = $GCheck_Dt
+  AND FORM_ID            = $GForm_ID
+  AND EMPLID             = $GEmplID;
+end-SQL
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Update-FSA_RunCtl
+!***************************************************************************
+
+let $sql-statement = 'FSA003CN.SQR,Update-FSA_RunCtl,FSA_Runctl,Update'
+begin-SQL on-error=SQL-Error
+UPDATE PS_FSA_RUNCTL
+   SET FSA_RUN_STATUS = 'F'
+ WHERE FSA_RUN_STATUS = 'C'
+   AND FORM_ID = $FormID;
+end-SQL
+
+end-procedure
+
+
+!*************************************
+begin-procedure Check-Pay-Period
+!*************************************
+
+!*************************************************************************
+! Determine 1st open pay period for the current company being processed  *
+!*************************************************************************
+
+  move 'N' to $OKPayCalX
+
+begin-SELECT
+
+PAYCALX.PAY_BEGIN_DT
+PAYCALX.PAY_END_DT
+PAYCALX.COMPANY
+PAYCALX.PAYGROUP
+PAYCALX.PAY_PERIOD
+PAYCALX.PAY_SHEETS_RUN
+PAYCALX.PAY_CONFIRM_START
+PAYCALX.PAY_CONFIRM_RUN
+
+   move 'Y' to $OKPayCalX
+                                            ! 19960320 use fsa cheque date
+  !If  &paycalx.company = 'BCT'             ! Use ISM paycal for BCT
+  !  let $FSA_EFFDT = $ISM_begin_Dt         !JMS - 19930327 use paycal payperiod begin date
+  !  let $Pay_Begin_Dt = $ISM_begin_Dt      ! force pay dates to be
+  !  let $payend = $ISM_End_Dt              ! same as ISM since
+  !  let $Pay_End_Dt = $ISM_End_Dt          ! BCT pay calendar is not
+  !                                         ! updated for flags
+  !else
+     move &PAYCALX.Company to $Company
+     move &PAYCALX.PayGroup to $PayGroup
+     move &PAYCALX.Pay_End_Dt to $Pay_End_Dt
+     move &PAYCALX.Pay_Begin_Dt to $Pay_Begin_Dt
+     move &PAYCALX.Pay_Begin_Dt to $FSA_EFFDT       !JMS - 19930327 use paycal payperiod begin date
+  !   move &PAYCALX.Pay_Begin_Dt to $FSA_EFFDT       !JMS - not fsa cheque date
+  !end-if
+
+FROM  PS_PAY_CALENDAR PAYCALX
+WHERE PAYCALX.PAY_CONFIRM_RUN = 'N'
+  AND PAYCALX.COMPANY    = &Job.Company
+  AND PAYCALX.PAYGROUP   = &Job.PayGroup
+  AND PAYCALX.PAY_END_DT =
+       (SELECT MIN(PAYCALY.PAY_END_DT)
+         FROM  PS_PAY_CALENDAR  PAYCALY
+         WHERE PAYCALY.COMPANY         =  PAYCALX.COMPANY
+           AND PAYCALY.PAYGROUP        =  PAYCALX.PAYGROUP
+           AND PAYCALY.PAY_CONFIRM_RUN =  PAYCALX.PAY_CONFIRM_RUN)
+!           AND paycalY.Pay_Check_Dt    = $GCheck_Dt    ! additional edit
+!           AND paycalY.Pay_sheets_run  =  'Y')
+
+end-SELECT
+
+  If $OKPayCalX = 'N'
+     Let $Paysheets_ready = 'N'
+     DISPLAY 'FAILED PAY CALENDAR LOOKUP'
+     DISPLAY '&Job.Company=' NOLINE
+     DISPLAY &Job.Company
+     DISPLAY '&Job.PayGroup=' NOLINE
+     DISPLAY &Job.PayGroup
+  else
+      Let $Paysheets_ready = 'Y'
+  end-if
+
+end-procedure
+
+! This procedure is used to read language-dependent text from the database.
+! Initially, the array is loaded with texts from the base language. However,
+! if the employee's preferred language is different from the base, the array
+! must be reloaded again to retrieve texts for the new language. From then on,
+! whenever a language change occurs, a reload will become necessary.
+
+begin-procedure Report-Translation
+! Read from FSA003CN  program ids
+
+   do Init_Report_Translation($ReportID,$Language_Cd)
+   do Get-Translated-Texts
+   do Load-NumberLits-Array
+
+end-procedure
+
+begin-procedure Repopulate-Array
+
+   clear-array name=strings
+   clear-array name=numberlits
+   let #array_element = 0
+   do Get_Strings ($ReportID, #array_element)
+   do Get-Translated-Texts
+   let $Ldnumtrn_appended = ''
+   do Load-NumberLits-Array
+
+end-procedure
+
+begin-procedure Get-Translated-Texts
+
+   do Get_Field_Information ('FSA003CN', 'REPORT_TITLE',   $Fsa003cn_ReportTitle, #dummy_width)
+   do Get_Field_Information ('FSA003CN', 'CHECK_DATE',     $Fsa003cn_Check_Date,  #dummy_width)
+   do Get_Field_Information ('FSA003CN', 'CHECK_NO',       $Fsa003cn_Check_No,    #dummy_width)
+   do Get_Field_Information ('FSA003CN', 'EMP_ID',         $Fsa003cn_Emp_Id,      #dummy_width)
+   do Get_Field_Information ('FSA003CN', 'REIMBURSE1',     $Fsa003cn_Reimburse1,  #dummy_width)
+   do Get_Field_Information ('FSA003CN', 'REIMBURSE2',     $Fsa003cn_Reimburse2,  #dummy_width)
+   do Get_Field_Information ('FSA003CN', 'REIMBURSE3',     $Fsa003cn_Reimburse3,  #dummy_width)
+   do Get_Field_Information ('FSA003CN', 'REIMBURSE4',     $Fsa003cn_Reimburse4,  #dummy_width)
+   do Get_Field_Information ('FSA003CN', 'GROUP_TXT1',     $Fsa003cn_Group_Txt1,  #dummy_width)
+   do Get_Field_Information ('FSA003CN', 'GROUP_TXT2',     $Fsa003cn_Group_Txt2,  #dummy_width)
+   do Get_Field_Information ('FSA003CN', 'GROUP_TXT3',     $Fsa003cn_Group_Txt3,  #dummy_width)
+   do Get_Field_Information ('FSA003CN', 'SERVICE_TXT',    $Fsa003cn_Service_Txt, #dummy_width)
+   do Get_Field_Information ('FSA003CN', 'PENDED_TXT',     $Fsa003cn_Pended_Txt,  #dummy_width)
+
+end-procedure
+
+!*************************************************************************
+!  Read Xlat table again now using report language code. If this exists, *
+!  use this value instead of the base language.                          *
+!*************************************************************************
+begin-procedure Get-Other-Name
+
+begin-SELECT
+Y.FIELDVALUE
+Y.FIELDNAME
+
+  let $FieldName = &Y.FIELDNAME
+  let $FieldValue = &Y.FIELDVALUE
+  do Read-Translate-Table
+  move $XlatShortName to $Print_Shortname
+    FROM  PSXLATITEM Y
+    WHERE Y.FIELDNAME   = 'SVC_TYPE'
+      AND Y.FIELDVALUE  = $Service_Type
+      AND EFFDT =
+          (SELECT MAX(EFFDT)
+             FROM   PSXLATITEM
+             WHERE  FIELDNAME  = Y.FIELDNAME
+               AND  FIELDVALUE = Y.FIELDVALUE
+               AND  EFFDT     <= $Service_Date)
+      AND Y.EFF_STATUS = 'A'
+end-SELECT
+
+end-procedure
+
+begin-procedure Check-Lang-Strings
+begin-SELECT
+'x'
+  let $StringFound = 'Y'
+
+  FROM PS_STRINGS_LNG_TBL LNG
+  WHERE PROGRAM_ID = $ReportID
+  AND LANGUAGE_CD = $Emp_Preferred_Lang
+
+end-SELECT
+end-procedure
+
+
+#IFDEF PROCESS-PAYROLL
+
+!*************************************
+begin-procedure Process-For-Payroll
+!*************************************
+!************************************************************************
+!*                                                                      *
+!*  -Check for the existence of the validated detail transaction        *
+!*      emplid/earnings code in PS_ADDL_PAY_DATA.                       *
+!*      If a PS_ADDL_PAY_DATA record does not exist:                    *
+!*        -Add the FSA payment transaction code 'FSP'                   *
+!*         PS_ADDL_PAY_ERNCD if required.                               *
+!*        -Add the FSA payment transaction                              *
+!*          to PS_ADDL_PAY_EFFDT if required.                           *
+!*        -Add the FSA payment transaction                              *
+!*          emplid to PS_ADDL_PAY_DATA .                                *
+!*      If a PS_ADDL_PAY_DATA record does exist:                        *
+!*        -Update the FSA payment transaction                           *
+!*          date/emplid in PS_ADDL_PAY_DATA.                            *
+!*                                                                      *
+!************************************************************************
+
+  move 'N' to $OKAddlPay
+  let $Emplid = &g.emplid
+  let $ErnCd  = 'FSP'
+  let #Prev_AP_oth_pay  = 0
+  let #Prev_AP_goal_amt  = 0
+
+begin-SELECT
+K.EMPLID
+K.EMPL_RCD
+K.ERNCD
+M.EFFDT
+M.EMPL_RCD
+M.ADDL_SEQ
+M.OTH_PAY
+M.GOAL_AMT
+M.EARNINGS_END_DT
+
+  move 'Y' to $OKAddlPay
+
+  let #Prev_AP_oth_pay  = &M.oth_pay
+  let #Prev_AP_goal_amt  = &M.goal_amt
+
+FROM PS_ADDL_PAY_ERNCD K,
+     PS_ADDL_PAY_EFFDT N,
+     PS_ADDL_PAY_DATA  M
+WHERE K.EMPLID    = $Emplid
+  AND K.ERNCD     = $ErnCd
+  AND N.EMPLID    = K.EMPLID
+  AND N.EMPL_RCD = K.EMPL_RCD
+  AND N.ERNCD     = K.ERNCD
+  AND N.EFFDT =
+    (SELECT MAX(N1.EFFDT)
+     FROM  PS_ADDL_PAY_EFFDT N1
+     WHERE N1.EMPLID    = N.EMPLID
+       AND N1.EMPL_RCD = N.EMPL_RCD
+       AND N1.ERNCD     = N.ERNCD
+       AND N1.EFFDT     = $FSA_EFFDT)
+!       AND N1.EffDt    <= $FSA_EFFDT)
+  AND M.EMPLID    = N.EMPLID
+  AND M.EMPL_RCD = N.EMPL_RCD
+  AND M.ERNCD     = N.ERNCD
+  AND M.EFFDT     = N.EFFDT
+  AND M.ADDL_SEQ =
+    (SELECT MAX(O.ADDL_SEQ)
+     FROM  PS_ADDL_PAY_DATA O
+     WHERE O.EMPLID    = M.EMPLID
+       AND O.EMPL_RCD = M.EMPL_RCD
+       AND O.ERNCD     = M.ERNCD
+       AND O.EFFDT     = M.EFFDT)
+end-select
+
+!  Let $EarningsEndDt = $Pay_End_Dt       !Required always for addl_pay_data
+  Let $EarningsEndDt = ''
+
+  if $OKAddlPay = 'Y'
+    Do 8910-Update-Addl-Pay-Data
+  else
+
+    Let #AddlSeq =  1
+
+    Do 4015-Get-Addl-Pay-Erncd
+
+    if $OKErnCd = 'N'
+      Do 8950-Insert-Addl-Pay-Erncd
+    end-if
+
+    Do 4012-Get-Addl-Pay-EffDt
+
+    if $OKEffDt = 'N'
+       Do 8920-Insert-Addl-Pay-EffDt
+    end-if
+
+    let $Addl_pay_reason = 'HSA'
+    Do 8930-Insert-Addl-Pay-Data
+
+  end-if
+
+end-procedure
+
+
+!********************************************
+begin-procedure 4012-Get-Addl-Pay-Effdt
+!********************************************
+
+!************************************************************************
+!*  -Retrieve the requested PS_Addl_Pay_EffDt row, if one exists        *
+!************************************************************************
+
+Let $OKEffDt = 'N'
+
+begin-select
+PE1.ERNCD
+
+ Let $OKEffDt = 'Y'
+
+FROM PS_ADDL_PAY_EFFDT PE1
+WHERE  PE1.EMPLID = $Emplid
+AND    PE1.ERNCD  = $ErnCd
+AND    PE1.EFFDT  = $FSA_EFFDT
+end-select
+
+end-procedure
+
+
+!********************************************
+begin-procedure 4015-Get-Addl-Pay-ErnCd
+!********************************************
+
+!************************************************************************
+!*  -Retrieve the requested PS_Addl_Pay_ErnCd row, if one exists        *
+!************************************************************************
+
+Let $OKErnCd = 'N'
+
+begin-select
+PE.ERNCD
+
+ Let $OKErnCd = 'Y'
+
+FROM PS_ADDL_PAY_ERNCD PE
+WHERE  PE.EMPLID = $Emplid
+AND    PE.ERNCD  = $ErnCd
+end-select
+
+end-procedure
+
+
+!********************************************
+begin-procedure 8910-Update-Addl-Pay-Data   !activated 01Apr96
+!********************************************
+
+!************************************************************************
+!*                                                                      *
+!*     -If the emplid's current PS_ADDL_PAY_DATA effective dt is not    *
+!*      equal to the transaction event date:                            *
+!*                                                                      *
+!*       -stop date the current PS_ADDL_PAY_DATA record                 *
+!*       -add the detail transaction goal balance and other pay amt.to  *
+!*        PS_ADDL_PAY_DATA.                                             *
+!*    -If the emplid's current PS_ADDL_PAY_DATA effective date is equal *
+!*     to the transaction event date:                                   *
+!*       -update PS_ADDL_PAY_DATA with the detail transaction goal      *
+!*        balance and other pay amt.                                    *
+!*                                                                      *
+!************************************************************************
+
+  If &M.EffDt = $FSA_EFFDT
+
+    Let #GFSA_Check_Amt  = #GFSA_Check_Amt + #Prev_AP_oth_pay
+!    AP_oth_pay and AP_goal_amt are always the same for HSA
+!    Let #GFSA_Check_Amt  = #GFSA_Check_Amt + #Prev_AP_goal_amt
+
+    Do 8945-Change-Addl-Pay-Data-Rtn2
+
+  end-if
+
+end-procedure
+
+
+!********************************************
+begin-procedure 8920-Insert-Addl-Pay-EffDt
+!********************************************
+
+let $sql-statement = 'FSA003CN: begin-procedure 8920-Insert-Addl-Pay-EffDt'
+begin-SQL on-error=SQL-Error
+INSERT INTO PS_ADDL_PAY_EFFDT ( EMPLID,
+                                EMPL_RCD,
+                                ERNCD,
+                                EFFDT,                                  !HP99999
+                                RECORD_SOURCE)                          !HP99999
+VALUES                        ( $EmplId,
+                                #GEMPL_RCD,
+                                $ErnCd,
+                                $FSA_EFFDT,                             !HP99999
+                                'O')                                    !HP99999
+end-SQL
+
+end-procedure
+
+
+!********************************************
+begin-procedure 8930-Insert-Addl-Pay-Data
+!********************************************
+
+#DEBUGX DISPLAY '8930-Insert-Addl-Pay-Data;$FSA_EFFDT= ' NOLINE
+#DEBUGX DISPLAY $FSA_EFFDT
+
+let $sql-statement = 'FSA003CN: begin-procedure 8930-Insert-Addl-Pay-Data'
+
+begin-SQL on-error=SQL-Error
+INSERT INTO  PS_ADDL_PAY_DATA  ( EMPLID,
+                                EMPL_RCD,
+                                ERNCD,
+                                EFFDT,
+                                ADDL_SEQ,
+                                DEPTID,
+                                JOBCODE,
+                                POSITION_NBR,
+                                ACCT_CD,
+                                GL_PAY_TYPE,
+                                ADDL_PAY_SHIFT,
+                                OTH_HRS,
+                                HOURLY_RT,
+                                OTH_PAY,
+                                ADDLPAY_REASON,
+                                SEPCHK,
+                                EARNINGS_END_DT,
+                                GOAL_AMT,
+                                GOAL_BAL,
+                                OK_TO_PAY,
+                                DISABLE_DIR_DEP,
+                                PRORATE_ADDL_PAY,
+                                PRORATE_CUI_WEEKS,
+                                PAY_PERIOD1,
+                                PAY_PERIOD2,
+                                PAY_PERIOD3,
+                                PAY_PERIOD4,
+                                PAY_PERIOD5,
+                                STATE,
+                                LOCALITY,
+                                TAX_PERIODS,
+                                TAX_METHOD,
+                                ADDL_PAY_FREQUENCY,
+                                DED_TAKEN,
+                                DED_SUBSET_ID,
+                                DED_TAKEN_GENL,
+                                DED_SUBSET_GENL,
+                                BUSINESS_UNIT,
+                                COMP_RATECD,
+                                PLAN_TYPE,                              !HP99999
+                                RECORD_SOURCE)                          !HP99999
+
+VALUES                        ( $EmplId,
+                                #GEMPL_RCD,
+                                $ErnCd,
+                                $FSA_EFFDT,
+                                #AddlSeq,
+                                ' ',
+                                ' ',
+                                ' ',
+                                ' ',
+                                ' ',
+                                'N',
+                                0,
+                                0,
+                                #GFSA_Check_Amt,        !FSA PAYMENT AMOUNT
+                                $Addl_pay_reason,       !19960329jms-'HS2' for seq #2
+                                0,
+                                $EarningsEndDt,
+                                #GFSA_Check_Amt,        !GOAL_AMT = OTH_PAY
+                                0,
+                                'Y',
+                                'N',
+                                'N',
+                                'N',
+                                'Y',
+                                'Y',
+                                'N',
+                                'N',
+                                'N',
+                                ' ',
+                                ' ',
+                                1,
+                                'A',
+                                'P',
+                                'R',
+                                ' ',
+                                'R',
+                                ' ',
+                                ' ',
+                                ' ',
+                                $GPlan_Type,                            !HP99999
+                                'O')                                    !HP99999
+end-SQL
+end-procedure
+
+
+!********************************************
+begin-procedure 8945-Change-Addl-Pay-Data-Rtn2   !activated 01Apr96
+!********************************************
+
+let $sql-statement = 'FSA003CN.SQU: begin-procedure 8945-Change-Addl-Pay-Data2'
+begin-SQL on-error=SQL-Error
+UPDATE  PS_ADDL_PAY_DATA
+SET OTH_PAY  = #GFSA_Check_Amt,
+    GOAL_AMT = #GFSA_Check_Amt
+WHERE EMPLID    = $Emplid
+  AND EMPL_RCD = &M.EMPL_RCD
+  AND ERNCD     = $ErnCd
+  AND EFFDT     = &M.EffDt
+  AND ADDL_SEQ  = &M.Addl_Seq
+end-SQL
+
+end-procedure
+
+
+!********************************************
+begin-procedure 8950-Insert-Addl-Pay-ErnCd
+!********************************************
+
+let $sql-statement = 'FSA003CN: begin-procedure 8950-Insert-Addl-Pay-ErnCd'
+begin-SQL on-error=SQL-Error
+INSERT INTO  PS_ADDL_PAY_ERNCD ( EMPLID,
+                                 EMPL_RCD,
+                                 ERNCD,                                 !HP99999
+                                 RECORD_SOURCE)                         !HP99999
+VALUES                         ( $EmplId,
+                                 #GEMPL_RCD,
+                                 $ErnCd,                                !HP99999
+                                 'O')                                   !HP99999
+end-SQL
+end-procedure
+
+#END-IF  !--------------- Process Payroll Code ---------------
+
+
+!***************************************************************************
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'readxlat.sqc'  !get translates for fieldname, value
+
+#Include 'stdapi.sqc'    !Update Process API
+#Include 'bnrunctl.sqc'  !Get application run control parameters
+#Include 'bngetval.sqc'  !Get BEN values mask routines
+#Include 'getaddr.sqc'   !Get current address for specified address type
+#Include 'sqrtrans.sqc'  !Translate SQR strings to given language
+#Include 'getrplng.sqc'  !Get the report languge
+#Include 'ldnumtrn.sqc'  !Load-FraNumLits-Array procedure
+#Include 'netintrn.sqc'  !Spells amount in French
+
+!***************************** End of Report ***************************

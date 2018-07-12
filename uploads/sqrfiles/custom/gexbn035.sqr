@@ -1,0 +1,984 @@
+!***********************************************************************
+! GEXBN035:  Insurance Report                                          *
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module is the confidential and proprietary information of       *
+! Giant Eagle, Inc.; it is not to be copied, reproduced,or transmitted *
+! in any form, by any means, in whole or in part, nor is it to be used *
+! for any purpose other than that for which it is expressly provided   *
+! without the written permission of Giant Eagle.                       *
+!                                                                      *
+! Copyright (c) 1997-1998 Giant Eagle,Inc. All Rights Reserved         *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+! GEXBN035:             Insurance Report                               *
+!                                                                      *
+! Narrative:            This program creates a detail report and a     *
+!                       summary report showing insurance detail for    *
+!                       employees in plan types 20 to 2Z, and plan     *
+!                       type 31                                        *
+!                                                                      *
+! #Debugx Used:         #debug9 paragraph trace                        *
+!                       #debug8 key variable values                    *
+!                       #debug7 data returned from sql calls           *
+!                                                                      *
+! SQL Tables:           disblty_pln_tbl                                *
+!                       ben_defn_optn                                  *
+!                       ben_defn_cost                                  *
+!                       pay_check                                      *
+!                       pay_deduction                                  *
+!                       dependent_benef                                *
+!                       flat_rate_tbl                                  *
+!                       age_covg_tbl                                   *
+!                       xlattable                                      *
+!                       personal_data                                  *
+!                       job                                            *
+!                                                                      *
+! Written by:           Jim Hutchison                                  *
+!                                                                      *
+! Normally Run:         Monthly                                        *
+!                                                                      *
+! Control Parms:        FOR WHERE CLAUSE:                              *
+!                         As Of Date                                   *
+!                         Benefit Program(s)                           *
+!                                                                      *
+!***********************************************************************
+!                         MODIFICATION HISTORY                         *
+!***********************************************************************
+! INITIALS  DATE        DESCRIPTION OF THE CHANGE                      *
+!***********************************************************************
+! JDH       09/16/98    Initial Creation                               *
+!                                                                      *
+! JDH       01/02/99    Modified layout according to spec changes      *
+!                                                                      *
+! JDH       01/08/99    Added logic to obtain balances for the month   *
+!                        of the last confirmed pay end date.           *
+!                       Added AsOfDate run control parameter.          *
+!                                                                      *
+! JDH       02/19/99    Age should be calculated as of end of year.    *
+!                                                                      *
+! JDH       02/26/99    Pull pay_check rows by the check date of the   *
+!                        pay end rather than the check date of the     *
+!                        pay_check row.                                *
+!                                                                      *
+! JDH       08/11/99    Fixed effective dating on age_covg_tbl.        *
+!                       Obtain index tablespace name from database.    *
+!                                                                      *
+! AXL       04/27/2001  Added a procedure to detemine correct balance  *
+!                       period. New sort request by name               *
+!                                                                      *
+! SCM       07/11/2002  Fixed select on XLAT table to add more criteria*
+!                       When a new XLAT value was added and the effdt  *
+!                       was > 1900, the code only picked up that max row
+!                                                                      !
+! GBD       10/16/2002  Modified selection to eliminate multiple row   *
+!                       select caused by Plan_Type/Option_ID.          *
+!                                                                      *
+! ISDVNPK   08/29/2007 MODIFIED for UPGRADE 9.0                        *
+! ISDVASS   04/21/2008 Smoker field has a blank in 9.0 instead of a 'N'*
+!***********************************************************************
+
+
+#include 'setenv.sqc'    !Set environment
+#Include 'setup32.sqc'   !Printer and Page-Size Initialization (Landscape)
+
+
+#define #detail_column1   001
+#define #detail_column2   037
+#define #detail_column3   055
+#define #detail_column4   068
+#define #detail_column5   098
+#define #detail_column6   107
+#define #detail_column7   121
+#define #detail_column8   141
+#define #detail_column9   161
+
+
+#define #summary_column1  001
+#define #summary_column2  028
+#define #summary_column3  078
+#define #summary_column4  094
+#define #summary_column5  110
+#define #summary_column6  134
+#define #summary_column7  161
+
+
+Begin-Setup
+  Declare-Report Detail
+Printer-Type=HPLASERJET
+  End-Declare
+  Declare-Report Summary
+Printer-Type=HPLASERJET
+  End-Declare
+End-Setup
+
+
+Begin-Report
+#debug9 Show 'Begin-Report'
+  Do P100-Initialization
+  Do P200-Main-Process
+  Do P300-Finalization
+End-Report
+
+
+Begin-Heading 7
+  For-Reports=(Detail)
+#debug9 Show 'Begin-Heading (Detail)'
+  Let $ReportID = 'BN035DET'
+  Let $ReportTitle   = 'Insurance Detail Report'
+
+  #Include 'stdhdg01.sqc'
+
+  Print 'Benefit Program:'     (3,1)
+  Print $Benefit_Program       (,+2)
+
+  print $Reporting_Period      (3,) center 
+
+  Print 'BENEFIT'              (+3,{#detail_column3})
+  Print 'PLAN'                 (+0,{#detail_column4})
+  Print ' PREMIUM'             (+0,{#detail_column6})
+  Print '      COVERAGE'       (+0,{#detail_column7})
+  Print '      EMPLOYEE'       (+0,{#detail_column8})
+  Print '      EMPLOYER'       (+0,{#detail_column9})
+
+  Print 'EMPLOYEE NAME'        (+1,{#detail_column1})
+  Print 'SSN'                  (+0,{#detail_column2})
+  Print 'PLAN'                 (+0,{#detail_column3})
+  Print 'TYPE'                 (+0,{#detail_column4})
+  Print 'AGE'                  (+0,{#detail_column5})
+  Print '    RATE'             (+0,{#detail_column6})
+  Print '        AMOUNT'       (+0,{#detail_column7})
+  Print '     DEDUCTION'       (+0,{#detail_column8})
+  Print '     DEDUCTION'       (+0,{#detail_column9})
+End-Heading
+
+
+Begin-Heading 7
+  For-Reports=(Summary)
+#debug9 Show 'Begin-Heading (Summary)'
+  Let $ReportID = 'BN035SUM'
+  Let $ReportTitle   = 'Insurance Summary Report'
+
+  #Include 'stdhdg01.sqc'
+
+  print $Reporting_Period      (3,) center 
+
+  Print 'BENEFIT'              (+3,{#summary_column1})
+  Print 'COVERED'              (+0,{#summary_column3})
+  Print 'BENEFIT'              (+0,{#summary_column4})
+  Print 'PLAN'                 (+0,{#summary_column5})
+  Print '     VOLUME OF'       (+0,{#summary_column6})
+  Print '    CALCULATED'       (+0,{#summary_column7})
+
+  Print 'PROGRAM'              (+1,{#summary_column1})
+  Print 'DESCRIPTION'          (+0,{#summary_column2})
+  Print '  LIVES'              (+0,{#summary_column3})
+  Print 'PLAN'                 (+0,{#summary_column4})
+  Print 'TYPE'                 (+0,{#summary_column5})
+  Print '     INSURANCE'       (+0,{#summary_column6})
+  Print '    AMOUNT DUE'       (+0,{#summary_column7})
+End-Heading
+
+
+Begin-Procedure P100-Initialization
+#debug9 Show 'P100-Initialization'
+ ! Do Set-Optimizer-Goal  !GEX ISDVNPK 08/29/2007 MODIFIED for UPG 9.0
+
+  Do Init-DateTime           !datetime.sqc
+  Do Init-Number             !number.sqc
+  Do Get-Current-DateTime    !curdttim.sqc
+  Do Stdapi-Init             !stdapi.sqc
+
+  Let $ReportID      = 'GEXBN035'
+  Let $ReportTitle   = 'Insurance Report'
+
+  Show '$ReportID    = ' $ReportID
+  Show '$ReportTitle = ' $ReportTitle
+  Show '$ReportDate  = ' $ReportDate
+  Show '$ReportTime  = ' $ReportTime
+
+  create-array name=summary size=30
+	 field=bpplan:char:6
+	 field=ptype:char:12
+	 field=lives:number
+	 field=rate:number
+	 field=volume:number
+	 field=empl_amt:number
+	 field=empr_amt:number
+  
+  clear-array name=summary
+
+  Let $GEXXX911_Benefit_Program_Alias  = 'bdo.benefit_program'
+  Let $GEXXX911_Plan_Type_Alias        = '1'
+  Let $GEXXX911_Benefit_Plan_Alias     = '1'
+
+  If $prcs_process_instance = ''
+    Do P110-SQRW-Run-Controls
+  Else
+    Do P120-Process-Scheduler-Run-Controls
+  End-If
+
+  Do Format-DateTime($X000_Where_Select_AsOfDate, $X000_Report_Heading_AsOfDate, {DEFDATE}, '', '')
+  Let $X000_Order_By = 'Benefit Program, Employee ID, Plan Type, Benefit Plan'
+
+  Show '$X000_Where_Select_AsOfDate = ' $X000_Where_Select_AsOfDate
+
+  Do Get-Calendar-Year-Id
+
+  Do Get-Last-Confirmed-Pay
+  Do Get-Pay-Cal-Bal-Info	!AXL - 04/27/2001 
+  Do P130-Print-Cover-Page
+  Do P140-Get-Xlat-Lookup
+  Do P150-Get-Tablespace-Name
+  Do P160-Create-Index
+End-Procedure
+
+!GEX ISDVNPK 08/29/2007 MODIFIED for UPG 9.0
+!begin-procedure Set-Optimizer-Goal
+! Begin-SQL
+!   Alter Session Set OPTIMIZER_GOAL=RULE;
+!  End-SQL
+!end-procedure
+!GEX ISDVNPK 08/29/2007 MODIFIED for UPG 9.0
+
+Begin-Procedure P110-SQRW-Run-Controls
+#debug9 Show 'P110-SQRW-Run-Controls'
+  Do Ask-As-Of-Date
+  Let $X000_WHERE_SELECT_ASOFDATE = $AsOfDate
+
+  Let $BenefitProgramString = ''''
+  Display 'Enter Benefit Program or leave blank to exit.'
+  While 1=1
+    Input $In-Benefit-Program Maxlen=3 'Benefit Program'
+    Uppercase $In-Benefit-Program
+    If Rtrim($In-Benefit-Program, ' ') = ''
+      Concat '''' With $BenefitProgramString
+      Break
+    End-If
+    If $BenefitProgramString <> ''''
+      Concat ''',''' With $BenefitProgramString
+    End-If
+    Concat $In-Benefit-Program With $BenefitProgramString
+  End-While
+
+  If $BenefitProgramString = ''''''
+    Let $GEXXX911_INCLUDE_BENEFIT_PROGRAM_CRITERIA = '1=1'
+    Let $GEXXX911_INCLUDE_BENEFIT_PROGRAM_DISPLAY_CRITERIA = 'ALL'
+  Else
+    Let $GEXXX911_INCLUDE_BENEFIT_PROGRAM_CRITERIA = $GEXXX911_Benefit_Program_Alias || ' In (' || $BenefitProgramString || ')'
+    Let $GEXXX911_INCLUDE_BENEFIT_PROGRAM_DISPLAY_CRITERIA = $GEXXX911_INCLUDE_BENEFIT_PROGRAM_CRITERIA
+  End-If
+End-Procedure
+
+
+Begin-Procedure P120-Process-Scheduler-Run-Controls
+#debug9 Show 'P120-Process-Scheduler-Run-Controls'
+  Do GEXRCBN1-SELECT-PARAMETERS
+  Let $X000_WHERE_SELECT_ASOFDATE = &GEX_RC_BEN.ASOFDATE
+  if rtrim($X000_WHERE_SELECT_ASOFDATE, ' ' ) = ''
+    Let $X000_WHERE_SELECT_ASOFDATE = $asoftoday
+  end-if
+
+  Do GEXXX911-Select-Benefit-Program-Parameters
+End-Procedure
+
+
+Begin-Procedure Get-Last-Confirmed-Pay
+#debug9 Show 'Get-Last-Confirmed-Pay'
+Begin-Select Loops=1
+pay_end_dt
+!AXL - 04/27/2001 - Begin
+!Last_Day(pay_end_dt)               &current_month_end 
+!To_Char(pay_end_dt,'MM')           &balance_period
+!To_Char(pay_end_dt,'YYYY')         &balance_year
+!AXL - 04/27/2001 - End
+To_Char(pay_end_dt,'fmMonth YYYY') &period
+
+  Let $AsOfDate         = &pay_end_dt
+  Let $pay_end_dt       = &pay_end_dt
+  !AXL - 04/27/2001 - Begin
+  !Let $balance_year     = &balance_year
+  !Let $balance_period   = &balance_period
+  !Let #balance_year     = &balance_year
+  !Let #balance_period   = &balance_period
+  !AXL - 04/27/2001 - End
+  Let $Reporting_Period = &period
+
+  Let $last_day_of_year = '31-DEC-'||Substr($pay_end_dt,8,4)
+
+  Show 'Report will contain balances for the month of ' $Reporting_Period
+  Show 'Last confirmed pay end date:  ' $pay_end_dt
+
+From   ps_pay_calendar
+
+Where  pay_end_dt         =
+      (Select Max(pay_end_dt)
+       From   ps_pay_calendar
+       Where  pay_end_dt <= $X000_WHERE_SELECT_ASOFDATE
+       And    pay_confirm_run = 'Y')
+
+And    pay_confirm_run = 'Y'
+End-Select
+End-Procedure
+
+!AXL - 04/27/2001 - Begin
+!***********************************************************************
+Begin-Procedure Get-Pay-Cal-Bal-Info
+!***********************************************************************
+#debug9 Show 'Get-Pay-Cal-Bal-Info'
+Begin-Select Loops=1
+PCX.balance_period
+PCX.balance_year
+PCX.balance_id 
+
+FROM PS_PAY_CAL_BAL_ID PCX
+
+WHERE PCX.PAY_END_DT = $pay_end_dt 
+  AND PCX.BALANCE_ID = 'CY'
+
+End-Select
+End-Procedure
+!AXL - 04/27/2001 - End
+
+begin-procedure P130-Print-Cover-Page
+#debug9 Show 'P130-Print-Cover-Page'
+  Use-Report Detail
+  Print 'RUN CONTROL INFORMATION FOR THIS REPORT RUN:'            (+5,1)
+  Print '$Prcs_OprID          ='                                  (+2,5)
+  Print $Prcs_OprID                                               (0,+2)
+  Print '$Prcs_Run_Cntl_ID    ='                                  (+1,5)
+  Print $Prcs_Run_Cntl_ID                                         (0,+2)
+
+  Print 'SELECTION CRITERIA FOR THIS REPORT RUN:'                 (+5,2)
+
+  Print 'Report will contain balances for the month of'           (+2,5)
+  Print $Reporting_Period                                         (0,+1)
+  Print 'Last confirmed pay end date:'                            (+2,5)
+  Print $pay_end_dt                                               (0,+2)
+
+  Print 'As Of Date :'                                            (+2,5)
+  Print $X000_Report_Heading_AsOfDate                             (0,+2)
+
+  Print '$GEXXX911_INCLUDE_BENEFIT_PROGRAM_CRITERIA:'             (+2,5)
+  Print $GEXXX911_INCLUDE_BENEFIT_PROGRAM_DISPLAY_CRITERIA        (0,+2)
+
+  Print 'SORT ORDER FOR THIS REPORT RUN:'                         (+5,2)
+  Print $X000_Order_By                                            (+2,5)
+
+  Let #PAGE-COUNT = 0
+  new-page
+End-Procedure
+
+
+Begin-Procedure P140-Get-Xlat-Lookup
+#debug9 Show 'P140-Get-Xlat-Lookup'
+  Let $Where = '     x.fieldname   = ''PLAN_TYPE''' ||
+	       ' And x.eff_status  = ''A''' ||
+!	       ' And x.language_cd = ''ENG''' ||
+	       ' And x.effdt       = (Select Max(effdt)' ||
+	       '                      From   PSXLATITEM x1' ||
+	       '                      Where  x1.fieldname    = x.fieldname' ||
+!	       '                      And    x1.language_cd  = ''ENG''' ||
+!               '                      And    x1.LANGUAGE_CD  = x.LANGUAGE_CD' ||       !SCM 07/11/2002
+	       '		      And    x1.FIELDVALUE   = x.FIELDVALUE' ||        !SCM 07/11/2002
+	       '                      And    x1.effdt       <= ''' || $pay_end_dt  || '''' ||
+	       '                      And    x1.eff_status   = ''A'')'
+
+  Load-Lookup
+    Name=XlatLookup
+    Rows=100
+    Table='PSXLATITEM X'           ! XLATTABLE X GEX ISDVNPK 08/29/2007 MODIFIED for UPG 9.0  
+    Key='X.FIELDVALUE'
+    Return_Value='X.XLATSHORTNAME'
+    Where=$Where
+    Quiet
+End-Procedure
+
+
+Begin-Procedure P150-Get-Tablespace-Name
+#debug9 Show 'P150-Get-Tablespace-Name'
+   
+Begin-select
+tablespace_name
+    Let $Tablespace = &tablespace_name
+    display 'table space: ' noline
+    display $Tablespace             
+From   user_indexes
+Where  index_name = 'PS_BEN_DEFN_OPTN'
+
+End-Select
+End-Procedure
+
+
+Begin-Procedure P160-Create-Index
+#debug9 Show 'P160-Create-Index'
+Begin-SQL On-Error=P180-Handle-Error
+ 
+  Create Index PS0BEN_DEFN_OPTN ON PS_BEN_DEFN_OPTN(PLAN_TYPE,BENEFIT_PLAN) Tablespace [$Tablespace]
+
+End-SQL
+End-Procedure
+
+
+Begin-Procedure P170-Drop-Index
+#debug9 Show 'P170-Drop-Index'
+Begin-SQL On-Error=P180-Handle-Error
+  Drop Index PS0BEN_DEFN_OPTN
+End-SQL
+End-Procedure
+
+
+Begin-Procedure P180-Handle-Error
+#debug9 Show 'P180-Handle-Error'
+! ORA-00955: name is already used by an existing object
+!            (meaning index already exists)
+!
+  If Substr($sql-error,1,9) <> 'ORA-00955'
+    Display $sql-error
+    Stop
+  End-If
+End-Procedure
+
+
+Begin-Procedure P200-Main-Process
+#debug9 Show 'P200-Main-Process'
+Begin-Select
+bdo.benefit_program  ()  On-Break
+                         Level=1
+                         Print=Never
+                         Save=$save_benefit_program
+                         After=P225-BP-Subtotals
+                         Before=P228-New-Page
+
+per.name             ()  On-Break 
+                         Level=2
+                         Print=Never
+
+pd.plan_type         ()  On-Break
+                         Level=3
+                         Print=Never
+
+pd.benefit_plan      ()  On-Break
+                         Level=4
+                         Print=Never
+                         After=P220-Benefit-Plan-Subtotals
+
+bdo.plan_type
+bdo.option_id
+j.empl_rcd
+pd.ded_class
+pd.ded_cur
+j.emplid
+j.company
+j.paygroup
+j.monthly_rt
+j.annual_rt
+j.annl_benef_base_rt
+Trunc(Months_Between($last_day_of_year,per.birthdate)/12) &per.age
+per.sex
+per.smoker
+pd.calculated_base
+
+#debug8 Show 'benefit program= ' &bdo.benefit_program
+#debug8 Show 'emplid= ' &j.emplid
+#debug8 Show 'plan type= ' &pd.plan_type
+#debug8 Show 'benefit plan= ' &pd.benefit_plan
+
+  Let $Data-Found-Flag = 'Y'
+
+  Let $Benefit_Program = &bdo.benefit_program
+
+  Let $BenProgram   = &bdo.benefit_program
+  Let $Plan_Type    = &pd.plan_type
+  Let $Benefit_Plan = &pd.benefit_plan
+  Let $emplid       = &j.emplid
+  Let $name         = &per.name
+
+  Do Get-Benefit-Name
+
+  If &pd.ded_class = 'A'
+    Add &pd.ded_cur To #empl_ded_amount
+  End-If
+
+  If &pd.ded_class = 'N'
+    Add &pd.ded_cur To #empr_ded_amount
+  End-If
+
+  If $Coverage-Amount-Found <> 'Y'
+    Let #coverage_amount = &pd.calculated_base
+    If Substr(&pd.plan_type,1,1) = '3'
+      Do P250-Disability-Coverage-Amount
+    End-If
+    Let $Coverage-Amount-Found = 'Y'
+  End-If
+
+  Do P260-Get-Rate
+
+From   ps_personal_data       per,
+       ps_job                 j,
+       ps_ben_defn_optn       bdo,
+       ps_pay_cal_bal_id      pcbi,
+       ps_pay_check           pc,
+       ps_pay_deduction       pd
+
+Where [$GEXXX911_INCLUDE_BENEFIT_PROGRAM_CRITERIA]
+
+And    bdo.plan_type          = pd.plan_type
+And    bdo.benefit_plan       = pd.benefit_plan
+
+And    bdo.benefit_program    =
+      (Select Min(benefit_program)
+       From   ps_ben_defn_optn
+       Where  plan_type       = bdo.plan_type
+       And    benefit_plan    = bdo.benefit_plan
+       And    effdt          <= $pay_end_dt)
+
+And    bdo.effdt              =
+      (Select Max(effdt)
+       From   ps_ben_defn_optn
+       Where  benefit_program = bdo.benefit_program
+!GBD 10/16/2002 Begin
+       And    effdt          <= $pay_end_dt)
+!       And    effdt          <= $pay_end_dt
+!       And    plan_type       = bdo.plan_type
+!       And    option_id       = bdo.option_id)
+!GBD 10/16/2002 End
+
+And    j.effdt                =
+      (Select Max(effdt)
+       From   ps_job
+       Where  emplid          = j.emplid
+       And    empl_rcd       = j.empl_rcd
+       And    effdt          <= $pay_end_dt)
+
+And    j.effseq               =
+      (Select Max(effseq)
+       From   ps_job
+       Where  emplid          = j.emplid
+       And    empl_rcd       = j.empl_rcd
+       And    effdt           = j.effdt)
+
+And    per.emplid             = j.emplid
+
+And    pc.pay_end_dt          = pcbi.pay_end_dt
+
+And    pc.emplid              = j.emplid
+And    pc.empl_rcd           = j.empl_rcd
+
+And    pd.company             = pc.company
+And    pd.paygroup            = pc.paygroup
+And    pd.pay_end_dt          = pc.pay_end_dt
+And    pd.off_cycle           = pc.off_cycle
+And    pd.page_num               = pc.page_num
+And    pd.line_num               = pc.line_num
+And    pd.sepchk              = pc.sepchk
+
+And   (pd.plan_type     Between '20' And '2Z'
+Or     pd.plan_type           = '31')
+
+And    pd.ded_class          In ('A','N')
+
+And    pcbi.company           = pc.company
+And    pcbi.paygroup          = pc.paygroup
+!AXL - 04/27/2001 - Begin
+!And    pcbi.balance_id        = 'CY'
+!And    pcbi.balance_year      = #balance_year
+!And    pcbi.balance_period    = #balance_period
+And    pcbi.balance_id        = &pcx.balance_id 
+And    pcbi.balance_year      = &pcx.balance_year 
+And    pcbi.balance_period    = &pcx.balance_period 
+!AXL - 04/27/2001 - End
+
+Order By bdo.benefit_program,
+      ! j.emplid,
+       per.name,		!AXL 5/3/2001 New sort request
+       pd.plan_type,
+       pd.benefit_plan
+End-Select
+End-Procedure
+
+
+Begin-Procedure P210-Print-Detail
+#debug9 Show 'P210-Print-Detail'
+  If $BenProgram <> $Prior_BenProgram
+    Do Get-Benefit-Program-Name
+    Move $BenProgram To $Prior_BenProgram
+  End-If
+
+  Use-Report Detail
+
+  if $emplid <> $prev_emplid
+     Print $name          (+2,{#detail_column1},30)
+     Print $emplid        (+0,{#detail_column2})   !Edit xxx-xx-xxxx ! GEX_SEC_REENG 2015-06-24 Vahini Katta
+     move $emplid to $prev_emplid
+  else
+     position (+1)
+  end-if
+
+  Print $Benefit_Plan     (+0,{#detail_column3})
+  Print $plan_type_xlat   (+0,{#detail_column4})
+  Print #age              (+0,{#detail_column5})   Edit 990
+  Print #rate             (+0,{#detail_column6})   Edit 9,990.00
+  Print #coverage_amount  (+0,{#detail_column7})   Edit 999,999,990.00
+  Print #empl_ded_amount  (+0,{#detail_column8})   Edit 999,999,990.00
+  Print #empr_ded_amount  (+0,{#detail_column9})   Edit 999,999,990.00
+
+  Let #age             = 0
+  Let #rate            = 0
+  Let #coverage_amount = 0
+  Let #empl_ded_amount = 0
+  Let #empr_ded_amount = 0
+End-Procedure
+
+
+Begin-Procedure P220-Benefit-Plan-Subtotals
+#debug9 Show 'P220-Benefit-Plan-Subtotals'
+  Lookup XlatLookup $Plan_Type $Plan_Type_Xlat
+
+  Let $found = 'N'
+  Let #k = 0
+
+  get $BPPlan $ptype #lives #rate_b #amt_a #empl_amt_a #empr_amt_b from summary(#k)
+
+  While $found = 'N'
+    if $Benefit_Plan = $BPPlan         And
+       $ptype        = $plan_type_xlat
+      move #rate to #rate_b
+      add #coverage_amount to #amt_a
+      add #empl_ded_amount to #empl_amt_a
+      add #empr_ded_amount to #empr_amt_b
+      add 1 To #lives
+      put $Benefit_Plan $plan_type_xlat #lives #rate_b #amt_a #empl_amt_a #empr_amt_b into summary(#k)
+      let $found = 'Y'
+    else
+      if Rtrim($BPPlan, ' ') = '' And
+         Rtrim($ptype,  ' ') = ''
+        put $Benefit_Plan $plan_type_xlat 1 #rate #coverage_amount #empl_ded_amount #empr_ded_amount into summary(#k)
+        let $found = 'Y'
+      else
+        add 1 to #k
+        get $BPPlan $ptype #lives #rate_b #amt_a #empl_amt_a #empr_amt_b from summary(#k)
+      end-if
+    end-if
+  end-while
+
+  Do P210-Print-Detail
+
+  Let $Coverage-Amount-Found = 'N'
+End-Procedure
+
+
+Begin-Procedure P225-BP-Subtotals
+#debug9 Show 'P225-BP-Subtotals'
+
+  Use-Report Detail
+  Print 'Benefit Program'        (+2,{#detail_column1})
+  Print $save_benefit_program    (+0,+1)
+
+  Use-Report Summary
+  Print $BenProgram               (+1,{#summary_column1})
+  Print $BenefitProgramName       (+0,{#summary_column2})
+
+  let #j = 0
+  get $bpplan $ptype #lives #rate_A #volume #empl_amt #empr_amt from summary(#j)
+
+  while RTRIM($bpplan,' ') <> ''
+    Use-Report Detail
+    if #j <> 0
+      position (+1)
+    end-if
+    Print $bpplan    (+0,{#detail_column3}) 
+    Print $ptype     (+0,{#detail_column4})
+    Print #rate_a    (+0,{#detail_column6}) Edit 9,990.00
+    Print #volume    (+0,{#detail_column7}) Edit 999,999,990.00
+    Print #empl_amt  (+0,{#detail_column8}) Edit 999,999,990.00
+    Print #empr_amt  (+0,{#detail_column9}) Edit 999,999,990.00
+
+    Use-Report Summary
+    if #j <> 0
+      position (+1)
+    end-if
+    add #empl_amt to #calc_amt
+    add #empr_amt to #calc_amt
+    add #calc_amt to #bp_sub_ded_amount
+    Print #lives                  (+0,{#summary_column3})    Edit 999,990
+    Print $bpplan                 (+0,{#summary_column4}) 
+    Print $ptype                  (+0,{#summary_column5})
+    Print #volume                 (+0,{#summary_column6})    Edit 999,999,990.00
+    Print #calc_amt               (+0,{#summary_column7})    Edit 999,999,990.00
+    let #calc_amt = 0
+
+    add 1 to #j
+    get $bpplan $ptype #lives #rate_A #volume #empl_amt #empr_amt from summary(#j)
+  end-while
+
+  Use-Report Summary
+  Print '-'                       (+1,{#summary_column7},14)  Fill
+  Print #bp_sub_ded_amount        (+1,{#summary_column7})     Edit 999,999,990.00 
+  Print '-'                       (+1,{#summary_column7},14)  Fill
+ 
+  clear-array name=summary
+
+  Let #bp_sub_ded_amount      = 0
+End-Procedure
+
+
+Begin-Procedure P228-New-Page
+#debug9 Show 'P228-New-Page'
+  If $Data-Found-Flag = 'Y'
+    Use-Report Detail
+    New-Page
+    Use-Report Summary
+    New-Page
+  End-If
+End-Procedure
+
+
+Begin-Procedure P250-Disability-Coverage-Amount
+#debug9 Show 'P250-Disability-Coverage-Amount'
+Begin-Select
+!GEX ISDVNPK 08/29/2007 MODIFIED for UPG 9.0
+!Least((dpt.maximum_mo_benefit/(dpt.salary_replace_pct/100)),#coverage_amount) &coverage_amount
+Least(((SELECT bnform.COVERAGE_MAXIMUM FROM PS_BN_FORMULA bnform 
+      WHERE  bnform.BN_FORMULA_ID = dpt.BN_FORMULA_ID AND   bnform.effdt = (SELECT MAX(effdt)FROM PS_BN_FORMULA 
+       WHERE  bnform.BN_FORMULA_ID = BN_FORMULA_ID AND effdt <= $pay_end_dt))/(dpt.salary_replace_pct/100)),#coverage_amount) &coverage_amount
+!GEX ISDVNPK 08/29/2007 MODIFIED for UPG 9.0
+
+  Let #coverage_amount = &coverage_amount
+
+From   ps_disblty_pln_tbl    dpt
+
+Where  dpt.plan_type         = &pd.plan_type
+And    dpt.benefit_plan      = &pd.benefit_plan
+
+And    dpt.effdt             =
+      (Select Max(effdt)
+       From   ps_disblty_pln_tbl
+       Where  plan_type      = dpt.plan_type
+       And    benefit_plan   = dpt.benefit_plan
+       And    effdt         <= $pay_end_dt)
+End-Select
+End-Procedure
+
+
+Begin-Procedure P260-Get-Rate
+#debug9 Show 'P260-Get-Rate'
+Begin-Select
+bdc.rate_type
+bdc.rate_tbl_id
+!  show 'EMPLID -->   ' &j.emplid
+!  show '&bdc.rate_type ' &bdc.rate_type
+  If &bdc.rate_type = '1'
+    If &pd.plan_type = '25' Or
+       &pd.plan_type = '2Z'
+      Do P270-Get-Dependent-Info
+    Else
+      Let $sex    = &per.sex
+      Let #age    = &per.age
+      Let $smoker = &per.smoker
+      if $smoker = '' or $smoker = ' ' 							! ISDVASS smoker field has a blank in 9.0
+        let $smoker = 'N'           ! ISDVASS smoker field has a blank in 9.0
+      End-if                        ! ISDVASS smoker field has a blank in 9.0
+    End-If
+    Do P280-Age-Graded
+  End-If
+
+  If &bdc.rate_type = '2'
+    Let $sex    = &per.sex
+    Let #age    = &per.age
+    Let $smoker = &per.smoker
+    if $smoker = '' or $smoker = ' '		! ISDVASS smoker field has a blank in 9.0
+        let $smoker = 'N'               ! ISDVASS smoker field has a blank in 9.0 
+    end-if                              ! ISDVASS smoker field has a blank in 9.0 
+    Do P290-Flat-Amount
+  End-If
+
+From   ps_ben_defn_cost        bdc
+
+Where  bdc.benefit_program     = &bdo.benefit_program
+
+And    bdc.effdt               =
+      (Select Max(effdt)
+       From   ps_ben_defn_cost
+       Where  benefit_program  = bdc.benefit_program
+!GBD 10/16/2002 Begin
+       And    effdt           <= $pay_end_dt)
+!       And    effdt           <= $pay_end_dt
+!       And    plan_type        = bdc.plan_type
+!       And    option_id        = bdc.option_id
+!       And    cost_id          = bdc.cost_id)
+!GBD 10/16/2002 End
+
+And    bdc.plan_type           = &bdo.plan_type
+And    bdc.option_id           = &bdo.option_id
+End-Select
+End-Procedure
+
+
+Begin-Procedure P270-Get-Dependent-Info
+#debug9 Show 'P270-Get-Dependent-Info'
+Begin-Select
+db.sex
+Trunc(Months_Between($last_day_of_year,db.birthdate)/12) &db.age
+db.smoker
+
+  Let $sex    = &db.sex
+  Let #age    = &db.age
+  Let $smoker = &db.smoker
+  if $smoker = '' or $smoker = ' '        ! ISDVASS smoker field has a blank in 9.0
+     let $smoker = 'N'									  ! ISDVASS smoker field has a blank in 9.0
+  end-if   																! ISDVASS smoker field has a blank in 9.0
+
+From   ps_life_add_benefc  labc,
+       ps_dependent_benef  db
+
+Where  labc.emplid        = &j.emplid
+And    labc.empl_rcd     = &j.empl_rcd
+And    labc.plan_type     = &pd.plan_type
+
+And    labc.effdt         =
+      (Select Max(effdt)
+       From   ps_life_add_benefc
+       Where  emplid      = &j.emplid
+       And    empl_rcd   = &j.empl_rcd
+       And    plan_type   = &pd.plan_type
+       And    effdt      <= $pay_end_dt)
+
+And    db.emplid          = labc.emplid
+And    db.dependent_benef = labc.dependent_benef
+End-Select
+End-Procedure
+
+
+Begin-Procedure P280-Age-Graded
+#debug9 Show 'P280-Age-Graded'
+!GEX ISDVNPK 08/29/2007 MODIFIED for UPG 9.0
+!Begin-Select
+!act.total_rate_smoker
+!act.total_rate_nonsmok
+!
+!  If $smoker = 'Y'
+!    Let #rate = &act.total_rate_smoker
+!  Else
+!    Let #rate = &act.total_rate_nonsmok
+!  End-If
+
+!From   ps_age_covg_tbl       act
+
+!Where  act.age_rate_tbl_id    = &bdc.rate_tbl_id
+!
+!And    act.age_rate_sex       = $sex
+!
+!And    act.effdt              =
+!      (Select Max(effdt)
+!       From   ps_age_covg_tbl
+!       Where  age_rate_tbl_id = act.age_rate_tbl_id
+!       And    effdt          <= $pay_end_dt
+!       And    age_rate_sex    = act.age_rate_sex
+!       And    #age      Between act.age_range_low And act.age_range_high)
+!
+!And    #age             Between act.age_range_low And act.age_range_high
+!   show 'Emplid --> ' &j.emplid
+!   show 'sex    ' $Sex
+!   show 'age    ' #Age
+!   show 'smoker ' $Smoker
+!   show '&bdc.rate_tbl_id ' &bdc.rate_tbl_id
+Begin-Select
+(act.BN_EMPL_RATE + act.BN_EMPLR_RATE) &BN_rate
+      
+       Let #rate = &BN_rate  
+!       show ' Inside P280-Age-Graded'
+!       show 'Rate ' #rate
+       
+FROM   PS_BN_RATE_data act,
+       PS_BN_RATE_TBL bnrt
+WHERE  act.rate_tbl_id  = bnrt.rate_tbl_id
+   AND act.rate_tbl_id  = &bdc.rate_tbl_id
+   AND bnrt.effdt = (SELECT MAX(effdt)
+       FROM   PS_BN_RATE_TBL
+       WHERE  rate_tbl_id = bnrt.rate_tbl_id
+       AND    effdt          <= $pay_end_dt)
+   AND bnrt.rate_type = '1'
+   AND bnrt.effdt = act.effdt 
+   AND act.BN_RATE_KEY01 = $sex
+   AND act.BN_RATE_KEY02 = $smoker
+   AND act.BN_RATE_KEY03 = (SELECT MAX(TO_NUMBER(BN_RATE_KEY03)) FROM 
+                  PS_BN_RATE_DATA
+                  WHERE  rate_tbl_id = act.rate_tbl_id 
+				             AND effdt  =  act.effdt
+                     AND BN_RATE_KEY01 = act.BN_RATE_KEY01
+						         AND BN_RATE_KEY02 = act.BN_RATE_KEY02 
+                     AND TO_NUMBER(BN_RATE_KEY03) <= #age)
+!GEX ISDVNPK 08/29/2007 MODIFIED for UPG 9.0
+						
+End-Select
+End-Procedure
+
+
+Begin-Procedure P290-Flat-Amount
+#debug9 Show 'P290-Flat-Amount'
+!GEX ISDVNPK 08/29/2007 MODIFIED for UPG 9.0
+!Begin-Select
+!frt.total_covrg_rate
+!  Let #rate = &frt.total_covrg_rate
+!From   ps_flat_rate_tbl     frt
+!Where  frt.flat_rate_id     = &bdc.rate_tbl_id
+!And    frt.effdt            =
+!      (Select Max(effdt)
+!       From   ps_flat_rate_tbl
+!       Where  flat_rate_id  = frt.flat_rate_id
+!       And    effdt        <= $pay_end_dt)
+
+Begin-Select
+(frt.BN_EMPL_RATE + frt.BN_EMPLR_RATE) &frt_rate
+ 
+       Let #rate = &frt_rate  
+         
+FROM   PS_BN_RATE_data frt,
+       PS_BN_RATE_TBL bnrta
+WHERE  frt.rate_tbl_id = bnrta.rate_tbl_id
+   AND frt.rate_tbl_id = &bdc.rate_tbl_id
+   AND bnrta.effdt = (SELECT MAX(effdt)
+       FROM  PS_BN_RATE_TBL
+       WHERE rate_tbl_id = bnrta.rate_tbl_id
+       AND   effdt <= $pay_end_dt)
+   AND bnrta.effdt = frt.effdt 
+   AND bnrta.rate_type = '2'
+!GEX ISDVNPK 08/29/2007 MODIFIED for UPG 9.0
+   
+End-Select
+End-Procedure
+
+
+Begin-Procedure P300-Finalization
+#debug9 Show 'P300-Finalization'
+  If $Data-Found-Flag <> 'Y'
+    Use-Report Detail
+    Print 'NO DATA SELECTED FOR THIS REPORT RUN'        (25,) Center
+    Use-Report Summary
+    Print 'NO DATA SELECTED FOR THIS REPORT RUN'        (25,) Center
+  End-If
+
+  Do P170-Drop-Index
+
+  Do Reset                   !reset.sqc
+  Do Stdapi-Term             !stdapi.sqc
+  Show 'Successful end of report'
+End-Procedure
+
+
+#include 'askaod.sqc'    !Get-As-Of-Date procedure
+#include 'gexxx920.sqc'  !Get gex_rc_ben run controls
+#include 'gexxx911.sqc'  !Get "multiple" benefit_program run controls
+#include 'getpgmnm.sqc'  !Get the benefit program name
+#include 'getbennm.sqc'  !Get the benefit name
+#include 'getbalid.sqc'  !Get Balance Id for Calendar Year
+#Include 'stdapi.sqc'    !Process Scheduler Interface
+#Include 'reset.sqc'     !Reset Printer Procedure
+#Include 'curdttim.sqc'  !Get-Current-DateTime Procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'datemath.sqc'  !Routines for date math

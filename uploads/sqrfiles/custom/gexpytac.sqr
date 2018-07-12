@@ -1,0 +1,522 @@
+!***********************************************************************
+!GEXPYTAC:   This program is used to process Corp time through the     *
+!            timeload process.  The sqr will cat the Corp time file    *
+!            with whse for loading.                                    *
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module is the confidential and proprietary information of       *
+! Giant Eagle, Inc.; it is not to be copied, reproduced, or transmitted*
+! in any form, by any means, in whole or in part, nor is it to be used *
+! for any purpose other than that for which it is expressly provided   *
+! without the written permission of Giant Eagle.                       *
+!                                                                      *
+!                                                                      *
+!***********************************************************************
+!                         MODIFICATION HISTORY                         *
+!***********************************************************************
+!  ID#     INITIALS    DATE           DESCRIPTION OF THE CHANGE        *        
+!***********************************************************************
+!  P090    CJH         03/02/2004     INITIAL CREATION                 *
+!                                                                      *
+!          CJH         03/15/2004     change file dir for corptime     *
+!                                                                      *
+!          AXL         03/09/2006     Add UNIX commands to process     *
+!                                     multiple TA files from Corp Sys  *
+!                                     Suppt.                           *
+! ITG60757 MXR         05/17/2009     Add code to backup the TAC* files*
+! ITG63119 MXR         07/13/2009     Check for missing files TAC      *
+!	   KXY	       05/13/2011           Changes for file name issue      *
+! E83371   Vahini      08/13/2014     Handle missing whse file         *		
+!          Vahini      08/31/2015                                      *
+! Warehouse file has been discontinued as the store are on this file   *
+! are using Kronos. Creating a blank whse file so there will be very   *
+! minimal impact on the Time load processes i.e. less code changes and *
+! testing                                                              *                           
+!***********************************************************************
+#DEFINE Input_file1 'corptime.' 
+#DEFINE Input_file2 'whse.'     
+
+#include 'setenv.sqc' !Set environment 
+
+begin-setup
+#Include 'setup32a.sqc' 
+ 
+  begin-sql
+   !  ALTER SESSION SET OPTIMIZER_GOAL=RULE
+  ! Alter Session Set OPTIMIZER_MODE=RULE;
+  end-sql
+
+end-setup
+
+
+begin-report
+ 
+!  do Alter-Session    !gexaltse.sqc
+  do Init-DateTime
+  do Init-Number
+  do stdapi-init
+  display $ReportTitle
+  do Get-Current-DateTime
+  do Get-Current-Pay-End-Dt
+  do GET-DAY-SYSDATE
+  do check-for-missing-files
+  
+  IF $SEND_FLAG  = 'Y'
+   do Run-Script
+  END-IF
+  do Validate-Input-Files             ! commented out for testing MXR        05/17/2009 
+
+  let $asofnow_noAMPM = substr($asofnow,1,8)
+  
+
+
+  do back-up-ta-files                 ! Added code for backup  MXR           05/17/2009  !VENDKXY commented for testing 
+  do delete-original-file            ! commented out for testing MXR         05/17/2009  !VENDKXY commented for testing 
+
+  date-time () hh:mi:ss &timeEnded
+  display 'Report Ended: ' noline
+  display &timeEnded
+  do stdapi-term
+  
+
+end-report
+!***********************************************************
+! Get Current Pay End Date 
+!***********************************************************
+begin-procedure Get-Current-Pay-End-Dt
+
+ display 'Determining Appropriate Input filenames...'
+begin-select LOOPS=1
+to_char(Y1.PAY_END_DT, 'yyyymmdd') &pay_end_yyyymmdd
+
+  move 'Y' to $Found
+  move &pay_end_yyyymmdd to $pay_end_yyyymmdd
+  display '  Pay end: ' noline
+  display $pay_end_yyyymmdd
+
+FROM PS_PAY_CALENDAR Y1
+where Y1.PAY_SHEETS_RUN = 'Y'
+  AND Y1.PAY_CONFIRM_RUN = 'N'
+  AND Y1.RUN_ID > ' '
+  AND Y1.PAY_OFF_CYCLE_CAL = 'N'    ! CWB 01/02/2001
+  AND Y1.PAY_END_DT = (SELECT MAX(PAY_END_DT)
+			 FROM PS_PAY_CALENDAR
+			WHERE PAY_SHEETS_RUN = 'Y'
+			  AND PAY_CONFIRM_RUN = 'N'
+			  AND PAY_OFF_CYCLE_CAL = 'N'  ! CWB 01/02/2001
+			  AND PAY_END_DT <= $AsOfToday)
+end-select
+
+  if $Found = 'N'
+    display 'Error --  Pay Calendar not found or not setup for the Run ID.'
+    move ' ' to $SlctCompany
+  end-if
+
+  Let $Input_name1 = {Input_file1} || $pay_end_yyyymmdd
+  Let $Input_name2 = {Input_file2} || $pay_end_yyyymmdd
+
+  display 'Input filename 1 : ' noline
+  display $Input_name1
+  display 'Input filename 2 : ' noline
+  display $Input_name2 
+
+
+end-procedure
+
+
+!*********************************************************************              
+!This procedure gets the day of the week from sysdate          
+!*********************************************************************              
+begin-procedure GET-DAY-SYSDATE                                            
+!**********************************************************************             
+                                                      
+  LET $SEND_FLAG  = 'N'                                                                                  
+             
+begin-select               
+
+to_char(sysdate,'DAY') &day                                                                        
+                                                                                    
+      show &day     
+	  
+	 move  &day  to $day 
+	
+	 
+	 let $day    = ltrim($day,' ')
+	 let $day = rtrim ($day,' ')
+	   Evaluate $day
+	  when = 'SUNDAY' 
+	 !when = 'THURSDAY'
+	     LET $SEND_FLAG  = 'Y'
+	   break
+	   when = 'MONDAY'
+	       LET $SEND_FLAG  = 'N'
+	    
+	  break 
+	   End-Evaluate
+	
+	                                                                        
+from dual                                                               
+                                
+end-select                                       
+                                                                
+!**********************************************************************             
+end-procedure    GET-DAY-SYSDATE                                            
+!**********************************************************************    
+
+!***********************************************************
+! Validate Input Files - whse.yyymmdd and retail.yyyymmdd 
+!***********************************************************
+begin-procedure Validate-Input-Files
+
+ display 'Validating Warehouse and Corporate files...'
+ 
+ move 'N' to $errorfound
+ 
+ !Let $Input_filename1 = '{INFILE}' || 'staging/' || $Input_name1
+ Let $Input_filename1 = '{PSHOME}' || 'staging/' || $Input_name1
+ 
+
+ !AXL 03/09/2006 - Begin
+ Let $Input_dir = '{PSHOME}' || 'staging/'				
+ 
+ !Combine all TA files into file called corptime
+ !let $UNIX_CAT_COMMAND = 'cat ' || $Input_dir || 'TA* >> ' || $Input_filename1 !VENDKXY Done the changes for file name issue
+ 
+ let $UNIX_CAT_COMMAND = 'cat ' || $Input_dir || 'TA*' || $pay_end_yyyymmdd || ' >> ' || $Input_filename1  !VENDKXY Done the changes for file name issue
+ 
+   CALL SYSTEM USING $UNIX_CAT_COMMAND #system_status
+  if #system_status <> 0
+     add 1 to #errorcount
+     move 'Y' to $errorfound
+     display 'Concat failed'
+     display $UNIX_CAT_COMMAND
+    do end-sqr  !VENDKXY Done the changes for file name issue
+  else
+     display 'Input files appended to corptime successfully: ' noline
+     display $Input_filename1     
+  end-if
+  !AXL 03/09/2006 - End
+ 
+ open $Input_filename1 as 1 for-reading record=91 status=#filestat1
+
+  if #filestat1 <> 0
+	display $Input_filename1 noline
+	display ': Input file Open error occured;  Cannot proceed'
+	move 'Y' to $errorfound
+   do end-sqr  !VENDKXY Done the changes for file name issue
+  end-if        
+
+ show '$SEND_FLAG :' $SEND_FLAG
+ show '$Day       :' $Day
+ 
+ if $SEND_FLAG='Y'
+    Let $Input_filename2 = '{INFILE}' || $Input_name2
+    !Vahini 08/31/2015 Begins
+    !open $Input_filename2 as 2 for-reading record=91 status=#filestat2
+    open $Input_filename2 as 2 for-writing record=91 status=#filestat2
+    !Vahini 08/31/2015 Ends
+! E83371   Vahini      08/13/2014 Begins    
+ else
+    Let $Input_filename2 = '{INFILE}' || $Input_name2
+    open $Input_filename2 as 2 for-writing record=91 status=#filestat2
+ end-if       
+ ! E83371   Vahini      08/13/2014 Ends
+  if #filestat2 <> 0
+	display $Input_filename2 noline
+	display ': Input File Open error occured;  Cannot proceed'
+	move 'Y' to $errorfound
+	do end-sqr !VENDKXY Done the changes for file name issue
+  end-if        
+ 
+  close 1
+  close 2
+
+  If $errorfound = 'N'
+     let $UNIX_CAT_COMMAND = 'cat'||' '||$Input_filename1 || ' ' || $Input_filename2 || ' > ' || '{INFILE}/whseall' 
+
+     CALL SYSTEM USING $UNIX_CAT_COMMAND #system_status
+
+
+   if #system_status <> 0
+     add 1 to #errorcount
+     move 'Y' to $errorfound
+     display 'Concat failed'
+     display $UNIX_CAT_COMMAND
+     do end-sqr   !VENDKXY Done the changes for file name issue
+   else
+     display 'Input file created successfully: ' noline
+     display $Input_filename2     
+   end-if
+ end-if
+
+  If $errorfound = 'N'
+     let $UNIX_MV_COMMAND = 'mv'||' '|| '{INFILE}/whseall' || ' ' || $Input_filename2  
+
+     CALL SYSTEM USING $UNIX_MV_COMMAND #system_status
+
+
+   if #system_status <> 0
+     add 1 to #errorcount
+     display 'File rename failed'
+     display $UNIX_MV_COMMAND
+     do end-sqr !VENDKXY Done the changes for file name issue
+   else
+     display 'Input file created successfully: ' noline
+     display $Input_filename2     
+   end-if
+ end-if
+end-procedure
+
+!***********************************************************
+! Start code for backup  MXR         05/17/2009 
+begin-procedure back-up-ta-files
+display 'backing up TA* file from staging:' noline
+display $Input_filename1
+
+  
+
+   let $source_dir = '{PSHOME}' || 'staging/'
+   
+   show  ' $source_dir =  ' $source_dir 
+   
+   let $destn_dir = '{PSHOME}' || 'staging/backup/' || $pay_end_yyyymmdd || $SysDateTime
+   
+   show '$destn_dir = ' $destn_dir 
+   
+  
+   
+     let $UNIX_MK_DIR__COMMAND = 'mkdir ' ||  $destn_dir 
+       show ' $UNIX_MK_DIR__COMMAND  ' $UNIX_MK_DIR__COMMAND
+       
+     !let $UNIX_COPY_COMMAND = 'cp ' || $source_dir ||  'TA*' || ' ' || $destn_dir 
+     let $UNIX_COPY_COMMAND = 'cp ' || $source_dir ||  'TA*' || $pay_end_yyyymmdd || ' ' || $destn_dir  !VENDKXY Done the changes for file name issue
+       show ' $UNIX_COPY_COMMAND  ' $UNIX_COPY_COMMAND
+  
+!AXL 03/09/2006 - Begin
+display 'Moving  ta files from staging to backup directory'
+
+   CALL SYSTEM USING $UNIX_MK_DIR__COMMAND #system_status
+   
+
+
+if #system_status <> 0
+   add 1 to #errorcount
+   display 'copying ta staging input files failed'
+   do end-sqr !VENDKXY Done the changes for file name issue
+end-if
+display 'Successful copy is done'
+display 'Filename:' noline
+display $destn_dir
+!AXL 03/09/2006 - End
+
+
+CALL SYSTEM USING $UNIX_COPY_COMMAND #system_status
+   
+
+
+if #system_status <> 0
+   add 1 to #errorcount
+   display 'copying ta staging input files failed'
+   do end-sqr !VENDKXY Done the changes for file name issue
+end-if
+display 'Successful copy is done'
+display 'Filename:' noline
+display $destn_dir
+!AXL 03/09/2006 - End
+! end code for backup  MXR         05/17/2009 
+end-procedure
+
+!***********************************************************
+
+!***********************************************************
+! Start code for backup  MXR         05/17/2009 
+begin-procedure check-for-missing-files
+!display 'Checking for missing  TA* file in the  staging folder:' noline
+
+
+  move 'N' to $errorfound
+
+   let $source_dir = '{PSHOME}' || 'staging/'
+   
+    
+   let $destn_dir = '{PSHOME}' || 'staging/backup/' 
+   
+   
+ 
+       let $UNIX_DEL_FILENM_COMMAND =  'rm ' || $source_dir  || 'filename.txt' 
+       show ' $UNIX_DEL_FILENM_COMMAND  ' $UNIX_DEL_FILENM_COMMAND
+  
+!AXL 03/09/2006 - Begin
+ !display 'deleting previous runs filename.txt file  from  the staging folder'
+
+   CALL SYSTEM USING $UNIX_DEL_FILENM_COMMAND #system_status
+ 
+
+if #system_status <> 0
+    add 1 to #errorcount
+     move 'Y' to $errorfound
+    display 'Failed to delete the  filename.txt  file. '
+   ! do end-sqr 
+  else
+    display 'Successful delete of the old filename.txt is done'
+end-if
+
+
+   
+
+       let $UNIX_DEL_DIFFFILENM_COMMAND =  'rm ' || $source_dir  || 'diff.txt' 
+       show ' $UNIX_DEL_FILENM_COMMAND  ' $UNIX_DEL_DIFFFILENM_COMMAND
+  
+!AXL 03/09/2006 - Begin
+ !display 'deleting previous runs filename.txt file  from  the staging folder'
+
+   CALL SYSTEM USING $UNIX_DEL_DIFFFILENM_COMMAND #system_status
+ 
+
+if #system_status <> 0
+    add 1 to #errorcount
+     move 'Y' to $errorfound
+    display 'Failed to delete the  diff.txt  file. '
+   ! do end-sqr 
+  else
+    display 'Successful delete of the old diff.txt is done. '
+end-if
+
+
+     let $UNIX_CAT_FILENM_COMMAND = 'cd ' || $source_dir  ||';ls *.* | cut -d. -f1 > filename.txt' 
+!     let $UNIX_CAT_FILENM_COMMAND = 'cd /apps/hr/hrms90/hrdev90/staging;ls *.* | cut -d. -f1 > filename.txt' 
+       show ' $UNIX_CAT_FILENM_COMMAND  ' $UNIX_CAT_FILENM_COMMAND
+  
+!AXL 03/09/2006 - Begin
+!display 'Creating txt file with all  files from staging '
+
+   CALL SYSTEM USING $UNIX_CAT_FILENM_COMMAND #system_status
+   
+     show '#system_status 0 = ' #system_status
+
+   if #system_status <> 0
+     add 1 to #errorcount
+     move 'Y' to $errorfound
+     display 'Failed to create a new filename.txt. '
+     display $UNIX_CAT_FILENM_COMMAND
+    ! do end-sqr 
+   else
+     display 'Successful creation of the new filename.txt is done. ' 
+     !display $Input_filename2     
+   end-if
+   
+   
+   let $UNIX_DIFF_FILENM_COMMAND = 'cd ' || $source_dir  ||';diff filename.txt ' || $destn_dir  ||'orgflnmlst.txt > diff.txt' 
+    show ' $UNIX_DIFF_FILENM_COMMAND  ' $UNIX_DIFF_FILENM_COMMAND                                                                
+  
+!AXL 03/09/2006 - Begin
+!display ' starting difference between  filename.txt files  '
+
+   CALL SYSTEM USING $UNIX_DIFF_FILENM_COMMAND #system_status
+   
+   show '#system_status 1 = ' #system_status
+
+   if #system_status <> 1
+     add 1 to #errorcount
+     move 'Y' to $errorfound
+     display 'Failed to Create a  new diff.txt file. '
+     !display $UNIX_DIFF_FILENM_COMMAND
+    ! do end-sqr 
+   else
+     display 'Successfully created a new diff.txt file ' 
+     !display $Input_filename2     
+   end-if
+ 
+  
+! end code for backup  MXR         05/17/2009 
+end-procedure
+
+!**********************************
+! Procedure:   Run-Script                         *
+! Description:  Calls a unix script from SQR *
+!**********************************
+begin-procedure Run-Script
+ show 'Entering Run-Script STARTED'
+ 
+  
+
+! call script located in /ps_scripts folder 
+let $CALL_SHELL = '/apps/hr/hrms90/pshrprd/scripts/gex_shell/gexpytac.sh pshrprd'
+display $cmd
+   CALL SYSTEM USING $CALL_SHELL #system_status
+ if #call_status <> 0
+      show 'Could not call script.  Program being stopped.'
+  !   STOP Quiet
+ end-if
+
+ show 'Run-Script ENDED'
+end-procedure !Run-Script
+
+!***********************************************************
+begin-procedure delete-original-file
+
+display 'Deleting Corp file from staging:' noline
+display $Input_filename1
+
+let $UNIX_DELETE_COMMAND = 'rm'||' '|| $Input_filename1
+
+CALL SYSTEM USING $UNIX_DELETE_COMMAND #system_status
+
+if #system_status <> 0
+   add 1 to #errorcount
+   display 'Deleting Corp staging input file failed'
+   display 'Input file:' noline
+   !display $filename
+   display $Input_filename1	!AXL 03/09/2006
+   do end-sqr  !VENDKXY Done the changes for file name issue
+end-if
+
+!AXL 03/09/2006 - Begin
+display 'Deleting ta files from staging'
+!let $UNIX_DELETE_COMMAND    = 'rm ' || $Input_dir || 'TA*' 
+let $UNIX_DELETE_COMMAND    = 'rm ' || $Input_dir || 'TA*' || $pay_end_yyyymmdd !VENDKXY Done the changes for file name issue
+CALL SYSTEM USING $UNIX_DELETE_COMMAND #system_status
+
+if #system_status <> 0
+   add 1 to #errorcount
+   display 'Deleting ta staging input files failed'
+   do end-sqr !VENDKXY Done the changes for file name issue
+end-if
+display 'Successful delete is done'
+display 'Filename:' noline
+display $filename
+!AXL 03/09/2006 - End
+
+end-procedure
+
+!****************************************************************
+begin-procedure end-sqr 
+  let $tbl_name = 'ge_error_table'
+  ! E83371   Vahini      08/13/2014 Begins  
+  display 'Deleting Corp file from staging:' noline
+  display $Input_filename1
+
+  let $UNIX_DELETE_COMMAND = 'rm'||' '|| $Input_filename1
+
+  CALL SYSTEM USING $UNIX_DELETE_COMMAND #system_status
+
+  if #system_status <> 0
+   display 'Deleting Corp staging input file failed'
+   display 'Input file:' noline
+   display $Input_filename1	
+  end-if
+  ! E83371   Vahini      08/13/2014 Ends
+begin-select 
+aa
+from [$tbl_name]
+end-select
+end-procedure
+!**********************************************************
+#Include 'tranctrl.sqc'  !Common Transaction Control Procedures
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#include 'payrnctl.sqc'
+#Include 'stdapi.sqc'    !Get_Run_Control Procedure

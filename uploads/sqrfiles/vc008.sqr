@@ -1,0 +1,569 @@
+!***********************************************************************
+!  VC008:  Variable Compensation - Non Monetary Awards Report          *
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+!                                                                      *
+! This module contains confidential and proprietary information        *
+! of Oracle; it is not to be copied, reproduced, or transmitted        *
+! in any form, by any means, in whole or in part, nor is it to         *
+! be used for any purpose other than that for which it is              *
+! expressly provided under the applicable license agreement.           *
+!                                                                      *
+! Copyright (C) 2007 Oracle. All Rights Reserved.                      *
+!                                                                      *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!          $Date:  2007/09/06:01:02:26                                 !
+!       $Release:  HR9                                                 !
+!    $Resolution:  689848                                              !
+!                                                                      *
+!***********************************************************************
+!
+! Implements row-level security via PS_FAST_SQR_SEC_VW in hrsecty.sqc  *
+!                                                                      *
+! HP99999       Release 8                                              *
+!***********************************************************************
+
+#include 'setenv.sqc'    !Set environment
+
+#define GB_GROUP_TBL
+#define VC_PLAN_TBL
+#define VC_VALUE_TBL
+
+#Include 'rellang.sqc'
+
+Begin-setup
+#Include 'ptpsl177.sqc'
+end-setup
+
+!***********************************************************************
+begin-report
+!***********************************************************************
+
+  do Init-DateTime
+  do Init-Number
+  do Get-Current-DateTime
+  do Init-Report
+
+  if $start-error <> 'Y'
+    do Report
+  end-if
+  do Stdapi-Term
+  do Reset
+
+end-report
+
+!***********************************************************************
+begin-procedure Init-Report
+!***********************************************************************
+
+  move 'VCREPS' to $ReportID
+  move 'Non Monetary Awards Report' to $ReportTitle
+  display $ReportTitle
+  display ' '
+  do Stdapi-init
+  do Get-Report-Language   ! Procedure that decides the report language
+                           ! and then calls 'Report-Translation' procedure
+                           ! that reads the language dep. text.
+
+  if $prcs_process_instance = ''
+     display 'This process cannot be run outside the Process scheduler'
+     let $start_error = 'Y'
+  else
+     let $start_error = 'N'
+     do Security-Param
+     do Select-Parameters
+  end-if
+
+end-procedure
+
+!***********************************************************************
+begin-procedure select-parameters
+!***********************************************************************
+
+BEGIN-SELECT
+A.OPRID
+A.RUN_CNTL_ID
+A.VC_PLAN_ID
+A.VC_PAYOUT_PRD_ID
+A.PRD_END_DT
+A.TREE_NAME
+A.VC_TREE_DT
+A.VC_REPORT_TYPE
+A.FROMDATE
+A.THRUDATE
+B.CURRENCY_CD
+A.VC_PLAN_MEM_CRIT
+
+  move &A.PRD_END_DT to $prd_end_dt
+  do Format-DateTime($prd_end_dt, $prd_end_dt, {DEFYMD}, '', '')
+
+  if rtrim(&A.VC_PLAN_MEM_CRIT,' ') = 'E' or rtrim(&A.VC_PLAN_MEM_CRIT,' ') = 'A'
+     let $grp_flag = 'N'
+     let $sec_from = ''
+
+     !Setup for row-level security...
+     let $_TableAlias = 'VA'
+     do Security-Param
+     let $sec_where = $SecurityClauseWithERN
+
+     !Setup for row-level security...
+     let $_TableAlias = 'VA2'
+     do Security-Param
+     let $sec_where2 = $SecurityClauseWithERN
+
+     !Setup for row-level security...
+     let $_TableAlias = 'VA3'
+     do Security-Param
+     let $sec_where3 = $SecurityClauseWithERN
+
+     let $sec_list = '''NOGROUP'''
+  else
+     let $grp_flag = 'Y'
+     let $sec_from = ',PS_GB_GROUP_TBL    GT, PS_GB_SECGRPOPR_TB GS'
+     let $sec_where = 'AND VA.GB_GROUP_ID = GT.GB_GROUP_ID AND GT.EFFDT =
+                        (SELECT MAX(G2.EFFDT) FROM PS_GB_GROUP_TBL G2
+                        Where G2.GB_GROUP_ID = GT.GB_GROUP_ID AND
+                              G2.EFFDT <= '''||&A.prd_end_dt||''''||')
+                       AND GT.GB_GROUP_ID = GS.GB_GROUP_ID AND GS.GB_OPRID = '''||$prcs_oprid||''''
+     let $sec_list = 'GT.DESCR'
+  end-if
+
+  do getvaluation
+
+from PS_RC_VC_REPORTS A
+, PS_VC_PLAN_TBL B
+where A.OPRID       = $prcs_oprid and
+      A.RUN_CNTL_ID = $prcs_run_cntl_id
+AND B.VC_PLAN_ID = A.VC_PLAN_ID
+end-select
+
+if &A.VC_REPORT_TYPE = 'D'
+   let $reportname = $reportname||' - '||$Detail
+else
+   let $reportname = $reportname||' - '||$Summary
+end-if
+
+end-procedure
+
+!***********************************************************************
+begin-procedure Report
+!***********************************************************************
+
+ Position (1,1)
+ Move 0 To #group_target
+ Move 0 To #group_act_award
+ Move 0 To #group_award_val
+ Move 0 To #total_target
+ Move 0 To #total_act_award
+ Move 0 To #total_award_val
+ Move 0 to #group_units
+ Move 0 to #total_units
+ let $init_group = ''
+ let $last_group = ''
+
+Begin-Select
+VA.GB_GROUP_ID
+VA.VC_PLAN_ID
+VT.DESCR50
+VA.VC_PAYOUT_PRD_ID
+VA.EMPLID
+VA.EMPL_RCD
+VA.VC_TARGET_VALUE
+VA.VC_AWARD_VALUE
+VA.CURRENCY_CD
+PD.NAME
+VA.VC_CALC_SOURCE
+VA.VC_ACTUAL_AWD_UNIT
+VA.VC_ACTUAL_AWD_AMT
+[$sec_list] &GT_DESCR=char
+
+  do getrellang
+
+  let $calc_source = rtrim(&VA.VC_CALC_SOURCE,' ')
+  if $calc_source = 'M'
+     let $calc_source = 'Man'
+  else
+     if $calc_source = 'S'
+        let $calc_source = 'Sys'
+     else
+        if $calc_source = 'X'
+           let $calc_source = 'Max'
+        else
+           let $calc_source = 'Min'
+        end-if
+     end-if
+  end-if
+
+  if &VA.GB_GROUP_ID <> $init_group and $grp_flag = 'Y'
+     if $init_group <> ''
+        if &A.VC_REPORT_TYPE = 'D'
+              position (+1,)
+          Print $total_group (,8)
+        end-if
+        Print #group_target (,66) edit 99999999.999999
+        Print #group_units (,87) edit 99999999.999999
+!        Print #group_act_award (,109) edit 999999999999.999999
+        Print #group_award_val (,109) edit 999999999999.999999
+        position (+2,)
+        do getchild
+     end-if
+     position (+1)
+
+     Print $Group (,1)
+     Print &VA.GB_GROUP_ID (,9)
+     Print $GT_DESCR (,25)
+     if &A.VC_REPORT_TYPE = 'D'
+       position (+1,)
+     end-if
+     move 0 to #group_target
+     move 0 to #group_act_award
+     move 0 to #group_award_val
+     move 0 to #group_units
+     let $init_group = &VA.GB_GROUP_ID
+  end-if
+
+  let #vc_tv = &VA.VC_TARGET_VALUE
+  let #vc_aa = &VA.VC_ACTUAL_AWD_AMT
+  let #vc_av = &VA.VC_AWARD_VALUE
+  let #vc_au = &VA.VC_ACTUAL_AWD_UNIT
+  let #group_target = #group_target + #vc_tv
+  let #group_act_award = #group_act_award + #vc_aa
+  let #group_award_val = #group_award_val + #vc_av
+  let #group_units = #group_units + #vc_au
+!  let #total_target = #total_target + &VA.VC_TARGET_VALUE
+!  let #total_act_award = #total_act_award + &VA.VC_ACTUAL_AWD_AMT
+!  let #total_award_val = #total_award_val + &VA.VC_AWARD_VALUE
+!  let #total_units = #total_units + &VA.VC_ACTUAL_AWD_UNIT
+  if &A.VC_REPORT_TYPE = 'D'
+    do printrow
+  end-if
+
+From    PS_VC_AWARD VA
+       ,PS_VC_PLAN_TBL VT
+       ,PS_PERSON_NAME PD
+        [$sec_from]
+WHERE  VA.VC_PLAN_ID       = &A.VC_PLAN_ID
+AND    VA.VC_PAYOUT_PRD_ID = &A.VC_PAYOUT_PRD_ID
+AND    VT.VC_PLAN_ID       = VA.VC_PLAN_ID
+AND    VA.VC_AWARD_STATUS NOT IN ('I','R')
+AND    VA.EMPLID           = PD.EMPLID
+       [$sec_where]
+Order By VA.GB_GROUP_ID,VA.EMPLID,VA.EMPL_RCD
+End-Select
+
+if $grp_flag = 'Y'
+    if &A.VC_REPORT_TYPE = 'D'
+      position (+1,)
+      Print $total_group (,8)
+    end-if
+    Print #group_target (,66) edit 99999999.999999
+    Print #group_units (,87) edit 99999999.999999
+!    Print #group_act_award (,109) edit 999999999999.999999
+    Print #group_award_val (,109) edit 999999999999.999999
+    position (+2,)
+    do getchild
+end-if
+
+do GetSumPlan
+
+position (+2,)
+Print #total_target (,66) edit 99999999.999999
+Print #total_units (,87) edit 99999999.999999
+!Print #total_act_award (,109) edit 999999999999.999999
+Print #total_award_val (,109) edit 999999999999.999999
+Print $total_plan (,8)
+
+end-procedure
+
+!***********************************************************************
+Begin-procedure getchild
+!***********************************************************************
+
+begin-select
+TG.GB_CHILD_GROUP_ID
+
+  let $child_group = &TG.GB_CHILD_GROUP_ID
+
+  do GetSum
+
+  if &A.VC_REPORT_TYPE = 'D'
+    print $child_group (,8)
+    print #sum_target (,66) edit 99999999.999999
+    print #sum_units (,87) edit 99999999.999999
+    print #sum_act_award (,110) edit 99999999999.999999
+    print #sum_award_val (,131) edit 99999999999.999999
+    position (+1,)
+  end-if
+  let #group_target = #group_target + #sum_target
+  let #group_act_award = #group_act_award + #sum_act_award
+  let #group_award_val = #group_award_val + #sum_award_val
+  let #group_units = #group_units + #sum_units
+
+!  let #total_target = #total_target + #sum_target
+!  let #total_act_award = #total_act_award + #sum_act_award
+!  let #total_award_val = #total_award_val + #sum_award_val
+!  let #total_units = #total_units + #sum_units
+
+from PS_VC_TREE_GRP_VW TG
+where TG.TREE_NAME = &A.TREE_NAME AND
+      TG.TREE_EFFDT = &A.VC_TREE_DT AND
+      TG.GB_GROUP_ID = &VA.GB_GROUP_ID
+end-select
+
+end-procedure
+
+!***********************************************************************
+Begin-procedure GetSum
+!***********************************************************************
+
+move 0 to #sum_act_award
+move 0 to #sum_award_val
+move 0 to #sum_target
+move 0 to #sum_units
+
+begin-select
+VA2.VC_AWARD_VALUE
+VA2.VC_ACTUAL_AWD_UNIT
+VA2.VC_ACTUAL_AWD_AMT
+VA2.VC_TARGET_VALUE
+  let #vc_tv2 = &VA2.VC_TARGET_VALUE
+  let #vc_aa2 = &VA2.VC_ACTUAL_AWD_AMT
+  let #vc_av2 = &VA2.VC_AWARD_VALUE
+  let #vc_au2 = &VA2.VC_ACTUAL_AWD_UNIT
+  let #sum_target    = #sum_target    + #vc_tv2
+  let #sum_act_award = #sum_act_award + #vc_aa2
+  let #sum_award_val = #sum_award_val + #vc_av2
+  let #sum_units     = #sum_units     + #vc_au2
+from PS_VC_AWARD VA2
+       ,PS_VC_PLAN_TBL VT
+       ,PS_PERSON_NAME PD
+        [$sec_from]
+where   VA2.VC_PLAN_ID = &A.VC_PLAN_ID AND
+        VA2.VC_PAYOUT_PRD_ID = &A.VC_PAYOUT_PRD_ID AND
+        VA2.GB_GROUP_ID = &TG.GB_CHILD_GROUP_ID AND
+        VA2.VC_AWARD_STATUS NOT IN ('I','R')
+        AND    VT.VC_PLAN_ID       = VA2.VC_PLAN_ID
+        AND    VA2.EMPLID           = PD.EMPLID
+        [$sec_where2]
+end-select
+
+end-procedure
+
+!********************************************************
+Begin-procedure getrellang
+
+if rtrim(&A.VC_PLAN_MEM_CRIT,' ') = 'G' or rtrim(&A.VC_PLAN_MEM_CRIT,' ') = 'T'
+
+begin-select
+MAX(G2.EFFDT)  &G2_EFFDT=char
+FROM PS_GB_GROUP_TBL G2
+WHERE G2.GB_GROUP_ID = &VA.GB_GROUP_ID
+AND   G2.EFFDT <= &A.prd_end_dt
+end-select
+
+! Get Related Language info for PS_GB_GROUP_TBL
+  move &GT_DESCR to $GB_GROUP_TBL-DESCR
+  do Get_Related_GB_GROUP_TBL(&G2_EFFDT,&VA.GB_GROUP_ID)
+  move $GB_GROUP_TBL-DESCR to $GT_DESCR
+
+end-if
+
+! Get Related Language info for PS_VC_PLAN_TBL
+  move &VT.DESCR50 to $VC_PLAN_TBL-DESCR50
+  do Get_Related_VC_PLAN_TBL(&VA.VC_PLAN_ID)
+  move  $VC_PLAN_TBL-DESCR50 to $DESCR50
+
+end-procedure
+
+!***********************************************************************
+Begin-procedure GetSumPlan
+!***********************************************************************
+
+move 0 to #total_act_award
+move 0 to #total_award_val
+move 0 to #total_target
+move 0 to #total_units
+
+begin-select
+VA3.VC_AWARD_VALUE
+VA3.VC_ACTUAL_AWD_UNIT
+VA3.VC_ACTUAL_AWD_AMT
+VA3.VC_TARGET_VALUE
+
+  let #total_target = #total_target + &VA3.VC_TARGET_VALUE
+  let #total_act_award = #total_act_award + &VA3.VC_ACTUAL_AWD_AMT
+  let #total_award_val = #total_award_val + &VA3.VC_AWARD_VALUE
+  let #total_units = #total_units + &VA3.VC_ACTUAL_AWD_UNIT
+
+from PS_VC_AWARD VA3
+       ,PS_VC_PLAN_TBL VT
+       ,PS_PERSON_NAME PD
+        [$sec_from]
+where   VA3.VC_PLAN_ID = &A.VC_PLAN_ID AND
+        VA3.VC_PAYOUT_PRD_ID = &A.VC_PAYOUT_PRD_ID
+        AND    VT.VC_PLAN_ID       = VA3.VC_PLAN_ID
+        AND    VA3.VC_AWARD_STATUS NOT IN ('I','R')
+        AND    VA3.EMPLID           = PD.EMPLID
+        [$sec_where3]
+end-select
+
+end-procedure
+
+!********************************************************
+Begin-procedure getvaluation
+begin-select
+VT.VC_VALUATION_ID
+VT.DESCRSHORT
+VT.VC_VALUE_AMOUNT
+VT.CURRENCY_CD
+VT.EFFDT
+from    PS_VC_VALUE_TBL VT, PS_VC_PLAN_EFFDT  VE
+where   VT.VC_VALUATION_ID = VE.VC_VALUATION_ID AND
+        VE.VC_PLAN_ID = &A.VC_PLAN_ID AND
+        VE.EFFDT = (SELECT MAX(EFFDT) FROM PS_VC_PLAN_EFFDT VE2
+                    Where VE2.VC_PLAN_ID = VE.VC_PLAN_ID AND
+                          VE2.EFFDT <= &A.prd_end_dt) AND
+        VE.EFF_STATUS = 'A'
+end-select
+
+! Get Related Language info for PS_VC_VALUE_TBL
+  move &VT.DESCRSHORT to $VC_VALUE_TBL-DESCR50
+  do Get_Related_VC_VALUE_TBL(&VT.EFFDT,&VT.VC_VALUATION_ID)
+  move  $VC_VALUE_TBL-DESCRSHORT to $VT_DESCRSHORT
+
+let $valuation_str = ''
+let $ValueAmt =  ltrim(edit(&VT.VC_VALUE_AMOUNT, '999999999999.999999'),' ')
+
+if (rtrim(&VT.VC_VALUATION_ID,' ') <> '')
+  let $valuation_str = &VT.VC_VALUATION_ID || $VT_DESCRSHORT  || ' (' || $ValueAmt || ' ' || &VT.CURRENCY_CD  || ')'
+end-if
+
+end-procedure
+
+!***********************************************************************
+Begin-procedure PrintRow
+!***********************************************************************
+
+  print &VA.EMPLID (,8)
+  print &VA.EMPL_RCD (,21)
+  print &PD.NAME (,26)
+  print &VA.VC_TARGET_VALUE (,62) edit 999999999999.999999
+  print &VA.VC_ACTUAL_AWD_UNIT (,87) edit 99999999.999999
+  print $calc_source (,104)
+!  print &VA.VC_ACTUAL_AWD_AMT (,109) edit 999999999999.999999
+  print &VA.VC_AWARD_VALUE (,109) edit 999999999999.999999
+
+  position (+1,)
+
+end-procedure
+
+!***********************************************************************
+Begin-heading 13
+!***********************************************************************
+
+ let #topline = 12
+ let #labelpos = 110
+ let #fieldpos = 130
+
+ Print $current-date (2,1) edit 'MM/DD/YYYY'
+ Page-Number (1,#fieldpos)
+ Print $plan_id (3,#labelpos)
+ Print &A.VC_PLAN_ID (3,#fieldpos)
+ Print $DESCR50 (4,#fieldpos)
+ Print $payout_prd_id (5,#labelpos)
+ Print &A.VC_PAYOUT_PRD_ID (5,#fieldpos)
+
+ Print $curr_cd (6,#labelpos)
+ Print &B.CURRENCY_CD (6,#fieldpos)
+ Print $valuation (7,#labelpos)
+ Print &VT.VC_VALUATION_ID (7,#fieldpos)
+ Print $value_amount (8,#labelpos)
+ Print &VT.CURRENCY_CD (8,#fieldpos)
+ let #pos = #fieldpos+length(&VT.CURRENCY_CD)+2
+ Print &VT.VC_VALUE_AMOUNT (8,#pos) edit 888888888888.999999
+
+ Print $reportname (10,50)
+
+ if &A.VC_REPORT_TYPE = 'D'
+   Print $emplid (#topline,8)
+   Print $empl_rcd (#topline,21) wrap 4 2
+   Print $name (#topline,27)
+ end-if
+
+ Print $target_value (#topline, 70)
+ let #pos = 87+(15 - (length($award_unit)))
+ Print $award_unit (#topline,#pos)
+ if &A.VC_REPORT_TYPE = 'D'
+   Print $minmax (#topline,104) wrap 7 2
+ end-if
+ let #pos = 109+(19 - (length($award_value)))
+! Print $actual_awd_amt (#topline,#pos)
+! let #pos = #fieldpos+(19 - (length($award_value)))
+ Print $award_value (#topline,#pos)
+ position (+1,)
+
+End-Heading
+
+!***********************************************************************
+begin-procedure report-translation
+!***********************************************************************
+
+do Init_Report_Translation($ReportID,$Language_Cd)
+
+do Get_Field_Information ('VCREPS','ACTUAL_AWARD',$actual_award,#DW)
+do Get_Field_Information ('VCREPS','ACTUAL_FUNDING',$actual_funding,#DW)
+do Get_Field_Information ('VCREPS','ANNUAL_RATE',$annual_rate,#DW)
+do Get_Field_Information ('VCREPS','ATTAINED',$attained,#DW)
+do Get_Field_Information ('VCREPS','CARRYOVER_BALLANCE',$carryover_balance,#DW)
+do Get_Field_Information ('VCREPS','EMPLID',$emplid,#dw)
+do Get_Field_Information ('VCREPS','EMPL_RCD',$empl_rcd,#DW)
+do Get_Field_Information ('VCREPS','GROUP',$group,#DW)
+do Get_Field_Information ('VCREPS','GROUP_GOALS',$group_goals,#DW)
+do Get_Field_Information ('VCREPS','GUARANTEE',$guarantee,#DW)
+do Get_Field_Information ('VCREPS','JOB_CODE',$job_code,#DW)
+do Get_Field_Information ('VCREPS','MAX_AWARD',$max_award,#DW)
+do Get_Field_Information ('VCREPS','MIN/MAX',$minmax,#DW)
+do Get_Field_Information ('VCREPS','MIN_AWARD',$min_award,#DW)
+do Get_Field_Information ('VCREPS','NAME',$name,#DW)
+do Get_Field_Information ('VCREPS','OVERALL_PERF_FACT',$overall_perf_factor,#DW)
+do Get_Field_Information ('VCREPS','VC_PAYOUT_PRD_ID',$payout_prd_id,#DW)
+do Get_Field_Information ('VCREPS','PERFORMACE_FACTOR',$parf_factor,#DW)
+do Get_Field_Information ('VCREPS','PLAN ID',$plan_id,#DW)
+do Get_Field_Information ('VCREPS','PROJECTED_PAYOUT',$projected_payout,#DW)
+do Get_Field_Information ('VCREPS','VC_TARGET_AWARD',$target_award,#DW)
+do Get_Field_Information ('VCREPS','VC_TARGET_VALUE',$target_value,#DW)
+do Get_Field_Information ('VCREPS','TOTAL_PLAN',$total_plan,#DW)
+do Get_Field_Information ('VCREPS','TOTAL_GROUP',$total_group,#DW)
+do Get_Field_Information ('VCREPS','UNALLOCATED_BAL',$unallocated_balance,#DW)
+do Get_Field_Information ('VCREPS','VALUATION',$valuation,#DW)
+do Get_Field_Information ('VCREPS','VARIANCE',$variance,#DW)
+do Get_Field_Information ('VCREPS','WEIGHTING',$weighting,#DW)
+do Get_Field_Information ('VCREPS','DETAIL',$detail,#DW)
+do Get_Field_Information ('VCREPS','SUMMARY',$summary,#DW)
+do Get_Field_Information ('VCREPS','CURR_CD',$curr_cd,#DW)
+do Get_Field_Information ('VCREPS','VC_AWARD_VALUE',$award_value,#DW)
+do Get_Field_Information ('VCREPS','VC_ACTUAL_AWD_AMT',$actual_awd_amt,#DW)
+do Get_Field_Information ('VCREPS','VC_AWARD_UNIT',$award_unit,#DW)
+do Get_Field_Information ('VCREPS','VALUATION',$valuation,#DW)
+do Get_Field_Information ('VCREPS','VC_VALUE_AMOUNT',$value_amount,#DW)
+
+do Get_Field_Information ('VCREPS','VC008',$reportname,#DW)
+
+let $group = $group || ' :'
+
+end-procedure
+
+!***********************************************************************
+#include 'stdapi.sqc'    !Routine to update run Status
+#Include 'reset.sqc'     !Reset printer procedure
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'datemath.sqc'
+#include 'sqrtrans.sqc'
+#Include 'getrplng.sqc'  !Get the report language
+#include 'hrsecty.sqc'   !Get SQR Security parameters

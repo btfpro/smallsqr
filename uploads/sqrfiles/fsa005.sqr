@@ -1,0 +1,903 @@
+
+!***********************************************************
+!  FSA005:  Flexible Spending Account Quarterly Statement  *
+!***********************************************************
+
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+!                                                                      *
+! This module contains confidential and proprietary information        *
+! of Oracle; it is not to be copied, reproduced, or transmitted        *
+! in any form, by any means, in whole or in part, nor is it to         *
+! be used for any purpose other than that for which it is              *
+! expressly provided under the applicable license agreement.           *
+!                                                                      *
+! Copyright (C) 2006 Oracle. All Rights Reserved.                      *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+!                $Date:  2006/04/11:18:00:25                           !
+!             $Release:  HR9                                           !
+!            $Revision:  101                                           !
+!                                                                      *
+!***********************************************************************
+!This program prints the Quarterly Account Statement for all participants
+!who have had activity on one or more claims during the current quarter.
+
+!This program accomplishes the following:
+!  1.  Accesses PS_FSA_RunCtl record(s) which have their FSA_Qtrly_Rpt_Run
+!      indicators set to "R" (for "Ready").  The program will use the
+!      FSA_Run_ID in each of these run control records to locate matching
+!      values in one or more PS_Benef_Progm_Tbl records.
+!  2.  Retrieves the CURRENT DATE to determine the calendar quarter for
+!      which to prepare the statement.  The quarter picked in the one
+!      immediately preceding the CURRENT DATE.  For example, if the
+!      CURRENT DATE were any date between January 1, 1993 and March 31, 1993,
+!      the quarter reported would be the period October 1, 1992 through
+!      December 31, 1992.
+!  3.  Retrieves all PS_FSA_Claim records from
+!      January 1 through the end of the quarter as determined above.
+!      For example, if we're reporting for the third quarter of 1992
+!      (July 1 through September 30), we'll use the records from
+!      January 1 through June 30 to determine the total claim activity
+!      preceding the "reporting quarter".
+!***********************************************************************
+
+#Include 'setenv.sqc'  !Set Database Environment
+
+Begin-Setup
+  #Include 'ptpsl177.sqc'
+End-Setup
+
+
+begin-program
+
+  do Init-Report
+  do Process-Main
+  do StdAPI-Term
+
+end-program
+
+
+!*************************************************
+begin-procedure Init-Report
+!*************************************************
+
+  move 'FSA005' to $ReportID
+  move 'FSA Quarterly Statement' to $ReportTitle
+  display $ReportTitle
+  display ''
+  do Init-Number
+  do Init-DateTime
+  do Get-Current-DateTime
+  do StdAPI-Init
+  do Create-Arrays
+
+end-procedure
+
+
+!*************************************************
+begin-procedure Process-Main
+!*************************************************
+
+  do Get-System-Date-Override
+
+begin-SELECT
+A.CALENDAR_YEAR
+A.FSA_RUN_ID
+
+  move &A.Calendar_Year to $Calendar_Year
+  let $in = $Calendar_Year ||'0101'
+  do Format-DateTime($in, $YearBegin, {DEFCMP},'','native')
+
+  let $in = $Calendar_Year ||'1231'
+  do Format-DateTime($in, $YearEnd, {DEFCMP},'','native')
+
+  do Retrieve-Benefit-Programs
+
+FROM  PS_FSA_RUNCTL A
+WHERE A.FSA_QTRLY_RPT_RUN = 'R'  !Ready
+ORDER BY A.CALENDAR_YEAR,
+         A.FSA_RUN_ID
+end-SELECT
+
+  do UpDate-Qtrly-RunCtl
+
+end-procedure
+
+
+!*************************************************
+begin-procedure UpDate-Qtrly-RunCtl
+!*************************************************
+
+let $sql-statement = 'FSA005.SQR,UpDate-Qtrly-RunCtl,FSA_Runctl,Update'
+begin-SQL on-error=SQL-Error
+UPDATE PS_FSA_RUNCTL
+   SET FSA_QTRLY_RPT_RUN = 'F'
+ WHERE FSA_QTRLY_RPT_RUN = 'R';
+end-SQL
+
+end-procedure
+
+
+!*************************************************
+begin-procedure Retrieve-Benefit-Programs
+!*************************************************
+
+begin-SELECT
+B.BENEFIT_PROGRAM
+B.EFFDT
+B.DESCR
+
+  do Get-Balance-Year-Data
+  move '0000' to $old_EmplID
+  do Prepare-Quarterly-Statement
+
+FROM  PS_BEN_DEFN_PGM B
+WHERE B.EFFDT =
+      (SELECT MAX(EFFDT)
+       FROM   PS_BEN_DEFN_PGM
+       WHERE  BENEFIT_PROGRAM = B.BENEFIT_PROGRAM
+         AND  EFFDT          <= $YearEnd)
+  AND B.EFF_STATUS        = 'A'
+  AND B.FSA_RUN_ID        = &A.FSA_Run_ID
+ORDER BY B.BENEFIT_PROGRAM
+end-SELECT
+
+end-procedure
+
+
+!*************************************************
+begin-procedure Prepare-Quarterly-Statement
+!*************************************************
+
+begin-SELECT
+E.EMPLID
+  let $new_emplid = &e.emplid
+E.EMPL_RCD
+  let #new_emplrcd = &e.EMPL_RCD
+E.PLAN_TYPE
+E.ANNUAL_PLEDGE
+E.BENEFIT_PLAN
+E.ANNUAL_PLEDGE/G.PAY_PDS_PER_YEAR  &PayPdContrib
+F.COMPANY
+PD.MAIL_DROP
+
+  let $New_Mail_Drop = &PD.Mail_Drop
+  if ($new_EmplID <> $old_EmplID or #new_EmplRcd <> #old_EmplRcd)
+        and $old_emplid <> '0000'
+        and $new_Emplid <> ''
+    do Employee-Change
+  end-if
+
+  if $QtrBegin = $YearBegin
+    move 0            to #SumPdPrior
+    move 0            to #SumAprPrior
+  else
+    move $YearBegin   to $FromDate
+    move $QtrEndPrior to $ToDate
+    do Claims-Paid
+    move &SumPd       to #SumPdPrior
+    do Claims-Approved
+    do Claims-Paid-Of-Those-Approved
+    let #SumAprPrior = &SumApr - &SumPdApr
+  end-if
+
+  move $QtrBegin      to $FromDate
+  move $QtrEnd        to $ToDate
+  do Claims-Paid
+  do Claims-Approved
+  do Contributions-YTD
+  let #PledgeAvail = &E.Annual_Pledge - #SumPdPrior - &SumPd
+  let #ContribAvail = &ContribsYTD - #SumPdPrior - &SumPd
+  let #UnPdBalance = #SumAprPrior + &SumApr - &SumPd
+
+  evaluate &E.Plan_Type
+    when = '60'  !Health Care
+      let #ContribAvail = #PledgeAvail
+      move 52 to #col
+    when = '61'  !Dependent Day Care
+      let #ContribAvail = &ContribsYTD - #SumPdPrior - &SumPd
+      move 75 to #col
+    when = '65'   !Canadian Health care
+      let #ContribAvail = #PledgeAvail
+      move 52 to #col
+    when = '66'
+      let #ContribAvail = &ContribsYTD - #SumPdPrior - &SumPd
+      move 75 to #col
+
+
+  end-evaluate
+
+  do Print-Plan-Type-Amounts
+
+  let $old_emplid = $new_emplid
+  let #old_emplrcd = #new_emplrcd
+  let $Old_Mail_Drop = $New_Mail_Drop
+
+FROM  PS_BEN_PROG_PARTIC C,
+      PS_FSA_BENEFIT     E,
+      PS_PER_ORG_ASGN    M,
+      PS_JOB             F,
+      PS_PRIMARY_JOBS    PJ,
+      PS_PAY_CALENDAR    G,
+      PS_PAYROLL_DATA    PD
+WHERE C.BENEFIT_PROGRAM = &B.Benefit_Program
+  AND C.COBRA_EVENT_ID = 0
+  AND C.EFFDT =
+      (SELECT MAX(EFFDT)
+       FROM   PS_BEN_PROG_PARTIC
+       WHERE  EMPLID         = C.EMPLID
+         AND  COBRA_EVENT_ID = C.COBRA_EVENT_ID
+         AND  EMPL_RCD      = C.EMPL_RCD
+         AND  EFFDT         <= $QtrEnd)
+  AND E.EMPLID = C.EMPLID
+  AND E.EMPL_RCD = C.EMPL_RCD
+  AND E.COBRA_EVENT_ID = 0
+  AND E.EFFDT =
+      (SELECT MAX(EFFDT)
+       FROM   PS_FSA_BENEFIT
+       WHERE  EMPLID         = E.EMPLID
+         AND  EMPL_RCD      = E.EMPL_RCD
+         AND  COBRA_EVENT_ID = E.COBRA_EVENT_ID
+         AND  PLAN_TYPE      = E.PLAN_TYPE
+         AND  BENEFIT_NBR       = E.BENEFIT_NBR
+         AND  COVERAGE_ELECT = 'E'
+         AND  COVERAGE_BEGIN_DT BETWEEN $YearBegin AND $YearEnd)
+  AND (E.FSA_ACCT_STATUS = 'A'
+   OR  (E.FSA_ACCT_STATUS = 'I'
+  AND   E.COVERAGE_END_DT IS NOT NULL))
+  AND M.EMPLID           = E.EMPLID
+  AND M.BENEFIT_RCD_NBR  = E.EMPL_RCD          ! Yes, this is correct
+  AND PJ.EMPLID          = M.EMPLID
+  AND PJ.EMPL_RCD        = M.EMPL_RCD
+  AND PJ.PRIMARY_JOB_APP = 'BN'
+  AND PJ.PRIMARY_JOB_IND = 'Y'
+  AND PJ.EFFDT = (SELECT MAX(PJ1.EFFDT)
+                    FROM PS_PRIMARY_JOBS PJ1
+                   WHERE PJ1.EMPLID = PJ.EMPLID
+                     AND PJ1.EMPL_RCD = PJ.EMPL_RCD
+                     AND PJ1.PRIMARY_JOB_APP = 'BN'
+                     AND PJ1.EFFDT <= $YearEnd)
+  AND F.EMPLID         = M.EMPLID
+  AND F.EMPL_RCD       = M.EMPL_RCD
+  AND F.EFFDT =
+      (SELECT MAX(EFFDT)
+       FROM   PS_JOB
+       WHERE  EMPLID    = F.EMPLID
+         AND  EMPL_RCD = F.EMPL_RCD
+         AND  EFFDT    <= $YearEnd)
+  AND F.EFFSEQ =
+      (SELECT MAX(EFFSEQ)
+       FROM   PS_JOB
+       WHERE  EMPLID    = F.EMPLID
+         AND  EMPL_RCD = F.EMPL_RCD
+         AND  EFFDT     = F.EFFDT)
+  AND G.COMPANY         = F.COMPANY
+  AND G.PAYGROUP        = F.PAYGROUP
+  AND G.PAY_END_DT =
+      (SELECT MAX(PAY_END_DT)
+       FROM   PS_PAY_CALENDAR
+       WHERE  COMPANY  = G.COMPANY
+         AND  PAYGROUP = G.PAYGROUP
+         AND  PAY_END_DT BETWEEN $YearBegin AND $YearEnd)
+  AND PD.EMPLID  = F.EMPLID
+  AND PD.COMPANY = F.COMPANY
+ORDER BY E.EMPLID,
+         E.EMPL_RCD,
+         E.PLAN_TYPE
+end-SELECT
+
+  if $old_emplid <> '0000'
+    do employee-Change
+  end-if
+
+end-procedure
+
+
+!*************************************************
+begin-procedure Claims-Paid
+!*************************************************
+
+begin-SELECT
+
+#ifdef DB2ALL
+DECIMAL(SUM(K.FSA_CLAIM_AMT_PD),15,3) &SumPd
+#else
+SUM(K.FSA_CLAIM_AMT_PD)  &SumPd
+#endif
+
+FROM  PS_FSA_PAYMT_CLAIM K,
+      PS_FSA_PAYMENT     P
+WHERE K.CHECK_DT BETWEEN $FromDate AND $ToDate
+  AND P.FORM_ID            = K.FORM_ID
+  AND P.PAYCHECK_NBR             = K.PAYCHECK_NBR
+  AND P.CHECK_DT           = K.CHECK_DT
+  AND P.CALENDAR_YEAR      = &A.Calendar_Year
+  AND P.FSA_PAYMENT_STATUS = 'P'
+  AND EXISTS
+      (SELECT 'x'
+       FROM   PS_FSA_CLAIM
+       WHERE  EMPLID       = &E.EmplID
+         AND  EMPL_RCD    = &E.EMPL_RCD
+         AND  PLAN_TYPE    = &E.Plan_Type
+         AND  SVC_TO_DT BETWEEN $YearBegin AND $YearEnd
+         AND  CLAIMID      = K.CLAIMID)
+end-SELECT
+
+end-procedure
+
+
+!*************************************************
+begin-procedure Claims-Approved
+!*************************************************
+
+begin-SELECT
+SUM(X.FSA_CLAIM_APR_AMT)  &SumApr
+
+FROM  PS_FSA_CLAIM X
+WHERE X.EMPLID       = &E.EmplID
+  AND X.EMPL_RCD    = &E.EMPL_RCD
+  AND X.PLAN_TYPE    = &E.Plan_Type
+  AND X.SVC_TO_DT        BETWEEN $YearBegin AND $YearEnd
+  AND X.FSA_CLAIM_SUB_DT BETWEEN $FromDate AND $ToDate
+  AND X.FSA_CLAIM_STATUS NOT IN ('J','X')
+end-SELECT
+
+end-procedure
+
+
+!*************************************************
+begin-procedure Claims-Paid-Of-Those-Approved
+!*************************************************
+
+begin-SELECT
+SUM(Y.FSA_CLAIM_AMT_PD)  &SumPdApr
+
+FROM  PS_FSA_PAYMT_CLAIM Y,
+      PS_FSA_PAYMENT     P1
+WHERE Y.CHECK_DT BETWEEN $FromDate AND $ToDate
+  AND P1.FORM_ID            = Y.FORM_ID
+  AND P1.PAYCHECK_NBR             = Y.PAYCHECK_NBR
+  AND P1.CHECK_DT           = Y.CHECK_DT
+  AND P1.CALENDAR_YEAR      = &A.Calendar_Year
+  AND P1.FSA_PAYMENT_STATUS = 'P'
+  AND EXISTS
+      (SELECT 'X'
+       FROM   PS_FSA_CLAIM
+       WHERE  EMPLID           = &E.EmplID
+         AND  EMPL_RCD        = &E.EMPL_RCD
+         AND  PLAN_TYPE        = &E.Plan_Type
+         AND  SVC_TO_DT BETWEEN $YearBegin AND $YearEnd
+         AND  FSA_CLAIM_SUB_DT < $QtrBegin
+         AND  CLAIMID          = Y.CLAIMID)
+end-SELECT
+
+end-procedure
+
+
+!*************************************************
+begin-procedure Contributions-YTD
+!*************************************************
+
+begin-SELECT
+SUM(S.DED_YTD)  &ContribsYTD
+
+FROM  PS_DEDUCTION_BAL S
+WHERE PLAN_TYPE      = &E.Plan_Type
+  AND BALANCE_ID     = $Balance_Id
+  AND BALANCE_YEAR   = &A.Calendar_Year
+  AND EMPLID         = &E.EmplID
+  AND (S.COMPANY        = &F.Company
+     OR
+       S.COMPANY IN
+         (SELECT CP2.COMPANY
+          FROM   PS_COMPANY_TBL CP1,
+                 PS_COMPANY_TBL CP2
+          WHERE  CP1.COMPANY = &F.Company
+            AND  CP1.EFFDT <= $QtrEnd
+            AND  CP1.EFFDT = (SELECT MAX(X.EFFDT)
+                              FROM  PS_COMPANY_TBL X
+                              WHERE CP1.COMPANY = X.COMPANY
+                                AND X.EFFDT <= $QtrEnd)
+            AND ((CP1.COMMON_PAY_ID <> ' '
+                    AND CP1.COMMON_PAY_ID = CP2.COMMON_PAY_ID)
+                 OR
+                 (CP1.COMMON_OTH_ID <> ' '
+                    AND CP1.COMMON_OTH_ID = CP2.COMMON_OTH_ID))
+            AND  CP2.EFFDT <= $QtrEnd
+            AND  CP2.EFFDT = (SELECT MAX(X1.EFFDT)
+                                FROM PS_COMPANY_TBL X1
+                               WHERE CP2.COMPANY = X1.COMPANY
+                                 AND X1.EFFDT <= $QtrEnd)
+
+            AND  CP2.EFF_STATUS = 'A')
+      )
+  AND BALANCE_PERIOD =
+      (SELECT MAX(BALANCE_PERIOD)
+       FROM  PS_DEDUCTION_BAL
+       WHERE PLAN_TYPE     = S.PLAN_TYPE
+         AND BALANCE_ID    = S.BALANCE_ID
+         AND BALANCE_YEAR  = S.BALANCE_YEAR
+         AND BENEFIT_RCD_NBR = S.BENEFIT_RCD_NBR
+         AND EMPLID        = S.EMPLID
+         AND COMPANY       = S.COMPANY
+         AND DEDCD         = S.DEDCD
+         AND DED_CLASS     = S.DED_CLASS)
+end-SELECT
+
+end-procedure
+
+
+!*************************************************
+begin-procedure Print-Plan-Type-Amounts
+!*************************************************
+
+  print &E.Annual_Pledge     (22,#col)  edit 99,990.99
+  print &PayPdContrib        (+1,#col)  edit 99,990.99
+  print &ContribsYTD         (+1,#col)  edit 99,990.99
+
+  print #SumPdPrior          (+2,#col)  edit 99,990.99
+  print &SumPd               (+1,#col)  edit 99,990.99
+
+  print #PledgeAvail         (+2,#col)  edit 99,990.99
+  print #ContribAvail        (+1,#col)  edit 99,990.99
+
+  print #SumAprPrior         (+2,#col)  edit 99,990.99
+  print &SumApr              (+1,#col)  edit 99,990.99
+  print &SumPd               (+1,#col)  edit 99,990.99
+  print #UnPdBalance         (+1,#col)  edit 99,990.99
+
+end-procedure
+
+
+!*************************************************
+begin-procedure Employee-Change
+!*************************************************
+
+ let #tot_page_number = 0
+ let #page_number = 0
+
+begin-SELECT
+L.NAME
+
+  do Get-Empl-Address ($old_EmplID,$AddrType, $AddressFound)
+
+FROM  PS_PERSON_NAME L
+WHERE L.EMPLID    = $old_EmplID
+end-SELECT
+
+  do Print-Descriptive-Data
+  do Claims-Activity
+  do Claim-Change
+  do Print-Claim-Details
+  do print-footer
+
+  NEW-PAGE
+
+
+end-procedure
+
+
+!*************************************************
+begin-procedure Print-Descriptive-Data
+!*************************************************
+
+  let $Name = RTrim(&L.Name,' ')
+
+  let $City = RTRIM($GETADDR_CITY,' ')||', '||RTRIM($GETADDR_STATE,' ')||'  '||$GETADDR_POSTAL
+
+  do Get-Qtr-Heading
+
+  print 'Health Care     Dependent Day Care'                          (+3,50)
+
+  print 'Your Annual Pledge Amount:'                                   (22,1)
+  print 'Your Pay Period Contribution Amount:'                         (+1,1)
+  print 'Year-to-Date Contributions to Your Account:'                  (+1,1)
+
+  print 'Claims Paid in Prior Quarters:'                               (+2,1)
+  print 'Claims Paid this Quarter (see below as *):'                   (+1,1)
+
+  print 'Pledge Remaining Through End of Year:'                        (+2,1)
+  print 'Amount Currently Available for Additional Claims:'            (+1,1)
+
+  print 'Claims Approved but Unpaid at Beginning of Quarter:'          (+2,1)
+  print 'Claims Approved this Quarter (see below as *):'               (+1,1)
+  print 'Claims Paid this Quarter (see below as *):'                   (+1,1)
+  print 'Claims Approved but Unpaid at End of Quarter:'                (+1,1)
+
+
+
+  print '          <--------- Service ------------>   Submit         ' (+2,1)
+  print '      <- Claim Amounts -> | '                                 ()
+  print '<--------------- Claims Paid --------------->'                ()
+  print 'Claim ID  Type          From        To        Date'           (+1,1)
+  print '    Provider     Submitted Approved | Claim ID    Amount '    ()
+  print 'Check No.       Check Date'                                   ()
+  print '|' (+1,87)
+
+end-procedure
+
+!***************************************
+begin-procedure Create-Arrays
+!***************************************
+
+  create-array name=Claim_Tbl size= 120
+  field=Claim_ID1:char
+  field=Claim_Qtr1:char
+  field=Service_Type:Char
+  field=Service_FromDt:char
+  field=Service_ToDt:char
+  field=Submit_Dt:char
+  field=Provider:char
+  field=Submit_Amt:number
+  field=Approve_Amt:number
+  field=Deny_Amt:number
+  field=Deny_Rsn:char
+  field=FSA_Status:char
+
+  create-array name=Claim_Paid_Tbl size= 120
+  field=Claim_ID2:char
+  field=Claim_Qtr2:char
+  field=Paid_Amt:number
+  field=Check_Num:number
+  field=Check_Dt:char
+  field=FSA_Paymt_Status:char
+
+end-procedure
+
+!*************************************************
+begin-procedure Claims-Activity
+!*************************************************
+
+  Let #Col1_line = 0
+
+  if ($CurrentQtr = '05')
+    let $ClaimDateClause = ''
+  else
+    let $ClaimDateClause = ' AND W.FSA_CLAIM_SUB_DT <= ''' || $QtrEnd || ''' '
+  end-if
+
+begin-SELECT
+W.CLAIMID
+W.SVC_TYPE
+W.SVC_FROM_DT
+  move &W.Svc_From_Dt to $W.Svc_From_Dt
+  do Format-DateTime($W.Svc_From_Dt,$Svc_From_Dt,{DEFMDY},'','')
+W.SVC_TO_DT
+  move &W.Svc_To_Dt to $W.Svc_To_Dt
+  do Format-DateTime($W.Svc_To_Dt,$Svc_To_Dt,{DEFMDY},'','')
+W.SVC_PROVIDER
+W.FSA_CLAIM_SUB_AMT
+W.FSA_CLAIM_APR_AMT
+W.FSA_CLAIM_DENY_AMT
+W.FSA_CLAIM_DENY_RSN
+W.FSA_CLAIM_SUB_DT
+   move &W.FSA_Claim_Sub_Dt to $W.FSA_Claim_Sub_Dt
+   do Format-DateTime($W.FSA_Claim_Sub_Dt,$FSA_Claim_Sub_Dt,{DEFMDY},'','')
+W.FSA_CLAIM_STATUS
+X.FIELDNAME
+X.FIELDVALUE
+
+  let $FieldName = &X.FIELDNAME
+  let $FieldValue = &X.FIELDVALUE
+  do Read-Translate-Table
+
+  let $THIS_QTR = ' '
+  do Convert-To-DTU-Date(&W.FSA_CLAIM_SUB_DT,$CMP-Claim-Sub-Dt)
+  do Convert-To-DTU-Date($QtrBegin,$CMP-QtrBegin)
+  do Convert-To-DTU-Date($QtrEnd,$CMP-QtrEnd)
+  IF $CMP-Claim-Sub-Dt >= $CMP-qtrbegin
+    IF ($CMP-Claim-Sub-Dt <= $CMP-qtrend or $CurrentQtr = '05')
+       let $this_qtr = '*'
+    end-if
+  end-if
+
+  PUT  &W.CLAIMID
+       $this_qtr
+       $XlatShortName
+       $SVC_FROM_DT
+       $SVC_TO_DT
+       $FSA_CLAIM_SUB_DT
+       &W.FSA_CLAIM_SUB_AMT
+       &W.FSA_CLAIM_APR_AMT
+       &W.SVC_PROVIDER
+       &W.FSA_CLAIM_DENY_AMT
+       &W.FSA_CLAIM_DENY_RSN
+       &W.FSA_CLAIM_STATUS
+
+  INTO Claim_Tbl(#Col1_Line)
+       Claim_ID1
+       Claim_Qtr1
+       Service_Type
+       Service_FromDt
+       Service_ToDt
+       Submit_Dt
+       Submit_Amt
+       Approve_Amt
+       Provider
+       Deny_Amt
+       Deny_Rsn
+       FSA_Status
+
+  Add 1 to #Col1_Line
+
+  Let #Col1_Line_Count = #Col1_Line
+
+FROM  PS_FSA_CLAIM W,
+      PSXLATITEM X
+WHERE W.EMPLID     = $old_EmplID
+  AND W.EMPL_RCD  = #old_EmplRcd#
+  AND W.SVC_FROM_DT BETWEEN $YearBegin AND $YearEnd
+[$ClaimDateClause]
+  AND X.FIELDNAME   = 'SVC_TYPE'
+  AND X.FIELDVALUE  = W.SVC_TYPE
+  AND X.EFFDT =
+      (SELECT MAX(EFFDT)
+       FROM   PSXLATITEM
+       WHERE  FIELDNAME   = X.FIELDNAME
+         AND  FIELDVALUE  = X.FIELDVALUE
+         AND  EFFDT      <= W.SVC_TO_DT)
+  AND X.EFF_STATUS = 'A'
+order by W.FSA_CLAIM_SUB_DT,
+         W.CLAIMID
+end-SELECT
+
+end-procedure
+
+!*************************************************
+begin-procedure Claim-Change
+!*************************************************
+
+  Let #Col2_line = 0
+
+  if ($CurrentQtr = '05')
+    let $CheckDateClause = ''
+  else
+    let $CheckDateClause = ' AND ZZ.CHECK_DT <= ''' || $QtrEnd || ''' '
+  end-if
+
+begin-SELECT
+Z.PAYCHECK_NBR
+Z.CHECK_DT
+    move &Z.Check_Dt to $Z.Check_Dt
+    do Format-DateTime($Z.Check_Dt,$Check_Dt,{DEFMDY},'','')
+Z.FSA_CLAIM_AMT_PD
+Z.CLAIMID
+ZZ.FSA_PAYMENT_STATUS
+
+  let $THAT_QTR = ' '
+  do Convert-To-DTU-Date(&Z.CHECK_DT,$CMP-Check-Dt)
+  do Convert-To-DTU-Date($QtrBegin,$CMP-QtrBegin)
+  do Convert-To-DTU-Date($QtrEnd,$CMP-QtrEnd)
+  IF $CMP-check-dt  >= $CMP-qtrbegin
+  IF ($CMP-check-dt <= $CMP-qtrend  or $CurrentQtr = '05')
+     let $that_qtr = '*'
+  end-if
+  end-if
+
+  PUT  &Z.CLAIMID
+       $that_qtr
+       &Z.FSA_CLAIM_AMT_PD
+       &Z.PAYCHECK_NBR
+       $CHECK_DT
+       &ZZ.FSA_PAYMENT_STATUS
+
+  INTO Claim_Paid_Tbl(#Col2_line)
+       Claim_ID2
+       Claim_Qtr2
+       Paid_Amt
+       Check_Num
+       Check_Dt
+       FSA_Paymt_Status
+
+  Add 1 to #Col2_line
+
+  Let #Col2_Line_Count = #Col2_Line
+
+FROM PS_FSA_PAYMENT    ZZ,
+     PS_FSA_PAYMT_CLAIM Z
+WHERE ZZ.EMPLID     = $old_emplid
+  and ZZ.CHECK_DT  >= $YearBegin
+  and ZZ.CALENDAR_YEAR = &A.Calendar_Year
+[$CheckDateClause]
+  and ZZ.FSA_PAYMENT_STATUS IN ('P','X')
+  and Z.PAYCHECK_NBR      = ZZ.PAYCHECK_NBR
+  and Z.CHECK_DT    = ZZ.CHECK_DT
+
+order by Z.CHECK_DT,
+         Z.CLAIMID
+
+end-SELECT
+
+end-procedure
+
+!***************************************
+Begin-Procedure Print-Claim-Details
+!***************************************
+
+  Let #Print_line = 39
+  Let #Print_line2 = 39
+  Let #Col_line = 0
+
+  if #Col1_line_Count < #Col2_line_Count
+     let #Max_line_Count = #Col2_line_Count
+  else
+     let #Max_line_Count = #Col1_line_Count
+  end-if
+
+WHILE #Col_line < #Max_line_Count
+
+  if #Print_line > 52
+    do Print-Footer
+    NEW-PAGE
+    do Get-Qtr-Heading
+    do Print-Continued-Page-Header
+    move 24 to #Print_line
+    move 24 to #Print_line2
+  end-if
+
+  if #Col_line < #Col1_line_Count
+    do get-array1-data
+   !Print claim details
+    print $Claim_ID1               (#Print_line,1)
+    print $Claim_Qtr1              (0,09)
+    print $Service_Type            (0,11)
+    print $Service_FromDt          (0,22)
+    print $Service_ToDt            (0,33)
+    print $Submit_Dt               (0,44)
+
+    if $FSA_Status = 'X'
+      print '[This Claim was Reversed]'  (0,55)
+    else
+      print $Provider               (0,55)
+      print #Submit_Amt             (0,69)  edit 9,990.99
+      print #Approve_Amt            (0,78)  edit 9,990.99
+    end-if
+
+    print '|'                       (0,87)
+
+    if (#Deny_Amt > 0) And ($FSA_Status <> 'X')
+      move 'FSA_CLAIM_DENY_RSN'  to $FieldName
+      move $Deny_Rsn to $FieldValue
+      do Read-Translate-Table
+
+      do Format-Number(#Deny_Amt, $Amt, '$$,$$9.99')
+      let $DenyDesc = '[' || LTRIM($Amt, ' ') || ' was denied because: '
+      let $DenyDesc = $DenyDesc || RTRIM($XlatLongName, ' ') || ']'
+
+      add 1 to #Print_Line
+      print $DenyDesc               (#Print_Line,10)
+      print '|'                     (0,87)
+    end-if
+  end-if
+
+  if #Col_line < #Col2_line_Count
+    do get-array2-data
+    !Print payment details
+    print '|'                       (#Print_line2,87)
+    print $Claim_ID2                (0,89)
+    print $Claim_Qtr2               (0,97)
+
+    if ($FSA_Paymt_Status = 'X')
+      let $Temp = ' [Check ' || Edit($PAYCHECK_NBR, '099999999999999') || ' Reversed]'
+      print $Temp                   (0, 100)
+    else
+      print #Paid_Amt                (0, 99)  edit 9,990.99
+      print #Check_Num               (0,108)  edit 099999999999999
+      print $Check_Dt                (0,124)
+    end-if
+  end-if
+
+  Add 1 to #Print_line
+  Add 1 to #Print_line2
+  Add 1 to #Col_line
+
+END-WHILE
+
+  Clear-array name=Claim_Tbl
+  Clear-array name=Claim_Paid_tbl
+  Let #Col1_line_Count = 0
+  Let #Col2_line_Count = 0
+
+End-Procedure
+
+!*************************************************
+begin-procedure Get-Array1-Data
+!*************************************************
+
+    GET   $Claim_ID1              !Get data from claim details
+          $Claim_Qtr1
+          $Service_Type
+          $Service_FromDt
+          $Service_ToDt
+          $Submit_Dt
+          #Submit_Amt
+          #Approve_Amt
+          $Provider
+          #Deny_Amt
+          $Deny_Rsn
+          $FSA_Status
+
+    FROM  Claim_Tbl(#Col_line)
+          Claim_ID1
+          Claim_Qtr1
+          Service_Type
+          Service_FromDt
+          Service_ToDt
+          Submit_Dt
+          Submit_Amt
+          Approve_Amt
+          Provider
+          Deny_Amt
+          Deny_Rsn
+          FSA_Status
+
+ end-procedure
+
+!*************************************************
+begin-procedure Get-Array2-Data
+!*************************************************
+
+    GET   $Claim_ID2              !Get data from payment details
+          $Claim_Qtr2
+          #Paid_Amt
+          #Check_Num
+          $Check_Dt
+          $FSA_Paymt_Status
+
+    FROM  Claim_Paid_Tbl(#Col_line)
+          Claim_ID2
+          Claim_Qtr2
+          Paid_Amt
+          Check_Num
+          Check_Dt
+          FSA_Paymt_Status
+
+ end-procedure
+
+!*************************************************
+begin-procedure Print-footer
+!*************************************************
+
+ add 1 to #page_number
+
+ let $page_number = edit(#page_number,'99')
+ let $Footer = 'page'|| $page_number
+ print $Footer  (54,58)
+
+end-procedure
+
+!*************************************************
+begin-procedure Print-Continued-Page-Header
+!*************************************************
+
+   do Get-Qtr-Heading
+   print '                                          ' (+2,1)
+   print '     (continued from previous page)'             (0,40)
+
+   print '          <--------- Service ------------>   Submit         ' (+2,1)
+   print '      <- Claim Amounts -> | '                                 ()
+   print '<--------------- Claims Paid --------------->'                ()
+   print 'Claim ID  Type          From        To        Date'           (+1,1)
+   print '    Provider     Submitted Approved | Claim ID    Amount '    ()
+   print 'Check No.       Check Date'                                   ()
+   print '|' (+1,87)
+
+ end-procedure
+
+!*************************************************
+
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'datemath.sqc'  !Routines for date comparison conversions
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'readxlat.sqc'  !Read-Translate-Table procedure
+#Include 'fsadates.sqc'  !Get-Balance-Year-Data
+#Include 'stdapi.sqc'    !Update Process API
+#Include 'fsahead.sqc'   !Get-Qtr-Heading
+#Include 'getaddr.sqc'   !Get current address for specified address type
+
+!***************************** End of Report ***************************

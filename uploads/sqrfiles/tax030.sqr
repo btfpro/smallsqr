@@ -1,0 +1,567 @@
+!***********************************************************************
+!  TAX030: Print 1042-S Data by Pay Period
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+!   This module contains confidential and proprietary information      *
+!   of Oracle; it is not to be copied, reproduced, or transmitted      *
+!   in any form, by any means, in whole or in part, nor is it to       *
+!   be used for any purpose other than that for which it is            *
+!   expressly provided under the applicable license agreement.         *
+!                                                                      *
+!   Copyright (C) 2006 Oracle. All Rights Reserved.                    *
+!***********************************************************************
+!                                                                      *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+!          $Date:  2006/07/20:06:17:03                                 !
+!       $Release:  HR9                                                 !
+!      $Revision:  101                                                 !
+!                                                                      *
+!***********************************************************************
+! This program is specific to HRMS for Public Sector.                  *
+!***********************************************************************
+
+#include 'setenv.sqc'   ! set environment
+#include 'setup32.sqc'  ! printer and page-size initialization
+
+
+!***********************************************************************
+begin-report
+  do Init-Report
+  do Process-1042-Data
+  do Reset
+  do Stdapi-Term
+end-report
+
+!***********************************************************************
+begin-heading 9
+  #include 'stdhdg01.sqc'
+
+  print $Report_Title2          (3, 0)     center
+  print 'Company:'              (5, 1)
+  print $Company_Name           (5,23)
+  print 'Pay Period End Date:'  (6, 1)
+  do Format-DateTime ($Last_Pay_Period, $out, {DEFDATE}, '', '')
+  print $out                    (6,23)
+
+  print '  Withholding'  (7,105)
+  print '      Federal'  (7,121)
+
+  print 'Employee'       (8,  1)
+  print 'Income Code'    (8, 56)
+  print ' Gross Income'  (8, 89)
+  print '    Allowance'  (8,105)
+  print '   Tax Amount'  (8,121)
+  print 'Tax Rate'       (8,137)
+
+  print '-'              (9,  1,53) fill
+  print '-'              (9, 56,30) fill
+  print '-'              (9, 89,13) fill
+  print '-'              (9,105,13) fill
+  print '-'              (9,121,13) fill
+  print '-'              (9,137, 8) fill
+
+end-heading
+
+
+!***********************************************************************
+begin-procedure Init-Report
+  move 'TAX030' to $ReportID
+  move 'Form 1042-S Tax Liability Data by Pay Period' to $ReportTitle
+  display ' '
+  display $ReportTitle
+  display ' '
+
+  move '-' to $ReportDDelimiter
+  move '1' to $ReportDDLZero
+  move '1' to $ReportMMLZero
+  move '1' to $ReportYear4
+
+  do Init-DateTime
+  do Init-Number
+  do Get-Current-DateTime
+  do Stdapi-Init
+
+  ! set default date formatting parameters
+  move '-' to $DDelimiter
+  move '1' to $DDLZero
+  move '0' to $MMLZero
+  move '1' to $Year4
+
+  do Get-Parameters
+  do Create-Income-Code-Array
+
+end-procedure
+
+
+!***********************************************************************
+! Procedure:  Get-Parameters
+! Description:
+!   This routine gets the run control parameters and formats them
+!   as required.
+!   If a tax year is supplied, a start and end date will be created,
+!   using Jan 1 and Dec 31 of the tax year.  Otherwise, the program
+!   will use the supplied start and end dates.
+!***********************************************************************
+begin-procedure Get-Parameters
+
+  if $Prcs_Process_Instance = ''
+    input $Parm_Tax_Year 'Enter Year, e.g. 1990'
+    input $Parm_StartDt  'Enter Start Date, e.g. YYYY-MM-DD'
+    input $Parm_EndDt    'Enter End Date, e.g. YYYY-MM-DD'
+    input $Parm_Company  'Enter Company Code (use "ALL" to run for all companies'
+    let $Parm_Tax_Year = RTRIM($Parm_Tax_Year, ' ')
+    let $Parm_StartDt  = RTRIM($Parm_StartDt, ' ')
+    let $Parm_EndDt    = RTRIM($Parm_EndDt, ' ')
+    let $Parm_Company  = UPPER(RTRIM($Parm_Company, ' '))
+    let $date_out1     = $Parm_StartDt
+    let $date_out2     = $Parm_EndDt
+  else
+    do Select-Parameters
+    move #RC_TAX1042.Tax_Year to $Parm_Tax_Year 9999
+    move $RC_TAX1042.FromDate to $Parm_StartDt
+    move $RC_TAX1042.ThruDate to $Parm_EndDt
+    move $RC_TAX1042.Company  to $Parm_Company
+    do Format-DateTime ($Parm_StartDt, $date_out1, {DEFDATE}, '', '')
+    do Format-DateTime ($Parm_EndDt, $date_out2, {DEFDATE}, '', '')
+  end-if
+
+  ! if a Tax Year is entered, build the start and end date
+  if ltrim($Parm_Tax_Year,' ') <> '0'
+    let $StartDt = $Parm_Tax_Year || '-01-01'
+    do Format-DateTime($StartDt, $Parm_StartDt, {DEFYMD}, '', 'NATIVE')
+    let $EndDt = $Parm_Tax_Year || '-12-31'
+    do Format-DateTime($EndDt, $Parm_EndDt, {DEFYMD}, '', 'NATIVE')
+    let $date_out1 = $Parm_StartDt
+    let $date_out2 = $Parm_EndDt
+  end-if
+
+
+  let $Report_Title2 = 'For The Period From ' || $date_out1 || ' Thru ' || $date_out2
+
+  if $Parm_Company <> 'ALL'
+    let $Company_Where = 'AND A.COMPANY = ''' || $Parm_Company || ''' '
+  else
+    let $Company_Where = ''
+  end-if
+
+end-procedure
+
+
+!***********************************************************************
+! Procedure:  Create-Income-Code-Array
+! Description:
+!   This procedure determines how many income codes are currently defined
+!   in the XLATTABLE and then creates an array to hold totals for each
+!   income code.  For each income code, there will be totals kept at the
+!   Company level, the Pay Period level and the Paygroup level.
+!***********************************************************************
+begin-procedure Create-Income-Code-Array
+
+let #IC_Count = 0
+
+begin-SELECT
+COUNT(*)  &Count
+  move &Count to #IC_Count
+FROM PSXLATITEM
+WHERE FIELDNAME = 'INCOME_CD_1042'
+end-SELECT
+
+add 1 to #IC_Count  ! use position '0' for default (code not found) processing
+
+! NOTE: Because arrays cannot be sized dynamically, this array is initialized with
+!       30 rows, as this is the maximum number of Income Codes defined by the
+!       US Federal Government.  However, as of 96/11/20, the PeopleSoft application
+!       will only use six.  In the event that more codes are added [to the translate
+!       table], this program will continue to work without modification.
+
+
+! the 1st occurrence of gross-income is for Company
+! the 2nd occurrence is gross-income for Pay Period
+! the 3rd occurrence is gross-income for Paygroup
+! the same applies to withholding-amt and tax-amt
+create-array name=income-code-summary size=30
+  field=IC-code:char
+  field=IC-name:char
+  field=gross-income:number:3
+  field=withholding-amt:number:3
+  field=tax-amt:number:3
+
+! load array with value and description of each income code
+let #Pos = 1
+begin-SELECT
+X.FIELDVALUE
+
+  MOVE 'INCOME_CD_1042'       TO $FIELDNAME
+  MOVE &X.FIELDVALUE           TO $FIELDVALUE
+  DO READ-TRANSLATE-TABLE
+  let $XlatFieldValue = RTRIM(&X.FIELDVALUE, ' ')
+  let $XlatLongName   = RTRIM($XlatLongName , ' ')
+  PUT $XlatFieldValue $XlatLongName INTO INCOME-CODE-SUMMARY(#POS) IC-CODE IC-NAME
+  add 1 to #Pos
+FROM PSXLATITEM X
+WHERE X.FIELDNAME   = 'INCOME_CD_1042'
+  AND X.EFF_STATUS  = 'A'
+  AND X.EFFDT = (SELECT MAX(XX.EFFDT)
+                   FROM PSXLATITEM XX
+                  WHERE XX.FIELDNAME   = X.FIELDNAME
+                    AND XX.FIELDVALUE  = X.FIELDVALUE
+                    AND XX.EFFDT      <= $AsOfToday)
+end-SELECT
+
+end-procedure
+
+
+!***********************************************************************
+! Procedure:  Process-1042-Data
+! Description:
+!   This procedure reads data from the PAY_TAX_1042 table (joined to
+!   PAY_CHECK to get Emplid).  All data for the current tax year
+!   (or between the specified from/thru dates) is processed.  If a
+!   particular company was specified, only that company will be processed;
+!   otherwise, ALL companies will be.
+!
+!   For each row retrieved, tax data is added to the appropriate
+!   array position (based on income code) and then the row is
+!   printed.
+!***********************************************************************
+begin-procedure Process-1042-Data
+
+let $First_Record = 'Y'
+
+begin-SELECT
+A.COMPANY      (0,0) on-break print=never level=1 after=Company-Break    save=$Last_Company
+A.PAY_END_DT   (0,0) on-break print=never level=2 after=Pay-Period-Break save=$Last_Pay_Period
+A.PAYGROUP     (0,0) on-break print=never level=3 after=Paygroup-Break   save=$Last_Paygroup
+B.EMPLID       (0,0) on-break print=never level=4 after=Employee-Break
+A.INCOME_CD_1042
+A.TAX_1042_CUR
+A.TXGRS_1042_CUR
+A.WH_ALLOW_CUR
+A.TAX_RT
+
+  if $First_Record = 'Y'
+    let $Search_Company = &A.COMPANY
+    do Get-Company
+
+    let $Company  = &A.COMPANY
+    let $Paygroup = &A.PAYGROUP
+    let $AsOfDate = $AsOfToday
+    do Get-PayGroup-Data
+    let $Paygroup_Break = 'Y'
+
+    do Employee-Break
+
+    let $First_Record = 'N'
+  end-if
+
+  let $Record_Code = RTRIM(&A.INCOME_CD_1042, ' ')
+  do Determine-Income-Code
+
+  move &A.TXGRS_1042_CUR  to #Gross_Income
+  move &A.WH_ALLOW_CUR    to #Withholding_Amt
+  move &A.TAX_1042_CUR    to #Tax_Amt
+  move &A.TAX_RT          to #Tax_Rt
+
+  ARRAY-ADD #Gross_Income     to INCOME-CODE-SUMMARY(#IC_POS) GROSS-INCOME(2)
+  ARRAY-ADD #Withholding_Amt  to INCOME-CODE-SUMMARY(#IC_POS) WITHHOLDING-AMT(2)
+  ARRAY-ADD #Tax_Amt          to INCOME-CODE-SUMMARY(#IC_POS) TAX-AMT(2)
+
+  do Print-Employee-Data
+
+FROM PS_PAY_TAX_1042 A,
+     PS_PAY_CHECK B
+WHERE A.PAY_END_DT BETWEEN $Parm_StartDt AND $Parm_EndDt
+  AND A.STATE      = '$U'
+  AND B.COMPANY    = A.COMPANY
+  AND B.PAYGROUP   = A.PAYGROUP
+  AND B.PAY_END_DT = A.PAY_END_DT
+  AND B.OFF_CYCLE  = A.OFF_CYCLE
+  AND B.PAGE_NUM      = A.PAGE_NUM
+  AND B.LINE_NUM      = A.LINE_NUM
+  AND B.SEPCHK     = A.SEPCHK
+[$Company_Where]
+ORDER BY A.COMPANY,
+         A.PAY_END_DT,
+         A.PAYGROUP,
+         B.EMPLID,
+         A.INCOME_CD_1042
+end-SELECT
+
+end-procedure
+
+
+!***********************************************************************
+! Procedure:  Determine-Income-Code
+! Description:
+!   This procedure will search the income code summary array for the
+!   income code currently being processed to determine which array
+!   position should be used
+!***********************************************************************
+begin-procedure Determine-Income-Code
+
+  let #Pos = 1
+  let #IC_Pos = 0  ! default - code not found
+
+  while #Pos <= #IC_Count
+    get $IC_Code $IC_Name from income-code-summary(#Pos) IC-code IC-name
+    if $Record_Code = $IC_Code
+      let #IC_Pos = #Pos
+      let #Pos = #IC_Count
+    end-if
+    add 1 to #Pos
+  end-while
+
+end-procedure
+
+
+!***********************************************************************
+! Procedure:  Company-Break
+! Description:
+!   This procedure prints and then initialized the company totals.
+!***********************************************************************
+begin-procedure Company-Break
+
+  let $Search_Company = $Last_Company
+  do Get-Company
+
+  let $Print_Descr = 'Totals for Company: ' || $Company_Name
+  let #IC_Pos = 0
+  do Print-Totals
+  new-page
+
+  do Init-Totals
+
+end-procedure
+
+
+!***********************************************************************
+! Procedure:  Get-Company
+! Description:
+!   This procedure gets the company name (set in $Company_Name)
+!   from the COMPANY table, as determined by $Search_Company
+!***********************************************************************
+begin-procedure Get-Company
+
+begin-SELECT
+C.DESCR
+  move &C.DESCR to $Company_Name
+FROM PS_COMPANY_TBL C
+WHERE C.COMPANY = $Search_Company
+  AND C.EFF_STATUS = 'A'
+  AND C.EFFDT = (SELECT MAX(CC.EFFDT)
+                  FROM PS_COMPANY_TBL CC
+                 WHERE CC.COMPANY = C.COMPANY
+                   AND CC.EFFDT <= $AsOfToday)
+end-SELECT
+
+end-procedure
+
+
+!***********************************************************************
+! Procedure:  Pay-Period-Break
+! Description:
+!   This procedure prints pay period totals, adds the pay period
+!   totals to the company totals, and then initializes the pay period
+!   totals.
+!***********************************************************************
+begin-procedure Pay-Period-Break
+
+  ! this is required so that the company in the header changes
+  let $Search_Company = $Last_Company
+  do Get-Company
+
+  do Format-DateTime ($Last_Pay_Period, $out, {DEFDATE}, '', '')
+  let $Print_Descr = 'Totals for Pay Period End Date: ' || $out
+
+  let #IC_Pos = 1
+  do Print-Totals
+  new-page
+
+  do Add-Totals
+  do Init-Totals
+
+end-procedure
+
+
+!***********************************************************************
+! Procedure:  Paygroup-Break
+! Description:
+!   This procedure prints pay group totals, adds paygroup totals to
+!   pay-period totals, and then initializes the paygroup totals.
+!   It then gets the paygroup description for the paygroup about
+!   to be processed.
+!***********************************************************************
+begin-procedure Paygroup-Break
+
+  let $Print_Descr = 'Totals for Paygroup: ' || $PayGroupName
+
+  let #IC_Pos = 2
+  do Print-Totals
+
+  do Add-Totals
+  do Init-Totals
+
+  let $Paygroup_Break = 'Y'
+
+  let $Company  = &A.COMPANY
+  let $Paygroup = &A.PAYGROUP
+  let $AsOfDate = $AsOfToday
+  do Get-PayGroup-Data
+
+end-procedure
+
+
+!***********************************************************************
+! Procedure:  Print-Totals
+! Description:
+!   This procedure prints totals for a specific level (company,
+!   pay period, paygroup), as determined by the variable #IC_Pos.
+!   The variable $Print_Descr contains the description of
+!   the total being printed.
+!***********************************************************************
+begin-procedure Print-Totals
+
+  ! this command will prevent the block of total lines from printing
+  ! across pages
+  next-listing need=#IC_Count
+
+  let #Print = 1
+  while #Print <= #IC_Count
+
+    get $Income_Code_Name #Gross_Income #Withholding_Amt #Tax_Amt -
+      from income-code-summary(#Print) -
+      IC-name gross-income(#IC_Pos) withholding-amt(#IC_Pos) tax-amt(#IC_Pos)
+
+    if #Gross_Income > 0
+      print $Print_Descr       (+1,  1)
+      print $Income_Code_Name  ( 0, 56)
+      print #Gross_Income      ( 0, 89) edit 99,999,999.99
+      print #Withholding_Amt   ( 0,105) edit 99,999,999.99
+      print #Tax_Amt           ( 0,121) edit 99,999,999.99
+
+      move '' to $Print_Descr
+    end-if
+
+    add 1 to #Print
+
+  end-while
+
+  print '-' (+1,1,144) fill
+
+end-procedure
+
+
+!***********************************************************************
+! Procedure:  Add-Totals
+! Description:
+!   This procedure adds the totals for a specific level (company,
+!   pay period, paygroup) to the next higher level, as determined by
+!   the variable #IC_Pos.
+!***********************************************************************
+begin-procedure Add-Totals
+
+  let #Pos = 1
+  while #Pos <= #IC_Count
+    get #Total0 #Total1 #Total2 from income-code-summary(#Pos) -
+      gross-income(#IC_Pos) withholding-amt(#IC_Pos) tax-amt(#IC_Pos)
+
+    let #New_IC_Pos = #IC_Pos - 1
+
+    array-add #Total0 #Total1 #Total2 to income-code-summary(#Pos) -
+      gross-income(#New_IC_Pos) withholding-amt(#New_IC_Pos) tax-amt(#New_IC_Pos)
+    add 1 to #Pos
+  end-while
+
+end-procedure
+
+
+!***********************************************************************
+! Procedure:  Init-Totals
+! Description:
+!   This procedure initializes the totals for a specific level
+!   (company, pay period, paygroup), as determined by the variable
+!   #IC_Pos.
+!***********************************************************************
+begin-procedure Init-Totals
+
+  let #Pos = 1
+  while #Pos <= #IC_Count
+    put 0 0 0 into income-code-summary(#Pos) -
+      gross-income(#IC_Pos) withholding-amt(#IC_Pos) tax-amt(#IC_Pos)
+    add 1 to #Pos
+  end-while
+
+end-procedure
+
+
+!***********************************************************************
+! Procedure:  Employee-Break
+! Description:
+!   This procedure is called when a new employee is processed.
+!   It retrieves the name of the employee from PERSONAL_DATA.
+!   Print variables for ID and employee name are then set.
+!   This is so that the first detail line for an employee will
+!   contain this information; the print variables are set to blank
+!   after the first line so that subsequent detail lines will not
+!   repeat this info.  The NEXT-LISTING command is used to ensure
+!   that details for an employee are not split across pages.
+!***********************************************************************
+begin-procedure Employee-Break
+
+  let $Print_Emplid = &B.EMPLID
+
+  let $Emplid = &B.EMPLID
+  do Get-Employee-Name
+  let $Print_Employee_Name = $Name
+
+  let #Line = 2
+
+end-procedure
+
+
+!***********************************************************************
+! Procedure:  Print-Employee-Data
+! Description:
+!   This procedure will print out a detail line for an employee.
+!***********************************************************************
+begin-procedure Print-Employee-Data
+
+  if $Paygroup_Break = 'Y'
+    print 'Paygroup: '    (+2,1)
+    print $PayGroupName    (0,0)
+    let $Paygroup_Break = 'N'
+  end-if
+
+  print $Print_Emplid         (+#Line,  1)
+  print $Print_Employee_Name       (0, 13)
+
+  ! only print the ID and name on the first line for an employee
+  let $Print_Emplid = ''
+  let $Print_Employee_Name = ''
+  let #Line = 1
+
+  print $IC_Name               (0, 56)
+  print #Gross_Income          (0, 89) edit 99,999,999.99
+  print #Withholding_Amt       (0,105) edit 99,999,999.99
+  print #Tax_Amt               (0,121) edit 99,999,999.99
+  print #Tax_Rt                (0,137) edit 0.999999
+
+end-procedure
+
+
+!***********************************************************************
+#Include 'readxlat.sqc'  ! Read-Translate-Table procedure
+#Include 'reset.sqc'     ! Reset printer procedure
+#Include 'curdttim.sqc'  ! Get-Current-DateTime procedure
+#Include 'datetime.sqc'  ! Routines for date and time formatting
+#Include 'datemath.sqc'  ! Routine to perform date math
+#Include 'number.sqc'    ! Routines to format numbers
+#Include 'stdapi.sqc'    ! Update Process API
+#Include 'taxrctl1.sqc'  ! Retrieve run control parameters
+#Include 'getempnm.sqc'  ! Get-Employee-Name procedure
+#Include 'getpgdta.sqc'  ! Get-PayGroup-Data procedure

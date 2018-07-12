@@ -1,0 +1,775 @@
+!***********************************************************************
+! GEXPY147.SQR:                                                        *
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module is the confidential and proprietary information of       *
+! Giant Eagle, Inc.; it is not to be copied, reproduced,or transmitted *
+! in any form, by any means, in whole or in part, nor is it to be used *
+! for any purpose other than that for which it is expressly provided   *
+! without the written permission of Giant Eagle.                       *
+!                                                                      *
+! Copyright (c) 1997-2006 Giant Eagle,Inc. All Rights Reserved         *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+! GEXPY147.SQR :                                                       *
+!                                                                      *
+! Narrative:            Create a program that will generate a detail   *
+!			report (names), a summary file (headcount per  *
+!			paygroup) and the mailing labels for the annual*
+!			gift certificate program. The program will list*
+!			on the summary report: contact person, company,*
+!			paygroup, paygroup description, union/non union*
+!			, job code and headcount. Marelen Kurn heads   *
+!			this project, she is in the gift card          *
+!			department, and she will need access to the    *
+!			reports and run controls.                      *	 
+!                       ITG-35804                                      *
+!								       *
+! #Debug Used:          x                                              *
+!								       *
+! SQL Tables:           PS_JOB, PS_EMPLMT_SRCH_QRY, PS_EMPLOYMENT,     *
+!			PS_JOB_LABOR, PS_PERSONAL_DATA                 *
+!                                                                      *
+!								       *
+! Written by:           Rapidigm, Deepak, 05/12/06                     *
+!                                                                      *
+! Normally Run:         This should run the last week in September     *
+!			pulling all those active employees with a hire *
+!			date prior to the hire as of date specified in *
+!			the run control.                               *
+!                                                                      *
+! Control Parms:        Read run control values from PS_GEX_RUN_CNTL   *
+!								       *
+!                                                                      *
+!***********************************************************************
+
+!***********************************************************************
+!                         MODIFICATION HISTORY                         *
+!***********************************************************************
+! INITIALS  DATE        DESCRIPTION OF THE CHANGE                      *
+!***********************************************************************
+!                                                                      *
+!                                                                      *
+! MANISH    08/08/07    HCM 9.0 Upgrade                                *
+! GEX-MXT 04/02/2008   ADDED THE join condition for PER_ORG_INST       *
+!***********************************************************************
+
+
+#include 'setenv.sqc'    !Set environment
+#include 'setup02.sqc'   !Printer and Page-Size Initialization (Landscape)
+
+#define 	#column1 	001
+#define 	#column2 	015
+#define 	#column3 	028
+#define 	#column4 	040
+#define 	#column5 	050
+#define 	#column6 	060
+#define 	#column7 	070
+#define 	#column8 	080
+
+!***********************************************************************
+! Main Procedure
+!***********************************************************************
+Begin-Report
+  let $ReportID = 'GEXPY147'
+  do Init-DateTime           !datetime.sqc
+  do Init-Number             !number.sqc
+  do Get-Current-DateTime    !curdttim.sqc
+  do Stdapi-Init             !stdapi.sqc
+   
+  if isnull($prcs_process_instance)
+	let $Prcs_OprID = 'ISDVDXS'
+	let $Prcs_Run_Cntl_ID = 'gexpy147'
+  end-if
+  
+  do Get-Run-Control	     !gexrnctl.sqc  
+
+  if ltrim(rtrim(&hiredate,' '),' ') = ''
+	let $hiredate = $current-date
+  else
+	let $hiredate = &hiredate
+  end-if
+
+  #debugx show '<' $hiredate '>'
+  
+  do Get-FilePath
+  do Print-Summary-Header
+  do Get-Union-CD-Info
+  do Get-Company-Paygroup-Info
+  do Print-Detail-Header
+  do Select-Detail-Data
+  do stdapi-term
+
+End-Report
+
+
+!********************************************************
+! Procedure used for getting the filepath from the 
+! process scheduler table.
+!********************************************************
+begin-procedure Get-FilePath
+	let $filepath = ''
+begin-select
+origoutdest	&origoutdest
+prcsoutputdir	&prcsoutputdir
+
+	move &origoutdest to $origoutdest
+	move &prcsoutputdir to $prcsoutputdir
+	
+
+	if rtrim(ltrim($origoutdest,' '),' ') = ''    
+	! Process run to web, will not have trailing slash, so add it
+	
+		let $first_char = substr($prcsoutputdir,1,1)
+
+		if $first_char = '/'
+			let $prcsoutputdir = $prcsoutputdir || '/'
+		else
+			let $prcsoutputdir = $prcsoutputdir || '\'
+		end-if
+	else
+		! Process run to file, so first check if trailing slash is present, if not then add it
+		let #len = length($origoutdest)
+		let #start = #len - 1
+		let $last_char = substr($origoutdest,#start,1)
+		if $last_char != '/' or $last_char != '\' 
+			let $first_char = substr($origoutdest,1,1)
+			if $first_char = '/'
+				let $origoutdest = $origoutdest || '/'
+			else
+				let $origoutdest = $origoutdest || '\'
+			end-if
+		end-if
+	end-if
+
+	if isblank($origoutdest)
+		let $filepath = $prcsoutputdir
+	else
+		let $filepath = $origoutdest
+	end-if
+
+	#debugx show $filepath
+
+from psprcsparms
+where prcsinstance = #prcs_process_instance
+end-select
+
+	if $filepath = ''
+		let $filepath = 'c:\isdvdxs\'
+	end-if
+
+end-procedure 
+
+
+!***************************************************************
+! Opens the summary file for writing and writes the header row.
+!***************************************************************
+Begin-Procedure Print-Summary-Header
+
+	let $report-name = $filepath || $ReportID || '-Summary' || '.csv'	    
+	#debugx show $report-name
+
+	new-report  $report-name
+
+    Print 'Gift Certificates'     (1,1) center
+
+    Print 'Contact Person'     		(+1,{#column1})
+    Print 'Company'			(+0,{#column2})
+    Print 'Paygroup'     		(+0,{#column3})
+    Print 'Description'    		(+0,{#column4})
+    Print 'Employee Hourly/Salary'    	(+0,{#column5})
+    Print 'Union OR Non-Union'    	(+0,{#column6})
+    Print 'Full Time / Part Time'    	(+0,{#column7})
+    Print 'Counts'    			(+0,{#column8})
+
+End-Procedure
+
+!***********************************************************************
+! Procedure which builds the Union Code clause for the summary report.
+!***********************************************************************
+Begin-Procedure Get-Union-CD-Info
+
+  Let $OprID         = '''' || $Prcs_OprID       || ''''
+  Let $Run_Cntl_ID   = '''' || $Prcs_Run_Cntl_ID || ''''
+  Let $UNION_CD_Alias = 'J.UNION_CD'
+  Let #GEX_RC_UNION_CD_ROWS = 0
+  Let $INCLUDE_UNION_CD_CRITERIA = ''
+  Let $EXCLUDE_UNION_CD_CRITERIA = ''
+
+Begin-Select
+
+GEX_RC_NONUNION.UNION_CD
+
+  Add 1 To #GEX_RC_UNION_CD_ROWS
+
+  If #GEX_RC_UNION_CD_ROWS = 1
+    Let $INCLUDE_UNION_CD_CRITERIA = '(' || $UNION_CD_Alias || ' In ('''     || &GEX_RC_NONUNION.UNION_CD || ''''
+    Let $EXCLUDE_UNION_CD_CRITERIA = '(' || $UNION_CD_Alias || ' Not In (''' || &GEX_RC_NONUNION.UNION_CD || ''''
+  Else
+    Let $INCLUDE_UNION_CD_CRITERIA = $INCLUDE_UNION_CD_CRITERIA || ',''' || &GEX_RC_NONUNION.UNION_CD  || ''''
+    Let $EXCLUDE_UNION_CD_CRITERIA = $EXCLUDE_UNION_CD_CRITERIA || ',''' || &GEX_RC_NONUNION.UNION_CD  || ''''
+  End-If
+
+From  PS_GEX_RC_NONUNION GEX_RC_NONUNION
+
+Where GEX_RC_NONUNION.OPRID               = [$OprID]
+And   GEX_RC_NONUNION.RUN_CNTL_ID         = [$Run_Cntl_ID]
+End-Select
+
+! If following code is executed then there will be duplication in the summary info
+! Online peoplecode will make sure that there is some value on the run control page.
+  If #GEX_RC_UNION_CD_ROWS = 0
+    Let $INCLUDE_UNION_CD_CRITERIA = $UNION_CD_Alias || ' = ' || $UNION_CD_Alias
+    Let $EXCLUDE_UNION_CD_CRITERIA = $UNION_CD_Alias || ' = ' || $UNION_CD_Alias
+  Else
+    Let $INCLUDE_UNION_CD_CRITERIA = $INCLUDE_UNION_CD_CRITERIA || '))'
+    Let $EXCLUDE_UNION_CD_CRITERIA = $EXCLUDE_UNION_CD_CRITERIA || '))'
+  End-If
+
+End-Procedure
+
+
+!***********************************************************************
+! For every Company/Paygroup combination from the the run control page
+! get the summary info.
+!***********************************************************************
+Begin-Procedure Get-Company-Paygroup-Info
+
+  Let $OprID                = '''' || $Prcs_OprID       || ''''
+  Let $Run_Cntl_ID          = '''' || $Prcs_Run_Cntl_ID || ''''
+  Let #GEX_RC_PAYGROUP_ROWS = 0
+  Let $INCLUDE_COMPANY_PAYGROUP_CRITERIA = ''
+  Let $Company_Alias = 'J.COMPANY'
+  Let $Paygroup_Alias = 'J.PAYGROUP'
+
+Begin-Select
+
+GEX_RC_PAYGROUP.COMPANY
+GEX_RC_PAYGROUP.PAYGROUP
+
+  Add 1 To #GEX_RC_PAYGROUP_ROWS
+
+  Let $INCLUDE_COMPANY_PAYGROUP_CRITERIA  = '(' || $Company_Alias  || ' = '''  || &GEX_RC_PAYGROUP.COMPANY  || ''' And ' || $Paygroup_Alias || ' = '''  || &GEX_RC_PAYGROUP.PAYGROUP || ''')'
+  #debugx show $INCLUDE_COMPANY_PAYGROUP_CRITERIA 
+  do Select-Summary-Data
+
+  Let $Include_Condition = '(' || $Company_Alias  || ' = '''  || &GEX_RC_PAYGROUP.COMPANY  || ''' And ' || $Paygroup_Alias || ' = '''  || &GEX_RC_PAYGROUP.PAYGROUP || ''')'
+  
+  If #GEX_RC_PAYGROUP_ROWS = 1
+    Let $DETAIL_INCLUDE_COMPANY_PAYGROUP_CRITERIA = '(' || $Include_Condition
+  Else
+    Let $DETAIL_INCLUDE_COMPANY_PAYGROUP_CRITERIA = $DETAIL_INCLUDE_COMPANY_PAYGROUP_CRITERIA || ' Or '  || $Include_Condition
+  End-If
+
+From  PS_GEX_RC_PAYGROUP GEX_RC_PAYGROUP
+Where GEX_RC_PAYGROUP.OPRID                 = [$OprID]
+And   GEX_RC_PAYGROUP.RUN_CNTL_ID           = [$Run_Cntl_ID]
+And   Rtrim(GEX_RC_PAYGROUP.COMPANY,  ' ') != ' '
+And   Rtrim(GEX_RC_PAYGROUP.PAYGROUP, ' ') != ' '
+
+End-Select
+
+! Following condition will be only executed if there is no company/pagroup info on
+! the run control page. Process will work but will not sort properly. 
+! First it will fetch info for all company/pagroups with union codes and then again for 
+! non-union union codes 
+  If #GEX_RC_PAYGROUP_ROWS = 0
+    Let $INCLUDE_COMPANY_PAYGROUP_CRITERIA = $Company_Alias  || ' = ' || $Company_Alias  || ' And ' ||
+                                                      $Paygroup_Alias || ' = ' || $Paygroup_Alias
+    #debugx show $INCLUDE_COMPANY_PAYGROUP_CRITERIA 
+    do Select-Summary-Data
+  else
+      Let $DETAIL_INCLUDE_COMPANY_PAYGROUP_CRITERIA = $DETAIL_INCLUDE_COMPANY_PAYGROUP_CRITERIA || ')'
+  End-If
+  
+End-Procedure 
+
+
+!***********************************************************************
+! For each company/paygroup combo get the rows for union codes and 
+! non-union union codes.
+!***********************************************************************
+Begin-Procedure Select-Summary-Data
+	let $UNION_CD_CRITERIA = $INCLUDE_UNION_CD_CRITERIA	
+	let $unioncd = 'Non-Union' ! This is an asumption that user keyed in non-union union codes on the run control page.
+	let #i = 1
+	while 1
+		do Process-Summary
+		let #i = #i + 1
+		if #i > 2 
+			break	
+		end-if
+		let $UNION_CD_CRITERIA = $EXCLUDE_UNION_CD_CRITERIA
+		let $unioncd = 'Union'
+	end-while
+
+End-Procedure 
+
+
+!***********************************************************************
+! Main Procedure which fetches summary data
+!***********************************************************************
+Begin-Procedure Process-Summary
+		#debugx show $UNION_CD_CRITERIA
+Begin-Select
+J.COMPANY		&company
+J.PAYGROUP		&paygroup
+P.DESCR			&descr
+J.EMPL_TYPE		&empl_type
+J.FULL_PART_TIME	&full_part_time
+Count(*)		&count
+
+	move &count to #count
+	move &full_part_time to $full_part_time
+	move &empl_type to $empl_type
+	do Get-Empl-Type-Descr
+	do Get-Full-Part-Time-Descr
+	do Print-Summary-Row
+	
+	NEXT-LISTING
+
+From   PS_GEX_DEPT_TBL  GDT,
+       PS_JOB           J,
+	   PS_PAYGROUP_TBL P
+Where  J.EFFDT             =
+      (Select Max(EFFDT)
+       From   PS_JOB
+       Where  EMPLID       = J.EMPLID
+       And    EMPL_RCD    = J.EMPL_RCD
+       And    EFFDT       <= $hiredate) ! hire date                          
+And    J.EFFSEQ            =
+      (Select Max(EFFSEQ)
+       From   PS_JOB
+       Where  EMPLID       = J.EMPLID
+       And    EMPL_RCD    = J.EMPL_RCD
+       And    EFFDT        = J.EFFDT)
+And    J.DEPTID            = GDT.DEPTID
+And    GDT.EFFDT           =
+      (Select Max(EFFDT)
+       From  PS_GEX_DEPT_TBL
+       Where  DEPTID       = GDT.DEPTID
+       And    EFFDT       <= sysdate)
+And    GDT.SEQUENCE_NUMBER =
+      (Select Max(SEQUENCE_NUMBER)
+       From   PS_GEX_DEPT_TBL
+       Where  DEPTID       = GDT.DEPTID
+       And    EFFDT        = GDT.EFFDT)
+!And   (J.COMPANY = 'GEI' AND J.PAYGROUP = 'EXE')
+!And   (J.COMPANY = 'GEI' AND J.PAYGROUP = 'OFF')
+!AND   (COMPANY = 'TMK' AND PAYGROUP = 'W04')
+AND [$INCLUDE_COMPANY_PAYGROUP_CRITERIA]
+AND J.COMPANY = P.COMPANY
+AND J.PAYGROUP = P.PAYGROUP
+AND P.EFFDT = 
+	(SELECT MAX(P_ED.EFFDT) FROM PS_PAYGROUP_TBL P_ED
+	WHERE P_ED.COMPANY = P.COMPANY
+	AND P_ED.PAYGROUP = P.PAYGROUP
+	AND P_ED.EFFDT <= SYSDATE
+	AND P_ED.EFF_STATUS = 'A')
+! AND J.UNION_CD  in ('COL','GGO','HGN','MAS','MOD','MUR','NON','SEC','SFD','TOL')
+AND [$UNION_CD_CRITERIA]
+Group By J.COMPANY, J.PAYGROUP, P.DESCR, J.EMPL_TYPE, J.FULL_PART_TIME
+Order By J.COMPANY, J.PAYGROUP
+End-Select
+End-Procedure 
+
+
+!***********************************************************************
+! Gets description for field EMPL_TYPE
+!***********************************************************************
+Begin-procedure Get-Empl-Type-Descr
+begin-select
+X.XLATLONGNAME	&empl_type_descr
+
+	move &empl_type_descr to $empl_type_descr
+
+!Manish,08/08/2007,PY227-Giant Eagle modified on 08/08/2007 for HCM 9.0 Upgrade-Begin
+!FROM XLATTABLE X
+FROM PSXLATITEM X
+!Manish,08/08/2007,PY227-Giant Eagle modified on 08/08/2007 for HCM 9.0 Upgrade-End
+WHERE X.FIELDNAME = 'EMPL_TYPE'
+AND X.FIELDVALUE = $empl_type
+AND X.EFFDT = 
+!Manish,08/08/2007,PY227-Giant Eagle modified on 08/08/2007 for HCM 9.0 Upgrade-Begin
+!	(SELECT MAX(X_ED.EFFDT) FROM XLATTABLE X_ED
+	(SELECT MAX(X_ED.EFFDT) FROM PSXLATITEM X_ED
+!Manish,08/08/2007,PY227-Giant Eagle modified on 08/08/2007 for HCM 9.0 Upgrade-End	
+	WHERE X_ED.FIELDNAME = X.FIELDNAME
+	AND X_ED.FIELDVALUE = X.FIELDVALUE
+	AND X_ED.EFFDT <= SYSDATE)
+end-select
+End-procedure 
+
+
+!***********************************************************************
+! Gets description for field FULL_PART_TIME
+!***********************************************************************s
+Begin-procedure Get-Full-Part-Time-Descr
+begin-select
+X.XLATLONGNAME	&full_part_time_descr
+
+	move &full_part_time_descr to $full_part_time_descr
+
+!Manish,08/08/2007,PY227-Giant Eagle modified on 08/08/2007 for HCM 9.0 Upgrade-Begin
+!FROM XLATTABLE X	!Giant Eagle commented
+FROM PSXLATITEM X
+!Manish,08/08/2007,PY227-Giant Eagle modified on 08/08/2007 for HCM 9.0 Upgrade-End
+WHERE X.FIELDNAME = 'FULL_PART_TIME'
+AND X.FIELDVALUE = $full_part_time
+AND X.EFFDT = 
+!Manish,08/08/2007,PY227-Giant Eagle modified on 08/08/2007 for HCM 9.0 Upgrade-Begin
+!	(SELECT MAX(X_ED.EFFDT) FROM XLATTABLE X_ED
+	(SELECT MAX(X_ED.EFFDT) FROM PSXLATITEM X_ED
+!Manish,08/08/2007,PY227-Giant Eagle modified on 08/08/2007 for HCM 9.0 Upgrade-End	
+	WHERE X_ED.FIELDNAME = X.FIELDNAME
+	AND X_ED.FIELDVALUE = X.FIELDVALUE
+	AND X_ED.EFFDT <= SYSDATE)
+end-select
+End-Procedure 
+
+
+!***********************************************************************
+! Prints Summary Row
+!***********************************************************************
+Begin-Procedure Print-Summary-Row
+	
+	print ' '			(+1,{#column1})
+	print &company			(0,{#column2})
+	print &paygroup			(0,{#column3})
+	print &descr			(0,{#column4})
+	print $empl_type_descr		(0,{#column5})
+	print $unioncd			(0,{#column6})
+	print $full_part_time_descr	(0,{#column7})	
+	print #count			(0,{#column8})
+
+End-Procedure 
+
+
+!***************************************************************
+! Opens the detail file for writing and writes the header row.
+!***************************************************************
+Begin-Procedure Print-Detail-Header
+
+	let $report-name = $filepath || $ReportID || '-Detail' || '.csv'	    
+	#debugx show $report-name
+
+	new-report  $report-name
+
+    Print 'Gift Certificates'     (1,1) center
+
+    Print 'Emplid'			(+1,{#column1})
+    Print 'Name'			(+0,{#column2})
+    Print 'Jobcode'     		(+0,{#column3})
+    Print 'Full Time / Part Time'    	(+0,{#column4})
+    Print 'Company'    			(+0,{#column5})
+    Print 'Paygroup'   			(+0,{#column6})
+
+End-Procedure
+
+
+!***********************************************************************
+! Processes the detail report in a loop.
+! 1. GIFT_CERT_OK_PT_636
+! 2. GIFT_CERT_OK_FT
+! 3. GIFT_CERT_OFFICE
+! 4. GIFT_CERT_OK_PT_70010
+! 5. GIFT_CERT_COUNT_OFF (calls Gift-Cert-Count-Off)
+!***********************************************************************
+Begin-Procedure Select-Detail-Data
+	let #cnt = 1
+	while 1
+		evaluate #cnt
+		when = 1
+			let $FULL_PART_TIME = 'J.FULL_PART_TIME = ''' || 'P' || ''''
+			let $EMPL_STATUS = 'J.EMPL_STATUS = ''' || 'A' || '''' 
+			let $EMPL_TYPE = '1 = 1'
+			Let $GEXXX913_UNION_CD_Alias = 'C.UNION_CD'
+		        Do GEXXX913-Select-UNION-CD-Parameters   
+			let $GEXXX916_INCLUDE_JOBCODE_CRITERIA = '1 = 1'		
+			!Manish,08/08/2007,PY227-Giant Eagle modified on 08/08/2007 for HCM 9.0 Upgrade-BEGIN
+			!let $ORIG_HIRE_DT = 'D.ORIG_HIRE_DT < ''' || $hiredate || ''''
+			let $ORIG_HIRE_DT = 'INST.ORIG_HIRE_DT < ''' || $hiredate || ''''
+			!Manish,08/08/2007,PY227-Giant Eagle modified on 08/08/2007 for HCM 9.0 Upgrade-END
+			do Process-Detail
+			let #cnt = #cnt + 1
+			break
+		when = 2
+			let $FULL_PART_TIME = 'J.FULL_PART_TIME = ''' || 'F' || ''''
+			let $EMPL_STATUS = 'J.EMPL_STATUS = ''' || 'A' || ''''
+			let $EMPL_TYPE = '1 = 1'
+			let $GEXXX913_INCLUDE_UNION_CD_CRITERIA = '1 = 1'
+			let $GEXXX916_INCLUDE_JOBCODE_CRITERIA = '1 = 1'		
+			!Manish,08/08/2007,PY227-Giant Eagle modified on 08/08/2007 for HCM 9.0 Upgrade-BEGIN
+			!let $ORIG_HIRE_DT = 'D.ORIG_HIRE_DT < ''' || $hiredate || ''''
+			let $ORIG_HIRE_DT = 'INST.ORIG_HIRE_DT < ''' || $hiredate || ''''
+			!Manish,08/08/2007,PY227-Giant Eagle modified on 08/08/2007 for HCM 9.0 Upgrade-END
+			do Process-Detail
+			let #cnt = #cnt + 1
+			break
+		when = 3
+			let $FULL_PART_TIME = '1 = 1'
+			let $EMPL_STATUS = 'J.EMPL_STATUS in (''A'',''L'',''P'',''S'')'
+			let $EMPL_TYPE = 'J.EMPL_TYPE = ''H'''
+			let $GEXXX913_INCLUDE_UNION_CD_CRITERIA = '1 = 1'
+			let $GEXXX916_INCLUDE_JOBCODE_CRITERIA = '1 = 1'		
+			!Manish,08/08/2007,PY227-Giant Eagle modified on 08/08/2007 for HCM 9.0 Upgrade-BEGIN
+			!let $ORIG_HIRE_DT = 'D.ORIG_HIRE_DT < ''' || $hiredate || ''''
+			let $ORIG_HIRE_DT = 'INST.ORIG_HIRE_DT < ''' || $hiredate || ''''
+			!Manish,08/08/2007,PY227-Giant Eagle modified on 08/08/2007 for HCM 9.0 Upgrade-END
+			do Process-Detail
+			let #cnt = #cnt + 1
+			break
+		when = 4
+			let $FULL_PART_TIME =  'J.FULL_PART_TIME = ''' || 'P' || ''''
+			let $EMPL_STATUS =  'J.EMPL_STATUS = ''' || 'A' || '''' 
+			let $EMPL_TYPE = '1 = 1'
+			let $GEXXX913_INCLUDE_UNION_CD_CRITERIA = '1 = 1'
+			Let $GEXXX916_Jobcode_Alias = 'J.JOBCODE'
+			Do GEXXX916-Select-Jobcode-Parameters    
+			!Manish,08/08/2007,PY227-Giant Eagle modified on 08/08/2007 for HCM 9.0 Upgrade-BEGIN
+			!let $ORIG_HIRE_DT = 'D.ORIG_HIRE_DT < ''' || $hiredate || ''''
+			let $ORIG_HIRE_DT = 'INST.ORIG_HIRE_DT < ''' || $hiredate || ''''
+			!Manish,08/08/2007,PY227-Giant Eagle modified on 08/08/2007 for HCM 9.0 Upgrade-END
+			do Process-Detail
+			let #cnt = #cnt + 1
+			break
+		when = 5
+			Print 'Company'			(+2,{#column1})
+			Print 'Paygroup'		(0,{#column2})
+			Print 'Employee Status'		(0,{#column3})
+			Print 'Full Time/Part Time'	(0,{#column4})
+			Print 'Count'			(0,{#column5})
+		        let $EMPL_STATUS = 'J.EMPL_STATUS in (''A'',''L'',''P'',''S'')'
+			let $EMPL_TYPE = 'J.EMPL_TYPE = ''H'''
+			let $HIRE_DT = 'B.HIRE_DT < ''' || $hiredate || ''''
+			do Gift-Cert-Count-Off
+			let #cnt = #cnt + 1
+			break
+		end-evaluate
+
+		if #cnt = 6 
+			break
+		end-if
+	end-while
+End-Procedure
+
+
+
+
+!***********************************************************************
+! Main Procedure which fetches detail data
+!***********************************************************************
+Begin-Procedure Process-Detail
+	#ifdef debugx 
+		show $FULL_PART_TIME 
+		show $EMPL_STATUS
+		show $EMPL_TYPE
+		show $DETAIL_INCLUDE_COMPANY_PAYGROUP_CRITERIA
+		show $GEXXX913_INCLUDE_UNION_CD_CRITERIA 
+		show $GEXXX916_INCLUDE_JOBCODE_CRITERIA
+		show $ORIG_HIRE_DT 
+		show '======================================='
+	#end-if
+!Manish,08/08/2007,PY227-Giant Eagle modified on 08/08/2007 for HCM 9.0 Upgrade-Begin
+let $Oprid_list = ''
+Begin-Select
+opr.oprid
+       	if isblank($Oprid_list)
+       		let $Oprid_list = '''' || &opr.oprid || ''''
+       	else
+       		let $Oprid_list = $Oprid_list || ',' || '''' || &opr.oprid || ''''
+       	end-if
+FROM psoprdefn opr 
+WHERE opr.rowsecclass = 'DPALL' 
+End-Select 
+
+let $Oprid_list = '(' || $Oprid_list || ')'
+
+!Manish,08/08/2007,PY227-Giant Eagle modified on 08/08/2007 for HCM 9.0 Upgrade-End
+begin-select
+J.EMPLID		&emplid
+D.NAME			&name
+J.JOBCODE		&jobcode
+J.FULL_PART_TIME	&dtl_full_part_time
+J.COMPANY		&dtl_company
+J.PAYGROUP		&dtl_paygroup
+
+	move &emplid to $emplid
+	let $emplid = '="' || $emplid || '"'
+	move &jobcode to $jobcode
+	let $jobcode = '="' || $jobcode || '"'
+	do Print-Detail-Row
+
+	NEXT-LISTING
+
+!Manish,08/08/2007,PY227-Giant Eagle modified on 08/08/2007 for HCM 9.0 Upgrade-Begin
+
+!FROM PS_JOB J, PS_EMPLMT_SRCH_QRY A1, PS_JOB_LABOR C, PS_PERSONAL_DATA D 
+FROM PS_JOB J, PS_EMPLMT_SRCH_QRY A1, PS_JOB_LABOR C, PS_PERSONAL_DATA D, PS_PER_ORG_INST INST 
+
+!Manish,08/08/2007,PY227-Giant Eagle modified on 08/08/2007 for HCM 9.0 Upgrade-End
+WHERE J.EMPLID = A1.EMPLID 
+AND J.EMPL_RCD = A1.EMPL_RCD 
+!Manish,08/08/2007,PY227-Giant Eagle modified on 08/08/2007 for HCM 9.0 Upgrade-Begin
+AND INST.EMPLID = A1.EMPLID
+AND INST.EMPLID = J.EMPLID
+AND INST.EMPLID = C.EMPLID
+AND INST.EMPLID = D.EMPLID
+AND INST.ORG_INSTANCE_ERN  = J.EMPL_RCD	!GEX-MXT added for PER_ORG_INST join
+!AND A1.ROWSECCLASS = 'DPALL' 
+AND A1.OPRID = $Prcs_OprID 	!Manish,08/17/2007,PY227-Giant Eagle added on 09/28/2007 for HCM 9.0 Upgrade
+!Manish,08/08/2007,PY227-Giant Eagle modified on 08/08/2007 for HCM 9.0 Upgrade-End
+AND J.EFFDT = 
+(SELECT MAX(J_ED.EFFDT) FROM PS_JOB J_ED 
+WHERE J.EMPLID = J_ED.EMPLID 
+AND J.EMPL_RCD = J_ED.EMPL_RCD 
+AND J_ED.EFFDT <= SYSDATE) 
+AND J.EFFSEQ = 
+(SELECT MIN(J_ES.EFFSEQ) FROM PS_JOB J_ES 
+WHERE J.EMPLID = J_ES.EMPLID 
+AND J.EMPL_RCD = J_ES.EMPL_RCD 
+AND J.EFFDT = J_ES.EFFDT) 
+AND [$FULL_PART_TIME]
+AND [$EMPL_STATUS] 
+AND [$EMPL_TYPE]
+AND [$DETAIL_INCLUDE_COMPANY_PAYGROUP_CRITERIA]
+!AND A.COMPANY = 'GEI' 
+!AND A.PAYGROUP IN ('W02','W07') 
+AND C.EMPLID = J.EMPLID 
+AND C.EMPL_RCD = J.EMPL_RCD 
+AND C.EFFDT = 
+(SELECT MAX(C_ED.EFFDT) FROM PS_JOB_LABOR C_ED 
+WHERE C.EMPLID = C_ED.EMPLID 
+AND C.EMPL_RCD = C_ED.EMPL_RCD 
+AND C_ED.EFFDT <= SYSDATE) 
+AND C.EFFSEQ = 
+(SELECT MAX(C_ES.EFFSEQ) FROM PS_JOB_LABOR C_ES 
+WHERE C.EMPLID = C_ES.EMPLID 
+AND C.EMPL_RCD = C_ES.EMPL_RCD 
+AND C.EFFDT = C_ES.EFFDT) 
+!AND C.UNION_CD = 'W03' 
+AND [$GEXXX913_INCLUDE_UNION_CD_CRITERIA]
+AND [$GEXXX916_INCLUDE_JOBCODE_CRITERIA]
+AND [$ORIG_HIRE_DT]
+AND D.EMPLID = J.EMPLID
+order by J.COMPANY, J.PAYGROUP
+end-select
+End-Procedure
+
+
+!***********************************************************************
+! The columns fetched by this detail SQL is different than the others
+! So using a unique procedure to fetch the data. It has it own
+! Printing procedure too.
+!***********************************************************************
+Begin-Procedure Gift-Cert-Count-Off
+	#ifdef debugx 
+		show $EMPL_STATUS
+		show $EMPL_TYPE
+		show $DETAIL_INCLUDE_COMPANY_PAYGROUP_CRITERIA
+		show $HIRE_DT 
+		show '======================================='
+	#end-if
+
+!Manish,08/08/2007,PY227-Giant Eagle modified on 08/08/2007 for HCM 9.0 Upgrade-Begin
+let $Oprid_list = ''
+Begin-Select
+opr1.oprid
+       	if isblank($Oprid_list)
+       		let $Oprid_list = '''' || &opr1.oprid || ''''
+       	else
+       		let $Oprid_list = $Oprid_list || ',' || '''' || &opr1.oprid || ''''
+       	end-if
+FROM psoprdefn opr1 
+WHERE opr1.rowsecclass = 'DPALL' 
+End-Select 
+
+let $Oprid_list = '(' || $Oprid_list || ')'
+
+!Manish,08/08/2007,PY227-Giant Eagle modified on 08/08/2007 for HCM 9.0 Upgrade-End
+
+
+
+Begin-Select
+J.COMPANY		&dtl_company1
+J.PAYGROUP		&dtl_paygroup1
+J.EMPL_STATUS		&dtl_empl_status1
+J.FULL_PART_TIME	&dtl_full_part_time1
+COUNT(*)		&dtl_count1
+
+	move &dtl_company1 to $dtl_company1
+	move &dtl_paygroup1 to $dtl_paygroup1
+	move &dtl_empl_status1 to $dtl_empl_status1
+	move &dtl_full_part_time1 to $dtl_full_part_time1
+	move &dtl_count1 to $dtl_count1
+
+	do Print-Detail-Row2
+
+FROM PS_JOB J, PS_EMPLMT_SRCH_QRY A1, PS_EMPLOYMENT B 
+WHERE J.EMPLID = A1.EMPLID 
+AND J.EMPL_RCD = A1.EMPL_RCD 
+!AND A1.ROWSECCLASS = 'DPALL'	!Manish,08/08/2007,PY227-Giant Eagle modified on 08/08/2007 for HCM 9.0 Upgrade 
+AND A1.OPRID = $Prcs_OprID 	!Manish,08/17/2007,PY227-Giant Eagle added on 09/28/2007 for HCM 9.0 Upgrade
+AND B.EMPLID = A1.EMPLID 
+AND B.EMPL_RCD = A1.EMPL_RCD 
+AND J.EFFDT = 
+        (SELECT MAX(J_ED.EFFDT) FROM PS_JOB J_ED 
+        WHERE J.EMPLID = J_ED.EMPLID 
+        AND J.EMPL_RCD = J_ED.EMPL_RCD 
+        AND J_ED.EFFDT <= SYSDATE) 
+AND J.EFFSEQ = 
+        (SELECT MAX(J_ES.EFFSEQ) FROM PS_JOB J_ES 
+        WHERE J.EMPLID = J_ES.EMPLID 
+        AND J.EMPL_RCD = J_ES.EMPL_RCD 
+        AND J.EFFDT = J_ES.EFFDT) 
+AND [$DETAIL_INCLUDE_COMPANY_PAYGROUP_CRITERIA]
+AND [$EMPL_STATUS]
+AND [$EMPL_TYPE]
+AND [$HIRE_DT]
+GROUP BY  J.COMPANY,  J.PAYGROUP,  J.EMPL_STATUS,  J.FULL_PART_TIME 
+ORDER BY 1, 2, 3
+End-Select
+End-Procedure
+
+!***********************************************************************
+! Prints Detail Row
+!***********************************************************************
+Begin-Procedure Print-Detail-Row
+
+	Print $emplid			(+1,{#column1})
+	Print &name			(0,{#column2})
+	Print $jobcode			(0,{#column3})
+	Print &dtl_full_part_time	(0,{#column4})	
+	Print &dtl_company		(0,{#column5})
+	Print &dtl_paygroup		(0,{#column6})
+
+End-Procedure 
+
+
+!***********************************************************************
+! Printing procedure for data returned by Gift-Cert-Count-Off
+!***********************************************************************
+Begin-Procedure Print-Detail-Row2
+
+	Print $dtl_company1		(+1,{#column1})
+	Print $dtl_paygroup1		(0,{#column2})
+	Print $dtl_empl_status1		(0,{#column3})
+	Print $dtl_full_part_time1	(0,{#column4})	
+	Print $dtl_count1		(0,{#column5})
+
+End-Procedure 
+
+
+#include 'stdapi.sqc'    !Process Scheduler Interface
+#include 'reset.sqc'     !Reset Printer Procedure
+#include 'curdttim.sqc'  !Get-Current-DateTime Procedure
+#include 'datetime.sqc'  !Routines for date and time formatting
+#include 'number.sqc'    !Routines to format numbers
+#include 'datemath.sqc'  !Routines for date math
+#Include 'tranctrl.sqc'  !Common Transaction Control Procedures
+#include 'gexrnctl.sqc'  !Get Asofdate from Run Control Page
+#include 'gexxx916.sqc'  !Get Jobcode from Run Control Page
+#include 'gexxx913.sqc'	 !Get Union Code from Run Control Page

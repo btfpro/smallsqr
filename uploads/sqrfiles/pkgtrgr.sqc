@@ -1,0 +1,454 @@
+!***********************************************************************
+!  PKGTRGR - Generates Global Payroll triggers for Salary Packaging    *
+!            enrolment / de-enrolment process                          *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+!                                                                      *
+! This module contains confidential and proprietary information        *
+! of Oracle; it is not to be copied, reproduced, or transmitted        *
+! in any form, by any means, in whole or in part, nor is it to         *
+! be used for any purpose other than that for which it is              *
+! expressly provided under the applicable license agreement.           *
+!                                                                      *
+! Copyright (C) 2006 Oracle. All Rights Reserved.                      *
+!                                                                      *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!          $Date:  2006/07/19:15:17:37                                 !
+!       $Release:  HR9                                                 !
+!      $Revision:  101                                                 !
+!                                                                      *
+!***********************************************************************
+!  This copybook expects the following variables to be setup:          *                                                                  
+!          $Trgr_Recname                                               *
+!          $Trgr_Emplid                                                *
+!          #Trgr_Empl_Rcd                                              *
+!          $Trgr_GP_Paygroup                                           *
+!          $Trgr_Job_Effdt                                             *
+!          $Trgr_Action                                                *
+!          $Trgr_Action_Reason                                         *
+!***********************************************************************
+!30/05/03 sn 128735 : Multiple job rows for sal pkg do not process     *
+!                   : correctly in retro pays                          *
+!                   : was caused becuase stmt did not check if trigger *
+!                   : was processed or not                             *
+!
+
+begin-procedure Generate-GP-Triggers
+!***********************************
+  !------------------------------------
+  ! Retrieve current Open Calendar Run
+  !------------------------------------
+
+ let $Open_Per_Found = 'N'
+
+ let $sql-statement = 'SELECT PS_GP_CAL_RUN'
+ begin-SELECT on-error=SQL-Error
+C.CAL_RUN_ID 
+D.PRD_BGN_DT
+
+   let $Open_Per_Found = 'Y'
+
+ FROM PS_GP_CAL_RUN C, 
+      PS_GP_CAL_RUN_DTL D,
+      PS_GP_RUN_TYPE T 
+ WHERE C.RUN_OPEN_IND = 'Y'
+  AND  C.CAL_RUN_ID   = D.CAL_RUN_ID
+  AND  D.GP_PAYGROUP  = $Trgr_GP_Paygroup
+  AND  T.RUN_TYPE     = D.RUN_TYPE 
+  AND  T.CALC_TYPE    = 'P' 
+
+ end-SELECT
+ 
+
+ do Convert-To-DTU-Date(&D.PRD_BGN_DT, $dtu_Bgn_Date)
+
+ !-------------------------------------------------------------------
+ ! Retrieve Trigger definitions for the record requested
+ ! Depending on the type generate triggers for every definition found  
+ !-------------------------------------------------------------------
+  let $sql-statement = 'SELECT PS_GP_TRGR_REC'
+
+  begin-SELECT on-error=SQL-Error
+T.RECNAME
+T.TRGR_TYPE       
+T.TRGR_LVL_OPTN
+T.TRGR_EFFDT_TYPE
+T.TRGR_EVENT_ID
+T.TRGR_ACTIVE_IND
+
+  evaluate &T.TRGR_TYPE
+   when = 'I   '
+     do Gen-Iterative-Trigger
+     break
+   when = 'R   '
+     do Gen-Retro-Trigger
+     break
+   when = 'S   '
+     do Gen-Segm-Trigger
+     break
+   end-evaluate
+ 
+ FROM PS_GP_TRGR_REC T
+ WHERE T.RECNAME =  $Trgr_Recname
+  AND  T.TRGR_ACTIVE_IND ='Y'
+
+ end-select
+
+end-procedure
+
+begin-procedure Gen-Iterative-Trigger
+!************************************
+  !------------------------------------------------------
+  ! For Trigger level of Record - insert the trigger
+  ! Otherwise - check all fields defined for the trigger
+  !------------------------------------------------------
+    if &T.TRGR_LVL_OPTN = 'R'
+      let $Trgr_Event_Id = &T.TRGR_EVENT_ID
+      do Insert-Iterative-Trigger
+    else
+       do Check-Trigger-Fields
+    end-if  
+
+end-procedure
+
+begin-procedure Insert-Iterative-Trigger
+!***************************************
+  !--------------------------------------------------
+  ! Check if the Trigger does not exist on the table
+  !--------------------------------------------------
+  let $trig_found = 'N'
+
+  let $sql-statement = 'SELECT PS_GP_ITER_TRGR'
+  begin-SELECT on-error=SQL-Error
+I.EMPLID
+
+     let $trig_found = 'Y'
+
+  FROM PS_GP_ITER_TRGR I
+  WHERE I.EMPLID        = $Trgr_Emplid
+    AND I.CAL_RUN_ID    = &C.Cal_Run_Id
+  
+  end-SELECT
+ !---------------------------
+ !-- Insert Iterative Trigger
+ !---------------------------
+ IF $trig_found = 'N'
+  and $Open_Per_Found = 'Y'
+   
+  let $sql-statement = 'INSERT PS_GP_ITER_TRGR'
+  begin-SQL on-error=SQL-Error
+ INSERT INTO PS_GP_ITER_TRGR
+ ( CAL_RUN_ID
+ , EMPLID
+ , ITER_TRGR_STATUS
+ , TRGR_CREATE_TS
+ , ITER_TRGR_SRC
+ , COUNTRY)
+ VALUES
+ ( &C.Cal_Run_Id
+ , $Trgr_Emplid
+ , 'U'
+ , {DatetimeIn-Prefix}$SysDateTime{DatetimeIn-Suffix}
+ , 'B'
+ , 'AUS')
+  end-SQL
+ END-IF
+
+end-procedure
+
+begin-procedure Gen-Retro-Trigger
+!************************************
+  !------------------------------------------------------
+  ! For Trigger level of Record - insert the trigger
+  ! Otherwise - check all fields defined for the trigger
+  !------------------------------------------------------
+
+  !-- Retro Trigger is only generated if Package Effective
+  !-- Date is less than begining of the Open Calandar Run,
+  !-- or any other finalized Calendar 
+
+     let $Retro_Reqd = 'N'
+
+     if $Open_Per_Found = 'Y'
+        if $Trgr_Job_Effdt < $dtu_Bgn_Date
+           let $Retro_Reqd = 'Y'
+        end-if
+     else
+        begin-SELECT on-error=SQL-Error
+CC.CAL_RUN_ID 
+           let $Retro_Reqd = 'Y'
+
+           FROM PS_GP_CAL_RUN CC, 
+                PS_GP_CAL_RUN_DTL D
+          WHERE CC.RUN_FINALIZED_IND = 'Y'
+            AND CC.CAL_RUN_ID  = D.CAL_RUN_ID
+            AND D.GP_PAYGROUP  = $Trgr_GP_Paygroup
+            AND D.PRD_END_DT  >= $Trgr_Job_Effdt 
+        end-SELECT
+    end-if
+
+    if $Retro_Reqd = 'Y'
+       if &T.TRGR_LVL_OPTN = 'R'
+          let $Trgr_Event_Id = &T.TRGR_EVENT_ID
+          do Insert-Retro-Trigger
+       else
+          do Check-Trigger-Fields
+       end-if
+    end-if  
+
+end-procedure
+
+begin-procedure Insert-Retro-Trigger
+!***********************************
+  !-------------------------------------------------
+  ! Check if the Trigger does not exist on the table
+  !-------------------------------------------------
+ 
+  let $trig_found = 'N'
+
+  let $sql-statement = 'SELECT PS_GP_RTO_TRGR'
+  begin-SELECT on-error=SQL-Error
+R.EMPLID
+
+     let $trig_found = 'Y'
+
+  FROM PS_GP_RTO_TRGR R
+  WHERE R.EMPLID        = $Trgr_Emplid
+    AND R.TRGR_EVENT_ID = $Trgr_Event_Id
+    AND R.TRGR_EFFDT    = $Trgr_Job_Effdt
+    AND R.TRGR_STATUS = 'U'               ! resolution ID 128735 to check the status of existing trigger.
+  end-SELECT
+
+ !---------------------------
+ !-- Insert Retro Trigger
+ !---------------------------
+
+ if $trig_found = 'N'
+ 
+  let $sql-statement = 'INSERT PS_GP_RTO_TRGR'
+  begin-SQL on-error=SQL-Error
+ INSERT INTO PS_GP_RTO_TRGR
+ ( EMPLID
+ , COUNTRY
+ , TRGR_EVENT_ID
+ , TRGR_EFFDT
+ , TRGR_CREATE_TS
+ , RTO_TRGR_SRC
+ , TRGR_STATUS
+ , TRGR_DESCR
+ , CAL_RUN_ID)
+ VALUES
+ ( $Trgr_Emplid
+ , 'AUS'
+ , $Trgr_Event_Id
+ , $Trgr_Job_Effdt
+ , {DatetimeIn-Prefix}$SysDateTime{DatetimeIn-Suffix}
+ , 'A'
+ , 'U'
+ , ' '
+ , ' ')
+  end-SQL
+
+ end-if
+
+end-procedure
+
+
+begin-procedure Gen-Segm-Trigger
+!********************************
+
+  !------------------------------------------------------
+  ! For Trigger level of Record - insert the trigger
+  ! Otherwise - check all fields defined for the trigger
+  !------------------------------------------------------
+
+   if &T.TRGR_LVL_OPTN = 'R'
+       let $Trgr_Event_Id = &T.TRGR_EVENT_ID
+       do Insert-Segm-Trigger
+   else
+       do Check-Trigger-Fields
+   end-if  
+
+end-procedure
+
+begin-procedure Insert-Segm-Trigger
+!***********************************
+ !--------------------------------------------------
+ ! Check if the Trigger does not exist on the table
+ !--------------------------------------------------
+
+  let $trig_found = 'N'
+  begin-SELECT on-error=SQL-Error
+S.EMPLID
+     let $trig_found = 'Y'
+
+  FROM PS_GP_SEG_TRGR S
+  WHERE S.EMPLID        = $Trgr_Emplid
+    AND S.EMPL_RCD      = #Trgr_Empl_Rcd
+    AND S.TRGR_EVENT_ID = $Trgr_Event_Id
+    AND S.TRGR_EFFDT    = $Trgr_Job_Effdt
+  
+  end-SELECT 
+
+ !-----------------------------
+ ! Insert Segmentation Trigger 
+ !-----------------------------
+
+ if $trig_found = 'N'
+ 
+  let $sql-statement = 'INSERT PS_GP_SEG_TRGR'
+  begin-SQL on-error=SQL-Error
+ INSERT INTO PS_GP_SEG_TRGR
+ ( EMPLID
+ , EMPL_RCD
+ , COUNTRY
+ , TRGR_EVENT_ID
+ , TRGR_EFFDT
+ , TRGR_CREATE_TS
+ , SEG_TRGR_SRC
+ , SEG_TRGR_STATUS
+ , SEG_TRGR_LVL
+ , CAL_RUN_ID)
+ VALUES
+ ( $Trgr_Emplid
+ , #Trgr_Empl_Rcd
+ , 'AUS'
+ , $Trgr_Event_Id
+ , $Trgr_Job_Effdt
+ , {DatetimeIn-Prefix}$SysDateTime{DatetimeIn-Suffix}
+ , 'A'
+ , 'A'
+ , 'J'
+ , ' ')
+  end-SQL
+
+ end-if
+
+end-procedure
+
+
+begin-procedure Check-Trigger-Fields
+!***********************************
+
+ !----------------------------------------------------
+ ! Read through all the fields for the trigger defn
+ ! Verify against the fields changed in Sal Packaging
+ ! If match found - insert corresponding trigger
+ !----------------------------------------------------
+ 
+  let $sql-statement = 'SELECT PS_GP_TRGR_RECFLD'
+  begin-SELECT on-error=SQL-Error
+F.RECNAME
+F.TRGR_TYPE
+F.FIELDNAME
+F.TRGR_EVENT_ID
+F.VALUE_BASED_IND
+F.TRGR_NOMATCH_OPTN
+       let $Field_Name  = rtrim(&F.Fieldname,' ')
+       let $Rec_Name    = rtrim(&F.Recname,' ')
+
+ !----------------------------------------------------------
+ !  Validate if the trigger was defined for value of ACTION
+ !  or ACTION_REASON on JOB record 
+ !  In this case we need to check the values
+ !-----------------------------------------------------------
+ 
+   if &F.Value_Based_Ind = 'Y'
+    and  $Rec_Name = 'JOB'
+    and ($Field_Name = 'ACTION'
+     OR $Field_Name  = 'ACTION_REASON')
+      do CHECK_TRIGGER_VALUES
+   end-if
+  
+ !----------------------------------------------------------
+ !  For non-value based triggers - verify if they have been
+ !  defined for the fields changed in the Sal Packaging process
+ !-----------------------------------------------------------
+ 
+   if &F.Value_Based_Ind = 'N'
+
+     if ( $Rec_Name       = 'JOB'
+       and ( $Field_Name  = 'COMPRATE'
+       or $Field_Name     = 'ANNUAL_RT'))
+      or ( $Rec_Name      = 'COMPENSATION'
+       and ( $Field_Name  = 'COMPRATE'
+       or $Field_Name     = 'COMP_RATECD'))
+
+      let $Field_Defn = 'Y'
+      let $Trgr_Event_Id = &F.Trgr_Event_Id
+
+      evaluate &T.TRGR_TYPE
+      when = 'I   '
+        do Insert-Iterative-Trigger
+        break
+      when = 'R   '
+        do Insert-Retro-Trigger
+        break
+      when = 'S   '
+        do Insert-Segm-Trigger
+        break
+      end-evaluate
+
+     end-if
+   end-if
+
+  FROM PS_GP_TRGR_RECFLD F
+  WHERE F.RECNAME = $Trgr_Recname
+  AND F.TRGR_TYPE = &T.TRGR_TYPE
+ end-select
+ 
+end-procedure
+
+begin-procedure CHECK_TRIGGER_VALUES
+!***********************************
+ 
+  let $sql-statement = 'SELECT PS_GP_TRGR_RECFLD'
+  begin-SELECT on-error=SQL-Error
+V.RECNAME
+V.TRGR_TYPE
+V.FIELDNAME
+V.TRGR_EVENT_ID
+V.TRGR_FLD_VAL_CHAR
+   
+ !----------------------------------------------------------
+ !  Validate if the trigger was defined for value of ACTION
+ !  or ACTION_REASON on JOB record 
+ !  In this case we need to check the values
+ !-----------------------------------------------------------
+ 
+    
+    let $Field_Value = substr(&V.Trgr_Fld_Val_Char,1,3)
+    let $Field_Name  = rtrim(&V.Fieldname,' ')
+    IF ( $Field_Name  = 'ACTION'
+       and $Field_Value = $Trgr_Action )
+     or ( $Field_Name = 'ACTION_REASON'
+       and $Field_Value = $Trgr_Action_Reason )
+    
+      let $Field_Defn    = 'Y'
+      let $Trgr_Event_Id = &V.Trgr_Event_Id
+      evaluate &T.TRGR_TYPE
+      when = 'I   '
+        do Insert-Iterative-Trigger
+        break
+      when = 'R   '
+        do Insert-Retro-Trigger
+        break
+      when = 'S   '
+        do Insert-Segm-Trigger
+        break
+      end-evaluate
+
+   end-if
+  
+  FROM PS_GP_TRGR_VALUE V
+  WHERE V.RECNAME   = $Trgr_recname
+    AND V.FIELDNAME = &F.FIELDNAME
+    AND V.TRGR_TYPE = &T.TRGR_TYPE
+ end-select
+
+end-procedure

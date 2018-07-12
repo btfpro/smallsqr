@@ -1,0 +1,322 @@
+!***********************************************************************
+!  TAX940:  FUTA Wage Reconciliation Report - Tax Year 1995            *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+!   This module contains confidential and proprietary information      *
+!   of Oracle; it is not to be copied, reproduced, or transmitted      *
+!   in any form, by any means, in whole or in part, nor is it to       *
+!   be used for any purpose other than that for which it is            *
+!   expressly provided under the applicable license agreement.         *
+!                                                                      *
+!   Copyright (C) 2007 Oracle. All Rights Reserved.                    *
+!***********************************************************************
+!                                                                      *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+!          $Date:  2007/03/01:16:46:35                                 !
+!       $Release:  HR9                                                 !
+!    $Resolution:  698735                                              !
+!                                                                      *
+!***********************************************************************
+!***********************************************************************
+
+#include 'setenv.sqc' !Set environment
+#include 'setup31.sqc' !Printer and page-size initialization
+
+begin-report
+  do Init-Report
+  do Process-Main
+  do Stdapi-Term
+end-report
+
+begin-procedure Init-Report
+  move 'TAX940' to $ReportID
+  move 'FUTA Wage Reconciliation Report' to $ReportTitle
+  display ''
+  display 'FUTA Wage Reconciliation Report'
+
+  do Init-DateTime
+  do Init-Number
+  do Get-Calendar-Year-Id
+  do Stdapi-Init
+  do Initialization
+end-procedure
+
+begin-procedure Initialization
+  do Get-Current-DateTime
+
+  move '1' to $Year4
+  do Format-DateTime($AsOfToday, $AsOfYear, {DEFYMD}, '','')
+  move $AsOfYear  to $AsOfYear xxxx   !extract the current year
+  move $AsOfYear  to #AsOfYear
+  move #AsOfYear  to #saveAsOfYear
+  subtract 1 from #AsOfYear
+
+  do Get-Tax-Reporting-Run-Controls
+
+  if &TX.Balance_Year <> #AsOfYear and $Prcs_Process_Instance = ''
+    display ''
+    display 'Current Year is not one greater than Tax Reporting Year.'
+    display 'Current Year is    ' noline
+    display  #saveAsOfYear  9999
+    display 'Tax Reporting Year ' noline
+    display &TX.Balance_Year
+    input $Answer maxlen=1 'Do you want to continue? (Y/N)'
+    uppercase $Answer
+    if $Answer <> 'Y'
+      stop
+    end-if
+  end-if
+
+  move &TX.Balance_Year    to $AsOfDate
+  let $AsOfDate = $AsOfDate || '1231'
+  do Format-DateTime($AsOfDate, $AsOfDate, {DEFCMP}, '', 'native')
+
+  move &TX.Balance_Year to $CalYear 9999
+
+end-procedure
+
+begin-heading 9
+  #Include 'stdhdg01.sqc'
+
+  let $TaxYear = 'Tax Year ' || $CalYear
+  print $TaxYear                 (3,)    center
+end-heading
+
+begin-procedure Process-Main
+begin-SELECT
+A.FEDERAL_EIN           () on-break print=never level=1 after=EIN-Totals
+A.DESCR
+A.COMPANY               () on-break print=never level=2 after=Company-Totals
+
+  move &A.Federal_EIN to $StoredEIN     099999999
+  move &A.Company     to $StoredCompany
+  move &A.Descr       to $StoredDescr
+  do Get-Exempt-Earnings
+  if $SelectedEarns <> ')'
+    do Tally-Earnings
+  end-if
+
+  do Tally-Deductions
+  do Tally-Tax-Balances
+
+FROM  PS_COMPANY_TBL A
+WHERE  A.COUNTRY = 'USA'
+  AND  EFFDT =
+      (SELECT MAX(EFFDT)
+       FROM   PS_COMPANY_TBL
+       WHERE  COMPANY = A.COMPANY
+         AND  EFFDT  <= $AsOfDate)
+ORDER BY A.FEDERAL_EIN, A.COMPANY
+end-SELECT
+end-procedure
+
+begin-procedure Tally-Earnings
+begin-SELECT
+#ifdef DB2ALL
+DECIMAL(SUM(EB.GRS_YTD),15,3) &EB.Grs_YTD
+#else
+SUM(EB.GRS_YTD) &EB.Grs_YTD
+#endif
+
+ FROM PS_EARNINGS_BAL EB
+WHERE EB.COMPANY           = &A.Company
+  AND EB.ERNCD            IN [$SelectedEarns]
+  AND EB.BALANCE_YEAR     = &TX.Balance_Year
+  AND EB.BALANCE_ID       = $Calendar_Year_Id
+  AND EB.GRS_YTD           > 0
+  AND EB.BALANCE_PERIOD           =
+      (SELECT MAX(BALANCE_PERIOD)
+       FROM   PS_EARNINGS_BAL
+       WHERE  EMPLID            = EB.EMPLID
+         AND  COMPANY           = EB.COMPANY
+         AND  BALANCE_YEAR      = EB.BALANCE_YEAR
+         AND  BALANCE_ID        = EB.BALANCE_ID
+         AND  EMPL_RCD          = EB.EMPL_RCD
+         AND  SPCL_BALANCE      = EB.SPCL_BALANCE
+         AND  ERNCD             = EB.ERNCD)
+end-SELECT
+end-procedure
+
+begin-procedure Tally-Tax-Balances
+begin-SELECT
+
+#ifdef DB2ALL
+DECIMAL(SUM(TB.TXGRS_YTD),15,3) &TB.TxGrs_YTD
+#else
+SUM(TB.TXGRS_YTD) &TB.TxGrs_YTD
+#endif
+
+#ifdef DB2ALL
+DECIMAL(SUM(TB.NLGRS_YTD),15,3) &TB.NLGrs_YTD
+#else
+SUM(TB.NLGRS_YTD) &TB.NLGrs_YTD
+#endif
+
+FROM  PS_TAX_BALANCE TB
+WHERE TB.COMPANY       = &A.Company
+  AND TB.STATE         = '$U'
+  AND TB.TAX_CLASS     = 'U'   !Employer Unemployment
+  AND TB.BALANCE_YEAR = &TX.Balance_Year
+  AND TB.BALANCE_ID    = $Calendar_Year_Id
+  AND TB.BALANCE_PERIOD =
+      (SELECT MAX(BALANCE_PERIOD)
+         FROM PS_TAX_BALANCE
+        WHERE EMPLID        = TB.EMPLID
+          AND COMPANY       = TB.COMPANY
+          AND BALANCE_YEAR = TB.BALANCE_YEAR
+          AND BALANCE_ID = TB.BALANCE_ID
+          AND STATE         = TB.STATE
+          AND TAX_CLASS     = TB.TAX_CLASS)
+  AND TB.NLGRS_YTD     > 0
+end-SELECT
+end-procedure
+
+begin-procedure Get-Exempt-Earnings
+  move '(''' to $SelectedEarns
+begin-SELECT
+
+E.ERNCD
+
+  do Concat-Earns
+
+ FROM PS_TAXFORM_ERN E
+WHERE E.TAXFORM_ID = 'F'
+  AND E.EFFDT =
+      (SELECT MAX(EFFDT)
+       FROM   PS_TAXFORM_ERN
+       WHERE  TAXFORM_ID = E.TAXFORM_ID
+         AND  EFFDT     <= $AsOfDate)
+ORDER BY E.ERNCD
+
+end-SELECT
+  let $SelectedEarns = SUBSTR($SelectedEarns,1,LENGTH($SelectedEarns) - 2)
+  let $SelectedEarns = $SelectedEarns || ')'
+end-procedure
+
+begin-PROCEDURE Tally-Deductions
+  let $where01 = 'AND EXISTS (SELECT ' || '''x''' || ' FROM PS_TAXFORM_DED D WHERE D.TAXFORM_ID=' || '''F''' || ' AND D.EFFDT=(SELECT MAX(EFFDT) '
+  let $where02 = 'FROM PS_TAXFORM_DED WHERE PLAN_TYPE=D.PLAN_TYPE AND DEDCD=D.DEDCD AND EFFDT<=''' || $AsOfDate || ''')'
+  let $SelectedPlan = $where01 || $where02 || ' AND DB.PLAN_TYPE = D.PLAN_TYPE'
+  let $SelectedDeds = ' AND DB.DEDCD = D.DEDCD'
+  let $SelectedClas = ' AND DB.DED_CLASS = D.DED_CLASS)'
+
+begin-SELECT
+
+#ifdef DB2ALL
+DECIMAL(SUM(DB.DED_YTD),15,3) &DB.Ded_YTD
+#else
+SUM(DB.DED_YTD) &DB.Ded_YTD
+#endif
+
+FROM PS_DEDUCTION_BAL DB
+WHERE DB.COMPANY       = &A.Company
+  [$SelectedPlan]
+  [$SelectedDeds]
+  [$SelectedClas]
+  AND DB.BALANCE_YEAR = &TX.Balance_Year
+  AND DB.BALANCE_ID    = $Calendar_Year_Id
+  AND DB.BALANCE_PERIOD =
+      (SELECT MAX(BALANCE_PERIOD)
+         FROM PS_DEDUCTION_BAL
+        WHERE EMPLID        = DB.EMPLID
+          AND COMPANY       = DB.COMPANY
+          AND BALANCE_YEAR  = DB.BALANCE_YEAR
+          AND BALANCE_ID    = DB.BALANCE_ID
+          AND BENEFIT_PLAN  = DB.BENEFIT_PLAN
+          AND PLAN_TYPE     = DB.PLAN_TYPE
+          AND DEDCD         = DB.DEDCD
+          AND DED_CLASS     = DB.DED_CLASS)
+  AND DB.DED_YTD     > 0
+
+end-SELECT
+end-PROCEDURE
+
+begin-PROCEDURE Concat-Earns
+  let $SelectedErnCd = &E.ErnCd
+  uppercase $SelectedErnCd
+  let $SelectedEarns = $SelectedEarns || $SelectedErnCd || ''','''
+end-procedure
+
+begin-PROCEDURE Company-Totals
+  print 'Federal EIN '           (1,1)
+  print $StoredEIN               (,+2)   edit xx-xxxxxxx
+  print 'Totals for Company:'    (4,1)
+  print $StoredCompany           (0,22)
+  print $StoredDescr             (0,+2)
+  add 1 to #NumberCompanies
+  print 'Total payments (including exempt payments)'       (+4,22)
+  let #TotalPay = (&DB.Ded_YTD + &EB.Grs_YTD + &TB.NLGrs_YTD)
+  print #TotalPay                                          (0,70)  edit 9,999,999,999.99
+  print 'Payments defined as FUTA-exempt'                  (+2,22)
+  let #FUTAExempt = (&DB.Ded_YTD + &EB.Grs_YTD)
+  print #FUTAExempt                                        (0,70)  edit 9,999,999,999.99
+  print 'Payments in excess of FUTA taxable wage base'     (+2,22)
+  let #Excess = (&TB.NLGrs_YTD - &TB.TxGrs_YTD)
+  print #Excess                                            (0,70)  edit 9,999,999,999.99
+  print 'Total exempt payments'                            (+2,22)
+  let #TotalExempt = (#FUTAExempt + #Excess)
+  print #TotalExempt                                       (0,70)  edit 9,999,999,999.99
+  print 'Total taxable wages'                              (+2,22)
+  let #TotTaxWgs = (&TB.TxGrs_YTD)
+  print #TotTaxWgs                                         (0,70)  edit 9,999,999,999.99
+  add #TotalPay       to #EINTotalPay
+  add #FUTAExempt     to #EINExempt
+  add #Excess         to #EINExcess
+  add #TotalExempt    to #EINTotExempt
+  add &TB.TxGrs_YTD   to #EINTxblGross
+  let #TotalPay = round (#TotalPay,2)
+  let #TotalExempt = round (#TotalExempt,2)
+  let $TotTaxWgs = round (#TotTaxWgs,2)
+  let $GrandTotal = round (#TotalPay - #TotalExempt,2)
+  if $GrandTotal <> $TotTaxWgs
+    print '** WARNING:   Total Payments  -  total exempt payments not = total taxable wages' (+4, 20)
+  end-if
+  new-page
+end-PROCEDURE
+
+begin-PROCEDURE EIN-Totals
+  if #NumberCompanies > 1
+    do Print-EIN-Totals
+  end-if
+  move 0 to #NumberCompanies
+  move 0        to #EINTotalPay
+  move 0        to #EINExempt
+  move 0        to #EINExcess
+  move 0        to #EINTotExempt
+  move 0        to #EINTxblGross
+end-PROCEDURE
+
+begin-PROCEDURE Print-EIN-Totals
+  print 'Totals for EIN:'                                  (4,1)
+  print $StoredEIN                                         (0,20)  edit xx-xxxxxxx
+  print 'Total payments (including exempt payments)'       (+2,20)
+  print #EINTotalPay                                       (0,70)  edit 9,999,999,999.99
+  print 'Payments defined as FUTA-exempt'                  (+2,20)
+  print #EINExempt                                         (0,70)  edit 9,999,999,999.99
+  print 'Payments in excess of FUTA taxable wage base'     (+2,20)
+  print #EINExcess                                         (0,70)  edit 9,999,999,999.99
+  print 'Total exempt payments'                            (+2,20)
+  print #EINTotExempt                                      (0,70)  edit 9,999,999,999.99
+  print 'Total taxable wages'                              (+2,20)
+  print #EINTxblGross                                      (0,70)  edit 9,999,999,999.99
+  let #EINTotalPay = round (#EINTotalPay,2)
+  let #EINTotExempt = round (#EINTotExempt,2)
+  let $EINTxblGross = round (#EINTxblGross,2)
+  let $GrandTotal = round (#EINTotalPay - #EINTotExempt,2)
+  if $GrandTotal <> $EINTxblGross
+    print '** WARNING:   Total Payments  -  total exempt payments not = total taxable wages' (+4, 20)
+  end-if
+  new-page
+end-PROCEDURE
+
+#Include 'taxrnctl.sqc'  !Get-Tax-Reporting-Run-Controls procedure
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'stdapi.sqc'    !Update Process API
+#Include 'getbalid.sqc'  !Get-Calendar-Year-Id

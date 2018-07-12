@@ -1,0 +1,2171 @@
+!********************************************************************** 
+! SQR Name:           adphours.sqc  
+! SQR Descr:          ADP Employment Tax, hours worked
+! Created by:         drmonroe 
+! Create date:        03/04/2010 
+! Last modified by:   drmonroe
+! Last modified date: 09/01/15
+!*********************************************************************** 
+! adphours.sqc
+!   
+!  Purpose:  To contain all the source related to the ADP Transporter Tax interface related to HOURS and WEEKS worked
+!            Called through the PBZQTR.SQR
+!  Author:   Dan Monroe
+!  Date:     Feb 16, 2009
+! ------------------ v4Q2010 release -----------
+!            Nov 17, 2010 AGN1 moved their custom code to their probiz.sqc
+!            Dec 17, 2010 do not recalc Oregon W/C if no hours are calculated and weeks do exist
+!            Jan 21, 2011 remove HOURS_AND_WEEKS_FOR_SELECT_STATES_ONLY
+!            Apr 12, 2011 IRC1 customization for commission hours
+!            Apr 13, 2011 STD_MIN_HRS_STATES (CHS1)
+!            Jun 08, 2011 VZN1 and re-enable the CALC_OREGON_HOURS option
+!            Jun 10, 2011 VZN1 pull in special balance = 'N', and add debugging
+!            Jun 29, 2011 CALC_WA_LI_HOURS (needs to be set in probiz.sqc for now)
+!                           also $WA_WORKERS_COMP_ENABLE = 't' must be set in pbzqtr.to allow WA specia L&I processing
+!            Jul 06, 2011 SPG1
+!            Feb 01, 2012 Securian, for WA W/C, they will setup a new RUN_CNTL_ID in RC_TAX810WA and the earnings codes for this particular
+!                         set of rows will be for WA Local hours (change WA-Earnings-Codes-Select procedure for staters)
+!                         #define USE_RUN_CNTL_ID_WA_WC   ADPWRC  ! example of the definition with the specific run control it for WA W/C
+!                         #define WA_HOURS_from_RC_TAX810WA
+!            Apr 10, 2012 HFH1 - get OR hours from AG table for ORU and not ORB taxes
+!                          also for the AG clients we were not calc'ing OR and WA W/C hours based on tax/rate
+!            May 11, 2012 CALC_WA_LI_HOURS refined and now uses the data passed in if the $WC_Locality lets us know this is a W/C tax
+!            Feb 17, 2015 USE_INT_CRITERIA
+!            Apr 21, 2015 CALC_OREGON_HOURS allow it to be a variable locality
+!            Sep  1, 2015 #define DC_HOURS_from_RC_TAX810DC 
+!            Sep 21, 2015 Extract-Hours-Worked:, add EMPL_RCD in query
+!            Jan 21, 2016 LA_HOURS_WORKED_SELECTION added
+!---------------------------------------------------------------------------------------------------------------------------------------------
+
+#define adphours_release     2016.01.21
+
+#ifndef WAREHOUSE_SUFFIX
+  #define WAREHOUSE_SUFFIX
+#endif
+
+
+
+#if {SITE_ID} = 'VZN1'
+ #define OR_HOURS_from_RC_TAX810OR
+#else
+  #ifndef CALC_OREGON_HOURS
+    #define CALC_OREGON_HOURS OR0001 ! Oregon Hours for Workers comp.. calculated based on QTD taxes and tax rate
+  #endif
+#endif
+
+
+!these allow for us to use the default Peoplesoft RC tables to get the earnings codes to sum for these states
+!--------------------------------------------------------------------------------------------------------------------------
+!#define DC_HOURS_from_RC_TAX810DC
+!#define MA_HOURS_from_RC_TAX810MA
+!#define MN_HOURS_from_RC_TAX810MN
+!#define MO_HOURS_from_RC_TAX810MO
+!#define NV_HOURS_from_RC_TAX810NV
+!#define NY_HOURS_from_RC_TAX810NY
+!#define OR_HOURS_from_RC_TAX810OR
+!#define RI_HOURS_from_RC_TAX810RI
+!#define WA_HOURS_from_RC_TAX810WA
+!#define VT_HOURS_from_RC_TAX810VT   !this has optoinal definition to specificy specific codes:
+                                     !  eg. #define VT_HOURS_from_RC_TAX810VT VTF.ERNCD in (''ORE'') 
+
+#ifdef ADP_TAX_DEV
+ #define BATCH_OPRID           PS
+ #define BATCH_RUN_CNTL_ID     DM
+#endif
+
+!Minimum for Oregon and Washington if zero hours has been determined
+#ifndef STD_WEEKS_MIN
+  #define STD_WEEKS_MIN 1   !Q3, 2008 going forward only
+#endif
+#ifndef STD_HOURS_MIN
+  #define STD_HOURS_MIN 1
+#endif
+
+#if {SITE_ID} = 'CHS1'
+  #define STD_MIN_HRS_STATES  $State_trimmed = 'WA' or $State_trimmed = 'VT' or $State_trimmed = 'OR'
+#endif
+
+#ifndef STD_MIN_HRS_STATES
+  #define STD_MIN_HRS_STATES  $State_trimmed = 'WA' or $State_trimmed = 'OR'
+#endif
+
+#ifdef DERIVATION_CLIENT
+  #define MAX_WEEKS_IN_EXTRACT  52
+#else
+  #define MAX_WEEKS_IN_EXTRACT  14
+#endif
+
+#ifndef HOURS_WORKED_SELECTION
+  #define HOURS_WORKED_SELECTION      F.ERNCD in (''xxx'')
+#endif
+
+#ifdef STD_WEEKS_CALC
+  #define EXECUTE_WEEKS_ROUTINE
+#endif
+#ifdef GET_WEEKS_ADP
+  #define EXECUTE_WEEKS_ROUTINE
+#endif
+
+!2/11/09 - This is the standard going forward for hours worked, 3 options in clients' probiz.sqc
+!-----------------------------------------------------------------------------------------------
+! #define ADP_STANDARD_HOURS_WEEKS_CALC 2009                  ! This should always be in new clients probiz.sqc
+!                                                             ! and for any existing client wanting the new standard hours starting in 2009
+! 1. ACCUMULATOR for Hours Paid
+!       #define HOURS_ACCUMULATOR  
+!       #define HOURS_WORKED_SELECTION  F.ERNCD in (''ADP'')  ! where ADP is the ERNCD accumulator for hours
+! 2. EARNINGS PROGRAM for Paid Hours
+!       #define EARNINGS_PROGRAM
+!       #define EARNINGS_PROGRAM_CODE  ADP                    ! where ADP is the EARNINGS PROGRAM with the hours erncd's
+! 3. LIST of EARNINGS CODES with hours paid
+!       #define HOURS_WORKED_SELECTION      F.ERNCD in (''REG'',''OVT'',''OV2'')  ! List of specific earnings codes
+! 4. AG Conversion Clients
+!       #define HOURS_AG
+!       #define HOURS_AG_BALANCES
+!-------------------------------------------------------------------------------
+
+#ifdef GET_WEEKS_ADP
+  #include 'adpweeks.sqc'
+#else
+  #include 'getweeks.sqc'
+#endif
+
+#ifdef HOURS_AG
+ #include 'adpgetag.sqc'
+#endif
+
+begin-procedure init-hours-calc
+
+    show ' '
+    show 'init-hours-calc: adphours.sqc release : {adphours_release}'
+    
+    #ifdef ADP_STANDARD_HOURS_WEEKS_CALC
+      show 'ADP_STANDARD_HOURS_WEEKS_CALC {ADP_STANDARD_HOURS_WEEKS_CALC}'
+    #endif
+    
+    let $standard_hours_weeks_allowed = 'f'
+    let $HOURS_WORKED_SELECTION_STATE = 'xx'
+    
+    #ifdef ADP_STANDARD_HOURS_WEEKS_CALC
+    
+     show 'Hours: ADP_STANDARD_HOURS_WEEKS_CALC, starting in {ADP_STANDARD_HOURS_WEEKS_CALC}'
+     let $ADP_STANDARD_HOURS_WEEKS_CALC_Begin_year = rtrim('{ADP_STANDARD_HOURS_WEEKS_CALC}',' ')
+     
+     if $ADP_STANDARD_HOURS_WEEKS_CALC_Begin_year = ''
+      show 'Hours: ADP Standard Hours & Weeks allowed for processing in ' $RptYear
+      let $standard_hours_weeks_allowed = 't'
+     else     
+       move $ADP_STANDARD_HOURS_WEEKS_CALC_Begin_year to #ADP_STANDARD_HOURS_WEEKS_CALC_Begin_year
+       if #RptYear >= #ADP_STANDARD_HOURS_WEEKS_CALC_Begin_year
+        show 'Hours: ADP Standard Hours & Weeks allowed for processing in ' $RptYear
+        let $standard_hours_weeks_allowed = 't'
+       else
+        show 'Hours: ADP Standard Hours & Weeks not enabled for processing in ' $RptYear
+       end-if
+     end-if    
+     show 'standard_hours_weeks_allowed = ' $standard_hours_weeks_allowed
+    #endif
+
+    #ifdef HOURS_WORKED_SELECTION
+      show 'Hours: HOURS_WORKED_SELECTION: {HOURS_WORKED_SELECTION}'
+    #endif
+
+    #ifdef LA_HOURS_WORKED_SELECTION
+      show 'Hours: LA_HOURS_WORKED_SELECTION: {LA_HOURS_WORKED_SELECTION}'
+      move '{LA_HOURS_WORKED_SELECTION}' to  $LA_Hours_worked_selection
+    #endif
+    
+    #ifdef HOURS_ACCUMULATOR
+      show 'Hours: Special accumulator for Hours.'
+    #endif
+
+    #ifdef EARNINGS_PROGRAM
+      show 'Hours: Earnings Program Code: {EARNINGS_PROGRAM_CODE}'
+    #endif
+  
+    #ifdef HOURS_AG
+      show 'Hours: HOURS_AG enabled.'
+      #ifdef HOURS_AG_BALANCES
+        show 'Hours: HOURS_AG_BALANCES enabled.'
+      #endif
+      do initialize-HOURS-WORKED-AG
+    #endif
+    
+    #ifdef EXECUTE_WEEKS_ROUTINE
+      show '  EXECUTE_WEEKS_ROUTINE enabled, using get-weeks in adpweeks.sqc'
+    #endif
+
+    #ifdef STD_WEEKS_CALC
+      show '  STD_WEEKS_CALC enabled. Hours: Estimated = Weeks X Standard Hours.'
+    #endif
+
+    #ifdef GET_WEEKS_ADP
+      show '  GET_WEEKS_ADP enabled, Using get-weeks in adpweeks.sqc'
+    #endif
+
+    #ifdef WA_WORKERS_COMP_ENABLE
+     #ifdef CALC_WA_LI_HOURS
+      if $WA_WORKERS_COMP_ENABLE = 't'
+        let $CALC_WA_LI_HOURS = 't'
+        show 'CALC_WA_LI_HOURS enabled.'
+      else
+        show 'CALC_WA_LI_HOURS enabled, but not allowed until Q3, 2011.'
+      end-if
+     #endif
+    #endif
+    
+    #ifdef COMMISSION_HOURS_WFB
+     #debughr show 'Hours: COMMISSION_HOURS_WFB enabled.'
+    #endif
+
+    #ifdef COMMISSION_HOURS
+     #debughr show 'Hours: COMMISSION_HOURS enabled {COMMISSION_HOURS}.'
+    #endif
+
+    #ifdef SEVERANCE_HOURS
+     #debughr show 'Hours: SEVERANCE_HOURS enabled {SEVERANCE_HOURS}.'
+    #endif
+
+    #ifdef STD_MIN_HRS_STATES
+     #debughr show 'Hours: see STD_MIN_HRS_STATES definition for list of states.  Min weeks worked = {STD_WEEKS_MIN}, min hours worked = {STD_HOURS_MIN}'
+    #endif
+
+    let $Batch_OPRID = $PRCS_OPRID
+    let $BATCH_RUN_CNTL_ID = $PRCS_RUN_CNTL_ID
+    #ifdef BATCH_OPRID
+       let $Batch_OPRID       = '{BATCH_OPRID}'
+    #endif
+    #ifdef BATCH_RUN_CNTL_ID
+       let $BATCH_RUN_CNTL_ID = '{BATCH_RUN_CNTL_ID}'
+    #endif
+
+
+    #ifdef DC_HOURS_from_RC_TAX810DC  
+      do DC-Earnings-Codes-Select
+      show 'DC_HOURS_from_RC_TAX810DC enabled. Earnings codes for QTD Hours: ' $HOURS_WORKED_SELECTION_DC
+    #endif
+    
+   
+    #ifdef MA_HOURS_from_RC_TAX810MA  
+      do MA-Earnings-Codes-Select
+      show 'MA_HOURS_from_RC_TAX810MA enabled. Earnings codes for QTD Hours: ' $HOURS_WORKED_SELECTION_MA
+    #endif
+    
+    #ifdef MN_HOURS_from_RC_TAX810MN
+      do MN-Earnings-Codes-Select
+     #debughr show 'MN_HOURS_from_RC_TAX810MN enabled. Earnings codes for QTD Hours: ' $HOURS_WORKED_SELECTION_MN
+    #endif
+
+    #ifdef MO_HOURS_from_RC_TAX810MO
+      do MO-Earnings-Codes-Select
+     #debughr show 'MO_HOURS_from_RC_TAX810MO enabled. Earnings codes for QTD Hours: ' $HOURS_WORKED_SELECTION_MO
+    #endif
+
+    #ifdef NV_HOURS_from_RC_TAX810NV
+      do NV-Earnings-Codes-Select
+     #debughr show 'NV_HOURS_from_RC_TAX810NV enabled. Earnings codes for QTD Hours: ' $HOURS_WORKED_SELECTION_NV
+    #endif
+
+    #ifdef NY_HOURS_from_RC_TAX810NY
+      do NY-Earnings-Codes-Select
+     #debughr show 'NY_HOURS_from_RC_TAX810NY enabled. Earnings codes for QTD Hours: ' $HOURS_WORKED_SELECTION_NY
+    #endif
+
+    #ifdef OR_HOURS_from_RC_TAX810OR
+      do OR-Earnings-Codes-Select
+     #debughr show 'OR_HOURS_from_RC_TAX810OR enabled. Earnings codes for QTD Hours: ' $HOURS_WORKED_SELECTION_OR
+    #endif
+
+    #ifdef RI_HOURS_from_RC_TAX810RI
+      do RI-Earnings-Codes-Select
+     #debughr show 'RI_HOURS_from_RC_TAX810RI enabled. Earnings codes for QTD Hours: ' $HOURS_WORKED_SELECTION_RI
+    #endif
+
+    #ifdef VT_HOURS_from_RC_TAX810VT
+      if rtrim('{VT_HOURS_from_RC_TAX810VT}',' ') = ''
+        do VT-Earnings-Codes-Select
+       #debughr show 'VT_HOURS_from_RC_TAX810VT from RC table. Earnings codes for QTD Hours: ' $HOURS_WORKED_SELECTION_VT
+      else
+        let $HOURS_WORKED_SELECTION_VT = '{VT_HOURS_from_RC_TAX810VT}'
+        let $VT_Erncds = 't'
+       #debughr show 'VT_HOURS_from_RC_TAX810VT fixed.   Earnings codes for QTD Hours: ' $HOURS_WORKED_SELECTION_VT
+      end-if
+    #endif
+
+    #ifdef WA_HOURS_from_RC_TAX810WA
+      do WA-Earnings-Codes-Select
+     #debughr show 'WA_HOURS_from_RC_TAX810WA enabled. Earnings codes for SUI Hours: ' $HOURS_WORKED_SELECTION_WA
+      #ifdef USE_RUN_CNTL_ID_WA_WC
+     #debughr show 'WA_HOURS_from_RC_TAX810WA enabled. Earnings codes for W/C Hours: ' $HOURS_WORKED_SELECTION_WA_WC
+      #endif
+    #endif
+
+
+    !This Selection from Earnings-Pgm should be the default
+    !------------------------------------------------------
+    #ifdef EARNINGS_PROGRAM
+       do Earnings-Code-Select-From-Earnings-Pgm
+    #else
+      #ifdef STANDARD_HOURS_WORKED_SELECTION
+        do Standard-Earnings-Codes-Select
+      #else
+      #if {SITE_ID} = 'ANC1'
+        do ANC-Earnings-Codes-Select
+      #else
+        #if {SITE_ID} = 'JCP1'
+        do JCP-Earnings-Codes-Select
+      #else
+        #if {SITE_ID} = 'AXA1'
+          do Axa-Earnings-Codes-Select
+        #else
+         #if {SITE_ID} = 'ATE1'
+           do ATE1-Earnings-Codes-Select
+         #else
+          #ifdef MULTIPLE_HOURS_WORKED_SELECTIONS
+           move '{Hours_Worked_Selection1}' to  $Hours_worked_selection1
+           move '{Hours_Worked_Selection2}' to  $Hours_worked_selection2
+           move '{Hours_Worked_Selection3}' to  $Hours_worked_selection3
+          #else
+           move '{Hours_Worked_Selection}' to  $Hours_worked_selection
+          #endif
+          #if {SITE_ID} = 'PFZ1'
+           #ifdef HOURS_WORKED_CATEGORY
+            #debughr show 'PFZ1: HOURS_WORKED_CATEGORY = {HOURS_WORKED_CATEGORY}'
+             do Get-Category-Earnings ('{HOURS_WORKED_CATEGORY}', $Qtr_End_Native, $Erncd_List)
+             if rtrim($Erncd_List,' ') <> ''
+               let $Hours_worked_selection = 'F.ERNCD in ' || $Erncd_List
+              #debughr show 'PFZ1: HOURS_WORKED_CATEGORY = {HOURS_WORKED_CATEGORY}, erncd_list = ' $erncd_list 
+             else
+              #debughr show ' '
+              #debughr show 'HOURS_WORKED_CATEGORY ({HOURS_WORKED_CATEGORY}) is defined, but no rows exist in ERNCD Category Table.'
+               stop
+             end-if
+           #endif
+          #endif
+        #endif
+       #endif
+      #endif
+     #endif
+    #endif
+   #endif
+   
+   do initialize-std-weeks-calc
+   
+  show 'Hours: Final $HOURS_WORKED_SELECTION: ' $HOURS_WORKED_SELECTION
+  show ' '
+ 
+ end-procedure
+ 
+ 
+ #ifdef DERIVATION_CLIENT
+ begin-procedure Initialize-std-weeks-calc
+ 
+  
+  #debughr show 'DERIVATION_CLIENT Initing... Weeks worked ' $RptYear
+   
+   move $RptYear to $QtrBeginDate xxxx
+   let #QtrBeginMonth = 1
+!   ------------------------------------------------------------------------
+!   10/15/09 bug   
+!   let #RptMonth = 12                                           
+!   let $Year_End_DTU = $QtrBeginDate || '-' || '12-31'
+!   Do Convert-From-DTU-Date($Year_end_DTU,$Year_End_Native)
+!   let $PeriodEndDate = $Year_End_Native
+   
+   let $PeriodEndDate = $Qtr_End_Native
+   ! -----------------------------------------------------------------------
+   
+   let $QtrBeginDate = $QtrBeginDate || '-' || '01-01'
+ 
+   move '1' to $Year4
+   move '-' to $DDelimiter
+   do Format-DateTime($PeriodEndDate,$PEndDateYMD,{DEFYMD},'','')
+ 
+   do DTU-DayOfWeek#($QtrBeginDate,#QtrBeginWeekday)
+   if #QtrBeginWeekday <> 1
+     let #BegOffsetDays = #QtrBeginWeekday - 1
+     do DTU-Subtract-Days($QtrBeginDate,#BegOffsetDays,$EarnsBeginDate)
+   else
+     move $QtrBeginDate to $EarnsBeginDate
+   end-if
+ 
+   move '1' to $Year4
+   move '-' to $DDelimiter
+   do Format-DateTime($EarnsBeginDate,$SlctEarnsBeginDate,{DEFYMD},'','native')
+   do DTU-DayOfWeek#($PEndDateYMD,#QtrEndWeekday)
+   if #QtrEndWeekday <> 7
+     let #EndOffsetDays = 7 - #QtrEndWeekday
+     do DTU-Add-Days($PEndDateYMD,#EndOffsetDays,$EarnsEndDate)
+   else
+     move $PEndDateYMD to $EarnsEndDate
+   end-if
+   move '1' to $Year4
+   move '-' to $DDelimiter
+   do Format-DateTime($EarnsEndDate,$SlctEarnsEndDate,{DEFYMD},'','native')
+ 
+   show ' $PeriodEndDate       = ' $PeriodEndDate
+   show ' $PEndDateYMD         = ' $PEndDateYMD
+   show ' $QtrBeginDate        = ' $QtrBeginDate
+   show ' $SlctEarnsBeginDate  = ' $SlctEarnsBeginDate
+   show ' $SlctEarnsEndDate    = ' $SlctEarnsEndDate
+   show ' $EarnsBeginDate      = ' $EarnsBeginDate
+   show ' $EarnsEndDate        = ' $EarnsEndDate
+  #debughr show ' '
+ 
+  create-array name=QtrWeeks size=1  field=WeekWorked:char:15
+ 
+    #if {SITE_ID} = 'SRC1'
+      #define QTR_DAY_MAX 400
+    #else
+      #define QTR_DAY_MAX 80
+    #endif
+  
+  create-array name=QtrDays  size={QTR_DAY_MAX} field=PayGroup:char:1         !doubled on 3/3/04 from 10
+                                      field=WkSched:char:1
+                                      field=WeekDay:number:400
+                                      field=Week#:number:400
+                                      field=WorkDay:char:400
+                                      field=Wages:number:400
+ end-procedure
+
+#else
+
+ begin-procedure Initialize-std-weeks-calc
+ 
+   move $RptYear to $QtrBeginDate xxxx
+   let #QtrEndMonth = #RptMonth
+ 
+   let #QtrBeginMonth = #QtrEndMonth - 2
+   let $PeriodEndDate = $Qtr_End_Native
+   
+   move #QtrBeginMonth to $QtrBeginMonth 09
+   let $QtrBeginDate = $QtrBeginDate || '-' || $QtrBeginMonth || '-01'
+ 
+   move '1' to $Year4
+   move '-' to $DDelimiter
+   do Format-DateTime($PeriodEndDate,$PEndDateYMD,{DEFYMD},'','')
+ 
+   do DTU-DayOfWeek#($QtrBeginDate,#QtrBeginWeekday)
+   if #QtrBeginWeekday <> 1
+     let #BegOffsetDays = #QtrBeginWeekday - 1
+     do DTU-Subtract-Days($QtrBeginDate,#BegOffsetDays,$EarnsBeginDate)
+   else
+     move $QtrBeginDate to $EarnsBeginDate
+   end-if
+ 
+   move '1' to $Year4
+   move '-' to $DDelimiter
+   do Format-DateTime($EarnsBeginDate,$SlctEarnsBeginDate,{DEFYMD},'','native')
+   do DTU-DayOfWeek#($PEndDateYMD,#QtrEndWeekday)
+   if #QtrEndWeekday <> 7
+     let #EndOffsetDays = 7 - #QtrEndWeekday
+     do DTU-Add-Days($PEndDateYMD,#EndOffsetDays,$EarnsEndDate)
+   else
+     move $PEndDateYMD to $EarnsEndDate
+   end-if
+   move '1' to $Year4
+   move '-' to $DDelimiter
+   do Format-DateTime($EarnsEndDate,$SlctEarnsEndDate,{DEFYMD},'','native')
+ 
+   create-array name=QtrWeeks size=1  field=WeekWorked:char:15
+ 
+    #if {SITE_ID} = 'SRC1'
+      #define QTR_DAY_MAX 100
+    #else
+      #define QTR_DAY_MAX 20
+    #endif
+  
+  create-array name=QtrDays  size={QTR_DAY_MAX} field=PayGroup:char:1         !doubled on 3/3/04 from 10
+                                      field=WkSched:char:1
+                                      field=WeekDay:number:120
+                                      field=Week#:number:120
+                                      field=WorkDay:char:120
+                                      field=Wages:number:120
+ end-procedure
+
+#endif
+
+ 
+#ifdef STANDARD_HOURS_WORKED_SELECTION   !from HCR 8/9/02
+ 
+ !********************************************************************** !
+ !---------------------------------------------------------------------- !
+ ! Procedure: Standard-Earnings-Codes-Select                             !
+ !---------------------------------------------------------------------- !
+begin-procedure Standard-Earnings-Codes-Select
+ 
+   move 'F.ERNCD in (' to $Hours_Worked_Selection
+   let $q = chr(39)
+ 
+  #ifdef  enable_performance_monitor
+     do Get-Current-Time
+     move $display_dt to $display_dt0
+  #endif
+ 
+begin-SELECT DISTINCT
+ETBL.ERNCD
+ 
+   let $HOURS_WORKED_SELECTION = $Hours_worked_Selection || $q || &ETBL.ERNCD || $q || ','
+ 
+ FROM PS_EARNINGS_TBL ETBL
+ WHERE ETBL.EFFECT_ON_FLSA IN ('B','H') ! TMG 020807 Removed 'A'
+ AND   ETBL.EFFDT =
+       (SELECT MAX(EFFDT)
+        FROM PS_EARNINGS_TBL ETBL2
+        WHERE ETBL2.ERNCD  = ETBL.ERNCD
+        AND   ETBL2.EFFDT <= $Qtr_End_Native)
+ 
+ #ifdef SELECT_WITH_UR
+  {SELECT_WITH_UR} with ur
+ #endif
+end-select
+ 
+   let $Hours_worked_Selection = rtrim($Hours_worked_Selection,',') || ')'
+   show 'Standard-Earnings-Code Hours worked selection = ' $Hours_worked_Selection
+ 
+end-procedure
+ 
+#endif
+
+#ifdef EARNINGS_PROGRAM
+
+!********************************************************************** !
+!---------------------------------------------------------------------- !
+! Procedure: Earnings-code-Select-From_Earnings-Pgm                     !
+! Descr:     Gets EARNINGS Codes associated with ERN_PROGRAM = 'PRO'    !
+!            from PS_ERN_PROGRAM_DEF                                    !
+!--------------------------------------------------------------------   !
+begin-procedure Earnings-Code-Select-From-Earnings-Pgm
+
+  move 'F.ERNCD in (' to $Hours_Worked_Selection
+  let $q = chr(39)
+ #ifdef  enable_performance_monitor
+    do Get-Current-Time
+    move $display_dt to $display_dt0
+ #endif
+
+begin-SELECT DISTINCT
+EP.ERN_PROGRAM
+EP.ERNCD
+
+ if rtrim(&EP.ERN_PROGRAM,' ') = '{EARNINGS_PROGRAM_CODE}'
+   let $HOURS_WORKED_SELECTION = $Hours_worked_Selection || $q || &EP.ERNCD || $q || ','
+ end-if
+
+   ! 12/21/98, from Rich Parisi, "we have setup a new Earnings Program with an
+   ! ID of "PRO" for all the Earnings Codes that should be selected by the
+   ! ProBusiness SQR's.  We would like you to change your SQR's so that for
+   ! Ogden, you select all the Earnings Codes that are in the ERN_PROGRAM_DEF
+   ! table where ERN_PROGRAM equals PRO.  Please let me know when you think
+   ! the changed SQR's can be delivered."  Also, see the EARNS.DOC for details
+   ! on how to set this up.
+   ! --------------------------------------------------------------------------
+
+    FROM PS_ERN_PROGRAM_DEF EP
+
+      WHERE EP.ERN_PROGRAM =  '{EARNINGS_PROGRAM_CODE}'
+       and EP.EFFDT = (SELECT MAX(EFFDT)
+            FROM PS_ERN_PROGRAM_DEF                ! USED to be (3/5/99) PS_EARNINGS_TBL
+               Where ERN_PROGRAM = EP.ERN_PROGRAM
+                 AND EFFDT <= $Qtr_End_Native)
+
+ #ifdef SELECT_WITH_UR
+  {SELECT_WITH_UR} with ur
+ #endif
+end-select
+
+ let $Hours_worked_Selection = rtrim($Hours_worked_Selection,',') || ')'
+
+ #ifdef debug_pbz
+   show 'From Earnings Program ... Earnings codes: '  $Hours_worked_Selection
+ #endif
+
+end-procedure
+
+#endif
+
+#if {SITE_ID} = 'ATE1'
+
+!********************************************************************** !
+!---------------------------------------------------------------------- !
+! Procedure: Axa-Earnings-Codes-Select                                  !
+! Description: Build the earnings code from the table for AXA           !
+!---------------------------------------------------------------------- !
+begin-procedure ATE1-Earnings-Codes-Select
+
+  move 'F.ERNCD in (' to $Hours_Worked_Selection
+  let $q = chr(39)
+ #ifdef  enable_performance_monitor
+    do Get-Current-Time
+    move $display_dt to $display_dt0
+ #endif
+
+begin-SELECT DISTINCT
+G2.ERNCD
+
+   let $HOURS_WORKED_SELECTION = $Hours_worked_Selection || $q || &G2.ERNCD || $q || ','
+
+ !Hourly, with eff_status = 'A'
+ !-----------------------------
+ FROM PS_EARNINGS_TBL G2
+ WHERE G2.ERNCD not in ('02', '02B')
+   AND G2.EFF_STATUS = 'A'
+   AND G2.EFFDT = (SELECT MAX(G3.EFFDT)
+            FROM PS_EARNINGS_TBL G3
+               Where G3.ERNCD      = G2.ERNCD
+                 AND G3.EFF_STATUS = G2.EFF_STATUS
+                 AND G3.EFFDT      <= $Qtr_End_Native)
+#ifdef SELECT_WITH_UR
+ {SELECT_WITH_UR} with ur
+#endif
+end-select
+
+  let $Hours_worked_Selection = rtrim($Hours_worked_Selection,',') || ')'
+  
+ #debughr show 'ATE1-Earnings-Codes-Select: ' $Hours_worked_Selection
+
+end-procedure
+
+#endif
+
+#if {SITE_ID} = 'AXA1'
+
+!********************************************************************** !
+!---------------------------------------------------------------------- !
+! Procedure: Axa-Earnings-Codes-Select                                  !
+! Description: Build the earnings code from the table for AXA           !
+!---------------------------------------------------------------------- !
+begin-procedure Axa-Earnings-Codes-Select
+
+  move 'F.ERNCD in (' to $Hours_Worked_Selection
+  let $q = chr(39)
+ #ifdef  enable_performance_monitor
+    do Get-Current-Time
+    move $display_dt to $display_dt0
+ #endif
+
+begin-SELECT DISTINCT
+G2.ERNCD
+
+   let $HOURS_WORKED_SELECTION = $Hours_worked_Selection || $q || &G2.ERNCD || $q || ','
+
+ !Hourly, with eff_status = 'A'
+ !-----------------------------
+ FROM PS_EARNINGS_TBL G2
+ WHERE G2.PAYMENT_TYPE = 'H'
+   AND G2.EFF_STATUS = 'A'
+   AND G2.EFFDT = (SELECT MAX(G3.EFFDT)
+            FROM PS_EARNINGS_TBL G3
+               Where G3.ERNCD      = G2.ERNCD
+                 AND G3.EFF_STATUS = G2.EFF_STATUS
+                 AND G3.EFFDT      <= $Qtr_End_Native)
+#ifdef SELECT_WITH_UR
+ {SELECT_WITH_UR} with ur
+#endif
+end-select
+
+  let $Hours_worked_Selection = rtrim($Hours_worked_Selection,',') || ')'
+
+end-procedure
+
+#endif
+
+
+!--------------------------------- DC --------------------------------            (MA,MN,MO,NV,NY,OR,RI,VT,WA)
+#ifdef DC_HOURS_from_RC_TAX810DC !added 9/1/15
+begin-procedure DC-Earnings-Codes-Select
+
+  move 'VTF.ERNCD in (' to $Hours_Worked_Selection_DC
+  let $DC_Erncds = 'f'
+
+begin-SELECT DISTINCT
+DC.ERNCD
+
+  let $Hours_Worked_Selection_DC = $Hours_worked_Selection_DC || '''' || &DC.ERNCD || '''' || ','
+  let $DC_Erncds = 't'
+
+   FROM PS_RC_TAX810DC DC
+   WHERE  DC.OPRID       = $BATCH_Oprid
+    AND   DC.RUN_CNTL_ID = $BATCH_Run_Cntl_ID
+
+#ifdef SELECT_WITH_UR
+ {SELECT_WITH_UR} with ur
+#endif
+end-select
+
+  let $Hours_worked_Selection_DC = rtrim($Hours_worked_Selection_DC,',') || ')'
+  if rtrim($DC_Erncds,' ') = 'f'
+    show 'DC-Earnings-Codes-Select: Warning, No Earnings codes setup in RC_TAX810DC Table.  Using standard hours worked calculation'
+  end-if
+  
+end-procedure
+#endif
+
+
+!--------------------------------- MA --------------------------------            (MA,MN,MO,NV,NY,OR,RI,VT,WA)
+#ifdef MA_HOURS_from_RC_TAX810MA !added 2/3/10
+begin-procedure MA-Earnings-Codes-Select
+
+  move 'VTF.ERNCD in (' to $Hours_Worked_Selection_MA
+  let $MA_Erncds = 'f'
+
+begin-SELECT DISTINCT
+MA.ERNCD
+
+  let $Hours_Worked_Selection_MA = $Hours_worked_Selection_MA || '''' || &MA.ERNCD || '''' || ','
+  let $MA_Erncds = 't'
+
+   FROM PS_RC_TAX810MA MA
+   WHERE  MA.OPRID       = $BATCH_Oprid
+    AND   MA.RUN_CNTL_ID = $BATCH_Run_Cntl_ID
+
+#ifdef SELECT_WITH_UR
+ {SELECT_WITH_UR} with ur
+#endif
+end-select
+
+  let $Hours_worked_Selection_MA = rtrim($Hours_worked_Selection_MA,',') || ')'
+  if rtrim($MA_Erncds,' ') = 'f'
+    show 'MA-Earnings-Codes-Select: Warning, No Earnings codes setup in RC_TAX810MA Table.  Using standard hours worked calculation'
+  end-if
+  
+end-procedure
+#endif
+
+!--------------------------------- MN --------------------------------
+#ifdef MN_HOURS_from_RC_TAX810MN !added 2/3/10
+begin-procedure MN-Earnings-Codes-Select
+
+  move 'VTF.ERNCD in (' to $Hours_Worked_Selection_MN
+  let $MN_Erncds = 'f'
+
+begin-SELECT DISTINCT
+MN.ERNCD
+
+  let $Hours_Worked_Selection_MN = $Hours_worked_Selection_MN || '''' || &MN.ERNCD || '''' || ','
+  let $MN_Erncds = 't'
+
+   FROM PS_RC_TAX810MN MN
+   WHERE  MN.OPRID       = $BATCH_Oprid
+    AND   MN.RUN_CNTL_ID = $BATCH_Run_Cntl_ID
+
+#ifdef SELECT_WITH_UR
+ {SELECT_WITH_UR} with ur
+#endif
+end-select
+
+  let $Hours_worked_Selection_MN = rtrim($Hours_worked_Selection_MN,',') || ')'
+  if rtrim($MN_Erncds,' ') = 'f'
+    show 'MN-Earnings-Codes-Select: Warning, No Earnings codes setup in RC_TAX810MN Table.  Using standard hours worked calculation'
+  end-if
+  
+end-procedure
+#endif
+!--------------------------------- MO --------------------------------
+#ifdef MO_HOURS_from_RC_TAX810MO !added 2/3/10
+begin-procedure MO-Earnings-Codes-Select
+
+  move 'VTF.ERNCD in (' to $Hours_Worked_Selection_MO
+  let $MO_Erncds = 'f'
+
+begin-SELECT DISTINCT
+MO.ERNCD
+
+  let $Hours_Worked_Selection_MO = $Hours_worked_Selection_MO || '''' || &MO.ERNCD || '''' || ','
+  let $MO_Erncds = 't'
+
+   FROM PS_RC_TAX810MO MO
+   WHERE  MO.OPRID       = $BATCH_Oprid
+    AND   MO.RUN_CNTL_ID = $BATCH_Run_Cntl_ID
+
+#ifdef SELECT_WITH_UR
+ {SELECT_WITH_UR} with ur
+#endif
+end-select
+
+  let $Hours_worked_Selection_MO = rtrim($Hours_worked_Selection_MO,',') || ')'
+  if rtrim($MO_Erncds,' ') = 'f'
+    show 'MO-Earnings-Codes-Select: Warning, No Earnings codes setup in RC_TAX810MO Table.  Using standard hours worked calculation'
+  end-if
+  
+end-procedure
+#endif
+!--------------------------------- NV --------------------------------
+#ifdef NV_HOURS_from_RC_TAX810NV !added 2/3/10
+begin-procedure NV-Earnings-Codes-Select
+
+  move 'VTF.ERNCD in (' to $Hours_Worked_Selection_NV
+  let $NV_Erncds = 'f'
+
+begin-SELECT DISTINCT
+NV.ERNCD
+
+  let $Hours_Worked_Selection_NV = $Hours_worked_Selection_NV || '''' || &NV.ERNCD || '''' || ','
+  let $NV_Erncds = 't'
+
+ !Hourly, with eff_status = 'A'
+ !-----------------------------
+   FROM PS_RC_TAX810NV NV
+   WHERE  NV.OPRID       = $BATCH_Oprid
+    AND   NV.RUN_CNTL_ID = $BATCH_Run_Cntl_ID
+
+#ifdef SELECT_WITH_UR
+ {SELECT_WITH_UR} with ur
+#endif
+end-select
+
+  let $Hours_worked_Selection_NV = rtrim($Hours_worked_Selection_NV,',') || ')'
+  if rtrim($NV_Erncds,' ') = 'f'
+    show 'NV-Earnings-Codes-Select: Warning, No Earnings codes setup in RC_TAX810NV Table.  Using standard hours worked calculation'
+  end-if
+  
+end-procedure
+#endif
+!--------------------------------- NY --------------------------------
+#ifdef NY_HOURS_from_RC_TAX810NY !added 2/3/10
+begin-procedure NY-Earnings-Codes-Select
+
+  move 'VTF.ERNCD in (' to $Hours_Worked_Selection_NY
+  let $NY_Erncds = 'f'
+
+begin-SELECT DISTINCT
+NY.ERNCD
+
+  let $Hours_Worked_Selection_NY = $Hours_worked_Selection_NY || '''' || &NY.ERNCD || '''' || ','
+  let $NY_Erncds = 't'
+ 
+   FROM PS_RC_TAX810NY NY
+   WHERE  NY.OPRID       = $BATCH_Oprid
+    AND   NY.RUN_CNTL_ID = $BATCH_Run_Cntl_ID
+
+#ifdef SELECT_WITH_UR
+ {SELECT_WITH_UR} with ur
+#endif
+end-select
+
+  let $Hours_worked_Selection_NY = rtrim($Hours_worked_Selection_NY,',') || ')'
+  if rtrim($NY_Erncds,' ') = 'f'
+    show 'NY-Earnings-Codes-Select: Warning, No Earnings codes setup in RC_TAX810NY Table.  Using standard hours worked calculation'
+  end-if
+  
+end-procedure
+#endif
+!--------------------------------- OR --------------------------------
+#ifdef OR_HOURS_from_RC_TAX810OR !added 2/3/10
+begin-procedure OR-Earnings-Codes-Select
+
+  move 'VTF.ERNCD in (' to $Hours_Worked_Selection_OR
+  let $OR_Erncds = 'f'
+
+begin-SELECT DISTINCT
+ORE.ERNCD
+
+  let $Hours_Worked_Selection_OR = $Hours_worked_Selection_OR || '''' || &ORE.ERNCD || '''' || ','
+  let $OR_Erncds = 't'
+
+   FROM PS_RC_TAX810OR ORE
+   WHERE  ORE.OPRID       = $BATCH_Oprid
+    AND   ORE.RUN_CNTL_ID = $BATCH_Run_Cntl_ID
+
+#ifdef SELECT_WITH_UR
+ {SELECT_WITH_UR} with ur
+#endif
+end-select
+
+  let $Hours_worked_Selection_OR = rtrim($Hours_worked_Selection_OR,',') || ')'
+  if rtrim($OR_Erncds,' ') = 'f'
+    show 'OR-Earnings-Codes-Select: Warning, No Earnings codes setup in RC_TAX810OR Table.  Using standard hours worked calculation'
+  end-if
+  
+end-procedure
+#endif
+!--------------------------------- RI --------------------------------
+#ifdef RI_HOURS_from_RC_TAX810RI !added 2/3/10
+begin-procedure RI-Earnings-Codes-Select
+
+  move 'VTF.ERNCD in (' to $Hours_Worked_Selection_RI
+  let $RI_Erncds = 'f'
+
+begin-SELECT DISTINCT
+RI.ERNCD
+
+  let $Hours_Worked_Selection_RI = $Hours_worked_Selection_RI || '''' || &RI.ERNCD || '''' || ','
+  let $RI_Erncds = 't'
+
+   FROM PS_RC_TAX810RI RI
+   WHERE  RI.OPRID       = $BATCH_Oprid
+    AND   RI.RUN_CNTL_ID = $BATCH_Run_Cntl_ID
+
+#ifdef SELECT_WITH_UR
+ {SELECT_WITH_UR} with ur
+#endif
+end-select
+
+  let $Hours_worked_Selection_RI = rtrim($Hours_worked_Selection_RI,',') || ')'
+  if rtrim($RI_Erncds,' ') = 'f'
+    show 'RI-Earnings-Codes-Select: Warning, No Earnings codes setup in RC_TAX810RI Table.  Using standard hours worked calculation'
+  end-if
+  
+end-procedure
+#endif
+
+!--------------------------------- VT --------------------------------
+#ifdef VT_HOURS_from_RC_TAX810VT
+begin-procedure VT-Earnings-Codes-Select
+
+  #if {SITE_ID} = 'TCN1'           !YUM, may need to do this for ALL DB2 clients
+    let $30blank = '                              '
+    let $BATCH_Oprid = $30blank
+    let $BATCH_Run_Cntl_ID = $30blank
+  #endif
+  
+  move 'VTF.ERNCD in (' to $Hours_Worked_Selection_VT
+  let $VT_Erncds = 'f'
+
+begin-SELECT DISTINCT
+VT.ERNCD
+
+  let $Hours_Worked_Selection_VT = $Hours_worked_Selection_VT || '''' || &VT.ERNCD || '''' || ','
+  let $VT_Erncds = 't'
+
+#if {SITE_ID} = 'JCP1'
+   FROM PS_EARNINGS_TBL VT 
+   WHERE VT.{Client_Table_Prefix}ERNCD_TYPE_IND = 'P'
+     AND VT.EFFDT = (SELECT MAX(VT1.EFFDT) FROM PS_EARNINGS_TBL VT1 
+                   WHERE VT1.ERNCD = VT.ERNCD)
+#else
+   FROM PS_RC_TAX810VT VT
+   WHERE  VT.OPRID       = $BATCH_Oprid
+    AND   VT.RUN_CNTL_ID = $BATCH_Run_Cntl_ID
+#endif
+
+#ifdef SELECT_WITH_UR
+ {SELECT_WITH_UR} with ur
+#endif
+end-select
+
+  let $Hours_worked_Selection_VT = rtrim($Hours_worked_Selection_VT,',') || ')'
+ 
+  if rtrim($VT_Erncds,' ') = 'f'
+    show 'VT-Earnings-Codes-Select: Warning, No Earnings codes setup in RC_TAX810VT Table.  Using standard hours worked calculation'
+  end-if
+  
+end-procedure
+#endif
+!--------------------------------- WA --------------------------------
+#ifdef WA_HOURS_from_RC_TAX810WA !added 2/3/10
+begin-procedure WA-Earnings-Codes-Select
+
+  move 'VTF.ERNCD in (' to $Hours_Worked_Selection_WA
+  let $WA_Erncds    = 'f'
+  #ifdef USE_RUN_CNTL_ID_WA_WC
+   move 'VTF.ERNCD in (' to $Hours_Worked_Selection_WA_WC
+   let $WA_Erncds_WC = 'f'
+  #endif
+
+  show 'WA-Earnings-Codes-Select:  (SUI)    ' $BATCH_Oprid ' ' $BATCH_Run_Cntl_ID
+  #ifdef USE_RUN_CNTL_ID_WA_WC
+   show 'WA-Earnings-Codes-Select:  (W/C)    ' $BATCH_Run_Cntl_ID ' {USE_RUN_CNTL_ID_WA_WC}'
+  #endif
+
+begin-SELECT 
+WA.ERNCD
+WA.RUN_CNTL_ID
+
+  if rtrim(&WA.RUN_CNTL_ID,' ') = rtrim($BATCH_Run_Cntl_ID,' ')
+    let $Hours_Worked_Selection_WA = $Hours_worked_Selection_WA || '''' || &WA.ERNCD || '''' || ','
+    let $WA_Erncds = 't'
+  end-if
+  
+  #ifdef USE_RUN_CNTL_ID_WA_WC
+   if rtrim(&WA.RUN_CNTL_ID,' ') = rtrim('{USE_RUN_CNTL_ID_WA_WC}',' ')
+    let $Hours_Worked_Selection_WA_WC = $Hours_worked_Selection_WA_WC || '''' || &WA.ERNCD || '''' || ','
+    let $WA_Erncds_WC = 't'
+   end-if
+  #endif
+  
+  FROM PS_RC_TAX810WA WA
+   WHERE  WA.OPRID       = $BATCH_Oprid
+    
+    #ifdef USE_RUN_CNTL_ID_WA_WC
+      AND   WA.RUN_CNTL_ID = $BATCH_Run_Cntl_ID or WA.RUN_CNTL_ID = '{USE_RUN_CNTL_ID_WA_WC}'
+    #else
+      AND   WA.RUN_CNTL_ID = $BATCH_Run_Cntl_ID
+    #endif
+
+   Order by WA.RUN_CNTL_ID
+
+#ifdef SELECT_WITH_UR
+ {SELECT_WITH_UR} with ur
+#endif
+end-select
+
+  let $Hours_worked_Selection_WA    = rtrim($Hours_worked_Selection_WA,',') || ')'
+  if rtrim($WA_Erncds,' ') = 'f'
+    show 'WA-Earnings-Codes-Select: Warning, No SUI Earnings codes setup in RC_TAX810WA Table.  Using standard hours worked calculation'
+  end-if
+  #ifdef USE_RUN_CNTL_ID_WA_WC
+   let $Hours_worked_Selection_WA_WC = rtrim($Hours_worked_Selection_WA_WC,',') || ')'
+   if rtrim($WA_Erncds_WC,' ') = 'f'
+    show 'WA-Earnings-Codes-Select: Warning, No W/C Earnings codes setup in RC_TAX810WA Table.  Using standard hours worked calculation'
+   end-if
+  #endif
+  
+end-procedure
+#endif
+
+
+#if {SITE_ID} = 'ANC1'
+
+!********************************************************************** !
+!---------------------------------------------------------------------- !
+! Procedure: ANC-Earnings-Codes-Select                                  !
+!---------------------------------------------------------------------- !
+begin-procedure ANC-Earnings-Codes-Select
+
+  move 'F.ERNCD in (' to $Hours_Worked_Selection
+  let $q = chr(39)
+ #ifdef  enable_performance_monitor
+    do Get-Current-Time
+    move $display_dt to $display_dt0
+ #endif
+
+begin-SELECT
+R.OUTPUT_01
+
+  let $HOURS_WORKED_SELECTION = $Hours_worked_Selection || $q || &R.OUTPUT_01 || $q || ','
+
+ FROM PS_RI_EXT_XLAT_TBL  R
+WHERE INPUT_01   = 'PBZQTR.SQR'
+  AND INPUT_02   = 'ERNCD_WORKED_HRS'
+  AND EFF_STATUS = 'A'
+#ifdef SELECT_WITH_UR
+ {SELECT_WITH_UR} with ur
+#endif
+end-select
+
+  let $Hours_worked_Selection = rtrim($Hours_worked_Selection,',') || ')'
+  show 'ANC... Hours worked selection = ' $Hours_worked_Selection
+
+end-procedure
+
+#endif
+
+#if {SITE_ID} = 'JCP1'
+
+!********************************************************************** !
+!---------------------------------------------------------------------- !
+! Procedure: JCP-Earnings-Codes-Select                                  !
+!---------------------------------------------------------------------- !
+begin-procedure JCP-Earnings-Codes-Select
+
+  move 'F.ERNCD in (' to $Hours_Worked_Selection
+  let $q = chr(39)
+ #ifdef  enable_performance_monitor
+    do Get-Current-Time
+    move $display_dt to $display_dt0
+ #endif
+
+begin-SELECT
+V.ERNCD
+
+   let $HOURS_WORKED_SELECTION = $Hours_worked_Selection || $q || &V.ERNCD || $q || ','
+
+ FROM   PS_{Client_Table_Prefix}INTERFC_TBL V
+ WHERE  V.PROGRAM_ID = '{HOURS_PROGRAM_ID}'
+   AND    V.EFFDT = (SELECT MAX(W.EFFDT)
+        FROM   PS_{Client_Table_Prefix}INTERFC_TBL W
+        WHERE   W.PROGRAM_ID = V.PROGRAM_ID
+         AND    W.ERNCD      = V.ERNCD
+         AND    W.EFF_STATUS = V.EFF_STATUS
+         AND    W.EFFDT      <= $Qtr_End_Native)
+#ifdef SELECT_WITH_UR
+ {SELECT_WITH_UR} with ur
+#endif
+end-select
+
+  let $Hours_worked_Selection = rtrim($Hours_worked_Selection,',') || ')'
+  show 'JCP... Hours worked selection = ' $Hours_worked_Selection
+
+end-procedure
+#endif
+
+! ******************* main procedure called from pbzqtr.sqr for all SUI and LOCAL taxes **************************
+
+begin-procedure calc-hours-weeks-paid
+
+  let #EarningsBal_Hrs_Qtd = 0
+  let #EarningsBal_Hrs_Ytd = 0
+  let #QTD_Weeks_Worked = 0
+  let #YTD_Weeks_Worked = 0
+  let #WeeksWorked      = 0
+  let #QTD_Hours_worked = 0
+  let #YTD_Hours_worked = 0
+    
+  move ' 0'      to $Qtd_weeks_worked
+  move ' 0'      to $Ytd_weeks_worked
+  move '   0'   to $Qtd_Hours_Worked
+
+  
+#ifdef HOURS_AG
+   do calc-hours-weeks-paid-AG
+#else
+   
+ if $standard_hours_weeks_allowed = 't'
+     do calc-hours-weeks-paid-standard
+ else
+    do Extract-Hours-Worked
+    #ifdef EXECUTE_WEEKS_ROUTINE
+         !setup for call to standard get-weeks routine
+         !--------------------------------------------
+         move $Current_Emplid  to $EmplID
+         move $Current_Company to $Company
+         move $State_trimmed   to $state
+
+          !6/22/07 added
+          !----------------
+          evaluate $State
+           when = 'PA'
+           when = 'OH'
+            move 50 to #StateMinimum
+          when-other
+           move  0 to #StateMinimum
+          end-evaluate
+
+          do Psoft-Get-Weeks
+          !----------------
+    #endif
+
+    !--------------------------------------------------------------------------
+    !If using WEEKS to drive hours, multiply weeks by STD_HOURS / Week
+    !-----------------------------------------------------------------
+    #ifdef EXECUTE_WEEKS_ROUTINE
+       #ifdef STD_WEEKS_MIN
+        if (#RptYear = 2008 and #RptQtr >= 3) or #RptYear >= 2009  !This logic only should go into affect going forward to avoid amendments
+          if  ({STD_MIN_HRS_STATES})  AND $Class_trimmed = 'U'   !min of 1 for UI only - WA,OR only
+           if #WeeksWorked = 0 and #TaxBalance_Nlgrs_Qtd > 0
+            let #WeeksWorked = {STD_WEEKS_MIN}
+            if $SelectEmplid <> ''
+             #debughr show 'Weeks for emplid ' $Current_Emplid ' set to MINIMUM {STD_WEEKS_MIN} due to wages of ' #TaxBalance_Nlgrs_Qtd
+            end-if
+            #ifdef STD_HOURS_MIN
+              let #Std_Hours = {STD_HOURS_MIN}
+              if $SelectEmplid <> ''
+               #debughr show 'Hours for emplid ' $Current_Emplid ' set to MINIMUM {STD_HOURS_MIN} due to wages of ' #TaxBalance_Nlgrs_Qtd
+              end-if
+            #endif              
+          end-if
+         end-if
+        end-if
+       #endif
+       
+       if #WeeksWorked > {MAX_WEEKS_IN_EXTRACT}
+         move {MAX_WEEKS_IN_EXTRACT} to #Qtd_weeks_worked
+       else
+         move #WeeksWorked to #Qtd_weeks_worked
+       end-if
+       do Format-Number(#Qtd_weeks_worked, $Qtd_weeks_worked , '99')
+
+      #ifdef DECOUPLE_HOURS_WEEKS
+          if $SelectEmplid <> ''
+            show 'calc-hours-weeks-paid: Decouple'
+          end-if
+          do Extract-Hours-Worked  !Calcs hours only (since STD_WEEKS_CALC is on)
+      #else
+          if $SelectEmplid <> ''
+            show 'calc-hours-weeks-paid: No Decouple'
+          end-if
+          let $Calc_hours_logic = 'f'
+          #ifdef CALC_OREGON_HOURS
+            if ($Local_trimmed = rtrim('{CALC_OREGON_HOURS}',' ')) AND ($State_trimmed = 'OR')  AND ($Class_trimmed = 'B')
+               let $Calc_hours_logic = 't'
+               if $SelectEmplid <> ''
+                show 'calc-hours-weeks-paid: CALC_OREGON_HOURS = ' #EarningsBal_Hrs_Qtd
+               end-if
+            end-if
+          #endif
+          #ifdef WA_WORKERS_COMP_ENABLE
+            if ($CALC_WA_LI_HOURS = 't') and ($State_trimmed = '{WA_STATE}') and ($WC_Locality = $Local_Trimmed) and ($Local_Trimmed <> '')
+               let $Calc_hours_logic = 't'
+               if $SelectEmplid <> ''
+                show 'calc-hours-weeks-paid: CALC_WA_LI_HOURS = ' #EarningsBal_Hrs_Qtd
+               end-if
+            end-if
+          #endif
+          if $Calc_hours_logic <> 't'
+            let #EarningsBal_Hrs_Qtd = #Qtd_weeks_worked * #Std_Hours
+            if $SelectEmplid <> ''
+              show 'calc-hours-weeks-paid: QTD Hours (Calced) = ' #EarningsBal_Hrs_Qtd ', weeks = ' #Qtd_weeks_worked ', Std_Hours = ' #Std_Hours
+            end-if
+          end-if
+      #endif !decouple
+    #endif !EXECUTE_WEEKS_ROUTINE
+
+ end-if  !end-if - for determining if we should use the calc-hours-weeks-paid or calc-hours-weeks-paid-standard routine
+ 
+#endif !not AG
+  
+ let #Severance_hours = 0
+ #ifdef SEVERENCE_HOURS                             ! SEVERENCE_HOURS  ERNCD in (''232'')
+   do calc-severance-hours
+   let #EarningsBal_Hrs_Qtd = #EarningsBal_Hrs_Qtd  + #Severance_hours
+ #endif
+     
+ let #Commission_hours = 0
+ #ifdef COMMISSION_HOURS                             ! COMMISSION_HOURS  ERNCD in (''232'')
+   do calc-commission-hours
+   let #EarningsBal_Hrs_Qtd = #EarningsBal_Hrs_Qtd  + #Commission_hours 
+ #endif
+     
+ if #EarningsBal_Hrs_Qtd < 1
+   let #EarningsBal_Hrs_Qtd = 0
+ end-if
+ if #EarningsBal_Hrs_Qtd > 9999
+   let #EarningsBal_Hrs_Qtd = 9999
+ end-if
+
+ move #EarningsBal_Hrs_Qtd to #QTD_Hours_worked
+ do Format-Number(#QTD_Hours_worked,$Qtd_Hours_Worked,   '9999')
+     
+ if #QTD_Weeks_Worked < 1
+   let #Qtd_weeks_worked = 0
+ end-if
+ if #QTD_Weeks_Worked > {MAX_WEEKS_IN_EXTRACT}
+   let #Qtd_weeks_worked = {MAX_WEEKS_IN_EXTRACT}
+ end-if
+
+ do Format-Number(#QTD_Weeks_Worked,$Qtd_weeks_worked,   '99')
+ 
+ if rtrim($SelectEmplid,' ') <> ''
+     show 'calc-hours-weeks-paid complete:  $QTD Hours =  ' $Qtd_Hours_worked
+     show '                                 $QTD Weeks =  ' $Qtd_weeks_worked
+ end-if
+
+ if $RptDetail = 'Y' and $State_trimmed <> '$U' and $Class_Trimmed = 'U'
+        print 'Hours & Weeks Worked for EMPLID '   (+1,1)
+        print $Current_Emplid                      ()
+        print ':  QTD Hours = '                    ()
+        print $Qtd_Hours_Worked                    () 
+        print ',  QTD Weeks = '                    ()
+        print $Qtd_weeks_worked                    ()
+ end-if 
+ 
+ 
+  #ifdef  enable_performance_monitor
+      do Get-Current-Time
+      move 'calc-hours-weeks-paid' to $debug-proc1
+      move ' '    to $debug-table1
+      do log-delta-time
+  #endif
+ 
+end-procedure
+
+begin-procedure Extract-Hours-Worked-Workers-comp-rate-calc
+
+   if rtrim($SelectEmplid,' ') <> ''
+     #debughr show 'Extract-Hours-Worked-Workers-comp-rate-calc: ' $State_trimmed ' ' $local_trimmed ' ' $wc_rate ' ' $wc_code 
+   end-if
+   
+   if #wc_rate = 0
+     let $get_local_rate = $Local_Trimmed
+     do get-local-rate
+   end-if
+   
+   #ifndef DERIVATION_CLIENT
+    if #wc_rate <> 0
+      let #EarningsBal_Hrs_Qtd =  #TaxBalance_Tax_Qtd / #wc_rate
+    end-if
+
+    if rtrim($SelectEmplid,' ') <> ''
+     show 'Calculating hours for                   ' $State_Trimmed ' ' $get_local_rate
+     show '                       local rate       ' #wc_rate
+     show '                        QTD Taxes       ' #TaxBalance_Tax_Qtd
+     show '    Hours (QTD Taxes / Local rate)   =  ' #EarningsBal_Hrs_Qtd
+    end-if
+  #else
+    if #wc_rate <> 0
+      let #EarningsBal_Hrs_Qtd =  #TaxBalance_Tax_Ytd / #wc_rate
+    end-if
+
+    if rtrim($SelectEmplid,' ') <> ''
+     show 'Calculating hours for                   ' $State_Trimmed ' ' $get_local_rate
+     show '                       local rate       ' #wc_rate
+     show '                        YTD Taxes       ' #TaxBalance_Tax_Ytd
+     show '    Hours (YTD Taxes / Local rate)   =  ' #EarningsBal_Hrs_Qtd
+    end-if
+  
+  #endif
+  
+  
+end-procedure
+
+#ifdef SEVERENCE_HOURS                             ! eg. #define SEVERENCE_HOURS  ERNCD in (''232'')
+
+begin-procedure calc-severance-hours
+
+      if $State_Trimmed = 'RI' and $Class_Trimmed = 'U'
+        do get-severance-hours       
+      end-if
+
+      if $SelectEmplid <> ''
+        #debughr show 'Severance hours ' $Severance_HOURS_WORKED_SELECTION ', state: ' $State_trimmed ', severance hours = ' #severance_hours
+      end-if
+
+end-procedure
+
+begin-procedure get-severance-hours
+
+  let $Severance_HOURS_WORKED_SELECTION = 'SF.{SEVERENCE_HOURS}'
+  let #Severance_hours = 0
+  
+BEGIN-SELECT
+SF.HRS_QTD
+
+    add &SF.HRS_QTD to #Severance_hours
+
+ FROM PS_EARNINGS_BAL{WAREHOUSE_SUFFIX} SF                                   !Updated 11/15/00, tested @Biltmore
+      WHERE     SF.EMPLID        = $Current_Emplid
+            AND SF.COMPANY       = $Current_Company
+            AND SF.BALANCE_ID    = $Calendar_Year_Id
+         #ifdef USE_INT_CRITERIA
+            AND SF.BALANCE_YEAR  = int(\$RptYearZ\) 
+            AND SF.BALANCE_QTR   = int(\$RptQtrZ\) 
+         #else
+            AND SF.BALANCE_YEAR = #RptYear
+            AND SF.BALANCE_QTR  = #RptQtr
+         #endif
+            AND SF.BALANCE_PERIOD = (SELECT MAX(BALANCE_PERIOD)
+
+           FROM PS_EARNINGS_BAL{WAREHOUSE_SUFFIX}
+           WHERE  EMPLID      = SF.EMPLID         AND
+                COMPANY       = SF.COMPANY        AND
+                BALANCE_ID    = SF.BALANCE_ID     AND
+                BALANCE_YEAR  = SF.BALANCE_YEAR   AND
+                BALANCE_QTR   = SF.BALANCE_QTR    AND
+                SPCL_BALANCE  = SF.SPCL_BALANCE   AND
+                ERNCD         = SF.ERNCD          AND
+         #ifdef USE_INT_CRITERIA
+                BALANCE_PERIOD  <= int(\$RptMonthZ\))
+         #else
+                BALANCE_PERIOD <= #RptMonth)
+         #endif
+
+               #ifdef MVS
+                 AND \$Severance_HOURS_WORKED_SELECTION\
+               #else
+                 AND [$Severance_HOURS_WORKED_SELECTION]
+               #endif
+
+               AND (SF.HRS_QTD > 0)
+
+#ifdef SELECT_WITH_UR
+ {SELECT_WITH_UR} with ur
+#endif
+end-select
+
+    
+end-procedure
+
+#endif
+
+#ifdef COMMISSION_HOURS                             ! eg. #define COMMISSION_HOURS  ERNCD in (''232'')
+
+begin-procedure calc-commission-hours
+
+       if $Class_Trimmed = 'U'
+
+        #ifdef COMMISSION_HOURS_FOR_ALL_STATES
+        if $State_Trimmed <> '$U'
+        #else
+        if $State_Trimmed = 'WA'
+        #endif
+        
+        do get-commission-hours
+   
+        if $SelectEmplid <> ''
+          #debughr show 'Commission hours ' $commission_HOURS_WORKED_SELECTION ', state: ' $State_trimmed ', commission hours = ' #Commission_hours
+        end-if
+       end-if 
+      end-if
+
+end-procedure
+
+begin-procedure get-commission-hours
+
+  let $commission_HOURS_WORKED_SELECTION = 'CF.{COMMISSION_HOURS}'
+  let #commission_hours = 0
+
+  if #first_commission_hours = 0
+   #debughr show 'get-commission-hours, selection criteria: ' $commission_HOURS_WORKED_SELECTION
+    add 1 to #first_commission_hours
+  end-if
+  
+BEGIN-SELECT
+CF.HRS_QTD
+CF.ERNCD
+
+  #if {SITE_ID} = 'IRC1'
+     move 520 to #commission_hours
+  #else
+    add &CF.HRS_QTD to #commission_hours
+  #endif
+
+ FROM PS_EARNINGS_BAL{WAREHOUSE_SUFFIX} CF                                   !Updated 11/15/00, tested @Biltmore
+      WHERE     CF.EMPLID        = $Current_Emplid
+            AND CF.COMPANY       = $Current_Company
+            AND CF.BALANCE_ID    = $Calendar_Year_Id
+         #ifdef USE_INT_CRITERIA
+            AND CF.BALANCE_YEAR  = int(\$RptYearZ\) 
+            AND CF.BALANCE_QTR   = int(\$RptQtrZ\) 
+         #else
+            AND CF.BALANCE_YEAR = #RptYear
+            AND CF.BALANCE_QTR  = #RptQtr
+         #endif
+            AND CF.BALANCE_PERIOD = (SELECT MAX(BALANCE_PERIOD)
+
+           FROM PS_EARNINGS_BAL{WAREHOUSE_SUFFIX}
+           WHERE  EMPLID      = CF.EMPLID         AND
+                COMPANY       = CF.COMPANY        AND
+                BALANCE_ID    = CF.BALANCE_ID     AND
+                BALANCE_YEAR  = CF.BALANCE_YEAR   AND
+                BALANCE_QTR   = CF.BALANCE_QTR    AND
+                SPCL_BALANCE  = CF.SPCL_BALANCE   AND
+                ERNCD         = CF.ERNCD          AND
+         #ifdef USE_INT_CRITERIA
+                BALANCE_PERIOD  <= int(\$RptMonthZ\))
+         #else
+                BALANCE_PERIOD <= #RptMonth)
+         #endif
+
+               #ifdef MVS
+                 AND \$commission_HOURS_WORKED_SELECTION\
+               #else
+                 AND [$commission_HOURS_WORKED_SELECTION]
+               #endif
+
+              #if {SITE_ID} <> 'IRC1'
+               AND (CF.HRS_QTD > 0)
+              #endif
+              
+#ifdef SELECT_WITH_UR
+ {SELECT_WITH_UR} with ur
+#endif
+end-select
+
+end-procedure
+
+#endif
+
+!************************************************************************
+!----------------------------------------------------------------------!
+! Procedure: Extract-Hours-Worked                                      !
+! Desc:      This procedure extracts an Employee's Earnings Bal. table !
+!            data.   (we only need QTD and YTD Hours worked)           !
+!----------------------------------------------------------------------!
+begin-procedure Extract-Hours-Worked
+
+ #ifdef  enable_performance_monitor
+    do Get-Current-Time
+    move $display_dt to $display_dt0
+ #endif
+
+ if rtrim($LA_Hours_worked_selection,' ') <> '' and $State = 'LA'
+    move $Hours_worked_selection    to $Hours_worked_selection_save
+    move $LA_Hours_worked_selection to $Hours_worked_selection
+ end-if
+  
+ if $SelectEmplid <> ''
+   show 'Extract-Hours-Worked ' $Hours_worked_selection
+ end-if
+  
+  let #EarningsBal_Hrs_Qtd = 0
+  let #EarningsBal_Hrs_Ytd = 0
+
+ !5/4/06 New calc for OR Workers comp, as we CALCULATE Wages/Taxses based on hours
+ !----------------------------------------------------------------------------------
+ 
+ #ifdef CALC_OREGON_HOURS
+   if ($Local_trimmed = rtrim('{CALC_OREGON_HOURS}',' ')) AND ($State_trimmed = 'OR')  AND ($Class_trimmed = 'B')
+     do Extract-Hours-Worked-Workers-comp-rate-calc
+     goto no_hours_for_this_state
+   end-if
+ #endif
+
+ !6/29/2011 added calc for WA L&I
+ !--------------------------------
+ #ifdef WA_WORKERS_COMP_ENABLE
+   if ($CALC_WA_LI_HOURS = 't') and ($State_trimmed = '{WA_STATE}') and ($WC_Locality = $Local_Trimmed) and ($Local_Trimmed <> '')
+     do Extract-Hours-Worked-Workers-comp-rate-calc
+     goto no_hours_for_this_state
+   end-if
+ #endif
+ 
+ if $SelectEmplid <> ''
+   show 'Extract-Hours-Worked:      ' $Current_Company ' ' $Current_Emplid ', STD_Hours = ' #Std_Hours ', State = ' $State_trimmed
+   show '  HOURS_WORKED_SELECTION = ' $HOURS_WORKED_SELECTION
+ end-if
+ 
+ #ifdef  enable_performance_monitor
+    do Get-Current-Time
+    move $display_dt to $display_dt0
+ #endif
+
+BEGIN-SELECT
+#if {SITE_ID} = 'JCP1'
+/*+ index (f ps_earnings_bal) */
+#endif
+#if {SITE_ID} = 'HWL1'
+/*+ index (f ps_earnings_bal) */
+#endif
+F.HRS_QTD
+F.ERNCD
+F.BALANCE_QTR
+F.BALANCE_PERIOD
+F.BALANCE_YEAR
+
+   let #hours_qtd = &F.HRS_QTD
+
+   if $SelectEmplid <> ''
+     show 'Extract-Hours-Worked:      ERNCD: ' &F.ERNCD ', HRS_QTD ' #hours_qtd ', BALANCE_QTR = ' &F.BALANCE_QTR ', BALANCE_PERIOD = ' &F.BALANCE_PERIOD
+   end-if
+
+   !Paramount, don't sum the DAY earnings codes 6/25/01
+   !----------------------------------------------------
+   #if {SITE_ID} = 'PMT1'
+    if (rtrim(&F.ERNCD,' ') = 'DAY')
+       goto dont_sum_hours
+    end-if
+   #endif
+
+   Add #hours_qtd to #EarningsBal_Hrs_Ytd
+
+   !move out of From Clause Below to catch QTD=0, YTD<>0 conditions 7/9/99 DMonroe
+   !------------------------------------------------------------------------------
+   if (&F.BALANCE_QTR = #RptQtr)
+     Add #hours_qtd to #EarningsBal_Hrs_Qtd
+   end-if
+
+dont_sum_hours:
+
+ FROM PS_EARNINGS_BAL{WAREHOUSE_SUFFIX} F                                   !Updated 11/15/00, tested @Biltmore
+      WHERE F.EMPLID            = $Current_Emplid
+            AND F.COMPANY       = $Current_Company
+            AND F.BALANCE_ID    = $Calendar_Year_Id
+         #ifdef USE_INT_CRITERIA
+            AND F.BALANCE_YEAR  = int(\$RptYearZ\) 
+            AND F.BALANCE_QTR   = int(\$RptQtrZ\) 
+         #else
+            AND F.BALANCE_YEAR = #RptYear
+            AND F.BALANCE_QTR  = #RptQtr
+         #endif
+            AND F.BALANCE_PERIOD = (SELECT
+
+            #if {SITE_ID} = 'JCP1'
+            /*+ index (PS_EARNINGS_BAL ps_earnings_bal) */
+            #endif
+            #if {SITE_ID} = 'HWL1'
+            /*+ index (PS_EARNINGS_BAL ps_earnings_bal) */
+            #endif
+
+           MAX(BALANCE_PERIOD)
+
+           FROM PS_EARNINGS_BAL{WAREHOUSE_SUFFIX}
+           WHERE  EMPLID      = F.EMPLID         AND
+                COMPANY       = F.COMPANY        AND
+                BALANCE_ID    = F.BALANCE_ID     AND
+                BALANCE_YEAR  = F.BALANCE_YEAR   AND
+                BALANCE_QTR   = F.BALANCE_QTR    AND
+                SPCL_BALANCE  = F.SPCL_BALANCE   AND
+                ERNCD         = F.ERNCD          AND
+                {emp_rec}     = F.{emp_rec}      AND             !20150921 added
+         #ifdef USE_INT_CRITERIA
+                BALANCE_PERIOD  <= int(\$RptMonthZ\))
+         #else
+                BALANCE_PERIOD <= #RptMonth)
+         #endif
+
+                #ifdef HOURS_ACCUMULATOR
+                 AND F.SPCL_BALANCE = 'Y'
+                #else
+                 AND F.SPCL_BALANCE = 'N'
+                #endif
+
+     #if {SITE_ID} = 'SUN1'
+            AND F.ERNCD IN ('OTH' ,'OTJ' ,'OTS' , 'OTZ' , 'OT1' , 'OT2' ,'REG')
+          #else
+       #ifdef MULTIPLE_HOURS_WORKED_SELECTIONS
+         #ifdef MVS
+               AND (\$HOURS_WORKED_SELECTION1\ OR
+                \$HOURS_WORKED_SELECTION2\ OR
+                \$HOURS_WORKED_SELECTION3\)
+         #else
+               AND ([$HOURS_WORKED_SELECTION1] OR
+                [$HOURS_WORKED_SELECTION2] OR
+                [$HOURS_WORKED_SELECTION3])
+         #endif
+
+            #else
+               #ifdef MVS
+                 AND \$HOURS_WORKED_SELECTION\
+               #else
+                 AND [$HOURS_WORKED_SELECTION]
+               #endif
+            #endif
+          #endif
+
+          AND (F.HRS_QTD > 0)
+
+#ifdef SELECT_WITH_UR
+ {SELECT_WITH_UR} with ur
+#endif
+end-select
+
+   #if {SITE_ID} = 'AGN1'
+     let $OutTaxCode= $State_Trimmed || $Class_Trimmed || $Local_Trimmed
+     if $OutTaxCode = 'ORU'
+        do Process-ORU  !in their probiz.sqc
+     end-if
+
+   #endif
+
+no_hours_for_this_state:
+
+
+  #ifndef EXECUTE_WEEKS_ROUTINE
+   let #QTD_Weeks_Worked = #EarningsBal_Hrs_Qtd / #Std_Hours
+   let #YTD_Weeks_Worked = #EarningsBal_Hrs_Ytd / #Std_Hours
+  #endif
+
+  if $SelectEmplid <> ''
+      show 'Extract-Hours-Worked complete. QTD Hours = ' #EarningsBal_Hrs_Qtd
+  end-if
+  
+  #ifdef COMMISSION_HOURS_WFB
+     do Extract-hours-commission-associates
+  #endif
+
+ #ifdef  enable_performance_monitor
+     do Get-Current-Time
+     move 'Extract-Hours-Worked' to $debug-proc1
+     move ' '    to $debug-table1
+     do log-delta-time
+ #endif
+ 
+ if rtrim($LA_Hours_worked_selection,' ') <> '' and $State = 'LA'
+     move $Hours_worked_selection_save to $Hours_worked_selection
+ end-if
+
+end-procedure
+
+
+begin-procedure Extract-Hours-Worked-State
+
+ let #EarningsBal_Hrs_Qtd = 0
+
+ if $SelectEmplid <> ''
+   show 'Extract-Hours-Worked-State:      ' $Current_Company ' ' $Current_Emplid ', State = ' $State_trimmed
+   show '  HOURS_WORKED_SELECTION_STATE = ' $HOURS_WORKED_SELECTION_STATE
+ end-if
+ 
+BEGIN-SELECT
+VTF.ERNCD
+VTF.HRS_QTD
+VTF.EMPLID
+VTF.COMPANY
+VTF.BALANCE_ID
+VTF.BALANCE_YEAR
+VTF.BALANCE_QTR
+VTF.BALANCE_PERIOD
+VTF.{emp_rec}
+VTF.SPCL_BALANCE  
+
+   if $SelectEmplid <> ''
+     show 'Extract-Hours-Worked-State:  ERNCD: ' &VTF.ERNCD ' ' &VTF.EMPLID ' ' &VTF.COMPANY ' ' &VTF.SPCL_BALANCE
+     show '                                    ' &VTF.BALANCE_ID ' ' &VTF.BALANCE_YEAR ' ' &VTF.BALANCE_QTR ' ' &VTF.BALANCE_PERIOD ' --> ' &VTF.HRS_QTD
+   end-if
+   
+   Add &VTF.HRS_QTD to #EarningsBal_Hrs_Qtd
+
+ FROM PS_EARNINGS_BAL{WAREHOUSE_SUFFIX} VTF                                   
+        WHERE   VTF.EMPLID        = $Current_Emplid
+            AND VTF.COMPANY       = $Current_Company
+            #ifdef MVS
+              AND \$HOURS_WORKED_SELECTION_STATE\
+            #else
+              AND [$HOURS_WORKED_SELECTION_STATE]
+            #endif
+            AND VTF.BALANCE_ID    = $Calendar_Year_Id
+         #ifdef USE_INT_CRITERIA
+            AND VTF.BALANCE_YEAR  = int(\$RptYearZ\) 
+            AND VTF.BALANCE_QTR   = int(\$RptQtrZ\) 
+         #else
+            AND VTF.BALANCE_YEAR = #RptYear
+            AND VTF.BALANCE_QTR  = #RptQtr
+         #endif
+            
+            #if {SITE_ID} = 'APP1'
+            AND VTF.SPCL_BALANCE = 'N'
+            #endif  
+            #if {SITE_ID} = 'VZN1'
+            AND VTF.SPCL_BALANCE = 'N'
+            #endif
+            
+            AND VTF.BALANCE_PERIOD = (SELECT MAX(BALANCE_PERIOD)
+            FROM PS_EARNINGS_BAL{WAREHOUSE_SUFFIX}
+             WHERE  EMPLID        = VTF.EMPLID         AND
+                    COMPANY       = VTF.COMPANY        AND
+                    BALANCE_ID    = VTF.BALANCE_ID     AND
+                    BALANCE_YEAR  = VTF.BALANCE_YEAR   AND
+                    BALANCE_QTR   = VTF.BALANCE_QTR    AND
+                    {emp_rec}     = VTF.{emp_rec}      AND
+                    SPCL_BALANCE  = VTF.SPCL_BALANCE   AND
+                    ERNCD         = VTF.ERNCD          AND
+         #ifdef USE_INT_CRITERIA
+                    BALANCE_PERIOD  <= int(\$RptMonthZ\))
+         #else
+                    BALANCE_PERIOD <= #RptMonth)
+         #endif
+
+#ifdef SELECT_WITH_UR
+ {SELECT_WITH_UR} with ur
+#endif
+end-select
+
+  move #EarningsBal_Hrs_Qtd to #QTD_Hours_worked
+
+  if $SelectEmplid <> ''
+      show 'Extract-Hours-Worked-State complete. QTD Hours = ' #QTD_Hours_worked ' for ' $State_trimmed ', ERNCDS: ' $HOURS_WORKED_SELECTION_STATE
+  end-if
+
+  if $RptDetail = 'Y'
+     print 'VT Hours Worked for EMPLID '         (+1,1)
+     print  $Current_Emplid                      ()
+     print ':  QTD Hours = '                     ()
+     print #EarningsBal_Hrs_Qtd                  () edit 99999.99mi
+  end-if
+
+end-procedure
+
+#ifdef USE_HIRE_DATE_FOR_HOURS_AND_WEEKS                  ! {SITE_ID} = 'RJ'
+
+Begin-Procedure Calc-Hours
+
+ let #Days-Worked-QTD = 0
+ let #Days-Worked-YTD = 0
+ #ifdef  enable_performance_monitor
+    do Get-Current-Time
+    move $display_dt to $display_dt0
+ #endif
+
+BEGIN-SELECT
+
+PEMP.TERMINATION_DT
+PEMP.HIRE_DT
+
+  Let $hire_dt_orig = &PEMP.HIRE_DT
+  Let $Term_dt_orig = &PEMP.TERMINATION_DT
+
+  Do Convert-To-DTU-Date($hire_dt_orig, $hire_dt_DTU)
+  Do Convert-To-DTU-Date($Term_dt_orig, $Term_dt_DTU)
+
+  If IsNull(&PEMP.TERMINATION_DT)
+
+    if  $Hire_dt_DTU < $Qtr_Start_DTU
+      do dtu-diff-days($Qtr_Start_DTU, $Qtr_End_DTU , #Days-Worked-QTD)
+    else
+      do dtu-diff-days($hire_dt_DTU, $Qtr_End_DTU , #Days-Worked-QTD)
+    end-if
+
+    if $Hire_dt_DTU < $Year_Start_Date_DTU
+      do dtu-diff-days($Year_Start_Date_DTU , $Qtr_End_DTU , #Days-Worked-YTD)
+    else
+      do dtu-diff-days($hire_dt_DTU, $Qtr_End_DTU , #Days-Worked-YTD)
+    end-if
+
+  else
+
+    !Handle QTD Days Worked
+    !----------------------
+    if  $Hire_Dt_DTU <= $Qtr_Start_DTU  and $Term_Dt_DTU >= $Qtr_End_DTU     ! worked the entire quarter
+     do dtu-diff-days($Qtr_Start_DTU, $Qtr_End_DTU , #Days-Worked-QTD)
+    else
+      if  $Hire_Dt_DTU <= $Qtr_Start_DTU and $Term_Dt_DTU <  $Qtr_End_DTU     ! hired before quarter,termed during quarter
+        do dtu-diff-days($Qtr_Start_DTU, $Term_Dt_DTU, #Days-Worked-QTD)
+      else
+        if  $Hire_Dt_DTU > $Qtr_Start_DTU and $Term_Dt_DTU < $Qtr_End_DTU     ! hired and termed during quarter
+          do dtu-diff-days($Hire_Dt_DTU, $Term_Dt_DTU, #Days-Worked-QTD)
+        else
+          if  $Hire_Dt_DTU >  $Qtr_Start_DTU and $Term_Dt_DTU >= $Qtr_End_DTU ! hired during quarter, termed after quarter
+            do dtu-diff-days($Hire_Dt_DTU, $Qtr_End_DTU, #Days-Worked-QTD)
+          end-if
+        end-if
+      end-if
+    end-if
+
+    !Handle YTD Days Worked
+    !----------------------
+    if  $Hire_Dt_DTU  <= $Year_Start_Date_DTU   and $Term_Dt_DTU  >= $Qtr_End_DTU
+       do dtu-diff-days($Year_Start_Date_DTU , $Qtr_End_DTU , #Days-Worked-YTD)
+    else
+      if  $Hire_Dt_DTU  <= $Year_Start_Date_DTU  and $Term_Dt_DTU  < $Qtr_End_DTU
+        do dtu-diff-days($Year_Start_Date_DTU , $Term_Dt_DTU , #Days-Worked-YTD)
+      else
+        if  $Hire_Dt_DTU  > $Year_Start_Date_DTU  and $Term_Dt_DTU  < $Qtr_End_DTU
+         do dtu-diff-days($Hire_Dt_DTU, $Term_Dt_DTU , #Days-Worked-YTD)
+        else
+          if  $Hire_Dt_DTU  > $Year_Start_Date_DTU  and $Term_Dt_DTU  >= $Qtr_End_DTU
+            do dtu-diff-days($Hire_Dt_DTU, $QTR_End_DTU , #Days-Worked-YTD)
+          End-if
+        End-if
+      End-if
+    End-if
+
+  End-if
+
+  let #QTD_Weeks_Worked    = (#Days-Worked-QTD / 7)
+  let #YTD_Weeks_Worked    = (#Days-Worked-YTD / 7)
+
+  Let #EarningsBal_Hrs_Qtd = (#QTD_Weeks_Worked * #STD_HOURS)
+  Let #EarningsBal_Hrs_Ytd = (#YTD_Weeks_Worked * #STD_HOURS)
+
+  !3/16/04 added this check due to negative days being returned...
+  !----------------------------------------------------------
+  if #QTD_Weeks_Worked < 0
+     let #QTD_Weeks_Worked = 0
+     let #EarningsBal_Hrs_Qtd = 0
+  end-if
+
+  if #YTD_Weeks_Worked < 0
+     let #YTD_Weeks_Worked = 0
+     Let #EarningsBal_Hrs_Ytd = 0
+  end-if
+
+
+  !** Begin RJ MOD - Added the following IF and Print
+  if $RptDetail = 'Y'
+     print 'Hours Worked for EMPLID '            (+1,1)
+     print  $Current_Emplid                        ()
+     print ':  QTD Hours = '                     ()
+     print #EarningsBal_Hrs_Qtd                  () edit 99999.99mi
+
+  end-if
+
+  !** End RJ MOD
+
+  From  PS_EMPLOYMENT PEMP
+  Where PEMP.EMPLID = $Current_Emplid
+
+#ifdef SELECT_WITH_UR
+ {SELECT_WITH_UR} with ur
+#endif
+end-select
+
+End-procedure
+
+#endif
+
+! ---------------------------------------------2/11/09 FOR 2/16/09 RELEASE ---------------------------------------
+
+begin-procedure calc-hours-weeks-paid-standard 
+
+ #ifdef  enable_performance_monitor
+    do Get-Current-Time
+    move $display_dt to $display_dt0
+ #endif
+ 
+ if $SelectEmplid <> ''
+   show 'calc-hours-weeks-paid-standard start, for state: ' $state_trimmed
+ end-if
+ 
+ !MUST PRODUCE: #EarningsBal_Hrs_Qtd, #QTD_Weeks_Worked   (This routine can easily be replaced with custom code...)
+
+    !Get QTD Hours
+    !--------------
+    let #EarningsBal_Hrs_Qtd = 0
+    move '   0'   to $Qtd_Hours_Worked
+
+    #ifdef DC_HOURS_from_RC_TAX810DC                                
+       if ($State_trimmed = 'DC') AND ($Class_trimmed = 'U')
+        if rtrim($DC_Erncds,' ') = 't'
+          move $HOURS_WORKED_SELECTION_DC to $HOURS_WORKED_SELECTION_STATE
+          do Extract-Hours-Worked-State
+          do Format-Number(#QTD_Hours_worked, $Qtd_Hours_Worked,   '9999')
+        end-if
+       end-if
+    #endif
+    
+    
+    #ifdef MA_HOURS_from_RC_TAX810MA                                
+       if ($State_trimmed = 'MA') AND ($Class_trimmed = 'U')
+        if rtrim($MA_Erncds,' ') = 't'
+          move $HOURS_WORKED_SELECTION_MA to $HOURS_WORKED_SELECTION_STATE
+          do Extract-Hours-Worked-State
+          do Format-Number(#QTD_Hours_worked, $Qtd_Hours_Worked,   '9999')
+        end-if
+       end-if
+    #endif
+
+    #ifdef MN_HOURS_from_RC_TAX810MN                                
+       if ($State_trimmed = 'MN') AND ($Class_trimmed = 'U')
+        if rtrim($MN_Erncds,' ') = 't'
+          move $HOURS_WORKED_SELECTION_MN to $HOURS_WORKED_SELECTION_STATE
+          do Extract-Hours-Worked-State
+          do Format-Number(#QTD_Hours_worked, $Qtd_Hours_Worked,   '9999')
+        end-if
+       end-if
+    #endif
+
+    #ifdef MO_HOURS_from_RC_TAX810MO                                
+       if ($State_trimmed = 'MO') AND ($Class_trimmed = 'U')
+        if rtrim($MO_Erncds,' ') = 't'
+          move $HOURS_WORKED_SELECTION_MO to $HOURS_WORKED_SELECTION_STATE
+          do Extract-Hours-Worked-State
+          do Format-Number(#QTD_Hours_worked, $Qtd_Hours_Worked,   '9999')
+        end-if
+       end-if
+    #endif
+
+    #ifdef NV_HOURS_from_RC_TAX810NV                                
+       if ($State_trimmed = 'NV') AND ($Class_trimmed = 'U')
+        if rtrim($NV_Erncds,' ') = 't'
+          move $HOURS_WORKED_SELECTION_NV to $HOURS_WORKED_SELECTION_STATE
+          do Extract-Hours-Worked-State
+          do Format-Number(#QTD_Hours_worked, $Qtd_Hours_Worked,   '9999')
+        end-if
+       end-if
+    #endif
+
+    #ifdef NY_HOURS_from_RC_TAX810NY                                
+       if ($State_trimmed = 'NY') AND ($Class_trimmed = 'U')
+        if rtrim($NY_Erncds,' ') = 't'
+          move $HOURS_WORKED_SELECTION_NY to $HOURS_WORKED_SELECTION_STATE
+          do Extract-Hours-Worked-State
+          do Format-Number(#QTD_Hours_worked, $Qtd_Hours_Worked,   '9999')
+        end-if
+       end-if
+    #endif
+
+    #ifdef OR_HOURS_from_RC_TAX810OR                                
+       if ($State_trimmed = 'OR') AND ($Class_trimmed = 'U' or $Class_trimmed = 'B')
+        if rtrim($OR_Erncds,' ') = 't'
+          move $HOURS_WORKED_SELECTION_OR to $HOURS_WORKED_SELECTION_STATE
+          do Extract-Hours-Worked-State
+          do Format-Number(#QTD_Hours_worked, $Qtd_Hours_Worked,   '9999')
+        end-if
+       end-if
+    #endif
+
+    #ifdef RI_HOURS_from_RC_TAX810RI                                
+       if ($State_trimmed = 'RI') AND ($Class_trimmed = 'U')
+        if rtrim($RI_Erncds,' ') = 't'
+          move $HOURS_WORKED_SELECTION_RI to $HOURS_WORKED_SELECTION_STATE
+          do Extract-Hours-Worked-State
+          do Format-Number(#QTD_Hours_worked, $Qtd_Hours_Worked,   '9999')
+        end-if
+       end-if
+    #endif
+
+    #ifdef VT_HOURS_from_RC_TAX810VT
+       if ($State_trimmed = 'VT') AND ($Class_trimmed = 'U')
+        if rtrim($VT_Erncds,' ') = 't'
+          move $HOURS_WORKED_SELECTION_VT to $HOURS_WORKED_SELECTION_STATE
+          do Extract-Hours-Worked-State
+          do Format-Number(#QTD_Hours_worked, $Qtd_Hours_Worked,   '9999')
+         #debughr show 'Extract-Hours-Worked-State for VT = ' $Qtd_Hours_Worked
+        end-if
+       end-if
+    #endif
+    
+    #ifdef WA_HOURS_from_RC_TAX810WA                                
+       if ($State_trimmed = 'WA') AND ($Class_trimmed = 'U')
+        if rtrim($WA_Erncds,' ') = 't'
+          move $HOURS_WORKED_SELECTION_WA to $HOURS_WORKED_SELECTION_STATE
+          do Extract-Hours-Worked-State
+          do Format-Number(#QTD_Hours_worked, $Qtd_Hours_Worked,   '9999')
+        end-if
+       end-if
+       #ifdef USE_RUN_CNTL_ID_WA_WC
+        if ($State_trimmed = 'WA') AND ($local_trimmed <> '')
+         if rtrim($WA_Erncds_WC,' ') = 't'
+           move $HOURS_WORKED_SELECTION_WA_WC to $HOURS_WORKED_SELECTION_STATE
+           do Extract-Hours-Worked-State
+           do Format-Number(#QTD_Hours_worked, $Qtd_Hours_Worked,   '9999')
+         end-if
+        end-if
+       #endif
+    #endif
+
+    if $Qtd_Hours_Worked = '   0'
+       do Extract-Hours-Worked
+    end-if
+    
+    do get-standard-weeks 
+    
+    !adjust WA or OR if no hours have been reported
+    !----------------------------------------------------
+    if ({STD_MIN_HRS_STATES}) AND $Class_trimmed = 'U' 
+       if #EarningsBal_Hrs_Qtd < 1 and #TaxBalance_Nlgrs_Qtd > 0
+         let #EarningsBal_Hrs_Qtd = {STD_HOURS_MIN}
+         if $SelectEmplid <> ''
+          #debughr show 'adjusting hours to {STD_HOURS_MIN} for state ' $state_trimmed
+         end-if
+          
+       end-if
+    end-if
+
+    
+    if $SelectEmplid <> ''
+     show 'calc-hours-weeks-paid-standard Complete. #EarningsBal_Hrs_Qtd = ' #EarningsBal_Hrs_Qtd
+     show '                                         #QTD_Weeks_Worked    = ' #QTD_Weeks_Worked
+     show '                                         $Qtd_Hours_Worked    = ' $Qtd_Hours_Worked
+    end-if
+    
+    #ifdef  enable_performance_monitor
+         do Get-Current-Time
+         move 'calc-hours-weeks-paid-standard' to $debug-proc1
+         move ' '    to $debug-table1
+         do log-delta-time
+    #endif
+     
+ 
+    
+end-procedure
+
+begin-procedure get-standard-weeks
+
+ #ifdef  enable_performance_monitor
+    do Get-Current-Time
+    move $display_dt to $display_dt0
+ #endif
+ 
+ 
+    !Get QTD Weeks
+    !--------------
+    let #QTD_Weeks_Worked = 0
+    let #WeeksWorked      = 0
+    move ' 0'      to $Qtd_weeks_worked
+
+    move $Current_Emplid  to $EmplID
+    move $Current_Company to $Company
+    move $State_trimmed   to $state
+
+    evaluate $State
+       when = 'PA'
+       when = 'OH'
+         move 50 to #StateMinimum
+       when-other
+         move  0 to #StateMinimum
+    end-evaluate
+    
+    do Psoft-Get-Weeks !returns, #WeeksWorked
+    move #WeeksWorked to #Qtd_weeks_worked
+
+    !adjust WA or OR if not a full week has been reported
+    !----------------------------------------------------
+    if  ({STD_MIN_HRS_STATES}) AND $Class_trimmed = 'U'   !min of 1 for UI only - WA,OR only
+       if #Qtd_weeks_worked < 1 and #TaxBalance_Nlgrs_Qtd > 0
+         let #Qtd_weeks_worked = {STD_WEEKS_MIN}
+         if $SelectEmplid <> ''
+          #debughr show 'adjusting weeks to {STD_WEEKS_MIN} for state ' $state_trimmed
+         end-if
+       end-if
+    end-if
+        
+    if  ($state_trimmed = 'WA' and $WA_Erncds = 't')
+     OR ($state_trimmed = 'MA' and $MA_Erncds = 't')
+     OR ($state_trimmed = 'LA' and $LA_Erncds = 't')
+     OR ($state_trimmed = 'DC' and $DC_Erncds = 't')
+     OR ($state_trimmed = 'MN' and $MN_Erncds = 't')
+     OR ($state_trimmed = 'MO' and $MO_Erncds = 't')
+     OR ($state_trimmed = 'NV' and $NV_Erncds = 't')
+     OR ($state_trimmed = 'NY' and $NY_Erncds = 't')
+     OR ($state_trimmed = 'OR' and $OR_Erncds = 't')
+     OR ($state_trimmed = 'RI' and $RI_Erncds = 't')
+     OR ($state_trimmed = 'VT' and $VT_Erncds = 't')
+         if $SelectEmplid <> ''
+          #debughr show 'get-standard-weeks: Skipping hours. State = ' $state_trimmed ', #EarningsBal_Hrs_Qtd = ' #EarningsBal_Hrs_Qtd 
+         end-if
+         goto done_hours_calc
+    end-if
+
+    !if no hours.. calculate hours (except for Oregon W/C)
+    !-----------------------------
+    if $State_trimmed = 'OR' AND $Class_trimmed = 'B'   !12/17/2010 - OR W/C do not recalc hours if we determined there are no hours
+       if $SelectEmplid <> ''
+        show 'get-standard-weeks: No Recalc hours for Oregon W/C'
+       end-if
+    else
+      if #EarningsBal_Hrs_Qtd < 1
+       let #EarningsBal_Hrs_Qtd = #Qtd_weeks_Worked * #Std_Hours
+       if $SelectEmplid <> ''
+        show 'get-standard-weeks: Calculated hours = ' #EarningsBal_Hrs_Qtd ' = (' #Qtd_weeks_Worked ' * ' #Std_Hours ')'
+       end-if
+      end-if
+    end-if
+    
+done_hours_calc:
+
+ #ifdef  enable_performance_monitor
+      do Get-Current-Time
+      move 'get-standard-weeks' to $debug-proc1
+      move ' '    to $debug-table1
+      do log-delta-time
+ #endif
+ 
+end-procedure
+
+#ifdef HOURS_AG
+begin-procedure calc-hours-weeks-paid-AG
+
+   #ifdef HOURS_AG_BALANCES
+     do Get-AG-Hours-Balances
+   #else
+     do Get-AG-Hours
+   #endif
+   
+   do get-standard-weeks
+ 
+   #ifdef CALC_OREGON_HOURS
+      if ($Local_trimmed = rtrim('{CALC_OREGON_HOURS}',' ')) AND ($State_trimmed = 'OR')  AND ($Class_trimmed = 'B')
+        do Extract-Hours-Worked-Workers-comp-rate-calc
+      end-if
+   #endif
+   
+   !6/29/2011 added calc for WA L&I
+   !--------------------------------
+   #ifdef WA_WORKERS_COMP_ENABLE
+      if ($CALC_WA_LI_HOURS = 't') and ($State_trimmed = '{WA_STATE}') and ($WC_Locality = $Local_Trimmed) and ($Local_Trimmed <> '')
+        do Extract-Hours-Worked-Workers-comp-rate-calc
+      end-if
+   #endif
+
+   if $SelectEmplid <> ''
+    #debughr show 'calc-hours-weeks-paid-AG.      #EarningsBal_Hrs_Qtd = ' #EarningsBal_Hrs_Qtd
+    #debughr show '                               #QTD_Weeks_Worked    = ' #QTD_Weeks_Worked
+   end-if   
+   
+end-procedure
+#endif
+
+begin-procedure Psoft-Get-Weeks
+ 
+   #ifdef  enable_performance_monitor
+    do Get-Current-Time
+    move $display_dt to $display_dt0
+   #endif
+ 
+   do Get-Weeks  !returns, #WeeksWorked
+ 
+   if $SelectEmplid <> ''
+     show 'Get-Weeks complete. ' $State ', #WeeksWorked = ' #WeeksWorked
+   end-if
+                    
+   #ifdef  enable_performance_monitor
+      do Get-Current-Time
+      move 'Psoft-Get-Weeks' to $debug-proc1
+      move ' '    to $debug-table1
+      do log-delta-time
+   #endif
+ 
+end-procedure
+ 
+ 

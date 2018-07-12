@@ -1,0 +1,1025 @@
+! ***************************************************************!
+!  This software and related documentation are provided under a!
+!  license agreement containing restrictions on use and!
+!  disclosure and are protected by intellectual property!
+!  laws. Except as expressly permitted in your license agreement!
+!  or allowed by law, you may not use, copy, reproduce,!
+!  translate, broadcast, modify, license, transmit, distribute,!
+!  exhibit, perform, publish or display any part, in any form or!
+!  by any means. Reverse engineering, disassembly, or!
+!  decompilation of this software, unless required by law for!
+!  interoperability, is prohibited.!
+!  The information contained herein is subject to change without!
+!  notice and is not warranted to be error-free. If you find any!
+!  errors, please report them to us in writing.!
+!  !
+!  Copyright (C) 1988, 2011, Oracle and/or its affiliates.!
+!  All Rights Reserved.!
+! ***************************************************************!
+ 
+ 
+!                                                                    !
+!***********************************************************************
+!                                                                      *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+!                                                                      *
+!                                                                      *
+!                                                                      *
+!                                                                      *
+!***********************************************************************
+!
+!NUMBER.SQC
+!
+!This file contains generalized routines to format numbers.  The
+!types of legal output formats are derived from the number formats
+!present in MSC Windows.  MSC Window number formats can be set in the
+!the Windows Control Panel and are stored in win.ini.
+!
+!To set these parameters for SQR, edit the environment file, setenv.sqc.
+!Number symbols in setenv.sqc are grouped together under a database
+!environment.  A list of the symbols and their definitions/values follows:
+!
+!                                                             MSC
+!                                                             Windows
+!Symbol          Definition                Value              Counterpart
+!------          ----------                -----              -----------
+!                                                             iCurrency
+!                                                             iCurrDigits
+!                                                             iNegCurr
+!                                                             sCurrency
+!                                                             iDigits
+!                                                             iLzero
+!SThousand       Thousand separator        any                sThousand
+!SDecimal        Decimal separator         any                sDecimal
+!
+!These global number symbols are string symbols and can be changed by
+!referencing them either without the underscore if the procedure does
+!not have parameters or with the underscore (i.e. $_????????).
+!These symbols can be modified while running a SQR
+!program because their default values are restored before returning to
+!the calling program.  This feature allows a program to format a number in
+!multiple formats without editing setenv.sqc.
+!
+!To use the generalized datetime routine, do the following:
+!   1. Set the number values in setenv.sqc
+!   2. At the top of the SQR program, include files "setenv.sqc".
+!      Also include "number.sqc".
+!   3. Before using the generalized number routine, a program must
+!      call "Init-Number"
+!
+!There are several routines:
+!
+! Format-Number(#in, $out, $mask)
+!
+!     #in - input value or literal number
+!     $out - output number format (will be null if fails)
+!     $mask - number format
+!
+!
+!   Examples:
+!     Format-Number(#Total, $out, '99,999')
+!
+! ------------------------------------------------------------
+!
+! Format-Amt(#in, $out, $mask, $incurr, $outcurr)
+!
+!     #in - input value or literal number
+!     $out - output number format (will be null if fails)
+!     $mask - number format
+!     $incurr - input currency
+!     $outcurr - output currency (will be space if multicurrency
+!                                 flag in installation is off)
+!
+!   Examples:
+!     Format-Amt(#Amt, $out, '99,999', 'FRF', $out)
+!
+! ------------------------------------------------------------
+!
+! ConvertCurrency(#FromAmt,$FromCurr,$ToCurr,$RateType,$EffDt,#ToAmt,$MsgType)
+!
+!     #FromAmt - amount to convert from
+!     $FromCurr - currency that amount is expressed in
+!     $ToCurr - currency that amount should be converted to
+!     $RateType - type of currency exchange rate to use
+!     $EffDt - effective date of the exchange rate to use
+!     #ToAmt - result of the conversion (will be #FromAmt if no conversion
+!                                        rate found)
+!     $MsgType - if no conversion rate found, following occurs depending
+!                on value of $MsgType ('F' is the default)
+!                'I'  : no message
+!                'W'  : warning message at end of report
+!                'F'  : error message on panel and program aborted
+!
+!   Examples:
+!     ConvertCurrency(#OfferAmt,'USD','FRF','OFFIC',$OfferDt,#ToAmt,'W')
+!
+!************************************************************************
+
+!This guards against the SQC being #included twice...
+#ifndef NUMBER-INCLUDED
+
+#define NUMBER-INCLUDED
+
+
+!************************************************************************
+!Init-Number - init number varibles                                     *
+!  This procedure sets some variable for use by the other procedures in *
+!  this SQC.  It needs to be called prior to the others being called.   *
+!************************************************************************
+begin-procedure Init-Number
+#ifdef debugx
+  display 'Entering NUMBER.SQC: Init-Number'
+#end-if
+
+  if $ReportSDecimal = ''
+    move {SDecimal} to $ReportSDecimal
+  end-if
+
+  if $ReportSThousand = ''
+    move {SThousand} to $ReportSThousand
+  end-if
+
+  move $ReportSDecimal   to $SDecimal
+  move $ReportSThousand  to $SThousand
+
+  let $Delimiters = $Sthousand||$SDecimal
+
+  Do Select-Default-Curr
+
+  if $ReportMultiCurr <> ''
+    move $ReportMultiCurr  to $Multicurr
+  end-if
+
+  if $MultiCurr = 'N'
+    let #MultiCurr = 0
+  else
+    let #MultiCurr = 1
+  end-if
+  let #MsgFlagW = 0
+  let $MsgTextW1 = 'WARNING - AN ERROR OCCURRED DURING CURRENCY CONVERSION. ' ||
+                   'One or more table entries missing for a Currency Code '   ||
+                   'and Rate Type.  Substituted 1.00 for exchange rate.'
+  let $MsgTextW2 = 'WARNING - AN ERROR OCCURRED DURING CURRENCY FORMATTING. ' ||
+                   'Table entry missing or invalid for Currency Precision.  ' ||
+                   'Using program default value as precision.'
+  let $MsgTextF =  'FATAL - AN ERROR OCCURRED DURING CURRENCY CONVERSION.  '  ||
+                   'Following entry missing for a currency conversion.  '     ||
+                   'Program is aborted.'
+  let $MsgTextF2 = 'FATAL - AN ERROR OCCURRED DURING CURRENCY FORMATTING.  '  ||
+                   'Following entry missing or invalid for currency formatting.  '  ||
+                   'Program is aborted.'
+
+#ifdef debugx
+  #ifdef debugy
+    display ' $SDecimal: ' noline
+    display $SDecimal
+    display ' $SThousand: ' noline
+    display $SThousand
+    display ' #MultiCurr: ' noline
+    display #MultiCurr
+  #end-if
+  display 'Exiting NUMBER.SQC: Init-Number'
+#end-if
+end-procedure
+
+
+!************************************************************************
+!Select-Default-Curr: Get data from installation table                  *
+!************************************************************************
+begin-procedure Select-Default-Curr
+#ifdef debugx
+  display 'Entering NUMBER.SQC: Select-Default-Curr'
+#end-if
+
+  BEGIN-SELECT
+PSO.MULTICURRENCY
+INS.EXCHNG_TO_CURRENCY
+INS.EXCHNG_TO_RT_TYPE
+
+    move &PSO.MultiCurrency to $MultiCurr
+    move &INS.Exchng_To_Currency to $BaseCurr
+    move &INS.Exchng_To_Rt_Type to $BaseRtType
+
+    FROM PS_INSTALLATION INS, PSOPTIONS PSO
+  END-SELECT
+
+#ifdef debugx
+  #ifdef debugy
+    display ' $MultiCurr: ' noline
+    display $MultiCurr
+    display ' $BaseCurr: ' noline
+    display $BaseCurr
+    display ' $BaseRtType: ' noline
+    display $BaseRtType
+  #end-if
+  display 'Exiting NUMBER.SQC: Select-Default-Curr'
+#end-if
+end-procedure
+
+
+!************************************************************************
+!  Format-Number                                                        *
+!  Formats the input number using the input mask.  It will also perform *
+!  the proper translation of the numeric "punctuation".                 *
+!************************************************************************
+begin-procedure Format-Number(#in, :$out, $mask)
+#ifdef debugx
+  display 'Entering NUMBER.SQC: Format-Number'
+  display ' Input #in: ' noline
+  display #in
+  display ' Input $mask: ' noline
+  display $mask
+#end-if
+
+  move #in to $out :$mask
+  let $out = translate($out,',.',$_Delimiters)
+
+#ifdef debugx
+  #ifdef debugy
+    display ' $Delimiters: ' noline
+    display $_Delimiters
+  #end-if
+  display 'Exiting NUMBER.SQC: Format-Number'
+  display ' Output $out: ' noline
+  display $out
+#end-if
+end-procedure
+
+
+!************************************************************************
+!  Format-Amt                                                           *
+!  Formats the input monetary amount                                    *
+!************************************************************************
+begin-procedure Format-Amt(#in, :$out, $mask, $curin, :$curout)
+#ifdef debugx
+  display 'Entering NUMBER.SQC: Format-Amt'
+  display ' Input #in: ' noline
+  display #in
+  display ' Input $mask: ' noline
+  display $mask
+  display ' Input $curin: ' noline
+  display $curin
+#end-if
+
+  do format-number(#in, $out, $mask)
+  if #_MultiCurr
+    move $curin to $curout
+  else
+    let $curout = '   '
+  end-if
+
+#ifdef debugx
+  display 'Exiting NUMBER.SQC: Format-Amt'
+  display ' Output $out: ' noline
+  display $out
+  display ' Output $curout: ' noline
+  display $curout
+#end-if
+end-procedure
+
+
+!************************************************************************
+!  ConvertCurrency                                                      *
+!************************************************************************
+begin-procedure ConvertCurrency(#FromAmt,$FromCurr,
+                $ToCurr,$RateType,$EffDt,:#ToAmt,$MsgType)
+#ifdef debugx
+  display 'Entering NUMBER.SQC: ConvertCurrency'
+  display ' Input #FromAmt: ' noline
+  display #FromAmt
+  display ' Input $FromCurr: ' noline
+  display $FromCurr
+  display ' Input $ToCurr: ' noline
+  display $ToCurr
+  display ' Input $RateType: ' noline
+  display $RateType
+  display ' Input $EffDt: ' noline
+  display $EffDt
+  display ' Input $MsgType: ' noline
+  display $MsgType
+#end-if
+
+    if $FromCurr = $ToCurr
+      let #ToAmt = #FromAmt
+    else
+     if $FromCurr = $_FromCurr and $ToCurr = $_ToCurr and $RateType = $_RateType and
+        $EffDt = $_EffDt
+       let #RateMult = #_RateMult
+       let #RateDiv = #_RateDiv
+     else
+        do Get-Currency-Rate-MultDiv($FromCurr,$ToCurr,$RateType,
+               $EffDt,$MsgType,#RateMult,#RateDiv)
+      end-if
+      if #RateMult <> 0 and #RateDiv <> 0
+        let #ToAmt = (#FromAmt / #RateDiv) * #RateMult
+        if #ToAmt <> 0
+          if not #_MultiCurr
+              let #Out_ToAmt = round (#ToAmt, 2)
+           else
+              do Format_Currency_Amt_Numeric(#ToAmt, $ToCurr, $Effdt, #Out_ToAmt, 'I')
+           end-if
+           let #ToAmt = #Out_ToAmt
+        end-if
+      else
+        let #ToAmt = #FromAmt
+      end-if
+    end-if
+
+  let $_FromCurr = $FromCurr
+  let $_ToCurr = $ToCurr
+  let $_RateType = $RateType
+  let $_EffDt = $EffDt
+  let #_RateMult = #RateMult
+  let #_RateDiv = #RateDiv
+
+#ifdef debugx
+  #ifdef debugy
+    display ' #MultiCurr: ' noline
+    display #MultiCurr
+    display ' #RateMult: ' noline
+    display #RateMult
+    display ' #RateDiv: ' noline
+    display #RateDiv
+  #end-if
+  display 'Exiting NUMBER.SQC: ConvertCurrency'
+  display ' Output #ToAmt: ' noline
+  display #ToAmt
+#end-if
+end-procedure
+
+
+!************************************************************************
+!  Get-Currency-Rate-MultDiv                                            *
+!************************************************************************
+begin-procedure Get-Currency-Rate-MultDiv($FromCurr,$ToCurr,
+                  $RateType,$EffDt,$MsgType,:#RateMult,:#RateDiv)
+#ifdef debugx
+  display 'Entering NUMBER.SQC: Get-Currency-Rate-MultDiv'
+  display ' Input $FromCurr: ' noline
+  display $FromCurr
+  display ' Input $ToCurr: ' noline
+  display $ToCurr
+  display ' Input $RateType: ' noline
+  display $RateType
+  display ' Input $EffDt: ' noline
+  display $EffDt
+  display ' Input $MsgType: ' noline
+  display $MsgType
+#end-if
+
+  Let #NoRowsFnd = 1
+
+BEGIN-SELECT
+CR.RATE_MULT
+CR.RATE_DIV
+
+    move &CR.RATE_MULT to #RateMult
+    move &CR.RATE_DIV to #RateDiv
+    move 0 to #NoRowsFnd
+
+    FROM PS_RT_RATE_TBL CR,
+         PS_RT_INDEX_TBL RI
+    WHERE CR.RT_RATE_INDEX = RI.RT_RATE_INDEX
+      AND RI.DEFAULT_INDEX = 'Y'
+      AND CR.TERM = 0
+      AND CR.FROM_CUR       = $FromCurr
+      AND CR.RT_TYPE        = $RateType
+      AND CR.TO_CUR         = $ToCurr
+      AND CR.EFFDT          <= $Effdt
+      AND CR.EFFDT          =
+        (SELECT MAX(CR2.EFFDT) FROM PS_RT_RATE_TBL CR2
+           WHERE CR2.RT_RATE_INDEX = CR.RT_RATE_INDEX
+             AND CR2.TERM = CR.TERM
+             AND CR2.FROM_CUR = CR.FROM_CUR
+             AND CR2.RT_TYPE = CR.RT_TYPE
+             AND CR2.TO_CUR = CR.TO_CUR
+             AND CR2.EFFDT <= $Effdt)
+  END-SELECT
+
+  if #NoRowsFnd
+    If $MsgType <> 'I'
+      If $MsgType = 'W'
+        let #_MsgFlagW = 1
+        let $_MsgTextW = $_MsgTextW1
+      else
+        display $_MsgTextF
+        display 'From Currency ' noline
+        display $FromCurr
+        display 'To Currency ' noline
+        display $ToCurr
+        display 'Rate Type ' noline
+        display $RateType
+        display 'Effective Date ' noline
+        display $EffDt
+        stop
+      end-if
+    end-if
+  end-if
+
+#ifdef debugx
+  #ifdef debugy
+    display ' #NoRowsFnd: ' noline
+    display #NoRowsFnd
+  #end-if
+  display 'Exiting NUMBER.SQC: Get-Currency-Rate-MultDiv'
+  display ' Output #RateMult: ' noline
+  display #RateMult
+  display ' Output #RateDiv: ' noline
+  display #RateDiv
+#end-if
+end-procedure
+
+
+!************************************************************************
+!  Get-Currency-Rate                                                    *
+!************************************************************************
+begin-procedure Get-Currency-Rate($FromCurr,$ToCurr,
+                  $RateType,$EffDt,$MsgType,:#CurrRate)
+#ifdef debugx
+  display 'Entering NUMBER.SQC: Get-Currency-Rate'
+  display ' Input $FromCurr: ' noline
+  display $FromCurr
+  display ' Input $ToCurr: ' noline
+  display $ToCurr
+  display ' Input $RateType: ' noline
+  display $RateType
+  display ' Input $EffDt: ' noline
+  display $EffDt
+  display ' Input $MsgType: ' noline
+  display $MsgType
+#end-if
+
+  Let #NoRowsFnd = 1
+
+  BEGIN-SELECT
+CR.RATE_MULT
+CR.RATE_DIV
+
+    move &CR.RATE_MULT to #Rate_Mult
+    move &CR.RATE_DIV to #Rate_Div
+    let #CurrRate = #Rate_Mult / #Rate_Div
+    move 0 to #NoRowsFnd
+
+    FROM PS_RT_RATE_TBL CR,
+         PS_RT_INDEX_TBL RI
+    WHERE CR.RT_RATE_INDEX = RI.RT_RATE_INDEX
+      AND RI.DEFAULT_INDEX = 'Y'
+      AND CR.TERM = 0
+      AND CR.FROM_CUR       = $FromCurr
+      AND CR.RT_TYPE        = $RateType
+      AND CR.TO_CUR         = $ToCurr
+      AND CR.EFFDT          =
+        (SELECT MAX(CR2.EFFDT) FROM PS_RT_RATE_TBL CR2
+           WHERE CR2.RT_RATE_INDEX = CR.RT_RATE_INDEX
+             AND CR2.TERM = CR.TERM
+             AND CR2.FROM_CUR = CR.FROM_CUR
+             AND CR2.RT_TYPE = CR.RT_TYPE
+             AND CR2.TO_CUR = CR.TO_CUR
+             AND CR2.EFFDT <= $Effdt)
+  END-SELECT
+
+  if #NoRowsFnd
+    If $MsgType <> 'I'
+      If $MsgType = 'W'
+        let #_MsgFlagW = 1
+        let $_MsgTextW = $_MsgTextW1
+      else
+        display $_MsgTextF
+        display 'From Currency ' noline
+        display $FromCurr
+        display 'To Currency ' noline
+        display $ToCurr
+        display 'Rate Type ' noline
+        display $RateType
+        display 'Effective Date ' noline
+        display $EffDt
+        stop
+      end-if
+    end-if
+  end-if
+
+#ifdef debugx
+  #ifdef debugy
+    display ' #NoRowsFnd: ' noline
+    display #NoRowsFnd
+  #end-if
+  display 'Exiting NUMBER.SQC: Get-Currency-Rate'
+  display ' Output #CurrRate: ' noline
+  display #CurrRate
+#end-if
+end-procedure
+
+
+!***********************************************************************
+!Set-Visual-Rate: Determine the visual exchange rate                   *
+!***********************************************************************
+
+begin-procedure Set-Visual-Rate($FromCurr,$ToCurr,$EffDt,#RateMult,
+                 #RateDiv,:#VisualRate)
+
+#ifdef debugx
+  display 'Entering NUMBER.SQC: Set-Visual-Rate'
+  display ' Input $FromCurr: ' noline
+  display $FromCurr
+  display ' Input $ToCurr: ' noline
+  display $ToCurr
+  display ' Input $EffDt: ' noline
+  display $EffDt
+  display ' Input #RateMult: ' noline
+  display #RateMult
+  display ' Input #RateDiv: ' noline
+  display #RateDiv
+#end-if
+
+let $QuoteFound = 'N'
+
+begin-SELECT    ON-ERROR=SQL-Error
+
+CQ.QUOTE_UNITS        () NOP
+CQ.RATE_DIRECT        () NOP
+CQ.RATE_TRIANGULATE   () NOP
+CQ.PRIMARY_VISUAL     () NOP
+    let $QuoteFound = 'Y'
+FROM PS_CURR_QUOTE_TBL CQ
+WHERE CQ.FROM_CUR = $FromCurr
+  AND CQ.TO_CUR = $ToCurr
+  AND CQ.EFFDT  =
+    (SELECT MAX(CQ2.EFFDT) FROM PS_CURR_QUOTE_TBL CQ2
+       WHERE CQ2.FROM_CUR = CQ.FROM_CUR
+         AND CQ2.TO_CUR = CQ.TO_CUR
+         AND CQ2.EFFDT <= $EffDt)
+  AND CQ.EFF_STATUS = 'A'
+end-SELECT
+
+   if $QuoteFound = 'Y'
+       let #QuoteUnits = &CQ.Quote_Units
+       let $RateDirect = &CQ.Rate_Direct
+       let $RateTriangulate = &CQ.Rate_Triangulate
+       let $PrimaryVisual = &CQ.Primary_Visual
+   else
+       let #QuoteUnits = 1
+       let $RateDirect = 'D'
+       let $RateTriangulate = 'N'
+       let $PrimaryVisual = 'FT'
+   end-if
+
+   if $RateTriangulate <> 'Y' or $PrimaryVisual = 'FT'
+       if $RateDirect = 'D'
+           if #RateDiv <> 0
+               let #VisualRateTemp = (#RateMult / #RateDiv) * #QuoteUnits
+           else
+               let #VisualRateTemp = 0
+           end-if
+       else
+           if $RateDirect = 'I'
+               if #RateMult <> 0
+                   let #VisualRateTemp = (#RateDiv / #RateMult) * #QuoteUnits
+               else
+                   let #VisualRateTemp = 0
+               end-if
+           end-if
+       end-if
+   else
+      if $PrimaryVisual = 'FR'
+          let #VisualRateTemp = #RateDiv
+      else
+          if $PrimaryVisual = 'RT'
+              let #VisualRateTemp = #RateMult
+          end-if
+      end-if
+   end-if
+
+   let #VisualRate = round (#VisualRateTemp, 8)
+
+#ifdef debugx
+  #ifdef debugy
+    display ' $QuoteFound: ' noline
+    display $QuoteFound
+    display ' #QuoteUnits: ' noline
+    display #QuoteUnits
+    display ' $RateDirect: ' noline
+    display $RateDirect
+    display ' $RateTriangulate: ' noline
+    display $RateTriangulate
+    display ' $PrimaryVisual: ' noline
+    display $PrimaryVisual
+    display ' #VisualRateTemp: ' noline
+    display #VisualRateTemp
+  #end-if
+  display 'Exiting NUMBER.SQC: Set-Visual-Rate'
+  display ' Output #VisualRate: ' noline
+  display #VisualRate
+#end-if
+
+end-procedure
+
+
+!************************************************************************
+!  Format_Currency_Amt                                                  *
+!  Formats the input currency amount using the decimal precision that   *
+!  is associated with the given currency, returning the string          *
+!  representation of the formatted amount.                              *
+!************************************************************************
+begin-procedure Format_Currency_Amt (#in_amt, $currency, $in_Effdt,
+                                     $in_mask, :$out_amt, $MsgType)
+#ifdef debugx
+  display 'Entering NUMBER.SQC: Format_Currency_Amt'
+  display ' Input #in_amt: ' noline
+  display #in_amt
+  display ' Input $currency: ' noline
+  display $currency
+  display ' Input $in_Effdt: ' noline
+  display $in_Effdt
+  display ' Input $in_mask: ' noline
+  display $in_mask
+  display ' Input $curin: ' noline
+  display $curin
+#end-if
+
+  if not #_MultiCurr                   ! Not in "multi-currency" mode
+    move $in_mask to $use_mask
+  else
+    do Get_Currency_Precision ($currency, $in_Effdt, $MsgType, #cur_prec)
+    if #cur_prec <> 999
+      if instr($in_mask, '.', 1)
+        unstring $in_mask by '.' into $use_mask $rest_of_mask
+        let $rest_of_mask = ltrim($rest_of_mask, '9')
+      else
+        move $in_mask to $use_mask
+      end-if
+      if #cur_prec > 0
+        let $use_mask = $use_mask || '.'
+        let #pad_length = #cur_prec + length($use_mask)
+        let $use_mask = rpad ($use_mask, #pad_length, '9')
+      end-if
+      if instr($in_mask, '.', 1)
+        let $use_mask = $use_mask || $rest_of_mask
+      end-if
+    else
+      move $in_mask to $use_mask
+    end-if
+  end-if
+
+  do Format-Number (#in_amt, $out_amt, $use_mask)
+
+#ifdef debugx
+  display 'Exiting NUMBER.SQC: Format_Currency_Amt'
+  display ' Output $out_amt: ' noline
+  display $out_amt
+#end-if
+end-procedure
+
+
+!************************************************************************
+!  Format_Currency_Amt_Numeric                                          *
+!  Formats the input currency amount using the decimal precision that   *
+!  is associated with the given currency, returning the numeric value   *
+!  with the formatted value (i.e., rounded value)                       *
+!************************************************************************
+begin-procedure Format_Currency_Amt_Numeric (#in_amt, $currency, $in_Effdt,
+                                             :#out_amt, $MsgType)
+#ifdef debugx
+  display 'Entering NUMBER.SQC: Format_Currency_Amt_Numeric'
+  display ' Input #in_amt: ' noline
+  display #in_amt
+  display ' Input $currency: ' noline
+  display $currency
+  display ' Input $in_Effdt: ' noline
+  display $in_Effdt
+  display ' Input $curin: ' noline
+  display $curin
+#end-if
+
+  if not #_MultiCurr                   ! Not in "multi-currency" mode
+    move #in_amt to #out_amt
+  else
+    do Get_Currency_Precision ($currency, $in_Effdt, $MsgType, #cur_prec)
+    if #cur_prec <> 999
+      let #out_amt = round (#in_amt, #cur_prec)
+    else
+      move #in_amt to #out_amt
+    end-if
+  end-if
+
+#ifdef debugx
+  display 'Exiting NUMBER.SQC: Format_Currency_Amt_Numeric'
+  display ' Output #out_amt: ' noline
+  display #out_amt
+#end-if
+end-procedure
+
+
+!************************************************************************
+!  Get_Currency_Precision                                               *
+!  Returns the decimal precision associated with a given currency,      *
+!  For optimization purposes, this procedure caches the previous value. *
+!  A returned value of 999 means that there was no row found for the    *
+!  given currency, or we're not running in multi-currency mode.         *
+!************************************************************************
+begin-procedure Get_Currency_Precision($currency, $in_EffDt, $MsgType, :#precision)
+#ifdef debugx
+  display 'Entering NUMBER.SQC: Get_Currency_Precision'
+  display ' Input $currency: ' noline
+  display $currency
+  display ' Input $in_Effdt: ' noline
+  display $in_Effdt
+  display ' Input $MsgType: ' noline
+  display $MsgType
+  #ifdef debugy
+    display '  $_Last_Currency: ' noline
+    display $_Last_Currency
+    display '  $_Last_Precision: ' noline
+    display $_Last_Precision
+  #end-if
+#end-if
+
+  if not #_MultiCurr                    ! Not in "multi-currency" mode
+    let #precision = 2
+    goto skip_select
+  end-if
+
+  if $currency = $_Last_Currency        ! Request for the same currency
+    let #precision = #_Last_Precision   ! Return the cached value
+    goto skip_select                    ! Skip the select
+  end-if
+
+  let #NoRowsFnd = 1
+
+  BEGIN-SELECT
+A.DECIMAL_POSITIONS
+
+    move &A.DECIMAL_POSITIONS to #precision
+    move 0 to #NoRowsFnd
+
+    FROM PS_CURRENCY_CD_TBL A
+    WHERE A.CURRENCY_CD = $currency
+      AND A.EFF_STATUS = 'A'
+      AND A.EFFDT=
+        (SELECT MAX(B.EFFDT) FROM PS_CURRENCY_CD_TBL B
+           WHERE B.CURRENCY_CD = A.CURRENCY_CD
+             AND B.EFFDT<=$in_Effdt)
+  END-SELECT
+
+  if (#NoRowsFnd) or (#precision > 3)
+    let #precision = 999
+    if $MsgType <> 'I'
+      if $MsgType = 'W'
+        let $_MsgTextW = $_MsgTextW2
+        let #_MsgFlagW = 1
+      else
+        display $_MsgTextF2
+        display 'Currency_Cd ' noline
+        display $currency
+        display 'Effective Date ' noline
+        display $in_EffDt
+        stop
+      end-if
+    end-if
+  end-if
+
+  let $_Last_Currency = $currency
+  let #_Last_Precision = #precision
+
+ skip_select:
+
+#ifdef debugx
+  display 'Exiting NUMBER.SQC: Get_Currency_Precision'
+  display ' Output #precision: ' noline
+  display #precision
+#end-if
+end-procedure
+
+
+!************************************************************************
+!  PS_SQR_Round                                                         *
+!  Rounds the input numeric value to the number of places specified     *
+!  to the right of the decimal point.  This routine is needed because   *
+!  the SQR-provided round function is not totally reliable because it   *
+!  does floating point to decimal conversion, which is inexact.  This   *
+!  routine implements MITI's suggested workaround to that problem.      *
+!************************************************************************
+begin-procedure PS_SQR_Round (#in_decimal, #precision, :#out_decimal)
+#ifdef debugx
+  display 'Entering NUMBER.SQC: PS_SQR_Round'
+  display ' Input #in_decimal: ' noline
+  display #in_decimal 999999999999.999999999999999
+  display ' Input #precision: ' noline
+  display #precision
+#end-if
+
+  do Check_Max_Precision (#precision)
+
+  let #copy_in_dec = #in_decimal
+
+  let #working = #precision + 2
+
+  let $add_string = rpad('0.', #working, '0')
+  let $add_string = $add_string || '5'
+  let $add_string = rpad($add_string, 17, '0')
+  let #add_factor = to_number($add_string)
+
+  if #copy_in_dec < 0                    ! Use negative if number is negative
+    multiply -1 times #add_factor
+  end-if
+
+  let #temp_decimal = #copy_in_dec + #add_factor
+
+  let #_called_from_round = 1
+  let #out_decimal = trunc(#temp_decimal, #precision)
+  let #_called_from_round = 0
+
+#ifdef debugx
+  display 'Exiting NUMBER.SQC: PS_SQR_Round'
+  display ' Output #out_decimal: ' noline
+  display #out_decimal 999999999999.999999999999999
+  #ifdef debugy
+    if #precision < 7                      ! SQR can handle 0 - 6
+      let #SQR_round = round(#in_decimal, #precision)
+      display '  SQR Rounded value: ' noline
+      display #SQR_round 999999999999.999999999999999
+    end-if
+  #end-if
+#end-if
+end-procedure
+
+
+!************************************************************************
+!  PS_SQR_Trunc                                                         *
+!  Truncates the input numeric value to the number of places specified  *
+!  to the right of the decimal point.  This routine is needed because   *
+!  the SQR-provided trunc function is not totally reliable because it   *
+!  does floating point to decimal conversion, which is inexact.  This   *
+!  routine implements MITI's suggested workaround to that problem.      *
+!************************************************************************
+begin-procedure PS_SQR_Trunc (#in_decimal, #precision, :#out_decimal)
+#ifdef debugx
+  display 'Entering NUMBER.SQC: PS_SQR_Trunc'
+  display ' Input #in_decimal: ' noline
+  display #in_decimal 999999999999.999999999999999
+  display ' Input #precision: ' noline
+  display #precision
+#end-if
+
+  if (#_called_from_round = 0)
+    do Check_Max_Precision (#precision)
+  end-if
+
+  do Adjust_Number (#in_decimal)
+
+  move '099999999999999.999999999999999' to $Trunc_Mask
+  move #in_decimal to $work_string :$Trunc_Mask
+
+  let #work_num = 16 + #precision    ! Set truncation point, based on mask
+
+  let $work_string = substr($work_string, 1, #work_num)
+  move $work_string to #out_decimal
+  do Adjust_Number (#out_decimal)
+
+#ifdef debugx
+  display 'Exiting NUMBER.SQC: PS_SQR_Trunc'
+  display ' Output #out_decimal: ' noline
+  display #out_decimal 999999999999.999999999999999
+  #ifdef debugy
+    if #precision < 7                      ! SQR can handle 0 - 6
+      let #SQR_trunc = trunc(#in_decimal, #precision)
+      display '  SQR Truncated value: ' noline
+      display #SQR_trunc 999999999999.999999999999999
+    end-if
+  #end-if
+#end-if
+end-procedure
+
+
+!************************************************************************
+!  Check_Max_Precision                                                  *
+!  For the procedures that we provide, make sure that the precision is  *
+!  within the supported range                                           *
+!************************************************************************
+
+#define PS_MAX_PRECISION 8
+
+begin-procedure Check_Max_Precision (#precision)
+#ifdef debugx
+  #ifdef debugy
+    display 'Entering NUMBER.SQC: Check_Max_Precision'
+    display ' Input #precision: ' noline
+    display #precision
+  #end-if
+#end-if
+
+  if #precision < 0
+    display 'Error -- negative precision specified'
+    display 'Terminating program.'
+    stop
+  end-if
+
+  if #precision > {PS_MAX_PRECISION}
+    display 'Specified precision exceeds the supported maximum ({PS_MAX_PRECISION})'
+    display 'Terminating program.'
+    stop
+  end-if
+
+#ifdef debugx
+  #ifdef debugy
+    display 'Exiting NUMBER.SQC: Check_Max_Precision'
+  #end-if
+#end-if
+end-procedure
+
+
+!************************************************************************
+!  Adjust_Number                                                        *
+!  There are some numbers that SQR will mangle.  42.2225 is one of      *
+!  these.  To get around this, if we see four 9's after the 6th place   *
+!  to the right of the decimal point, we will return the next largest   *
+!  SQR number.                                                          *
+!************************************************************************
+begin-procedure Adjust_Number (:#number)
+#ifdef debugx
+  display 'Entering NUMBER.SQC: Adjust_Number'
+  display ' Input #number: ' noline
+  display #number 9999999999.999999999999999
+#end-if
+
+  move #number to $work_string 999999999999999.999999999999999
+  let #adj_factor = 0
+  let #Need_Adjust = 0
+  do Check_Adjust($work_string, #Need_Adjust)
+  if #Need_Adjust = 1
+    let #index = 31
+    let #trail_count = 0
+    while (substr($work_string, #index, 1) <> '9')
+      add 1 to #trail_count
+      subtract 1 from #index
+    end-while
+    if #number > 0
+      let #add_factor = 0.0000000000000001
+    else
+      let #add_factor = -0.0000000000000001
+    end-if
+    if #trail_count = 0
+      let #trail_count = 1
+    end-if
+    let #add_factor = #add_factor * e10(#trail_count)
+    let #work_number = #number
+    let #MoreAdjust = 1
+
+    while (#MoreAdjust = 1)
+      add #add_factor to #adj_factor
+      let #work_number = #number + #adj_factor
+      move #work_number to $work_string 999999999999999.999999999999999
+      do Check_Adjust($work_string, #MoreAdjust)
+    end-while
+
+    let #number = #work_number
+  end-if
+
+#ifdef debugx
+  display 'Exiting NUMBER.SQC: Adjust_Number'
+  display ' Output #number: ' noline
+  display #number 9999999999.999999999999999
+  #ifdef debugy
+    display '  Final adjustment factor: ' noline
+    display #adj_factor 99.999999999999999
+  #end-if
+#end-if
+end-procedure
+
+
+!************************************************************************
+!  Check_Adjust                                                         *
+!  Check if the number is in need of adjustment.                        *
+!************************************************************************
+begin-procedure Check_Adjust ($StringNumber, :#NeedsAdjust)
+#ifdef debugx
+  display 'Entering NUMBER.SQC: Check_Adjust'
+  display ' Input $StringNumber: ' noline
+  display $StringNumber
+#end-if
+
+  move $StringNumber to $CheckWorkStr
+
+  let #PeriodPlace = instr($CheckWorkStr, '.', 1)
+  let #LenIntPart = #PeriodPlace - 1
+  let #StartDecPart = #PeriodPlace + 1
+  let #LenDecPart = length($CheckWorkStr) - #PeriodPlace
+  let $CheckWorkStr = substr($CheckWorkStr, 1, #LenIntPart) ||
+                      substr($CheckWorkStr, #StartDecPart, #LenDecPart)
+  let $CheckWorkStr = ltrim($CheckWorkStr, ' ')
+
+  if instr($CheckWorkStr, '9999', 11)
+    let #NeedsAdjust = 1
+  else
+    let #NeedsAdjust = 0
+  end-if
+
+#ifdef debugx
+  display 'Exiting NUMBER.SQC: Check_Adjust'
+  display ' Output #NeedsAdjust ' noline
+  display #NeedsAdjust
+#end-if
+end-procedure
+
+#end-if         ! ndef NUMBER-INCLUDED

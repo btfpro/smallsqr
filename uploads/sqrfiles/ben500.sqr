@@ -1,0 +1,903 @@
+!**************************************************
+! BEN500:   PeopleSoft Benefits                   *
+!           PS_PRIMARY_JOBS Maintenanace Utility  *
+!**************************************************
+
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+!
+! This module contains confidential and proprietary information        *
+! of Oracle; it is not to be copied, reproduced, or transmitted        *
+! in any form, by any means, in whole or in part, nor is it to         *
+! be used for any purpose other than that for which it is              *
+! expressly provided under the applicable license agreement.           *
+!                                                                      *
+! Copyright (C) 2006 Oracle. All Rights Reserved.                      *
+!                                                                      *
+!----------------------------------------------------------------------
+!
+!          $Date:  2006/07/19:08:45:59                                 !
+!       $Release:  HR9                                                 !
+!      $Revision:  101                                                 !
+!                                                                      *
+!***********************************************************************
+
+!***********************************************************************
+!
+! This SQR utility program is provided to allow the user to build/re-build
+! entries in the PRIMARY_JOBS table for the following populations:
+!
+!      (1) One or more employees (specified on the runcontrol).
+!      (2) All employees contained in a user-specified table.
+!          (this can be either a PeopleSoft-delivered table, or a
+!           user-created table. It must contain the "EMPLID" field.)
+!      (3) All employees in the database.
+!
+! When bringing new employees into the database (such as in the case of
+! acquiring a new company, or bringing in a new population due to a phased
+! implementation) this utility should be run to create PRIMARY_JOBS entries
+! if the new employees are added to the database via a batch load, rather than
+! using the HIRE or ADD Concurrent Job panels.
+!
+! In addition, this utility should be run (with the "All Employees in the
+! Database" option) immediately after loading the Person, PER_ORG_ASGN
+! and Job tables for a new implementation, in order to establish the required
+! Primary_Jobs entries.
+!
+! During the course of processing, two temporary tables are used:
+!      R_BN_PRIJOB1 (TEMP1)
+!      R_BN_PRIJOB2 (TEMP2)
+!
+! The basic process is as follows:
+!      The utility responds to the user's filtering criteria to establish the
+!      population of employees to process.
+!      (A) The utility deletes existing PRIMARY_JOBS rows for each employee
+!          to be processed.
+!      (B) The utility makes a first pass to insert rows into PRIMARY_JOBS
+!          for employees who only have a single job per Benefit_Rcd_Nbr.
+!          These rows simply represent the HIR row for the single Empl_Rcd
+!          for each Benefit_Rcd_Nbr.
+!      (C) The utility makes a second pass to process employees with multiple
+!          jobs per Benefit_Rcd_Nbr. For each employee, the following
+!          processing occurs:
+!           (1) Insert entries into TEMP1 for each significant change
+!               in Empl_Status across all jobs (and Benefit Records).
+!               A significant status change is defined as moving between
+!               "Active" and "Terminated" status.
+!           (2) For each entry in TEMP1, assign the primary job (using
+!               "lowest active Empl_Rcd" rule. When completed, the
+!               PRIMARY_ERN on each row contains the Empl_Rcd of the
+!               primary job for that Benefit Record, as of the Effdt of
+!               the TEMP1 row. Note that PRIMARY_ERN may point to the
+!               current row.
+!           (3) Using the data in TEMP1, insert rows into TEMP2 that
+!               essentially "turn on" and "turn off" the primary job
+!               desgination for each job. When a job newly becomes the
+!               primary job, a row is inserted with Primary_Job_Ind = 'Y'.
+!               Conversely, if a job loses its primary job designation,
+!               a row is inserted with Primary_Job_Ind = 'N'.
+!           (4) Using the data in TEMP2, insert rows into PRIMARY_JOBS,
+!               avoiding any redundant information.
+! -----------------------------------------------------------------------------
+!
+!      When building or re-building the PRIMARY_JOBS data for an employee,
+!      the Primary Job will be determined to be the job with the numerically
+!      lowest Empl_Rcd in an Active status, within the Benefit Record.
+!      If all jobs in the Benefit Record are terminated, then the job with the
+!      numerically lowest Empl_Rcd within the Benefit Record is designated as
+!      the Primary Job.
+!
+!      PRIMARY_JOBS data is created for all Benefit Records in which an
+!      employee participates.
+!
+!------------------------------------------------------------------------------
+
+!**********************************************************************
+!
+! Modification History:
+!       Initial Development: 1/20/2000   PeopleSoft, Inc.  (DCD)
+!                            Restructured Updates using self-referencing
+!                            subqueries for Informix compatibility.
+!
+!**********************************************************************
+
+
+#Include 'setenv.sqc'  !Set Database Environment
+
+!*************************************
+Begin-Setup
+!*************************************
+
+ #Include 'ptpsp125.sqc'
+
+End-Setup
+
+
+!*************************************
+Begin-Program
+!*************************************
+  do Init-DateTime
+  do Init-Number
+  do Get-Current-DateTime
+  do Init-Report
+  do Process-Main
+
+  display 'Process Ended at: ' noline
+  do Display-Time
+
+  do Reset
+  do Stdapi-Term
+
+End-Program
+
+
+!*************************************
+Begin-Procedure Init-Report
+!*************************************
+
+
+ Move 'BEN500'  to  $ReportID
+
+  Display $ReportTitle
+  Display 'Process Begin at: ' noline
+  Do Display-Time
+
+  do Stdapi-Init
+  if $prcs_process_instance = ''
+    do Ask-Parameters                   ! Invoked interactively
+  else
+    do Get-Values                       ! Invoked by Process Scheduler
+  end-if
+
+  Let $From_Clause = ' '
+  Let $Where_Clause = ' '
+  Let $Quote = ''''
+
+
+  Evaluate $BEN500_Run_Option
+      When = '1'
+           Move 'PS_PERSON PD ' to $From_Clause
+           Move ' PD.EMPLID = PD.EMPLID ' to $Where_Clause
+           Break
+      When = '2'
+           Move ' PS_PERSON PD, PS_BEN_PRIJOB_LIST PJL ' to $From_Clause
+           Move ' PD.EMPLID = PJL.EMPLID '    to  $Where_Clause
+           Concat 'AND PJL.OPRID = '        with  $Where_Clause
+           Concat $Quote                    with  $Where_Clause
+           Concat $prcs_oprid               with  $Where_Clause
+           Concat $Quote                    with  $Where_Clause
+           Concat ' AND PJL.RUN_CNTL_ID = ' with  $Where_Clause
+           Concat $Quote                    with  $Where_Clause
+           Concat $prcs_run_cntl_id         with  $Where_Clause
+           Concat $Quote                    with  $Where_Clause
+           Break
+      When = '3'
+           Move ' PS_PERSON PD, '  to $From_Clause
+           If SubStr($Table_Name, 1, 3) <> 'PS_'
+              Concat 'PS_'                 with $From_Clause
+           End-If
+           Concat $Table_Name           with $From_Clause
+           Concat ' UT' with $From_Clause
+           Move ' PD.EMPLID = UT.EMPLID ' to $Where_Clause
+      When = '4'
+           Move ' PS_PERSON PD, '  to $From_Clause
+           Concat $Table_Name           with $From_Clause
+           Concat ' UT' with $From_Clause
+           Move ' PD.EMPLID = UT.EMPLID ' to $Where_Clause
+      When-Other
+           Display 'Invalid Run Option: '     noline
+           Display $BEN500_Run_Option
+           STOP
+  End-Evaluate
+
+End-Procedure
+
+
+!**********************************
+Begin-Procedure Report-Translation
+!**********************************
+! Read from BEN500 program ids
+! do Init_Report_Translation($ReportID, $Language_Cd)
+
+End-Procedure
+
+
+!*************************************
+Begin-Procedure Get-Values
+!*************************************
+! Used for RunControl
+
+ do Select-Parameters
+
+ Let $BEN500_Run_Option = RTRIM(&RUN_CNTL_BEN.BEN500_RUN_OPTION,' ')
+ Let $Table_Name = RTRIM(&RUN_CNTL_BEN.TABLE_NAME,' ')
+
+End-Procedure
+
+
+!**********************************
+Begin-Procedure Ask-Parameters
+!**********************************
+! Used if run interactively
+
+ Let $BEN500_Run_Option = ' '
+ Let $Table_Name = ' '
+
+ While $BEN500_Run_Option <> '1' And $BEN500_Run_Option <> '3'
+     Input $BEN500_Run_Option 'Run Option: (1) All Employees, (3) Table of Employees '
+     Let $BEN500_Run_Option = RTRIM($BEN500_Run_Option,' ')
+ End-While
+
+
+ If $BEN500_Run_Option = '3'
+     While $Table_Name = ' ' Or $Table_Name = ''
+         Input $Table_Name 'Enter Table Name (if a PeopleSoft Table, add PS_ prefix) '
+         Let $Table_Name = UPPER(RTRIM($Table_Name,' '))
+     End-While
+ End-If
+
+End-Procedure
+
+
+!**************
+Begin-Heading 8
+!**************
+
+ #Include 'stdhdg01.sqc'
+
+End-Heading
+
+
+!*************************************
+Begin-Procedure Process-Main
+!*************************************
+
+ ! Print ' ' (+1,1,1)
+
+ ! Starting with PT8.0, all supported databases have persistent cursors.
+ Do 800-Get-Commit-Interval
+ ! Display 'Commit Interval: ' noline
+ ! Display #Commit-Interval 88,888 noline
+ ! Display ' employees.'
+
+ Do 900-Delete-Primary-Job-Entries
+ Do 100-Process-Sgl-Job-Employees
+ Do 110-Process-Multi-Job-Employees
+
+ Display 'Employees Processed: '  noline
+ Display #Count-Emp 8,888,888
+
+ Do Commit-Transaction
+
+End-Procedure
+
+
+!**********************************************
+Begin-Procedure 100-Process-Sgl-Job-Employees
+!**********************************************
+!
+! First pass: Select specified Emplids from a list, or every row
+! from Person, for employees having only a single job per
+! Benefit Rcd Number.
+
+ Let #Count-Emp = 0
+ Let #Commit-Count = 0
+
+Begin-Select
+
+COUNT(DISTINCT E.EMPLID)  &SGL_JOB_EMPS
+
+  Let #Count-Emp = &SGL_JOB_EMPS
+  Let #Commit-Count = &SGL_JOB_EMPS
+
+FROM PS_JOB J
+   , PS_PER_ORG_ASGN E
+WHERE J.EMPLID = E.EMPLID
+  AND J.EMPL_RCD = E.EMPL_RCD
+  AND J.EFFDT = (
+     SELECT MIN(J1.EFFDT)
+       FROM PS_JOB J1
+      WHERE J1.EMPLID = J.EMPLID
+        AND J1.EMPL_RCD = J.EMPL_RCD)
+  AND J.EFFSEQ = (
+     SELECT MAX(J2.EFFSEQ)
+       FROM PS_JOB J2
+      WHERE J2.EMPLID = J.EMPLID
+        AND J2.EMPL_RCD = J.EMPL_RCD
+        AND J2.EFFDT = J.EFFDT)
+  AND NOT EXISTS (
+     SELECT E1.BENEFIT_RCD_NBR
+       FROM PS_PER_ORG_ASGN E1
+      WHERE E1.EMPLID = E.EMPLID
+      GROUP BY E1.BENEFIT_RCD_NBR
+     HAVING COUNT(*) > 1)
+  AND E.EMPLID IN (
+     SELECT PD.EMPLID
+       FROM  [$From_Clause]
+      WHERE [$Where_Clause])
+
+End-Select
+
+let $sql-statement = '100-Process-Sgl-Job-Employees(): INSERT INTO PS_PRIMARY_JOBS'
+Begin-SQL on-error=SQL-Error
+
+INSERT INTO PS_PRIMARY_JOBS
+(EMPLID, PRIMARY_JOB_APP, EMPL_RCD, EFFDT, PRIMARY_JOB_IND,
+ PRIMARY_FLAG1, PRIMARY_FLAG2, PRIMARY_JOBS_SRC, JOB_EFFSEQ, JOB_EMPL_RCD)
+SELECT
+ E.EMPLID, 'BN', E.EMPL_RCD, J.EFFDT, 'Y',
+ 'Y', 'Y', 'J', J.EFFSEQ, J.EMPL_RCD
+FROM PS_JOB J
+   , PS_PER_ORG_ASGN E
+WHERE J.EMPLID = E.EMPLID
+  AND J.EMPL_RCD = E.EMPL_RCD
+  AND J.EFFDT = (
+     SELECT MIN(J1.EFFDT)
+       FROM PS_JOB J1
+      WHERE J1.EMPLID = J.EMPLID
+        AND J1.EMPL_RCD = J.EMPL_RCD)
+  AND J.EFFSEQ = (
+     SELECT MAX(J2.EFFSEQ)
+       FROM PS_JOB J2
+      WHERE J2.EMPLID = J.EMPLID
+        AND J2.EMPL_RCD = J.EMPL_RCD
+        AND J2.EFFDT = J.EFFDT)
+  AND NOT EXISTS (
+     SELECT E1.BENEFIT_RCD_NBR
+       FROM PS_PER_ORG_ASGN E1
+      WHERE E1.EMPLID = E.EMPLID
+      GROUP BY E1.BENEFIT_RCD_NBR
+     HAVING COUNT(*) > 1)
+  AND E.EMPLID IN (
+     SELECT PD.EMPLID
+       FROM  [$From_Clause]
+      WHERE [$Where_Clause])
+
+End-SQL
+
+!  If #Commit-Count >= #Commit-Interval
+!      Do Commit-Transaction
+!      Move 0  to  #Commit-Count
+!  End-If
+
+End-Procedure
+
+
+!**********************************************
+Begin-Procedure 110-Process-Multi-Job-Employees
+!**********************************************
+!
+! Driving loop - select specified Emplids from a list,
+!                or every row from Person
+
+Begin-Select
+PD.EMPLID
+
+            Move &PD.EMPLID   to  $Emplid
+            Add 1  to  #Count-Emp
+            Add 1  to  #Commit-Count
+
+            Do 200-Get-Job-Status-Changes
+            Do 300-Assign-Primary-Job
+            Do 400-Build-Primary-Jobs-Entries
+            Do 500-Insert-Primary-Jobs-Entries
+
+!            If #Commit-Count >= #Commit-Interval
+!                Do Commit-Transaction
+!                Move 0  to  #Commit-Count
+!            End-If
+
+
+FROM  [$From_Clause]
+WHERE [$Where_Clause]
+AND PD.EMPLID NOT IN
+   (SELECT EMPLID
+      FROM PS_PRIMARY_JOBS
+     WHERE PRIMARY_JOB_APP = 'BN')
+
+End-Select
+
+End-Procedure
+
+
+!*****************************************
+Begin-Procedure 200-Get-Job-Status-Changes
+!*****************************************
+
+let $sql-statement = '200-Get-Job-Status-Changes(): DELETE FROM PS_R_BN_PRIJOB1'
+Begin-SQL on-error=SQL-Error
+
+DELETE FROM PS_R_BN_PRIJOB1
+
+End-SQL
+
+let $sql-statement = '200-Get-Job-Status-Changes(): INSERT INTO PS_R_BN_PRIJOB1'
+Begin-SQL on-error=SQL-Error
+
+INSERT INTO PS_R_BN_PRIJOB1
+(BENEFIT_RCD_NBR, EFFDT, EMPL_RCD, PRIMARY_ERN, EMPL_STATUS, EMPLID,
+ JOB_EFFSEQ, JOB_EMPL_RCD)
+SELECT B.BENEFIT_RCD_NBR, A.EFFDT, A.EMPL_RCD, 9999, A.EMPL_STATUS, A.EMPLID,
+       A.EFFSEQ, A.EMPL_RCD
+  FROM PS_JOB A, PS_PER_ORG_ASGN B
+WHERE B.EMPLID = A.EMPLID
+  AND B.EMPL_RCD = A.EMPL_RCD
+  AND (
+       A.EMPL_STATUS <> (SELECT A1.EMPL_STATUS                ! Not same Empl_Status as
+                                 FROM PS_JOB A1               ! previous row for this job
+                                WHERE A1.EMPLID = A.EMPLID
+                                  AND A1.EMPL_RCD = A.EMPL_RCD
+                                  AND A1.EFFDT = (SELECT MAX(A2.EFFDT)
+                                                    FROM PS_JOB A2
+                                                   WHERE A2.EMPLID = A.EMPLID
+                                                     AND A2.EMPL_RCD = A.EMPL_RCD
+                                                     AND A2.EFFDT < A.EFFDT)
+                                  AND A1.EFFSEQ = (SELECT MAX(A3.EFFSEQ)
+                                                     FROM PS_JOB A3
+                                                    WHERE A3.EMPLID = A1.EMPLID
+                                                      AND A3.EMPL_RCD = A1.EMPL_RCD
+                                                      AND A3.EFFDT = A1.EFFDT))
+       OR NOT EXISTS (SELECT 'X'                  ! No previous row for this job
+                        FROM PS_JOB A4
+                       WHERE A4.EMPLID = A.EMPLID
+                         AND A4.EMPL_RCD = A.EMPL_RCD
+                         AND A4.EFFDT < A.EFFDT)
+      )
+  AND A.EFFSEQ = (SELECT MAX(A5.EFFSEQ)
+                    FROM PS_JOB A5
+                   WHERE A5.EMPLID = A.EMPLID
+                     AND A5.EMPL_RCD = A.EMPL_RCD
+                     AND A5.EFFDT = A.EFFDT)
+  AND B.EMPLID = $Emplid
+
+End-SQL
+
+End-Procedure
+
+
+!*************************************
+Begin-Procedure 300-Assign-Primary-Job
+!*************************************
+!
+! Set the Primary Job for the first job within a Benefit Record using the
+! "Lowest Active Empl_Rcd" rule:  assign the primary job to the lowest
+! active Empl_Rcd; if no active Empl_Rcd exists then assign the primary job
+! to the lowest Empl_Rcd.
+
+Begin-Select
+
+FJ.BENEFIT_RCD_NBR
+FJ.EFFDT
+FJ.EMPL_RCD
+
+    let #PriJob_Benefit_Rcd_Nbr = &FJ.BENEFIT_RCD_NBR
+    let $PriJob_Effdt = &FJ.EFFDT
+    let #PriJob_Empl_Rcd = &FJ.EMPL_RCD
+    let #PriJob_Primary_Ern = &FJ.EMPL_RCD
+
+    do 330-Update-Primary-Job
+
+FROM PS_R_BN_PRIJOB1 FJ
+WHERE NOT EXISTS (SELECT 'X'
+                    FROM PS_R_BN_PRIJOB1 A1
+                   WHERE A1.BENEFIT_RCD_NBR = FJ.BENEFIT_RCD_NBR
+                     AND A1.EFFDT < FJ.EFFDT)
+  AND ((FJ.EMPL_STATUS IN ('A','L','P','W','S')
+  AND NOT EXISTS (SELECT 'X'
+                    FROM PS_R_BN_PRIJOB1 A2
+                   WHERE A2.BENEFIT_RCD_NBR = FJ.BENEFIT_RCD_NBR
+                     AND A2.EFFDT = FJ.EFFDT
+                     AND A2.EMPL_STATUS IN ('A','L','P','W','S')
+                     AND A2.EMPL_RCD < FJ.EMPL_RCD))
+  OR (NOT EXISTS (SELECT 'X'
+                    FROM PS_R_BN_PRIJOB1 A3
+                   WHERE A3.BENEFIT_RCD_NBR = FJ.BENEFIT_RCD_NBR
+                     AND A3.EFFDT = FJ.EFFDT
+                     AND A3.EMPL_STATUS IN ('A','L','P','W','S'))
+  AND NOT EXISTS (SELECT 'X'
+                    FROM PS_R_BN_PRIJOB1 A4
+                   WHERE A4.BENEFIT_RCD_NBR = FJ.BENEFIT_RCD_NBR
+                     AND A4.EFFDT = FJ.EFFDT
+                     AND A4.EMPL_RCD < FJ.EMPL_RCD)))
+  AND PRIMARY_ERN = 9999
+
+End-Select
+
+! For the remaining rows, set the Primary Job as the lowest active job
+! in effect as of the Effdt, where an active job exists as of the Effdt
+! within the Benefit Record
+Begin-Select
+
+AJ.BENEFIT_RCD_NBR
+AJ.EFFDT
+AJ.EMPL_RCD
+
+    let #PriJob_Benefit_Rcd_Nbr = &AJ.BENEFIT_RCD_NBR
+    let $PriJob_Effdt = &AJ.EFFDT
+    let #PriJob_Empl_Rcd = &AJ.EMPL_RCD
+    let #PriJob_Primary_Ern = 9999
+
+    do 310-Select-Lowest-Active-Job
+    do 330-Update-Primary-Job
+
+FROM PS_R_BN_PRIJOB1 AJ
+WHERE EXISTS (SELECT 'X'                                    ! An active job exists in this
+                FROM PS_R_BN_PRIJOB1 A4                     ! Benefit Rcd as of Effdt
+               WHERE A4.BENEFIT_RCD_NBR = AJ.BENEFIT_RCD_NBR
+                 AND A4.EMPL_STATUS IN ('A','L','P','W','S')
+                 AND A4.EFFDT <= AJ.EFFDT
+                 AND A4.EFFDT = (SELECT MAX(A5.EFFDT)
+                                   FROM PS_R_BN_PRIJOB1 A5
+                                  WHERE A5.EMPL_RCD = A4.EMPL_RCD
+                                    AND A5.EFFDT <= AJ.EFFDT))
+  AND PRIMARY_ERN = 9999
+
+End-Select
+
+! Set the Primary Job as the lowest job where an active job DOES NOT
+! exist as of the Effdt within the Benefit Record
+Begin-Select
+
+IJ.BENEFIT_RCD_NBR
+IJ.EFFDT
+IJ.EMPL_RCD
+
+    let #PriJob_Benefit_Rcd_Nbr = &IJ.BENEFIT_RCD_NBR
+    let $PriJob_Effdt = &IJ.EFFDT
+    let #PriJob_Empl_Rcd = &IJ.EMPL_RCD
+    let #PriJob_Primary_Ern = 9999
+
+    do 320-Select-Lowest-Job
+    do 330-Update-Primary-Job
+
+FROM PS_R_BN_PRIJOB1 IJ
+WHERE NOT EXISTS (SELECT 'X'              ! An active job does not exist for this
+                    FROM PS_R_BN_PRIJOB1 A4   ! Benefit Record as of the Effdt
+                   WHERE A4.BENEFIT_RCD_NBR = IJ.BENEFIT_RCD_NBR
+                     AND A4.EMPL_STATUS IN ('A','L','P','W','S')
+                     AND A4.EFFDT <= IJ.EFFDT
+                     AND A4.EFFDT = (SELECT MAX(A5.EFFDT)
+                                       FROM PS_R_BN_PRIJOB1 A5
+                                      WHERE A5.EMPL_RCD = IJ.EMPL_RCD
+                                        AND A5.EFFDT <= IJ.EFFDT))
+  AND PRIMARY_ERN = 9999
+
+End-Select
+
+End-Procedure
+
+
+!*******************************************
+Begin-Procedure 310-Select-Lowest-Active-Job
+!*******************************************
+
+Begin-Select
+
+MIN(A2.EMPL_RCD) &LOWA_EMPL_RCD
+
+    let #PriJob_Primary_Ern = &LOWA_EMPL_RCD
+
+FROM PS_R_BN_PRIJOB1 A2
+WHERE A2.BENEFIT_RCD_NBR = #PriJob_Benefit_Rcd_Nbr
+  AND A2.EMPL_STATUS IN ('A','L','P','W','S')
+  AND A2.EFFDT <= $PriJob_Effdt
+  AND A2.EFFDT = (SELECT MAX(A3.EFFDT)
+                    FROM PS_R_BN_PRIJOB1 A3
+                   WHERE A3.EMPL_RCD = A2.EMPL_RCD
+                     AND A3.EFFDT <= $PriJob_Effdt)
+
+End-Select
+
+End-Procedure
+
+
+!*******************************************
+Begin-Procedure 320-Select-Lowest-Job
+!*******************************************
+
+Begin-Select
+
+MIN(A2.EMPL_RCD) &LOW_EMPL_RCD
+
+    let #PriJob_Primary_Ern = &LOW_EMPL_RCD
+
+FROM PS_R_BN_PRIJOB1 A2
+WHERE A2.BENEFIT_RCD_NBR = #PriJob_Benefit_Rcd_Nbr
+  AND A2.EFFDT <= $PriJob_Effdt
+
+End-Select
+
+End-Procedure
+
+
+!*************************************
+Begin-Procedure 330-Update-Primary-Job
+!*************************************
+
+let $sql-statement = '330-Update-Primary-Job(): UPDATE PS_R_BN_PRIJOB1'
+Begin-SQL on-error=SQL-Error
+
+UPDATE PS_R_BN_PRIJOB1
+SET PRIMARY_ERN = #PriJob_Primary_Ern
+WHERE BENEFIT_RCD_NBR = #PriJob_Benefit_Rcd_Nbr
+  AND EFFDT = $PriJob_Effdt
+  AND EMPL_RCD = #PriJob_Empl_Rcd
+
+End-SQL
+
+End-Procedure
+
+
+!*********************************************
+Begin-Procedure 400-Build-Primary-Jobs-Entries
+!*********************************************
+
+let $sql-statement = '400-Build-Primary-Jobs-Entries(): DELETE FROM PS_R_BN_PRIJOB2'
+Begin-SQL on-error=SQL-Error
+DELETE FROM PS_R_BN_PRIJOB2
+End-SQL
+
+let $sql-statement = '400-Build-Primary-Jobs-Entries(): INSERT INTO PS_R_BN_PRIJOB2(A)'
+Begin-SQL on-error=SQL-Error
+! Insert a row into TEMP2 for each row in TEMP1 which is the Primary Job
+! Set the Primary Job Indicator to 'Y'
+INSERT INTO PS_R_BN_PRIJOB2
+(BENEFIT_RCD_NBR, EFFDT, EMPL_RCD, PRIMARY_JOB_IND,
+ EMPLID, JOB_EFFSEQ, JOB_EMPL_RCD)
+SELECT BENEFIT_RCD_NBR, EFFDT, EMPL_RCD, 'Y',
+       EMPLID, JOB_EFFSEQ, JOB_EMPL_RCD
+  FROM PS_R_BN_PRIJOB1
+ WHERE PRIMARY_ERN = EMPL_RCD
+
+End-SQL
+
+let $sql-statement = '400-Build-Primary-Jobs-Entries(): INSERT INTO PS_R_BN_PRIJOB2(B)'
+Begin-SQL on-error=SQL-Error
+! Insert a row into TEMP2 for each row in TEMP 1 which is NOT a Primary Job
+! Set the Primary Job Indicator to 'N'
+INSERT INTO PS_R_BN_PRIJOB2
+(BENEFIT_RCD_NBR, EFFDT, EMPL_RCD, PRIMARY_JOB_IND,
+ EMPLID, JOB_EFFSEQ, JOB_EMPL_RCD)
+SELECT BENEFIT_RCD_NBR, EFFDT, EMPL_RCD, 'N',
+       EMPLID, JOB_EFFSEQ, JOB_EMPL_RCD
+  FROM PS_R_BN_PRIJOB1
+ WHERE PRIMARY_ERN <> EMPL_RCD
+
+End-SQL
+
+! Insert a row to "turn on" Primary Job designation when a different job in the
+! Benefit Record becomes the new Primary Job.
+Begin-Select
+A.BENEFIT_RCD_NBR
+A.EFFDT
+A.PRIMARY_ERN
+A.EMPLID
+A.JOB_EFFSEQ
+A.EMPL_RCD
+
+          do 410-Insert
+
+  FROM PS_R_BN_PRIJOB1 A
+ WHERE A.PRIMARY_ERN <> A.EMPL_RCD           ! Different Primary Job
+   AND NOT EXISTS (SELECT 'X'                ! Row to turn on doesn't exist yet
+                     FROM PS_R_BN_PRIJOB2 B
+                    WHERE B.EMPL_RCD = A.PRIMARY_ERN
+                      AND B.PRIMARY_JOB_IND = 'Y'
+                      AND B.EFFDT = (SELECT MAX(B1.EFFDT)
+                                       FROM PS_R_BN_PRIJOB2 B1
+                                      WHERE B1.EMPL_RCD = B.EMPL_RCD
+                                        AND B1.BENEFIT_RCD_NBR = B.BENEFIT_RCD_NBR
+                                        AND B1.EFFDT <= A.EFFDT))
+  AND A.EMPL_RCD = (SELECT MAX(B2.EMPL_RCD)  ! Select highest job as "trigger" if many exist
+                      FROM PS_R_BN_PRIJOB2 B2
+                     WHERE B2.BENEFIT_RCD_NBR = A.BENEFIT_RCD_NBR
+                       AND B2.EFFDT = A.EFFDT)
+End-Select
+
+let $sql-statement = '400-Build-Primary-Jobs-Entries(): INSERT INTO PS_R_BN_PRIJOB2(C)'
+Begin-SQL on-error=SQL-Error
+! Insert a row to "turn off" Primary Job designation when a different job in the
+! Benefit Record becomes the new Primary Job.
+INSERT INTO PS_R_BN_PRIJOB2
+(BENEFIT_RCD_NBR, EFFDT, EMPL_RCD, PRIMARY_JOB_IND,
+ EMPLID, JOB_EFFSEQ, JOB_EMPL_RCD)
+SELECT A.BENEFIT_RCD_NBR, B.EFFDT, A.EMPL_RCD, 'N',
+       A.EMPLID, B.JOB_EFFSEQ, B.JOB_EMPL_RCD
+  FROM PS_R_BN_PRIJOB1 A,                               ! "Old" Primary Job row
+       PS_R_BN_PRIJOB1 B                                ! "New" Primary Job row
+ WHERE B.PRIMARY_ERN = B.EMPL_RCD                  ! This is a Primary Job (New)
+   AND B.BENEFIT_RCD_NBR = A.BENEFIT_RCD_NBR
+   AND A.EMPL_RCD <> B.EMPL_RCD                    ! "Old" row is a different job
+   AND A.PRIMARY_ERN = A.EMPL_RCD                  ! "Old" row is a primary job
+   AND A.EFFDT = (SELECT MAX(A1.EFFDT)             ! "Old" row is in effect as of "New" row
+                    FROM PS_R_BN_PRIJOB1 A1
+                   WHERE A1.BENEFIT_RCD_NBR = A.BENEFIT_RCD_NBR
+                     AND A1.EMPL_RCD = A.EMPL_RCD
+                     AND A1.EFFDT <= B.EFFDT)
+  AND NOT EXISTS (SELECT 'X'                       ! "Old" row is not same job as "New" row"
+                    FROM PS_R_BN_PRIJOB1 A2
+                   WHERE A2.PRIMARY_ERN = A2.EMPL_RCD
+                     AND A2.BENEFIT_RCD_NBR = B.BENEFIT_RCD_NBR
+                     AND A2.EMPL_RCD = B.EMPL_RCD
+                     AND A2.EFFDT = (SELECT MAX(A3.EFFDT)
+                                       FROM PS_R_BN_PRIJOB1 A3
+                                      WHERE A3.BENEFIT_RCD_NBR = A2.BENEFIT_RCD_NBR
+                                        AND A3.EMPL_RCD = A2.EMPL_RCD
+                                        AND A3.EFFDT < B.EFFDT))
+
+End-SQL
+
+End-Procedure
+
+
+!*************************
+Begin-Procedure 410-Insert
+!*************************
+
+let $sql-statement = '410-Insert(): INSERT INTO PS_R_BN_PRIJOB1'
+Begin-SQL on-error=SQL-Error
+INSERT INTO PS_R_BN_PRIJOB1
+(BENEFIT_RCD_NBR, EFFDT, EMPL_RCD, PRIMARY_ERN, EMPL_STATUS,
+ EMPLID, JOB_EFFSEQ, JOB_EMPL_RCD)
+VALUES
+(
+ &A.BENEFIT_RCD_NBR
+,&A.EFFDT
+,&A.PRIMARY_ERN
+,&A.PRIMARY_ERN
+,'A'
+,&A.EMPLID
+,&A.JOB_EFFSEQ
+,&A.EMPL_RCD
+)
+
+End-SQL
+
+let $sql-statement = '410-Insert(): INSERT INTO PS_R_BN_PRIJOB2'
+Begin-SQL on-error=SQL-Error
+INSERT INTO PS_R_BN_PRIJOB2
+(BENEFIT_RCD_NBR, EFFDT, EMPL_RCD, PRIMARY_JOB_IND,
+ EMPLID, JOB_EFFSEQ, JOB_EMPL_RCD)
+VALUES
+(
+ &A.BENEFIT_RCD_NBR
+,&A.EFFDT
+,&A.PRIMARY_ERN
+,'Y'
+,&A.EMPLID
+,&A.JOB_EFFSEQ
+,&A.EMPL_RCD
+)
+
+End-SQL
+
+End-Procedure
+
+
+!**********************************************
+Begin-Procedure 500-Insert-Primary-Jobs-Entries
+!**********************************************
+
+let $sql-statement = '500-Insert-Primary-Jobs-Entries(): INSERT INTO PS_PRIMARY_JOBS'
+Begin-SQL on-error=SQL-Error
+! Insert rows into Primary_Jobs, avoiding "duplicates".
+! A "duplicate" is a row that has it's immediately preceeding row for the same
+! job (Empl_Rcd)with the same Primary_Job_Ind value.
+INSERT INTO PS_PRIMARY_JOBS
+(EMPLID, PRIMARY_JOB_APP, EMPL_RCD, EFFDT, PRIMARY_JOB_IND,
+ PRIMARY_FLAG1, PRIMARY_FLAG2, PRIMARY_JOBS_SRC, JOB_EFFSEQ, JOB_EMPL_RCD)
+SELECT
+ EMPLID
+,'BN'
+,EMPL_RCD
+,EFFDT
+,PRIMARY_JOB_IND
+,'Y'
+,'Y'
+,'J'
+,JOB_EFFSEQ
+,JOB_EMPL_RCD
+  FROM PS_R_BN_PRIJOB2 A
+ WHERE NOT EXISTS (SELECT 'X'
+                     FROM PS_R_BN_PRIJOB2 A2
+                    WHERE A2.BENEFIT_RCD_NBR = A.BENEFIT_RCD_NBR
+                      AND A2.EMPL_RCD = A.EMPL_RCD
+                      AND A2.PRIMARY_JOB_IND = A.PRIMARY_JOB_IND
+                      AND A2.EFFDT = (SELECT MAX(A3.EFFDT)
+                                        FROM PS_R_BN_PRIJOB2 A3
+                                       WHERE A3.BENEFIT_RCD_NBR = A2.BENEFIT_RCD_NBR
+                                         AND A3.EMPL_RCD = A2.EMPL_RCD
+                                         AND A3.EFFDT < A.EFFDT))
+
+End-SQL
+
+End-Procedure
+
+
+!**************************************
+Begin-Procedure 800-Get-Commit-Interval
+!**************************************
+!
+Begin-SELECT
+
+IN1.COMMIT_AFTER
+
+   Move &IN1.COMMIT_AFTER  to  #Commit-Interval
+
+FROM PS_INSTALLATION IN1
+
+End-SELECT
+
+End-Procedure
+
+
+!**********************************************
+Begin-Procedure 900-Delete-Primary-Job-Entries
+!**********************************************
+
+  If $BEN500_Run_Option = '1'
+
+let $sql-statement = '900-Delete-Primary-Job-Entries(): DELETE FROM PS_PRIMARY_JOBS(A)'
+Begin-SQL on-error=SQL-Error
+#Ifdef INFORMIX
+DELETE FROM PS_PRIMARY_JOBS
+#Else
+#Ifdef DB2ALL
+DELETE FROM PS_PRIMARY_JOBS
+#Else
+#Ifdef SYBASE
+DELETE FROM PS_PRIMARY_JOBS
+#Else
+TRUNCATE TABLE PS_PRIMARY_JOBS
+#EndIf  ! Informix
+#EndIf  ! DB2
+#EndIf  ! SYBASE
+End-SQL
+
+  Else
+
+let $sql-statement = '900-Delete-Primary-Job-Entries(): DELETE FROM PS_PRIMARY_JOBS(B)'
+Begin-SQL on-error=SQL-Error
+DELETE FROM PS_PRIMARY_JOBS
+WHERE EMPLID IN (
+     SELECT PD.EMPLID
+       FROM  [$From_Clause]
+      WHERE [$Where_Clause])
+  AND PRIMARY_JOB_APP = 'BN'
+End-SQL
+
+  End-If
+
+End-Procedure
+
+
+!*************************************
+Begin-Procedure Display-Time
+!*************************************
+
+  do Get-Current-DateTime
+  display $AsOfToday NoLine
+  display ', '       NoLine
+  display $AsOfNow
+  display ''
+
+End-Procedure
+
+
+!*************************************
+!Begin-Procedure sql-error
+!*************************************
+!End-Procedure
+
+
+#include 'stdapi.sqc'    !Routines to update run status
+#Include 'reset.sqc'     !Reset printer procedure
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'bnrunctl.sqc'  !Get application run control parameters
+#Include 'bngetval.sqc'  !Get BEN values mask routines
+#Include 'sqrtrans.sqc'  !Translate SQR strings to given language
+#Include 'getrplng.sqc'  !Get the report language

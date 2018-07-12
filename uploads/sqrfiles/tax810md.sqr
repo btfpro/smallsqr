@@ -1,0 +1,596 @@
+!***********************************************************************
+!  TAX810MD:  Qtrly Wage List - MARYLAND                               *
+!                                                                      *
+!             NOTE: "#IFDEF TAXTEST" in main SELECT is used for        *
+!                   testing this report against DEMO database          *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module contains confidential and proprietary information        *
+! of Oracle; it is not to be copied, reproduced, or transmitted        *
+! in any form, by any means, in whole or in part, nor is it to         *
+! be used for any purpose other than that for which it is              *
+! expressly provided under the applicable license agreement.           *
+!                                                                      *
+! Copyright (C) 2008 Oracle. All Rights Reserved.                      *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+!          $Date:  2008/03/03:09:36:02                                 !
+!       $Release:  HR9                                                 !
+!    $Resolution:  739116                                              !
+!                                                                      *
+!***********************************************************************
+
+#include 'setenv.sqc' !Set environment
+#include 'setup31.sqc' !Printer and page-size initialization
+#include 'usarpt.sqc'  ! NID_COUNTRY defined
+#define  max_array_size 101
+#define  max_array_cnt 100
+
+begin-report
+
+  create-array name=zero_wage_list size={max_array_size}
+               field=company:char
+               field=descr:char
+  
+  do Init-Report
+
+! These variables are used by rptsmmry.sqc
+  Let $Prnt_CoTxGrs = 'N'
+  Let $Prnt_CoExGrs = 'N'
+
+  do Process-Main
+
+  close 10
+
+  if $RecordWritten = 'Y'
+    display ''
+    display 'Upon successful conclusion of this program, one or more'
+    display 'files will have been created:'
+    display ''
+    display '  TAX810MD      (tape)'
+    display ''
+    display '     or  '
+    display '  TAX810MD.nnn  (diskette)    where "nnn" represents a'
+    display '                              volume number for each diskette.'
+    display '     or  '
+    display '  T81MDxxx      (electronic)  where "xxx" represents a volume'
+    display '                              identifier for each company code.'
+    display ''
+    display 'The file(s) contain(s) 275-character records in the ICESA'
+    display 'format required for reporting of quarterly wages to'
+    display 'Maryland Department of Economic and Employment Development.'
+    display ''
+    display 'Follow the instructions from the department for preparing'
+    display 'and submitting the file(s).'
+    display ''
+  else
+    do Print-Summary-Data('NoData')
+  end-if
+
+  do Stdapi-Term
+
+end-report
+
+begin-procedure Init-Report
+  do Init-DateTime
+  do Init-Number
+  do Get-Current-DateTime
+  do Get-Calendar-Year-Id
+  do Stdapi-Init
+
+  do Initialization
+
+  move 'TAX810MD'                          to $ReportID
+  move 'Maryland Quarterly UI Wage Report' to $ReportTitle
+  display ''
+  display 'Creating file for Maryland UI Wage Reporting'
+
+end-procedure
+
+begin-procedure Initialization
+#ifdef TAXTEST
+  move 'CA'              to $State
+#else
+  move 'MD'              to $State
+#endif
+
+  do Delete-Temp-Name-Table
+  do Get-Tax-Reporting-Run-Controls
+  move &TX.Balance_Year  to $ReptYear 9999
+  move $ReptYear         to $RptYear ~~xx
+  move $PeriodEndDate    to $AsOfDate
+
+  move &TX.Blocking_Factor to $BlockingFactor 09
+
+  display ' '
+  display 'Processing balances for '   noline
+  display $RptQtrYr
+
+  move 275 to #RecordLength
+  add  2   to #RecordLength
+
+  if $PRCS_Process_Instance = ''
+     do Prompts
+  else
+     do Select-Parameters
+     do Convert-Parameters
+  end-if
+
+  do Evaluate-File-Type
+  do Calculate-Diskette-Capacity
+  do Open-File
+end-procedure
+
+begin-procedure Open-File
+
+if $FileType = 'D'
+   move 0 to #RecordCount
+   if #FileExtension <> 0
+      close 10
+   end-if
+   add 1 to #FileExtension
+   move #FileExtension to $FileExtension 099
+#ifdef OS400
+   let $FileExtension = '(D' || $FileExtension || ')'
+   let $FileID = '{IMPORTPREFIX}' || 'TAX810MD' || $FileExtension
+#else
+   let $FileID = '{IMPORTPREFIX}' || 'TAX810MD.' || $FileExtension
+#endif
+
+   open $FileID as 10 for-writing record=275:fixed
+else
+   if $FileType = 'X'
+      move 1 to #FileCount
+   else
+      open '{IMPORTPREFIX}TAX810MD{IMPORTSUFFIX}' as 10 for-writing record=275:fixed
+   end-if
+
+end-if
+end-procedure
+
+
+begin-procedure Delete-Temp-Name-Table
+begin-SQL on-error=Ignore
+  DELETE FROM PS_R_TAX810ST
+end-SQL
+end-procedure
+
+begin-procedure Ignore
+! dummy procedure to avoid SQL error message on delete of empty table
+end-procedure
+
+
+begin-procedure Process-Main
+begin-SELECT
+TEMP_SSN_MASK
+FROM PS_INSTALLATION
+end-SELECT
+
+move 0 to #zero_wage_company_cnt
+
+begin-SELECT
+A.COMPANY
+A.FEDERAL_EIN
+A.DESCR
+A.ADDRESS1
+A.CITY
+A.STATE
+A.POSTAL
+A.COUNTRY
+
+  move &A.Company to $Company
+
+  move '' to $priorEmplID
+  move 'N' to $Employee_Processed
+    
+  do Read-Employee-Data
+
+  !--- no employee processed, it must be a zero wage company - load to array for report 
+  if $Employee_Processed = 'N' 
+     
+     let $check-co-state = 'N'
+     do check-co-statetax-tbl
+     
+     if $check-co-state = 'Y'
+        if #zero_wage_company_cnt < {max_array_cnt}  
+           add 1 to #zero_wage_company_cnt
+           let zero_wage_list.company(#zero_wage_company_cnt) = &A.COMPANY
+           let zero_wage_list.descr(#zero_wage_company_cnt)   = &A.DESCR
+        end-if
+     end-if
+       
+  end-if
+
+FROM  PS_COMPANY_TBL A
+WHERE A.EFF_STATUS      = 'A'
+  AND A.TAX_REPORT_TYPE = '2'
+  AND A.EFFDT =
+  (SELECT MAX(EFFDT)
+     FROM PS_COMPANY_TBL
+     WHERE  COMPANY = A.COMPANY
+       AND  EFFDT  <= $AsOfDate)
+ORDER BY COMPANY
+end-SELECT
+  if #Count_F > 0
+     if $FileType = 'X'
+        do Print-Summary-Data('FileNames')
+     else
+        do Print-Summary-Data('FileTotal')
+     end-if
+  end-if
+  
+  !--- Print list of company with zero wage 
+  if #zero_wage_company_cnt > 0
+     new-page
+     print '********************************************' ( +2,10)
+     print '*                                          *' ( +1,10)
+     print '*  List of active company with zero wage.  *' ( +1,10)
+     print '*                                          *' ( +1,10)
+     print '********************************************' ( +1,10)
+     print ' ' (+1,10)
+       
+     let #i = 1
+     while (#i <= #zero_wage_company_cnt)
+        get $print_company $print_descr from zero_wage_list(#i) company descr
+        print $print_company (+1,10)
+        print $print_descr   (  ,15)
+        add 1 to #i
+     end-while
+       
+     if #zero_wage_company_cnt >= {max_array_cnt}
+        print '*********************************************' ( +2,10)
+        print '*                                           *' ( +1,10)
+        print '*       Too many companies to report.       *' ( +1,10)
+        print '*                                           *' ( +1,10)
+        print '*  More than '                                ( +1,10)
+        print #zero_wage_company_cnt                         ( , ) edit 9999
+        print ' companies with zero wage. *'                 ( , )
+        print '*                                           *' ( +1,10)
+        print '*********************************************' ( +1,10)
+     else
+        print '*********************************************' ( +2,10)
+        print '*                                           *' ( +1,10)
+        print '*    End of list for zero wage companies.   *' ( +1,10)
+        print '*                                           *' ( +1,10)
+        print '*********************************************' ( +1,10)     
+     end-if
+  end-if
+  
+end-procedure
+
+
+begin-procedure check-co-statetax-tbl
+
+begin-SELECT
+STAX.COMPANY  
+
+  let $check-co-state = 'Y'
+
+FROM  PS_CO_STATETAX_TBL STAX
+WHERE STAX.COMPANY    = &A.COMPANY
+  AND STAX.STATE      = 'MD'
+  AND STAX.EFF_STATUS = 'A'
+  AND STAX.EFFDT      = (SELECT MAX(EFFDT)
+                           FROM PS_CO_STATETAX_TBL
+                          WHERE COMPANY = &A.COMPANY
+                            AND STATE   = 'MD'
+                            AND EFFDT  <= $AsOfDate)
+end-SELECT
+end-procedure
+
+
+
+begin-procedure Read-Employee-Data
+begin-SELECT
+C.COMPANY    () on-break print=never before=Before-Company
+                                     AFTER=AFTER-COMPANY
+C.EMPLID
+C.NLGRS_QTD
+C.TXGRS_QTD
+D1.NATIONAL_ID
+D.LAST_NAME
+D.FIRST_NAME
+D.MIDDLE_NAME
+
+  if &C.NlGrs_QTD > 0
+    do Process-Employee
+    move 'Y' to $Employee_Processed
+  else
+    do Print-Summary-Data('NegWage')
+  end-if
+
+FROM  PS_TAX_BALANCE C, PS_PERSON_NAME D, PS_PERS_NID D1
+WHERE C.COMPANY       = &A.Company
+  AND D.EMPLID        = C.EMPLID
+  AND C.TAX_CLASS     = 'U'
+  AND C.BALANCE_ID    = $Calendar_Year_Id
+  AND C.BALANCE_YEAR  = &TX.Balance_Year
+  AND C.BALANCE_QTR   = &TX.Balance_Qtr
+#ifdef TAXTEST
+  AND C.STATE         = 'CA'
+#else
+  AND C.STATE         = 'MD'
+#endif
+  AND C.LOCALITY      = ' '
+  AND C.BALANCE_PERIOD  =
+      (SELECT MAX(BALANCE_PERIOD)
+       FROM   PS_TAX_BALANCE
+       WHERE  EMPLID        = C.EMPLID
+         AND  COMPANY       = C.COMPANY
+         AND BALANCE_ID     = C.BALANCE_ID
+         AND  BALANCE_YEAR  = C.BALANCE_YEAR
+         AND  BALANCE_QTR   = C.BALANCE_QTR
+         AND  STATE         = C.STATE
+         AND  LOCALITY      = C.LOCALITY
+         AND  TAX_CLASS     = C.TAX_CLASS)
+  AND C.NLGRS_QTD <> 0
+  AND D1.EMPLID           = D.EMPLID
+  AND D1.COUNTRY = {NID_Country}
+  AND D1.NATIONAL_ID_TYPE = $Payroll_NID_Type
+ORDER BY D1.NATIONAL_ID
+end-SELECT
+end-procedure
+
+begin-procedure Process-Employee
+  move &D1.NATIONAL_ID to $S123 xxx       !isolate first 3 digits
+  if $S123 = &Temp_SSN_Mask or RTRIM(&D1.NATIONAL_ID, ' ') = ''
+    move 'I        '   to $NATIONAL_ID
+  else
+    move &D1.NATIONAL_ID        to $NATIONAL_ID
+  end-if
+
+  let $LastName   = rtrim(&D.LAST_NAME, ' ')
+  let $FirstName  = rtrim(&D.FIRST_NAME, ' ')
+  let $MidInitial = {ps-substr}(&D.MIDDLE_NAME,1,1)
+
+  move &C.NlGrs_QTD to #NlGrs_QTD
+  add #NlGrs_QTD to #Co_NlGrs_QTD
+  multiply 100 times #NlGrs_QTD
+
+  let #max_amt_NLG = 99999999999999
+  let #NLGrs_orig = #NlGrs_QTD
+
+  add 1 to #Count_S
+  add 1 to #Count_T
+  let $done1 = 'N'
+
+  if $FileType <> 'D'
+    while $done1 <> 'Y'
+      do split-s-record (#NLGrs_orig,#NlGrs_QTD,#max_amt_NLG,$done1)
+      do Format-Number(#NlGrs_QTD,  $NlGrs_QTD,  '09999999999999')
+      do Write-S-Record
+      add 1 to #Count_R
+    end-while
+  else
+    do Format-Number(#NlGrs_QTD,  $NlGrs_QTD,  '09999999999999')
+    do Write-S-Record
+    add 1 to #Count_R
+  end-if
+
+end-procedure
+
+begin-procedure Before-Company
+  do Get-Company-Data
+
+  do Get-State-Tax-Data             !Employer ID
+  if RTRIM(&Employer_ID_SUT,' ') = ''
+    display '*** State Unemployment ID missing in Company State Tax Table ***'
+    display '*********************** Processing stopped *********************'
+    display 'Company'
+    display $Company
+    stop
+  end-if
+! let $StateEIN = EDIT(RTRIM(&Employer_ID_SUT,' '),'0999999999')
+  let $StateEIN = ltrim(&Employer_ID_SUT,' ')
+
+  if $FileType = 'X'
+     do Open-Electronic-File
+     do Build-Temp-Name-Table
+  end-if
+
+end-procedure
+
+begin-procedure After-Company
+  if #Count_S > 0
+    do Print-Summary-Data('CoTotal')
+
+    add #Co_NlGrs_QTD to #Tot_NlGrs_QTD
+    add #Count_S to #Count_F
+    add #Count_R to #Count_R_Total
+
+    move 0 to #Co_NlGrs_QTD
+    move 0 to #Count_S
+    move 0 to #Count_R
+
+    add  1 to #FileCount
+    new-page
+  end-if
+end-procedure
+
+begin-procedure Write-S-Record
+
+  if $FileType = 'D'
+    do Write-Tape-Disk-S
+    if #RecordCount >= #MaxRecordsPerDiskette
+       do Open-File
+    end-if
+  else
+    do Write-Tape-Disk-S
+  end-if
+
+
+  move '' to $NlGrs_QTD
+  move 0  to #NlGrs_QTD
+end-procedure
+
+begin-procedure Write-Tape-Disk-S
+
+  while INSTR($StateEIN,'-',1) <> 0
+    let #Hyphen = INSTR($StateEIN,'-',1)
+    if #Hyphen > 0
+      let $StateEIN = SUBSTR($StateEIN,1,(#Hyphen - 1)) ||
+                      SUBSTR($StateEIN,(#Hyphen + 1),6)
+    end-if
+  end-while
+  while INSTR($StateEIN,' ',1) <> 0
+    let #Spaces = INSTR($StateEIN,' ',1)
+    if #Spaces > 0
+      let $StateEIN = SUBSTR($StateEIN,1,(#Spaces - 1)) ||
+                      SUBSTR($StateEIN,(#Spaces + 1),6)
+    end-if
+  end-while
+ move $StateEIN to $StateEIN 0999999999
+
+
+  write 10 from 'S':1   !   1
+       $NATIONAL_ID:9   !   2 -  10
+          $LastName:20  !  11 -  30
+         $FirstName:12  !  31 -  42
+                $Sp:1   !  43
+               '24':2   !  44 -  45
+                $Sp:18  !  46 -  63
+         $NlGrs_QTD:14  !  64 -  77
+                $Sp:69  !  78 - 146
+          $StateEIN:10  ! 147 - 156
+                $Sp:58  ! 157 - 214
+       $QtrEndMonth:2   ! 215 - 216
+          $ReptYear:4   ! 217 - 220
+                $Sp:55  ! 221 - 275
+
+  move 'Y' to $RecordWritten
+
+end-procedure
+
+begin-procedure Foreign-Address-Test($Format,#MaxLength)
+  if $_Country = 'USA'
+    move ' ' to $_ForeignAddrInd
+  else
+    move 'X' to $_ForeignAddrInd
+
+    if $_Country <> $priorCountry
+      do Get-Country-Code
+      move $_Country to $priorCountry
+      move &_Descr   to $CountryName
+    end-if
+
+    evaluate $Format
+      when = 'Format 1'
+        let #Length = LENGTH(RTRIM($CountryName,' '))
+        let $_City = SUBSTR(RTRIM($_City,' '),1,(#MaxLength - #Length - 4) )
+        let $_City = $_City || ' ' || $_StateCd || ' ' || $CountryName
+        move ' ' to $_StateCd
+      when = 'Format 2'
+        let $_StateCd = $_StateCd || ' ' || $CountryName
+        uppercase $_StateCd
+    end-evaluate
+  end-if
+  uppercase $_City
+  move $_Zip to $_ZipExtsn ~~~~~~xxxx
+  if instr($_Zip,'-',6) = 0
+  and $_ZipExtsn <> '    '
+    let $_Zip = substr($_Zip,1,5) || '-' || substr($_Zip,6,4)
+  end-if
+  move $_Zip to $_ZipExtsn ~~~~~xxxxx
+end-procedure
+
+begin-procedure Get-Country-Code
+begin-SELECT
+DESCR
+FROM  PS_COUNTRY_TBL
+WHERE COUNTRY = $Country
+end-SELECT
+end-procedure
+
+begin-procedure Prompts
+
+  while $FileType = ''
+    input $FileType 'Tape, cartridge, diskette, or electronic file? (T, C, D, X or Q to quit)'
+    uppercase $FileType
+    if INSTR('TCDXQ',$FileType,1) = 0
+      display ' '
+      display '***** Enter T, C, D, X or Q *****'
+      display ' '
+      move '' to $FileType
+    end-if
+  end-while
+end-procedure
+
+begin-procedure Convert-Parameters
+
+  move $RC_QTR_UI.Reporting_Medium to $FileType
+  move $RC_QTR_UI.Diskette_Type    to $DisketteType
+end-procedure
+
+begin-procedure Evaluate-File-Type
+
+  evaluate $FileType
+    when = 'Q'
+      stop
+
+    when = 'D'
+      if $Prcs_Process_Instance = ''
+         do Get-Diskette-Format
+      end-if
+      move &TX.Recording_Cd to $Recording_Cd
+      break
+
+    when = 'T'
+      move &TX.Tape_Density      to $Density
+      move &TX.Recording_Cd      to $Recording_Cd
+      move 'SL'                  to $Tape_Label
+      move &TX.Computer_Mfr      to $Computer_Mfr
+      move 'MT'                  to $FilingType
+      move '09'                  to $Tracks
+      break
+
+    when = 'C'
+      move &TX.Recording_Cd      to $Recording_Cd
+      move 'SL'                  to $Tape_Label
+      move &TX.Computer_Mfr      to $Computer_Mfr
+      move 'MC'                  to $FilingType
+
+  end-evaluate
+end-procedure
+
+
+begin-procedure Open-Electronic-File
+
+  if #FileCount > 1
+     close 10
+  end-if
+
+  let  $FileID = 'T81MD' || &A.Company
+  let  $FileID = '{IMPORTPREFIX}' || $FileID || '{IMPORTSUFFIX}'
+  open $FileID as 10 for-writing record=275:fixed
+
+end-procedure
+
+
+begin-Procedure Build-Temp-Name-Table
+begin-SQL on-error=Insert-Name-Error
+  INSERT INTO PS_R_TAX810ST (STATE, COMPANY)
+         VALUES ($State, &A.Company)
+end-SQL
+end-Procedure
+
+begin-procedure Insert-Name-Error
+  display 'Error on insert to temporary Name table '
+end-procedure
+
+
+#Include 'taxrnctl.sqc'  !Get-Tax-Reporting-Run-Controls procedure
+#Include 'getcodta.sqc'  !Get-Company-Data procedure
+#Include 'getstdta.sqc'  !Get-State-Tax-Data procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'getfrmat.sqc'  !Get-Diskette-Format procedure
+#Include 'rptsmmry.sqc'  !Print-Summary-Data procedure
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'getbalid.sqc'  !Get-Calendar-Year-Id
+#Include 'stdapi.sqc'    !Update Process API
+#Include 'txrnctl1.sqc'  !Process Scheduler Run Controls
+#Include 'txovrflw.sqc'  !Split-S-Record

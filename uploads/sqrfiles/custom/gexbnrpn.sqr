@@ -1,0 +1,488 @@
+!************************************************************************
+! GEXBNRPN:  This program process Ben Admin events that are determined  *
+!            to be eligible for the finalze process.  Finalizing Prepared
+!            events will move the event to an enrolled status in ben    * 
+!            admin.  Prepared events that are eligible to be finalized  *
+!            are those that contain plans with no elections allowed or  *
+!            with a single option.  The finalize process occurs for the *
+!            event as a whol, therefore, any plans within the event that*
+!            have multiplle options will cause the entire event to be   *
+!            ineligible for the finalize process.  This program will run*
+!            following each execution of the standard ben admin COBOL   *
+!            process.                                                   *
+!************************************************************************
+!                                                                       *
+!               Confidentiality Information:                            *
+!                                                                       *
+! This module is the confidential and proprietary information of        *
+! Giant Eagle, Inc.; it is not to be copied, reproduced, or transmitted *
+! in any form, by any means, in whole or in part, nor is it to be used  *
+! for any purpose other than that for which it is expressly provided    *
+! without the written permission of Giant Eagle.                        *
+!                                                                       *
+!                                                                       *
+!********************************************************************** *
+!                                                                       *
+!  $Date:: 01/27/98 09:00A      $                                       *
+!  $Revision:: 01               $                                       *
+!  $Workfile:: GEXBNRPN.SQR     $                                       *
+!                                                                       *
+!********************************************************************** *
+!                         MODIFICATION HISTORY                          *
+!********************************************************************** *
+!  ID#     INITIALS    DATE       DESCRIPTION OF THE CHANGE             *        
+!  GEX-MXT   MXT      11/28/2007  INITIAL CREATION                      *
+!  GEX-AXG   AXG      01/30/2008  Changed the SQL to pick GEX_EBEN_IND  *
+! as null or not equal to Y							*
+! ISDVASS             06/30/2008  Changes exit logic and changed procedure name *
+! ISDVNPK             07/28/2008  Changed the logic for multiple options and *
+!                                 added ELECT_SOURCE <> 'W'  *
+! GEX ISDVNPK 08/12/2008  Added to print if an EE has already an Open and multiple 
+!                         closed events                                 *
+! GEX ISDVNPK 09/02/2008  Removed  criteria in Check-If-Already-open    *
+! procedure so that it checks if an EE has  an Open event * 
+! VENDKXY     10/20/2008   Changed from:  Events Finalized  to:*
+! Events Reopened for S3 11594382				*
+! VENDKXY     04/24/2009	Added the logic to exclude benefit program*
+! GEX_SEC_REENG 2015-07-19 Vahini Katta                                *
+! Changes related to gex_emplid_mapp/7 digit emplid                    *
+!************************************************************************
+
+#include 'setenv.sqc' !Set environment
+#include 'setup01.sqc'
+!*********************************************************************
+!Initial processing, retrieving current dates and calls the main 
+!procedure to do the processing.                                     
+!*********************************************************************
+
+begin-setup
+  declare-variable 
+    date     $SELECT_ASOFDATE $SELECT_ASOFDATE1
+  end-declare
+end-setup
+
+begin-report
+
+  do Init-DateTime
+  do Init-Number
+  do stdapi-init
+  
+  Let $GEXXX912_Plan_Type_Alias       = 'B.PLAN_TYPE'
+    
+  Do GEXXX912-Select-BENEFIT-PLAN-Parameters
+  Do GEXRCHR1-SELECT-PARAMETERS
+  
+  !VENDKXY for iTG 59919-begin
+  
+  Let $GEXXX928_Benefit_program_Alias = 'A.BENEFIT_PROGRAM'
+  Do GEXXX928-Select-Benefit-Program-Parameters
+  show 'gexxx928: ' $GEXXX928_EXCLUDE_BENEFIT_PROGRAM_CRITERIA
+  
+  !VENDKXY for ITG 59919-end
+  
+  If Rtrim ($GEX_RC_HR.ASOfDATE, ' ') = ''
+      Let $SELECT_ASOFDATE = $AsOfToday
+  Else
+      Let $SELECT_ASOFDATE = $GEX_RC_HR.ASOfDATE
+  End-If
+  
+  if #GEX_RC_BEN_PLAN_ROWS = 0
+  	let $GEXXX912_EXCLUDE_BENEFIT_PLAN_CRITERIA = ''
+  else
+  	let $GEXXX912_EXCLUDE_BENEFIT_PLAN_CRITERIA = 'AND ' || $GEXXX912_EXCLUDE_BENEFIT_PLAN_CRITERIA
+  end-if  
+  
+  show 'Benefits plans excluded : ' $GEXXX912_EXCLUDE_BENEFIT_PLAN_CRITERIA
+  show 'As of Date : ' $SELECT_ASOFDATE
+  
+  move 'BNRPNLOG' to $ReportID
+ ! move 'GEXBNRPN Events Not Updated' to $ReportTitle
+  display $ReportTitle
+
+  do Get-Current-DateTime
+
+  do Report
+  do Commit-Transaction
+  date-time () hh:mi:ss &timeEnded
+  display 'Report Ended: ' noline
+  display &timeEnded
+  do stdapi-term
+
+end-report
+
+!*********************************************************************
+!If this Program is being executed through process scheduler, 
+!the run control parameters and calls the main processing procedure.
+!Otherwise, interrogates the user for the run control parameters and 
+!validates them. If the run control parameters are invalid, stops the
+!execution.
+!*********************************************************************
+begin-procedure Report
+
+date-time () hh:mi:ss &timeBegan
+display 'Report Began: ' noline
+display &timeBegan
+
+ move 'N' to $Errorfound
+
+
+ do process-events
+
+  
+Report-Exit:
+
+
+  print 'Events Processed: ' (+2,1)
+  print #inputtran () edit 999999
+  !print 'Events Finalized: ' (+2,1) ! Changed from:  Events Finalized  to:  Events Reopened on 10/20/2008 for S3 11594382 
+  print 'Events Reopened: ' (+2,1)
+  print #Final_counter () edit 999999
+
+  date-time () hh:mi:ss &timeProcess
+  display #InputTran 99999 noline
+  display ' Events Processed: ' noline
+  display &timeProcess
+  display #Final_counter 99999 noline
+  !display ' Events Finalized: ' noline ! Changed from:  Events Finalized  to:  Events Reopened on 10/20/2008 for S3 11594382 
+  display ' Events Reopened: ' noline 
+  display &timeProcess
+end-procedure
+
+! GEX ISDVNPK 08/12/2008 
+!*********************************************************************
+!Prints the header information in the error report.
+!*********************************************************************
+Begin-Heading 8 
+#Include 'stdhdg01.sqc'
+
+Print 'GEXBNRPN Events Not Updated' (-2,50) 
+Let $Sched_Title = 'Schedule Id : ' || &A.SCHED_ID
+Print $Sched_Title (+1,50) 
+
+
+Print 'EmplID'             (+3,1)
+Print 'Ben Rcd '           (,12) 
+Print 'Ben Pgm'     			 (,20) 
+Print 'Event ID '   			 (,28) 
+Print 'Event Class'        (,37) 
+Print 'Event Date'         (,49) 
+Print 'Status Date'        (,60) 
+Print 'Process Status'     (,72) 
+Print 'Event Status'       (,87) 
+Print 'Process Ind'        (,100)
+
+
+Print '------'             (+1,1)
+Print '------- '           (,12) 
+Print '--------'     			 (,20) 
+Print '-------- '   			 (,28) 
+Print '-----------'        (,37) 
+Print '----------'         (,49) 
+Print '-----------'        (,60) 
+Print '--------------'     (,72) 
+Print '------------'       (,87) 
+Print '-----------'        (,100)
+
+End-Heading
+! GEX ISDVNPK 08/12/2008 
+
+!*********************************************************************
+!Prints the footer in the report
+!*********************************************************************
+
+begin-footing 2 
+page-number (1,160) 'Page '  
+last-page () ' of ' '.'
+
+end-footing
+
+!*********************************************************************
+!This is the logic to process events that are to be finalized. For 
+!every event finds if any plan has multiple options. If it is so, does
+!not update the final enroll flag in ps_bas_partic table. Otherwise, 
+!updates the flag to 'Y'. 
+!*********************************************************************
+
+begin-procedure process-events
+
+date-time () MM/DD/YYYY &curr_date
+
+move &curr_date to $curr_date
+
+do format-datetime($curr_date,$curr_Date_dbf_1,{DEFMDY},'','native')
+
+move 'N' to $event_found
+
+let #inputtran = 0
+let #final_count = 0
+
+let $SELECT_ASOFDATE1  = DATEADD($SELECT_ASOFDATE,'DAY',-1)
+
+begin-select ON-ERROR=SQL-Error-Found('Process-events')
+A.SCHED_ID
+A.EMPLID
+A.BENEFIT_RCD_NBR
+A.EVENT_ID
+A.EMPL_RCD
+A.BENEFIT_PROGRAM
+A.EVENT_DT
+A.BAS_PROCESS_STATUS
+A.GEX_PROCESS_IND
+A.FINALIZE_ENROLL
+A.EVENT_CLASS
+A.STATUS_DT
+A.PROCESS_IND
+A.EVENT_STATUS
+
+  move 'Y' to $Event_Found
+  display &A.emplid
+  add 1 to #inputtran
+  
+    
+  Let $EMPLID             = &A.EMPLID
+  Let #BENEFIT_RCD_NBR    = &A.BENEFIT_RCD_NBR
+  Let $BENEFIT_PROGRAM    = &A.BENEFIT_PROGRAM
+  Let #EVENT_ID           = &A.EVENT_ID
+  Let $EVENT_CLASS        = &A.EVENT_CLASS
+  Let $EVENT_DT           = &A.EVENT_DT
+  Let $STATUS_DT          = &A.STATUS_DT
+  Let $BAS_PROCESS_STATUS = &A.BAS_PROCESS_STATUS
+  Let $EVENT_STATUS       = &A.EVENT_STATUS
+  Let $PROCESS_IND        = &A.PROCESS_IND
+  
+
+  do process-plans
+   If $multiple_options = 'Y' and $plan_found = 'Y'
+   ! GEX ISDVNPK 08/12/2008 
+    do Check-if-already-open
+    If $already_open   = 'N' 
+       If $old_emplid <> &A.EMPLID 
+         do Reopen-enroll
+        else
+         do Print-Detail-Report
+       end-if
+     else
+      do Print-Detail-Report
+    end-if
+  end-if
+ ! GEX ISDVNPK 08/12/2008 
+ 
+FROM PS_BAS_PARTIC A
+WHERE A.BAS_PROCESS_STATUS = 'FE'
+  AND A.EVENT_STATUS = 'C'            
+  !GEX-AXG Modified for upgrade 9.0 - Begin
+  !as the GEX_EBEN_IND field is Blank not 'N' 
+  !AND A.GEX_EBEN_IND = 'N'
+  AND (A.GEX_EBEN_IND is null or A.GEX_EBEN_IND <> 'Y')	    
+  !GEX-AXG Modified for upgrade 9.0 - End
+  AND A.PROCESS_IND = 'N'             !Normal         
+  !GEX-AXG Modified for upgrade 9.0 - Begin !As after second run of cobol for Finalize the flag is getting set to N
+  !AND A.FINALIZE_ENROLL = 'Y'         !Finalized 
+!  AND A.FINALIZE_ENROLL = 'N'         !Finalized ISDVASS 06/30/08
+   !GEX-AXG Modified for upgrade 9.0 - End
+  AND A.SCHED_ID ='EM'                !Only want to process events that have a sched_id = 'EM'.  
+  AND A.ELECT_SOURCE <> 'W'       ! ISDVNPK             07/28/2008  
+  AND ((A.STATUS_DT = $SELECT_ASOFDATE) or (A.STATUS_DT = $SELECT_ASOFDATE1)) 
+  AND [$GEXXX928_EXCLUDE_BENEFIT_PROGRAM_CRITERIA]  !VENDKXY for ITG 59919
+ORDER BY A.SCHED_ID,A.EMPLID,A.BENEFIT_RCD_NBR,A.EVENT_ID
+end-select
+
+if $Event_found = 'N'
+   do error-found
+   print 'No Events found to finalize '(,34)
+end-if
+
+end-procedure
+
+!*********************************************************************
+!This is the logic to find any plans with elect_allowed. If any rows 
+!found, tries to see if any one of the plans for the event that is 
+!currently in process has multiple options. If there are multiple options
+!exist for any plan in this event, does not update the final_enroll flag
+!otherwise, updates the flag.  If there are no plans with elect_allowed
+!to true for this event, updates the flag in ps_bas_partic table
+!*********************************************************************
+
+begin-procedure process-Plans
+
+move 'N' to $Plan_found
+let #option_max_counter = 0
+
+begin-select ON-ERROR=SQL-Error-Found('Process-Plans')
+B.PLAN_TYPE
+
+  move 'Y' to $Plan_Found
+  display 'elections for plan'
+  do process-options
+
+!  if $multiple_options = 'Y'				! ISDVASS 06/30/2008 ! ISDVNPK             07/28/2008  
+!  if $multiple_options = 'N'				! ISDVASS 06/30/2008 ! ISDVNPK             07/28/2008  
+!     exit-select                    ! ISDVNPK             07/28/2008  
+!  end-if                            ! ISDVNPK             07/28/2008  
+ 
+FROM PS_BAS_PARTIC_PLAN B
+WHERE B.SCHED_ID = &A.SCHED_ID
+  AND B.EMPLID = &A.EMPLID
+  AND B.BENEFIT_RCD_NBR = &A.BENEFIT_RCD_NBR
+  AND B.EVENT_ID = &A.EVENT_ID
+  AND B.BENEFIT_PROGRAM = &A.BENEFIT_PROGRAM
+  AND B.EVENT_DT = &A.EVENT_DT
+  AND B.ELECT_ALLOWED = 'Y'
+  [$GEXXX912_EXCLUDE_BENEFIT_PLAN_CRITERIA]
+ORDER BY B.SCHED_ID,B.EMPLID,B.BENEFIT_RCD_NBR,B.EVENT_ID,B.PLAN_TYPE
+end-select
+
+!if $plan_found = 'N'			! ISDVASS 06/30/2008 if plan_found is 'N' then #option_max_counter = 0
+!   do Reopen-enroll      ! ISDVASS 06/30/2008 
+!end-if
+
+end-procedure
+
+!*********************************************************************
+!This paragrph finds out if there are any plan types that have multiple
+!options and sets the multiple_options flag appropriately
+!*********************************************************************
+
+begin-procedure process-Options
+
+move 'N' to $multiple_options
+
+
+begin-select ON-ERROR=SQL-Error-Found('Process-Options')
+count(D.PLAN_TYPE) &option_counter
+
+  move &option_counter to  #Option_max_counter
+  if #option_max_counter > 1
+     display 'multiple options for plan'
+     move 'Y' to $multiple_options
+  end-if
+
+FROM PS_BAS_PARTIC_OPTN D
+WHERE D.SCHED_ID = &A.SCHED_ID
+  AND D.EMPLID = &A.EMPLID
+  AND D.BENEFIT_RCD_NBR = &A.BENEFIT_RCD_NBR
+  AND D.EVENT_ID = &A.EVENT_ID
+  AND D.PLAN_TYPE = &B.PLAN_TYPE
+  AND D.BENEFIT_PROGRAM = &A.BENEFIT_PROGRAM
+  AND D.EVENT_DT = &A.EVENT_DT
+end-select
+
+end-procedure
+
+! GEX ISDVNPK 08/12/2008 
+!*********************************************************************
+!This paragrph finds out if the EE already has an existing open event
+!*********************************************************************
+begin-procedure Check-if-already-open
+
+move 'N' to $already_open
+
+begin-select 
+'X'
+
+     move 'Y' to $already_open
+     
+FROM PS_BAS_PARTIC BMULT
+WHERE ! BMULT.SCHED_ID = &A.SCHED_ID AND  GEX ISDVNPK 09/02/2008
+   BMULT.EMPLID = &A.EMPLID
+  AND BMULT.BENEFIT_RCD_NBR = &A.BENEFIT_RCD_NBR
+  AND BMULT.EVENT_STATUS = 'O'
+  ! AND BMULT.BAS_PROCESS_STATUS <> 'PE'  GEX ISDVNPK 09/02/2008
+  ! AND BMULT.PROCESS_IND = 'N'  GEX ISDVNPK 09/02/2008
+    
+end-select
+
+end-procedure
+! GEX ISDVNPK 08/12/2008 
+
+!*********************************************************************
+!Updates the ps_bas_partic by setting final_enroll flag to 'Y'
+!*********************************************************************
+
+begin-procedure Reopen-enroll
+
+move 'N' to $found
+move 'N' to $errorfound
+
+  let $old_emplid = &A.EMPLID ! GEX ISDVNPK 08/12/2008 Added so that if there are 2 closed events then reopen the minumun event ID & print other one
+
+begin-sql on-error=sql-error-found('Reopen-Enroll')
+UPDATE PS_BAS_PARTIC K 
+SET K.GEX_EBEN_IND = 'Y',
+    K.EVENT_STATUS = 'O',
+    K.PROCESS_IND = 'R'
+WHERE K.SCHED_ID = &A.SCHED_ID
+  AND K.EMPLID = &A.EMPLID
+  AND K.BENEFIT_RCD_NBR = &A.BENEFIT_RCD_NBR
+  AND K.EVENT_ID = &A.EVENT_ID
+end-sql
+
+add 1 to #final_counter
+
+end-procedure
+
+
+!***************************************************************************
+Begin-Procedure Print-Detail-Report
+
+Print $EMPLID               (+1,1)
+Print #BENEFIT_RCD_NBR      (,12)
+Print $BENEFIT_PROGRAM   	  (,20)
+Print #EVENT_ID          	  (,28)
+Print $EVENT_CLASS          (,37)
+Print $EVENT_DT             (,49) 	edit 'MM/DD/YY'
+Print $STATUS_DT            (,60) 	edit 'MM/DD/YY'
+Print $BAS_PROCESS_STATUS   (,72)
+Print $EVENT_STATUS         (,87)
+Print $PROCESS_IND          (,100)
+
+End-Procedure Print-Detail-Report
+
+!*********************************************************************
+!Displays the error messages and stops execution
+!*********************************************************************
+ 
+begin-procedure SQL-Error-Found($Proc_Name) 
+  do error-found
+  display 'SQL Error in ' 
+  display $Proc_Name 
+  display $_sql-error
+  display 'sql-status:' 
+  display #_sql-status 
+
+  STOP
+
+end-procedure
+
+!*********************************************************************
+!Displays the employee id that failed 
+!*********************************************************************
+
+begin-procedure Error-Found
+  move 'Y' to $ErrorFound
+  do Format-Number(#InputTran, $out, '99999')
+  Show  'Error' $out
+ !GEX_SEC_REENG 2015-04-29 Vahini Katta Begins
+  !let $EmplId_1st3 = substr($EmplId,1,3)
+  !let $EmplId_mid2 = substr($EmplId,4,2)
+  !let $EmplId_last4 = substr($EmplId,6,4)
+ 
+  !String $EmplId_1st3 $EmplID_mid2 $EmplId_last4 by '-' into $EmplId11
+
+  !show 'EMPLID'  $EmplID11
+  show 'EMPLID'  $EmplId
+ !GEX_SEC_REENG 2015-04-29 Vahini Katta Ends
+  Show '*********************************************************'
+end-procedure
+
+#include 'gexxx912.sqc'  !Get benefit_plan multiple row run control
+#include 'gexxx921.sqc'  !get gex_rc_hr.asofdate 
+#Include 'tranctrl.sqc'  !Common Transaction Control Procedures
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'stdapi.sqc'    !Get_Run_Control Procedure
+#Include 'datemath.sqc'  !Does the date-math functions
+#Include 'getdatcd.sqc'  !Get-Date-Codes procedure
+#Include 'getbalid.sqc'  !Get-Calendar-Year-Id
+#Include 'gexxx928.sqc'	 !Get Benefit Program from run control

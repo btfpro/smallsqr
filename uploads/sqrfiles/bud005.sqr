@@ -1,0 +1,2313 @@
+!***********************************************************************
+!  BUD005.SQR:  Budget Load - Build Current FY                         *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+!                                                                      *
+! This module contains confidential and proprietary information        *
+! of Oracle; it is not to be copied, reproduced, or transmitted        *
+! in any form, by any means, in whole or in part, nor is it to         *
+! be used for any purpose other than that for which it is              *
+! expressly provided under the applicable license agreement.           *
+!                                                                      *
+! Copyright (C) 2007 Oracle. All Rights Reserved.                      *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+!          $Date:  2007/04/24:19:01:49                                 !
+!       $Release:  HR9                                                 !
+!    $Resolution:  689716                                              !
+!    HP999 Retro Distribution assign new fields                        *
+!                                                                      *
+!***********************************************************************
+! This program is specific to HRMS for Public Sector.                  *
+!***********************************************************************
+
+#include 'setenv.sqc'
+#include 'setup07.sqc'
+#define  daysinyear 365
+#define  colr 5
+
+!***********************************************************************
+Begin-REPORT
+
+  do Housekeeping
+  do Mainline
+  do Wrapup
+
+End-REPORT
+
+Begin-heading 6
+       #include 'stdhdg08.sqc'  ! for standard heading and from/thru dates
+       print '' (+1,,)
+End-heading
+
+
+!***********************************************************************
+! HOUSEKEEPING                                                         *
+! This procedure performs the application initializations.  Formats    *
+! variables for use.  Calls the procedures to get input parameters.    *
+!***********************************************************************
+Begin-Procedure Housekeeping
+
+        do INIT-DATETIME
+        do INIT-NUMBER
+        do GET-CURRENT-DATETIME
+        do DEFINE-PRCS-VARS
+        do GET-RUN-CONTROL-PARMS
+        do SELECT-PARAMETERS
+        do CREATE-ARRAYS
+        move 'BUD005.SQR' to $ReportID
+        move 'Build Current FY Budget' to $ReportTitle
+        show $ReportTitle ' ' $FromDate ' ' $ThruDate
+
+End-Procedure
+
+
+!***********************************************************************
+! GET-VALUES                                                           *
+! This procedure gets the necessary calls in the procedure             *
+! Get-FiscalYear that will be used throughout the report.              *
+!***********************************************************************
+Begin-Procedure Get-Values
+
+        do Get-From-Thru-Date
+        do Get-FiscalYear
+
+! Convert dates to dtu format for date calculation as well as
+! cmp format for comparison
+
+        do Convert-To-DTU-Date($FromDate, $FromDate_Dtu)
+        do Convert-To-DTU-Date($ThruDate, $ThruDate_Dtu)
+        do Format-DateTime ($FromDate, $FromDate_Cmp, {DEFCMP},'','')
+        do Format-DateTime ($ThruDate, $ThruDate_Cmp, {DEFCMP},'','')
+
+! Calculate an adjusted 'ThruDate' which is one day later than user
+! specified ThruDate.  This ensures that $ThruDate-Adj minus $FromDate
+! = 365 (or 366)        [i.e. {daysinyear}  ]
+
+        do dtu-add-days($ThruDate_Dtu, 1, $ThruDate_Adj_Dtu)
+        do Convert-From-DTU-Date($ThruDate_Adj_Dtu, $ThruDate_Adj)
+
+End-Procedure
+
+
+!******************************************************************************
+! CREATE-ARRAYS                                                               *
+! Sets up the storage arrays used during processing                           *
+!******************************************************************************
+begin-procedure CREATE-ARRAYS
+
+   Create-array name=Store_by_AcctCd  Size = 5000
+        field=Store_Acct_Cd:Char
+        field=Store_Earn_Amt:Number
+
+   Create-array name=Filled_Posns  Size = 2500
+        field=Store_Filled_Posn:Char
+
+   let #Entries = 0
+   let #PosnEntries = 0
+
+end-procedure
+
+
+!***********************************************************************
+! MAINLINE                                                             *
+! This procedure is the main processing paragraph.  For each department*
+! in the run control table, it will process all EE job records         *
+! associated with that department.  Following this, it will process all*
+! vacant positions.                                                    *
+!***********************************************************************
+Begin-Procedure Mainline
+
+Begin-SELECT
+I.COUNTRY
+I.EXCHNG_TO_CURRENCY
+FROM PS_INSTALLATION I,
+     PS_COUNTRY_CUR_TBL CC
+WHERE CC.COUNTRY = I.COUNTRY
+  AND CC.EFFDT = (SELECT MAX(CC1.EFFDT)
+                  FROM   PS_COUNTRY_CUR_TBL CC1
+                  WHERE  CC1.COUNTRY = CC.COUNTRY
+                    AND  CC1.EFFDT <= $FromDate)
+End-SELECT
+
+!Process jobs and fully/partially filled positions.
+Begin-SELECT distinct
+
+RC.SETID
+RC.DEPTID
+RC.BUD_LEVELS_OPTION
+RC.ACCT_CD
+RC.ACCT_CD_DED
+RC.ACCT_CD_TAX
+RC.DEPT_OFFSET_GRP
+RC.BUDGET_LEAVE
+RC.POPULATE_BUD_AMT
+RC.PERCENT_INCREASE
+RC.HP_ACCT_CD_SUSPNS
+RC.HP_FRINGE_GROUP
+RC.HP_REDIRECT_ACCT
+RC.HP_ERN_ACCT
+RC.HP_DED_ACCT
+RC.HP_TAX_ACCT
+
+        let $SetID            = rtrim(&RC.SETID,  ' ')
+        let $DeptID           = rtrim(&RC.DEPTID, ' ')
+        let $Budget_Levels    = rtrim(&RC.BUD_LEVELS_OPTION, ' ')
+        let #Percent_Increase = &RC.PERCENT_INCREASE
+        let #Dept_Sal_Total   = 0
+        let #Dept_BudAmt_Total= 0
+        let #ErnCap           = 0
+        let #Dept_FTE_C_Total = 0
+        let #Dept_FTE_T_Total = 0
+        let #Dept_FTE_U_Total = 0
+        let $Store-Info-Only  = 'N'
+
+        move &RC.HP_FRINGE_GROUP  to $Fringe_Group
+        move &RC.HP_REDIRECT_ACCT to $Redirect_Acct
+        move &RC.HP_ERN_ACCT      to $Ern_Acct
+        move &RC.HP_DED_ACCT      to $Ded_Acct
+
+        if &I.COUNTRY = 'CAN'
+           move &RC.HP_TAX_ACCT to $Ctx_Acct
+           move 'N'             to $Tax_Acct
+        else
+           move &RC.HP_TAX_ACCT to $Tax_Acct
+           move 'N'             to $Ctx_Acct
+        end-if
+
+        display 'Processing SetID/DeptID = ' noline
+        display $SetID                       noline
+        display ' / '                        noline
+        display $DeptID                      noline
+        display ' with Option = '            noline
+        display $Budget_Levels               noline
+
+        do Clean-Dept-Budgets
+
+        do Check-Valid-Budgeting-Dept
+
+        if $Valid_Bdgt_Dept = 'N' or $budget_cleaned = 'N'
+
+            if $budget_cleaned = 'N'
+
+                display ' --> budget has been used in Distribution, department ignored'
+
+            else
+
+                display '  --> not defined as Budgeting Department, department ignored'
+
+            end-if
+
+        else
+            display ' '
+
+            do Initialize-Arrays
+
+            evaluate $Budget_Levels
+
+               when = '1'                            !Position & Appointment
+                 do Process-Jobs
+                 do Process-Vacant-Positions
+                 break
+
+               when = '2'                            !Dept, Position & Appointment
+                 do Process-Jobs
+                 do Process-Vacant-Positions
+                 do Process-Dept-Summary
+                 break
+
+               when = '3'                            !Department Only
+                 let $Store-Info-Only = 'Y'
+                 do Process-Jobs
+                 do Process-Vacant-Positions
+                 do Process-Dept-Only
+                 break
+
+               when = '4'                            !Department & Position
+                 do Process-All-Positions
+                 do Process-Dept-Summary
+                 break
+
+               when = '5'                            !Department & Position Pool
+                 do Process-Posn-Pools
+                 do Process-Posns-With-No-Pool
+                 do Process-Dept-Summary
+                 break
+
+            end-evaluate
+
+            do Update-Dept-Budget
+            do Create-Dept-Records
+        end-if
+
+FROM PS_RUN_CNTL_BUDEPT RC
+WHERE RC.OPRID        = $prcs_oprid
+  AND RC.RUN_CNTL_ID  = $prcs_run_cntl_id
+ORDER BY RC.SETID,
+         RC.DEPTID
+
+End-SELECT
+
+End-Procedure
+
+
+!***********************************************************************
+! CHECK-VALID-BUDGETING-DEPT                                           *
+! This procedure validate the specified DEPTID to determine if it is   *
+! defined as a budgeting department. Setup the indicator accordingly.  *
+!                                                                      *
+!                                                                      *
+!***********************************************************************
+Begin-Procedure Check-Valid-Budgeting-Dept
+
+     let $Valid_Bdgt_Dept = 'N'
+
+Begin-SELECT
+DPT.DEPTID
+DPT.BUDGET_DEPTID
+
+     if &DPT.DEPTID = &DPT.BUDGET_DEPTID
+         let $Valid_Bdgt_Dept = 'Y'
+     else
+         let $Valid_Bdgt_Dept = 'N'
+     end-if
+
+FROM PS_DEPT_TBL DPT
+WHERE DPT.SETID = $SetID
+  AND DPT.DEPTID = $DeptID
+  AND DPT.EFFDT = (SELECT MAX(DPT1.EFFDT) FROM PS_DEPT_TBL DPT1
+                    WHERE DPT1.SETID = DPT.SETID
+                      AND DPT1.DEPTID = DPT.DEPTID
+                      AND DPT1.EFFDT <= $FromDate)
+End-Select
+
+End-Procedure
+
+!***********************************************************************
+! PROCESS-JOBS                                                         *
+! This procedure processes each job record and does so by department,  *
+! position and emplid/emplrcd#.  This particular procedure controls    *
+! the position level.  It calls Process-Employee-Jobs which controls   *
+! appointment level processing.                                        *
+!                                                                      *
+!                                                                      *
+!***********************************************************************
+Begin-Procedure Process-Jobs
+
+        let $SavePos  = 'First_Time'
+
+Begin-SELECT
+J1.POSITION_NBR
+J1.EMPLID
+J1.EMPL_RCD
+J1.EFFDT
+J1.EFFSEQ
+J1.EMPL_STATUS
+J1.POSITION_OVERRIDE
+J1.ACCT_CD
+J1.GL_PAY_TYPE
+J1.ANNUAL_RT
+J1.FTE
+J1.CLASS_INDC
+J1.PAYGROUP
+J1.DEPTID
+
+
+        let $Position = rtrim(&J1.POSITION_NBR, ' ')
+
+        if $SavePos = 'First_Time'
+
+                do Init-Position
+                let $SavePos = $Position
+        else
+                if $SavePos <> $Position
+                        let $LowerDate = $ApptDt
+                        let $UpperDate = $ThruDate_Adj
+
+                        do Process-Appointment
+                        do Process-EO-Position
+                        do Init-Position
+                        let $SavePos = $Position
+                end-if
+        end-if
+
+        let $Chk_DeptID = &J1.DEPTID
+        do Process-Employee-Jobs
+
+FROM PS_JOB J1
+WHERE J1.SETID_DEPT = $SetID
+  AND J1.DEPTID IN (SELECT BUDDEP.DEPTID FROM PS_DEPT_TBL BUDDEP
+                     WHERE BUDDEP.SETID = $SetID
+                       AND BUDDEP.BUDGET_DEPTID = $DeptID
+                       AND BUDDEP.EFFDT = (SELECT MAX(BUDDEP1.EFFDT) FROM PS_DEPT_TBL BUDDEP1
+                                           WHERE BUDDEP1.SETID = BUDDEP.SETID
+                                             AND BUDDEP1.DEPTID = BUDDEP.DEPTID
+                                             AND BUDDEP1.EFFDT <= $ThruDate)
+                       AND BUDDEP.EFF_STATUS = 'A')
+  AND ((J1.EFFDT >= $FromDate   AND
+            J1.EFFDT <= $ThruDate)
+   OR
+         (J1.EFFDT =
+        (SELECT MAX(J1S.EFFDT)
+           FROM PS_JOB J1S
+          WHERE J1S.EMPLID    = J1.EMPLID
+                        AND J1S.EMPL_RCD = J1.EMPL_RCD
+                AND J1S.EFFDT <= $FromDate)))
+  AND
+          J1.EFFSEQ =
+        (SELECT MAX(J1S1.EFFSEQ)
+           FROM PS_JOB J1S1
+          WHERE J1S1.EMPLID     = J1.EMPLID
+                AND J1S1.EMPL_RCD      = J1.EMPL_RCD
+                AND J1S1.EFFDT          = J1.EFFDT)
+ORDER BY        J1.POSITION_NBR,
+                J1.EMPLID,
+                J1.EMPL_RCD,
+                J1.EFFDT,
+                J1.EFFSEQ
+
+End-SELECT
+
+    if $SavePos <> 'First_Time'
+        let $LowerDate = $ApptDt
+        let $UpperDate = $ThruDate_Adj
+        do Check-Transfer-Out
+        do Process-Appointment
+        do Process-EO-Position
+    end-if
+
+End-Procedure
+
+
+!***********************************************************************
+! INIT-POSITION                                                        *
+! This procedure initalizes a new position by                          *
+! fetching the FTE maximum for the position and reseting the salary    *
+! and FTE accumulators for the position.  It also determines if this   *
+! is a budgeted position and sets the current budget level indicator   *
+! appropriately                                                        *
+!                                                                      *
+!***********************************************************************
+Begin-Procedure Init-Position
+
+        let $CurBudgetLev = 'A'         !Assume Appointment Level Budget Initially
+        let $PosnFound    = 'N'
+
+Begin-SELECT
+P1.FTE
+P1.BUDGETED_POSN
+P1.STATUS_DT
+P1.CLASS_INDC
+SG1.MID_RT_ANNUAL
+
+        if &P1.BUDGETED_POSN = 'Y'
+                let $CurBudgetLev = 'P' !Indicate Position Level Budgeting
+                let $PosnFound    = 'Y'
+        end-if
+
+FROM PS_POSITION_DATA P1,
+         PS_JOBCODE_TBL JC1,
+         PS_SAL_GRADE_TBL SG1
+WHERE P1.POSITION_NBR = $Position
+  AND P1.EFF_STATUS   = 'A'
+  AND P1.POSN_STATUS  = 'A'
+  AND P1.EFFDT =
+        (SELECT MAX(P1S.EFFDT)
+           FROM PS_POSITION_DATA P1S
+           WHERE P1S.POSITION_NBR = P1.POSITION_NBR
+                 AND P1S.EFFDT <= $ThruDate)
+  AND JC1.SETID =
+        (SELECT SCTL.SETID
+           FROM PS_SET_CNTRL_REC SCTL
+          WHERE SCTL.SETCNTRLVALUE = P1.BUSINESS_UNIT
+            AND SCTL.REC_GROUP_ID = 'HR_02'
+            AND SCTL.RECNAME = 'JOBCODE_TBL')
+  AND JC1.JOBCODE = P1.JOBCODE
+  AND JC1.EFFDT =
+        (SELECT MAX(JC1S.EFFDT)
+           FROM PS_JOBCODE_TBL JC1S
+           WHERE     JC1S.SETID      = JC1.SETID
+                 AND JC1S.JOBCODE    = JC1.JOBCODE
+                 AND JC1S.EFFDT         <= $ThruDate)
+  AND JC1.EFF_STATUS     = 'A'
+  AND SG1.SETID          = JC1.SETID_SALARY
+  AND SG1.SAL_ADMIN_PLAN = JC1.SAL_ADMIN_PLAN
+  AND SG1.GRADE          = JC1.GRADE
+  AND SG1.EFFDT =
+        (SELECT MAX(SG1S.EFFDT)
+           FROM PS_SAL_GRADE_TBL SG1S
+           WHERE     SG1S.SETID             = SG1.SETID
+                 AND SG1S.SAL_ADMIN_PLAN    = SG1.SAL_ADMIN_PLAN
+                 AND SG1S.GRADE             = SG1.GRADE
+                 AND SG1S.EFFDT            <= $FromDate)
+  AND SG1.EFF_STATUS = 'A'
+
+End-SELECT
+
+        let $SaveEmplID         = 'First_Time'
+        let #SaveEmplRCD        = 0
+        let #Max_FTE            = 0
+        let #Posn_FTE           = 0
+        let #Adj_FTE            = 0
+
+! Calculate an adjusted FTE based on a position becoming approved during
+! the from/thru period
+
+        if $CurBudgetLev = 'P'                                          !Position Level
+                let #Max_FTE            = &P1.FTE
+                let $StatusDt = &P1.STATUS_DT
+                do Format-DateTime ($StatusDt, $StatusDt_Cmp, {DEFCMP},'','')
+                if $StatusDt_Cmp > $FromDate_Cmp
+                        do Convert-To-DTU-Date($StatusDt, $StatusDt_Dtu)
+                        do dtu-diff-days($StatusDt_Dtu, $ThruDate_Dtu, #NumDays)
+                        let #Adj_FTE = round((#NumDays / {daysinyear} * #Max_FTE), 6)
+                      else
+                        let #Adj_FTE = #Max_FTE
+                end-if
+        end-if
+
+        let #PosnSeq    = 1     !Start sequence numbers at 1
+
+End-Procedure
+
+!***********************************************************************
+! PROCESS-EMPLOYEE-JOBS                                                *
+!                                                                      *
+!***********************************************************************
+Begin-Procedure Process-Employee-Jobs
+
+        if $SaveEmplID = 'First_Time'
+                do Init-Appointment
+                let $SaveEmplID = rtrim(&J1.EMPLID, ' ')
+                let #SaveEmplRCD = &J1.EMPL_RCD
+                if $ReProcess = 'Y'
+                        let $LowerDate = $ApptDt
+                        let $UpperDate = &J1.EFFDT
+                        do Process-Appointment
+                end-if
+        else
+                if $SaveEmplID <> rtrim(&J1.EMPLID, ' ') or
+                        #SaveEmplRCD <> &J1.EMPL_RCD
+                        let $LowerDate = $ApptDt
+                        let $UpperDate = $ThruDate_Adj
+                        do Check-Transfer-Out
+                        do Process-Appointment
+                        do Init-Appointment
+                        if $ReProcess = 'Y'
+                                let $LowerDate = $ApptDt
+                                let $UpperDate = &J1.EFFDT
+                                do Process-Appointment
+                        end-if
+                        let $SaveEmplID = rtrim(&J1.EMPLID, ' ')
+                        let #SaveEmplRCD = &J1.EMPL_RCD
+                else
+                        let $LowerDate = $ApptDt
+                        let $UpperDate = &J1.EFFDT
+                        do Process-Appointment
+                end-if
+        end-if
+
+End-Procedure
+
+
+!***********************************************************************
+! INIT-APPOINMENT                                                      *
+! This procedure initalizes a new appoinment                           *
+!                                                                      *
+!***********************************************************************
+Begin-Procedure Init-Appointment
+
+! Check for position override and set budget level to appointment if true
+
+        if rtrim(&J1.POSITION_OVERRIDE, ' ') = 'Y'
+                let $CurBudgetLev = 'A'
+        else
+            if $PosnFound = 'Y'
+                and rtrim(&J1.POSITION_OVERRIDE, ' ') = 'N'
+                   let $CurBudgetLev = 'P'
+            end-if
+        end-if
+        let $SaveOverride = rtrim(&J1.POSITION_OVERRIDE, ' ')
+
+! Set the inital Action Date for appointment and EE status of that date
+
+
+        let $ApptDt             = $FromDate
+        let $ApptDt_Cmp = $FromDate_Cmp
+        do Format-DateTime (&J1.EFFDT, $Date_Cmp, {DEFCMP},'','')
+        if $Date_Cmp > $FromDate_Cmp
+                let $ReProcess  = 'Y'
+                let $ApptStatus = 'N'
+                let #ApptFTE    = 0
+                let #ApptSal    = 0
+        else
+                let $ReProcess = 'N'
+                if &J1.EMPL_STATUS = 'A' or
+                        &J1.EMPL_STATUS = 'P' or
+                        &J1.EMPL_STATUS = 'Q' or
+                        &J1.EMPL_STATUS = 'U' or
+                        (&J1.EMPL_STATUS = 'L' and
+                         &RC.BUDGET_LEAVE = 'Y')
+                        let $ApptStatus = 'Y'
+                        let #ApptFTE    = &J1.FTE
+                        let #ApptSal    = &J1.ANNUAL_RT
+                else
+                        let $ApptStatus = 'N'
+                        let #ApptFTE    = 0
+                        let #ApptSal    = 0
+                end-if
+        end-if
+
+! Store important key information to retain on appointment control break
+
+        do Fetch-Acct-Cd
+        let $H_GLPayType                = rtrim(&J1.GL_PAY_TYPE, ' ')
+        let $H_ClassIndc                = rtrim(&J1.CLASS_INDC, ' ')
+        let $H_EmplStatus               = rtrim(&J1.EMPL_STATUS, ' ')
+        if $H_AcctCd = ''
+                let $H_AcctCd = ' '
+        end-if
+        if $H_GLPayType = ''
+                let $H_GLPayType = ' '
+        end-if
+
+        let #ApptSeq    = 1     !Start sequence numbers at 1
+
+End-Procedure
+
+!***********************************************************************
+! PROCESS-APPOINTMENT                                                  *
+! This procedure initalizes a new appointment                          *
+!                                                                      *
+!***********************************************************************
+Begin-Procedure Process-Appointment
+
+
+! Convert
+        do Convert-To-DTU-Date($UpperDate, $UpperDate_Dtu)
+        do Convert-To-DTU-Date($LowerDate, $LowerDate_Dtu)
+        do dtu-diff-days($LowerDate_Dtu, $UpperDate_Dtu, #NumDays)
+
+        let #Annual_Factor      = #NumDays/{daysinyear}
+        let #CurSal             = round((#ApptSal * #Annual_Factor),2)
+        let #Adjustment         = round((#CurSal  * #Percent_Increase / 100),2)
+        let #CurSal             = #CurSal + #Adjustment
+        let #CurFTE             = round((#ApptFTE * #Annual_Factor),6)
+        let $H_ErnCd            = ' '
+
+        do Post-Budgets
+
+        let $ApptDt     = &J1.EFFDT
+        let $ReProcess = 'N'
+
+! Store important key information to retain on appointment control break
+!
+        do Fetch-Acct-Cd
+        let $H_GLPayType                = rtrim(&J1.GL_PAY_TYPE, ' ')
+        let $H_ClassIndc                = rtrim(&J1.CLASS_INDC, ' ')
+        let $H_EmplStatus               = rtrim(&J1.EMPL_STATUS, ' ')
+        if $H_AcctCd = ''
+                let $H_AcctCd = ' '
+        end-if
+        if $H_GLPayType = ''
+                let $H_GLPayType = ' '
+        end-if
+        if $H_EmplStatus = 'A' or
+                $H_EmplStatus = 'P' or
+                $H_EmplStatus = 'Q' or
+                $H_EmplStatus = 'U' or
+                ($H_EmplStatus = 'L' and
+                 &RC.BUDGET_LEAVE = 'Y')
+                let $ApptStatus   = 'Y'
+                let #ApptFTE      = &J1.FTE
+                let #ApptSal      = &J1.ANNUAL_RT
+        else
+                let $ApptStatus = 'N'
+                let #ApptFTE    = 0
+                let #ApptSal    = 0
+        end-if
+
+End-Procedure
+
+
+!***********************************************************************
+! PROCESS-EO-POSITION                                                  *
+! This procedure performs the end of (EO) position processing.  It     *
+! determines if there is any vacant portion of the position by compar'g*
+! #Posn_FTE with #Adj_FTE.  If the sum is less than the adjusted,      *
+! the remaining portion is posted to the position budget.              *
+!***********************************************************************
+Begin-Procedure Process-EO-Position
+
+        if #Adj_FTE > #Posn_FTE         ! Vacant portions of position ?
+                let #CurFTE = #Adj_FTE - #Posn_FTE
+                let #CurSal = round((&SG1.MID_RT_ANNUAL * #CurFTE),6)
+                let #Adjustment   = round((#CurSal  * #Percent_Increase / 100),2)
+                let #CurSal       = #CurSal + #Adjustment
+                let $CurBudgetLev = 'P'
+                let $H_ClassIndc  = rtrim(&P1.CLASS_INDC, ' ')
+                let $H_ErnCd      = ' '
+                let $H_AcctCd     = rtrim(&RC.ACCT_CD, ' ')
+                let $H_GLPayType  = ' '
+
+                do Post-Budgets
+
+        end-if
+
+End-Procedure
+
+!***********************************************************************
+! CHECK-TRANSFER-OUT                                                   *
+! Checks to determine if an EE/RCD combination (appointment)           *
+! has transfered to a new department during the fiscal year.  Look     *
+! for a job record in another department past the last known effdt     *
+! in the J1 JOB query.                                                 *
+!***********************************************************************
+Begin-Procedure Check-Transfer-Out
+
+        let $NewDate = ''
+
+Begin-SELECT
+
+J2.EFFDT
+
+        let $NewDate = &J2.EFFDT
+
+FROM PS_JOB J2
+WHERE (J2.SETID_DEPT <> $SetID  or  J2.DEPTID   <> $Chk_DeptID)
+  AND J2.EMPLID    = $SaveEmplID
+  AND J2.EMPL_RCD = #SaveEmplRCD
+  AND J2.EFFDT =
+        (SELECT MIN(J2S.EFFDT)
+         FROM PS_JOB J2S
+         WHERE J2S.EMPLID    = J2.EMPLID
+           AND J2S.EMPL_RCD = J2.EMPL_RCD
+           AND J2S.EFFDT >  $LowerDate
+           AND J2S.EFFDT <= $UpperDate)
+End-SELECT
+
+        if $NewDate <> ''
+                let $UpperDate = $NewDate
+        end-if
+
+End-Procedure
+
+!***********************************************************************
+! FETCH-ACCT-CD                                                        *
+! Determine the acct cd to assign to the earnings record.  Look 1st    *
+! on the J1. JOB record, then use the default earnings acct cd from    *
+! the run control record.                                              *
+!                                                                      *
+!***********************************************************************
+
+Begin-Procedure Fetch-Acct-Cd
+
+   let $H_AcctCd   = rtrim(&J1.ACCT_CD, ' ')
+   if $H_AcctCd = ''
+     let $H_AcctCd = rtrim(&RC.ACCT_CD, ' ')
+   end-if
+
+End-Procedure
+
+!***********************************************************************
+! POST-BUDGETS                                                         *
+! This procedure posts the position, appt, or pool level salary to     *
+! the earnings budget.  It also accumulates FTE amounts for roll up to *
+! to the department level.                                              *
+!                                                                      *
+!***********************************************************************
+Begin-Procedure Post-Budgets
+
+! Construct the variable parts of the table keys/indicators depending on the
+! applicable budget level
+
+        if $CurBudgetLev = 'A'                                  !Appoinment Level
+             let $H_Posn_Pool   =  ' '
+             let $H_Posn        =  ' '
+             let $H_EmplID      =  $SaveEmplID
+             let #H_EmplRCD     =  #SaveEmplRCD
+             let #CurSeq        =  #ApptSeq
+             if &RC.POPULATE_BUD_AMT = 'Y'
+               let #BudAmt      =  #CurSal
+               let #BudPercent  =  0
+             else
+               let #BudAmt      =  0
+               let #BudPercent  =  100
+             end-if
+        else
+          if $CurBudgetLev = 'P'                                !Position Level
+             let $H_Posn_Pool   =  ' '
+             let $H_Posn        =  $SavePos
+             let $H_EmplID      =  ' '
+             let #H_EmplRCD     =  0
+             let #CurSeq        =  #PosnSeq
+             if &RC.POPULATE_BUD_AMT = 'Y'
+               let #BudAmt      =  #CurSal
+               let #BudPercent  =  0
+             else
+               let #BudAmt      =  0
+               let #BudPercent  =  100
+             end-if
+          else
+             if $CurBudgetLev = 'O'                             !Posn Pool Level
+                let $H_Posn_Pool   =  $SavePool
+                let $H_Posn        =  ' '
+                let $H_EmplID      =  ' '
+                let #H_EmplRCD     =  0
+                let #CurSeq        =  #PoolSeq
+                if &RC.POPULATE_BUD_AMT = 'Y'
+                  let #BudAmt      =  #CurSal
+                  let #BudPercent  =  0
+                else
+                  let #BudAmt      =  0
+                  let #BudPercent  =  100
+                end-if
+             end-if
+          end-if
+        end-if
+! Update the budget tables with the salary amount.
+! First of all, update the DEPT_BUDGET table.  IF #CurSeq is 1,
+! then we will do an insert, otherwise we will do an upate.
+
+! If processing Department Only option store info in array instead of
+! inserting the DEPT_BUDGET and DEPT_BUDGET_ERN tables with detail info.
+
+        if $Store-Info-Only = 'Y'
+            do Store-Info-In-Arrays
+        else
+            if #CurFTE > 0 or #BudAmt > 0 or #BudPercent > 0
+                if #CurSeq = 1
+                  if &RC.POPULATE_BUD_AMT = 'Y'
+                    let #ErnCap = #BudAmt
+                  else
+                    let #ErnCap = 0
+                  end-if
+                  do Ins-Dept-Lev
+                else
+                  if &RC.POPULATE_BUD_AMT = 'Y'
+                    do Upd-Dept-Lev
+                  end-if
+                end-if
+                do Ins-Earn-Lev
+            end-if
+        end-if
+
+! Accumulate Salary and FTE into department level totals
+!
+        add #CurSal to #Dept_Sal_Total
+        add #BudAmt to #Dept_BudAmt_Total
+        evaluate $H_ClassIndc
+                when = 'C'              !Classified
+                        add #CurFTE to #Dept_FTE_C_Total
+                        break
+                when = 'T'              !Temporary
+                        add #CurFTE to #Dept_FTE_T_Total
+                        break
+                when-other              !Unclassified
+                        add #CurFTE to #Dept_FTE_U_Total
+                        break
+        end-evaluate
+
+! Put the sequence number back in appropriate variable
+        if $CurBudgetLev = 'A'                             !Appointment Level
+                let #ApptSeq    =       #CurSeq
+                if $SavePos <> '' and $SaveOverride = 'Y'  !Consume position FTE
+                  add #CurFTE to #Posn_FTE                 !even if funding specified
+                end-if                                     !at appt level (override=Y)
+
+        else                                               !Position Level
+                add #CurFTE to #Posn_FTE
+                let #PosnSeq    =       #CurSeq
+        end-if
+
+End-Procedure
+
+
+!***********************************************************************
+! INS-DEPT-LEV                                                         *
+! This procedure will insert a new department level appointment,       *
+! position, or position pool budget record.                            *
+!                                                                      *
+!***********************************************************************
+Begin-Procedure Ins-Dept-Lev
+
+begin-sql on-error=Upd-Dept-Lev
+INSERT INTO PS_DEPT_BUDGET (
+  SETID,
+  DEPTID,
+  FISCAL_YEAR,
+  EFFDT,
+  EFFSEQ,                                                   !hP999 retro
+  EFF_STATUS,
+  POSITION_POOL_ID,
+  SETID_JOBCODE,
+  JOBCODE,
+  POSITION_NBR,
+  EMPLID,
+  EMPL_RCD,
+  BUDGET_LEVEL_INDC,
+  CURRENCY_CD,
+  OVERALL_BDGT_CAP,
+  ERN_BDGT_CAP,
+  DED_BDGT_CAP,
+  TAX_BDGT_CAP,
+  ACTION_DT)                                                !hp999 retro
+VALUES (
+  $SetID,
+  $DeptID,
+  #FiscalYear,
+  $FromDate,
+  0,                                                        !HP999 retro
+  'A',
+  $H_Posn_Pool,
+  ' ',
+  ' ',
+  $H_Posn,
+  $H_EmplID,
+  #H_EmplRCD,
+  $CurBudgetLev,
+  &I.EXCHNG_TO_CURRENCY,
+  #ErnCap,
+  0,
+  0,
+  0,
+  {DateIn-Prefix}$asoftoday{DateIn-Suffix})                 !hp999 retro
+
+
+end-sql
+
+
+End-Procedure
+
+!***********************************************************************
+! UPD-DEPT-LEV                                                         *
+! This procedure will update a department level appointment, position  *
+! or position pool budget with the current applicable salary amount.   *
+!                                                                      *
+!***********************************************************************
+Begin-Procedure Upd-Dept-Lev
+
+let $SQL-STATEMENT = 'BUD005.SQR, UPDATE, PS_DEPT_BUDGET'
+begin-sql on-error=SQL-Error
+UPDATE PS_DEPT_BUDGET
+  SET OVERALL_BDGT_CAP = OVERALL_BDGT_CAP + #BudAmt
+WHERE SETID                     = $SetID
+  AND DEPTID                    = $DeptID
+  AND FISCAL_YEAR               = #FiscalYear
+  AND EFFDT                     = $FromDate
+  AND EFFSEQ                    = 0                          !HP999 RETRO
+  AND POSITION_POOL_ID          = $H_Posn_Pool
+  AND SETID_JOBCODE             = ' '
+  AND JOBCODE                   = ' '
+  AND POSITION_NBR              = $H_Posn
+  AND EMPLID                    = $H_EmplID
+  AND EMPL_RCD                 = #H_EmplRCD
+
+end-sql
+End-Procedure
+
+
+!***********************************************************************
+! INS-EARN-LEV                                                         *
+! This procedure will insert a new earnings level appointment, position*
+! or position pool budget record.                                      *
+!                                                                      *
+!***********************************************************************
+Begin-Procedure Ins-Earn-Lev
+
+begin-sql on-error=Upd-Earn-Lev
+INSERT INTO PS_DEPT_BUDGET_ERN (
+  SETID,
+  DEPTID,
+  FISCAL_YEAR,
+  EFFDT,
+  EFFSEQ,                                                  !HP999 RETRO
+  POSITION_POOL_ID,
+  SETID_JOBCODE,
+  JOBCODE,
+  POSITION_NBR,
+  EMPLID,
+  EMPL_RCD,
+  ERNCD,
+  BUDGET_SEQ,
+  ACCT_CD,
+  GL_PAY_TYPE,
+  BUDGET_AMT,
+  DIST_PCT,
+  PERCENT_EFFORT,
+  FUNDING_END_DT,
+  HP_USED_DISTRIBUTN,                                       !HP999 RETRO
+  HP_EXCESS,                                                !HP999 RETRO
+  HP_FRINGE_GROUP,
+  HP_REDIRECT_ACCT)
+VALUES (
+  $SetID,
+  $DeptID,
+  #FiscalYear,
+  $FromDate,
+  0,                                                        !HP999 RETRO
+  $H_Posn_Pool,
+  ' ',
+  ' ',
+  $H_Posn,
+  $H_EmplID,
+  #H_EmplRCD,
+  $H_ErnCd,
+  #CurSeq,
+  $H_AcctCd,
+  $H_GLPayType,
+  #BudAmt,
+  #BudPercent,
+  0,
+  null,
+  'N',                                                      !HP999 RETRO
+  'N',                                                      !HP999 RETRO
+  $Fringe_Group,
+  $Redirect_Acct)
+
+end-sql
+
+! Increment the budget sequence number
+!
+
+End-Procedure
+
+!***********************************************************************
+! UPD-EARN-LEV                                                         *
+! This procedure will update a department level appointment or position*
+! budget with the current applicable salary amount                     *
+!                                                                      *
+!***********************************************************************
+Begin-Procedure Upd-Earn-Lev
+
+let $SQL-STATEMENT = 'BUD005.SQR, UPDATE, PS_DEPT_BUDGET_ERN'
+begin-sql on-error=SQL-Error
+UPDATE PS_DEPT_BUDGET_ERN
+   SET BUDGET_AMT = BUDGET_AMT + #BudAmt,
+       DIST_PCT   = #BudPercent
+WHERE SETID                     = $SetID
+  AND DEPTID                    = $DeptID
+  AND FISCAL_YEAR               = #FiscalYear
+  AND EFFDT                     = $FromDate
+  AND EFFSEQ                    = 0                          !HP999 RETRO
+  AND POSITION_POOL_ID          = $H_Posn_Pool
+  AND SETID_JOBCODE             = ' '
+  AND JOBCODE                   = ' '
+  AND POSITION_NBR              = $H_Posn
+  AND EMPLID                    = $H_EmplID
+  AND EMPL_RCD                 = #H_EmplRCD
+  AND ERNCD                     = $H_ErnCd
+  AND ACCT_CD                   = $H_AcctCd
+  AND BUDGET_SEQ                = #CurSeq
+
+end-sql
+
+! Increment the budget sequence number
+!
+        add 1 to #CurSeq
+
+End-Procedure
+
+
+!***********************************************************************
+! STORE-INFO-IN-ARRAYS                                                 *
+!                                                                      *
+!***********************************************************************
+Begin-Procedure Store-Info-In-Arrays
+
+  let $Found_Store_Value = 'N'
+  let #Store_Count       = 0
+
+  WHILE #Store_Count < #Entries
+
+     get $Stored_AcctCd
+         #Stored_Amt                From Store_by_AcctCd(#Store_Count)
+         Store_Acct_Cd
+         Store_Earn_Amt
+
+     let $Stored_AcctCd = rtrim($Stored_AcctCd, ' ')
+
+     if $H_AcctCd = $Stored_AcctCd
+       ARRAY-ADD #BudAmt to Store_by_AcctCd(#Store_Count) Store_Earn_Amt
+       let $Found_Store_Value = 'Y'
+     end-if
+
+     add 1 to #Store_Count
+
+  END-WHILE
+
+  if $Found_Store_Value = 'N'
+
+     put $H_AcctCD
+         #BudAmt
+     into Store_by_AcctCd(#Entries)
+         Store_Acct_Cd
+         Store_Earn_Amt
+
+     add 1 to #Entries
+
+  end-if
+
+
+  if $CurBudgetLev = 'P'
+    let $Found_Store_Value = 'N'
+    let #Store_Count       = 0
+
+    WHILE #Store_Count < #PosnEntries
+
+       get $Filled_Posn From Filled_Posns(#Store_Count)
+           Store_Filled_Posn
+
+       let $Filled_Posn = rtrim($Filled_Posn, ' ')
+       if $H_Posn = $Filled_Posn
+         let $Found_Store_Value = 'Y'
+       end-if
+
+       add 1 to #Store_Count
+
+    END-WHILE
+
+    if $Found_Store_Value = 'N'
+
+       put $H_Posn
+       into Filled_Posns(#PosnEntries)
+         Store_Filled_Posn
+
+       add 1 to #PosnEntries
+
+    end-if
+
+  end-if
+
+  add 1 to #CurSeq
+
+End-Procedure
+
+
+!***********************************************************************
+! CLEAN-DEPT-BUDGETS                                                   *
+!                                                                      *
+!***********************************************************************
+Begin-Procedure Clean-Dept-Budgets
+
+!HP999 RETRO DISTRUBUTION if earnings deductions or taxes contain
+!data used for distribution the budget can not be cleaned
+
+let $budget_cleaned = 'Y'                                !hp999 retro
+
+Begin-SELECT DISTINCT
+EARN.DEPTID
+
+   let $budget_cleaned = 'N'
+
+FROM PS_DEPT_BUDGET_ERN EARN
+WHERE SETID       = $SetID
+   AND DEPTID      = $DeptID
+   AND FISCAL_YEAR = #FiscalYear
+   AND EFFDT       = $FromDate
+   AND HP_USED_DISTRIBUTN = 'Y'
+End-SELECT
+
+
+Begin-SELECT DISTINCT
+DEDN.DEPTID
+
+   let $budget_cleaned = 'N'
+
+FROM PS_DEPT_BUDGET_DED DEDN
+WHERE SETID       = $SetID
+   AND DEPTID      = $DeptID
+   AND FISCAL_YEAR = #FiscalYear
+   AND EFFDT       = $FromDate
+   AND HP_USED_DISTRIBUTN = 'Y'
+End-SELECT
+
+Begin-SELECT DISTINCT
+TAXN.DEPTID
+
+   let $budget_cleaned = 'N'
+
+FROM PS_DEPT_BUDGET_TAX TAXN
+WHERE SETID       = $SetID
+   AND DEPTID      = $DeptID
+   AND FISCAL_YEAR = #FiscalYear
+   AND EFFDT       = $FromDate
+   AND HP_USED_DISTRIBUTN = 'Y'
+End-SELECT
+
+
+Begin-SELECT DISTINCT
+CTXN.DEPTID
+
+   let $budget_cleaned = 'N'
+
+FROM PS_DEPT_BUDGET_CTX CTXN
+WHERE SETID       = $SetID
+   AND DEPTID      = $DeptID
+   AND FISCAL_YEAR = #FiscalYear
+   AND EFFDT       = $FromDate
+   AND HP_USED_DISTRIBUTN = 'Y'
+End-SELECT
+
+
+! Only clean the department if there was no data found with
+! used by distributn set to on                        hp999 Retro
+if $budget_cleaned = 'Y'                             !hp999 retro
+
+
+let $SQL-STATEMENT = 'BUD005.SQR, DELETE, PS_DEPT_BUDGET'
+begin-sql on-error=SQL-Error
+DELETE FROM PS_DEPT_BUDGET
+ WHERE SETID       = $SetID
+   AND DEPTID      = $DeptID
+   AND FISCAL_YEAR = #FiscalYear
+   AND EFFDT       = $FromDate
+end-sql
+
+
+let $SQL-STATEMENT = 'BUD005.SQR, DELETE, PS_DEPT_BUDGET_DT'
+begin-sql on-error=SQL-Error
+DELETE FROM PS_DEPT_BUDGET_DT
+ WHERE SETID       = $SetID
+   AND DEPTID      = $DeptID
+   AND FISCAL_YEAR = #FiscalYear
+end-sql
+
+let $SQL-STATEMENT = 'BUD005.SQR, DELETE, PS_DEPTBDGT_SUSPNS'
+begin-sql on-error=SQL-Error                         !hp999 retro
+DELETE FROM PS_DEPTBDGT_SUSPNS                       !hp999 retro
+ WHERE SETID       = $SetID                          !hp999 retro
+   AND DEPTID      = $DeptID                         !hp999 retro
+   AND FISCAL_YEAR = #FiscalYear                     !hp999 retro
+end-sql                                              !hp999 retro
+
+
+let $SQL-STATEMENT = 'BUD005.SQR, DELETE, PS_DEPT_FTE_EFFDT'
+begin-sql on-error=SQL-Error
+DELETE FROM PS_DEPT_FTE_EFFDT
+ WHERE SETID       = $SetID
+   AND DEPTID      = $DeptID
+   AND FISCAL_YEAR = #FiscalYear
+   AND EFFDT       = $FromDate
+end-sql
+
+let $SQL-STATEMENT = 'BUD005.SQR, DELETE, PS_DEPT_FTE_CAP'
+begin-sql on-error=SQL-Error
+DELETE FROM PS_DEPT_FTE_CAP
+ WHERE SETID       = $SetID
+   AND DEPTID      = $DeptID
+   AND FISCAL_YEAR = #FiscalYear
+   AND EFFDT       = $FromDate
+end-sql
+
+
+let $SQL-STATEMENT = 'BUD005.SQR, DELETE, PS_DEPT_BUDGET_ERN'
+begin-sql on-error=SQL-Error
+DELETE FROM PS_DEPT_BUDGET_ERN
+ WHERE SETID       = $SetID
+   AND DEPTID      = $DeptID
+   AND FISCAL_YEAR = #FiscalYear
+   AND EFFDT       = $FromDate
+end-sql
+
+let $SQL-STATEMENT = 'BUD005.SQR, DELETE, PS_DEPT_BUDGET_TAX'
+begin-sql on-error=SQL-Error
+DELETE FROM PS_DEPT_BUDGET_TAX
+ WHERE SETID       = $SetID
+   AND DEPTID      = $DeptID
+   AND FISCAL_YEAR = #FiscalYear
+   AND EFFDT       = $FromDate
+end-sql
+
+let $SQL-STATEMENT = 'BUD005.SQR, DELETE, PS_DEPT_BUDGET_CTX'
+begin-sql on-error=SQL-Error
+DELETE FROM PS_DEPT_BUDGET_CTX
+ WHERE SETID       = $SetID
+   AND DEPTID      = $DeptID
+   AND FISCAL_YEAR = #FiscalYear
+   AND EFFDT       = $FromDate
+end-sql
+
+let $SQL-STATEMENT = 'BUD005.SQR, DELETE, PS_DEPT_BUDGET_DED'
+begin-sql on-error=SQL-Error
+DELETE FROM PS_DEPT_BUDGET_DED
+ WHERE SETID       = $SetID
+   AND DEPTID      = $DeptID
+   AND FISCAL_YEAR = #FiscalYear
+   AND EFFDT       = $FromDate
+end-sql
+
+end-if   !  End of if budget cleaned                        hp999 retro
+
+
+End-Procedure
+
+!****************************************************************************
+! INITIALIZE-ARRAYS                                                         *
+!****************************************************************************
+begin-procedure INITIALIZE-ARRAYS
+
+  let #Init_Count = 0
+
+  while #Init_Count < #Entries
+
+     put ' ' 0
+     into Store_by_AcctCd(#Init_Count)
+        Store_Acct_Cd
+        Store_Earn_Amt
+     add 1 to #Init_Count
+  end-while
+
+  let #Init_Count = 0
+
+  while #Init_Count < #PosnEntries
+
+     put ' '
+     into Filled_Posns(#Init_Count)
+        Store_Filled_Posn
+     add 1 to #Init_Count
+  end-while
+
+  let #Entries = 0
+  let #PosnEntries = 0
+
+end-procedure
+
+
+!***********************************************************************
+! CREATE-DEPT-RECORDS                                                  *
+! This procedure will create records in the DEPT_BUDGET_DT and         *
+! DEPT_FTE_CAP tables.                                                 *
+!                                                                      *
+!***********************************************************************
+Begin-Procedure Create-Dept-Records
+
+let #TotalFTE =  #Dept_FTE_C_Total + #Dept_FTE_T_Total + #Dept_FTE_U_Total
+
+
+let $SQL-STATEMENT = 'BUD005.SQR, INSERT, PS_DEPT_BUDGET_DT'
+begin-sql on-error=SQL-Error
+INSERT INTO PS_DEPT_BUDGET_DT (
+  SETID,
+  DEPTID,
+  FISCAL_YEAR,
+  BUDGET_BEGIN_DT,
+  BUDGET_END_DT,
+  BUDGET_CAP_INDC,
+  DEPT_OFFSET_GRP,
+  DEFAULT_FUND_OPTN,
+  ACCT_CD_DED,
+  FUND_END_DT_DED,
+  ACCT_CD_TAX,
+  FUND_END_DT_TAX,
+  HP_FRINGE_GROUP,
+  HP_ERN_ACCT,
+  HP_DED_ACCT,
+  HP_TAX_ACCT,
+  HP_CTX_ACCT)
+VALUES (
+  $SetID,
+  $DeptID,
+  #FiscalYear,
+  $FromDate,
+  $ThruDate,
+  'O',
+  &RC.DEPT_OFFSET_GRP,
+  'A',
+  ' ',
+  null,
+  ' ',
+  null,
+  $Fringe_Group,
+  $Ern_Acct,
+  $Ded_Acct,
+  $Tax_Acct,
+  $Ctx_Acct)
+end-sql
+
+
+let $SQL-STATEMENT = 'BUD005.SQR, INSERT, PS_DEPTBDGT_SUSPNS'
+begin-sql on-error=SQL-Error
+INSERT INTO PS_DEPTBDGT_SUSPNS (
+  SETID,
+  DEPTID,
+  FISCAL_YEAR,
+  HP_ACCT_CD_SUSPNS,
+  EFFDT,
+  EFFSEQ,
+  EFF_STATUS)
+VALUES (
+  $SetID,
+  $DeptID,
+  #FiscalYear,
+  &RC.HP_ACCT_CD_SUSPNS,
+  $FromDate,
+  0,
+  'A')
+end-sql
+
+
+let $SQL-STATEMENT = 'BUD005.SQR, INSERT, PS_DEPT_FTE_EFFDT'
+begin-sql on-error=SQL-Error
+INSERT INTO PS_DEPT_FTE_EFFDT (
+  SETID,
+  DEPTID,
+  FISCAL_YEAR,
+  EFFDT,
+  EFF_STATUS)
+VALUES (
+  $SetID,
+  $DeptID,
+  #FiscalYear,
+  $FromDate,
+  'A')
+end-sql
+
+let $SQL-STATEMENT = 'BUD005.SQR, INSERT, PS_DEPT_FTE_CAP'
+begin-sql on-error=SQL-Error
+INSERT INTO PS_DEPT_FTE_CAP (
+  SETID,
+  DEPTID,
+  FISCAL_YEAR,
+  EFFDT,
+  CLASS_INDC,
+  FTE_CAP)
+VALUES (
+  $SetID,
+  $DeptID,
+  #FiscalYear,
+  $FromDate,
+  'C',
+  #Dept_FTE_C_Total)
+end-sql
+
+let $SQL-STATEMENT = 'BUD005.SQR, INSERT, PS_DEPT_FTE_CAP'
+begin-sql on-error=SQL-Error
+INSERT INTO PS_DEPT_FTE_CAP (
+  SETID,
+  DEPTID,
+  FISCAL_YEAR,
+  EFFDT,
+  CLASS_INDC,
+  FTE_CAP)
+VALUES (
+  $SetID,
+  $DeptID,
+  #FiscalYear,
+  $FromDate,
+  'B',
+  #TotalFTE)
+end-sql
+
+
+End-Procedure
+
+!***********************************************************************
+! UPDATE-DEPT-BUDGET                                                   *
+! This procedure will insert corresponding deduction and tax.          *
+!                                                                      *
+!***********************************************************************
+Begin-Procedure Update-Dept-Budget
+
+Begin-SELECT
+
+DB2.POSITION_POOL_ID
+DB2.POSITION_NBR
+DB2.EMPLID
+DB2.EMPL_RCD
+
+        do Ins-Default-Ded-Tax
+
+FROM PS_DEPT_BUDGET DB2
+WHERE DB2.SETID             = $SetID
+  AND DB2.DEPTID            = $DeptID
+  AND DB2.FISCAL_YEAR       = #FiscalYear
+  AND DB2.EFFDT             = $FromDate
+  AND DB2.EFFSEQ            = 0                              !HP999 RETRO
+ORDER BY DB2.POSITION_POOL_ID,
+         DB2.POSITION_NBR,
+         DB2.EMPLID,
+         DB2.EMPL_RCD
+
+End-SELECT
+
+End-Procedure
+
+
+!***********************************************************************
+! INS-DEFAULT-DED-TAX                                                  *
+!                                                                      *
+!***********************************************************************
+Begin-Procedure Ins-Default-Ded-Tax
+
+        let $Wrk_AcctCd   = rtrim(&RC.ACCT_CD_DED, ' ')
+        let $Wrk_Override = 'Y'
+
+        if $Wrk_AcctCd = ''
+           let $Wrk_AcctCd   = rtrim(&RC.ACCT_CD, ' ')
+           let $Wrk_Override = 'N'
+        end-if
+
+let $SQL-STATEMENT = 'BUD005.SQR, INSERT, PS_DEPT_BUDGET_DED'
+begin-sql on-error=SQL-Error
+INSERT INTO PS_DEPT_BUDGET_DED (
+  SETID,
+  DEPTID,
+  FISCAL_YEAR,
+  EFFDT,
+  EFFSEQ,                                                   !HP999 RETRO
+  POSITION_POOL_ID,
+  SETID_JOBCODE,
+  JOBCODE,
+  POSITION_NBR,
+  EMPLID,
+  EMPL_RCD,
+  DEPT_BDGT_DED_KEY,                                      !HP999 RETRO
+  BUDGET_SEQ,
+  ACCT_CD,
+  PLAN_TYPE,
+  BENEFIT_PLAN,
+  DEDCD,
+  DED_CLASS,
+  GL_PAY_TYPE,
+  BUDGET_AMT,
+  DIST_PCT,
+  FUNDING_END_DT,
+  HP_USED_DISTRIBUTN,                                       !HP999 RETRO
+  HP_EXCESS,                                                !HP999 RETRO
+  OVERRIDE_IND)
+VALUES (
+  $SetID,
+  $DeptID,
+  #FiscalYear,
+  $FromDate,
+  0,                                                        !HP999 RETRO
+  &DB2.POSITION_POOL_ID,
+  ' ',
+  ' ',
+  &DB2.POSITION_NBR,
+  &DB2.EMPLID,
+  &DB2.EMPL_RCD,
+  ' ',                                                      !HP999 RETRO
+  1,
+  $Wrk_AcctCd,
+  ' ',
+  ' ',
+  ' ',
+  ' ',
+  ' ',
+  0,
+  100,
+  null,
+  'N',                                                      !HP999 RETRO
+  'N',                                                      !HP999 RETRO
+  $Wrk_Override)
+end-sql
+
+        if &I.COUNTRY = 'CAN'
+                do Ins-Default-CTX
+        else
+                do Ins-Default-TAX
+        end-if
+
+End-Procedure
+
+
+!***********************************************************************
+! INS-DEFAULT-CTX                                                      *
+!                                                                      *
+!***********************************************************************
+Begin-Procedure Ins-Default-CTX
+
+        let $Wrk_AcctCd   = rtrim(&RC.ACCT_CD_TAX, ' ')
+        let $Wrk_Override = 'Y'
+
+        if $Wrk_AcctCd = ''
+           let $Wrk_AcctCd   = rtrim(&RC.ACCT_CD, ' ')
+           let $Wrk_Override = 'N'
+        end-if
+
+let $SQL-STATEMENT = 'BUD005.SQR, INSERT, PS_DEPT_BUDGET_CTX'
+begin-sql on-error=SQL-Error
+INSERT INTO PS_DEPT_BUDGET_CTX (
+  SETID,
+  DEPTID,
+  FISCAL_YEAR,
+  EFFDT,
+  EFFSEQ,                                              !hp999 Retro
+  POSITION_POOL_ID,
+  SETID_JOBCODE,
+  JOBCODE,
+  POSITION_NBR,
+  EMPLID,
+  EMPL_RCD,
+  PROVINCE,
+  TAX_CLASS_CAN,
+  BUDGET_SEQ,
+  ACCT_CD,
+  GL_PAY_TYPE,
+  BUDGET_AMT,
+  DIST_PCT,
+  FUNDING_END_DT,
+  HP_USED_DISTRIBUTN,                                  !hp999 Retro
+  HP_EXCESS,                                           !hp999 Retro
+  OVERRIDE_IND)
+VALUES (
+  $SetID,
+  $DeptID,
+  #FiscalYear,
+  $FromDate,
+  0,                                                   !hp999 Retro
+  &DB2.POSITION_POOL_ID,
+  ' ',
+  ' ',
+  &DB2.POSITION_NBR,
+  &DB2.EMPLID,
+  &DB2.EMPL_RCD,
+  ' ',
+  ' ',
+  1,
+  $Wrk_AcctCd,
+  ' ',
+  0,
+  100,
+  null,
+  'N',                                                   !hp999 Retro
+  'N',                                                   !hp999 Retro
+  $Wrk_Override)
+end-sql
+
+End-Procedure
+
+
+!***********************************************************************
+! INS-DEFAULT-TAX                                                      *
+!                                                                      *
+!***********************************************************************
+Begin-Procedure Ins-Default-TAX
+
+        let $Wrk_AcctCd   = rtrim(&RC.ACCT_CD_TAX, ' ')
+        let $Wrk_Override = 'Y'
+
+        if $Wrk_AcctCd = ''
+           let $Wrk_AcctCd   = rtrim(&RC.ACCT_CD, ' ')
+           let $Wrk_Override = 'N'
+        end-if
+
+let $SQL-STATEMENT = 'BUD005.SQR, INSERT, PS_DEPT_BUDGET_TAX'
+begin-sql on-error=SQL-Error
+INSERT INTO PS_DEPT_BUDGET_TAX (
+  SETID,
+  DEPTID,
+  FISCAL_YEAR,
+  EFFDT,
+  EFFSEQ,                                            !hp999 Retro
+  POSITION_POOL_ID,
+  SETID_JOBCODE,
+  JOBCODE,
+  POSITION_NBR,
+  EMPLID,
+  EMPL_RCD,
+  STATE,
+  LOCALITY,
+  TAX_CLASS,
+  BUDGET_SEQ,
+  ACCT_CD,
+  GL_PAY_TYPE,
+  BUDGET_AMT,
+  DIST_PCT,
+  FUNDING_END_DT,
+  HP_USED_DISTRIBUTN,                                !hp999 Retro
+  HP_EXCESS,                                         !hp999 Retro
+  OVERRIDE_IND)
+VALUES (
+  $SetID,
+  $DeptID,
+  #FiscalYear,
+  $FromDate,
+  0,                                                 !hp999 Retro
+  &DB2.POSITION_POOL_ID,
+  ' ',
+  ' ',
+  &DB2.POSITION_NBR,
+  &DB2.EMPLID,
+  &DB2.EMPL_RCD,
+  ' ',
+  ' ',
+  ' ',
+  1,
+  $Wrk_AcctCd,
+  ' ',
+  0,
+  100,
+  null,
+  'N',                                               !hp999 Retro
+  'N',                                               !hp999 Retro
+  $Wrk_Override)
+end-sql
+
+End-Procedure
+
+
+!***********************************************************************
+! PROCESS-VACANT-POSITIONS                                             *
+!                                                                      *
+!***********************************************************************
+Begin-Procedure Process-Vacant-Positions
+
+Begin-SELECT
+
+P2.POSITION_NBR
+P2.FTE
+P2.BUDGETED_POSN
+P2.STATUS_DT
+P2.CLASS_INDC
+SG2.MID_RT_ANNUAL
+P2.DEPTID
+
+    let $CheckPosn = rtrim(&P2.POSITION_NBR, ' ')
+    let $Chk_DeptID = &P2.DEPTID
+
+    let $Posn-Stored = 'N'
+    if $Store-Info-Only = 'Y'              !Under this option, a filled position
+        do Check-if-Posn-in-Filled-Array   !can only be found in the array, not
+    end-if                                 !in DEPT_BUDGET
+
+    if $Posn-Stored = 'N'
+        let #Max_FTE            = &P2.FTE
+
+! Calculate an adjusted FTE based on a position becoming approved during
+! the from/thru period
+
+        let $StatusDt = &P2.STATUS_DT
+        do Format-DateTime ($StatusDt, $StatusDt_Cmp, {DEFCMP},'','')
+        if $StatusDt_Cmp > $FromDate_Cmp
+                let $LowerDate = $StatusDt
+        else
+                let $LowerDate = $FromDate
+        end-if
+
+        do Check-Transfered-Posn
+
+        do Convert-To-DTU-Date($LowerDate, $LowerDate_Dtu)
+        do Convert-To-DTU-Date($UpperDate, $UpperDate_Dtu)
+        do dtu-diff-days($LowerDate_Dtu, $UpperDate_Dtu, #NumDays)
+        let #Annual_Factor = round(((#NumDays + 1) / {daysinyear}), 6)
+        let #Adj_FTE = round((#Annual_Factor * #Max_FTE), 6)
+
+
+        let $CurBudgetLev = 'P'                                 !Position Level
+        let #CurFTE             = #Adj_FTE
+        let #CurSal     = round((&SG2.MID_RT_ANNUAL * #Annual_Factor), 2)
+        let #Adjustment = round((#CurSal  * #Percent_Increase / 100),2)
+        let #CurSal     = #CurSal + #Adjustment
+        let $SavePos    = &P2.POSITION_NBR
+        let $H_ErnCd    = ' '
+        let $H_ClassIndc= rtrim(&P2.CLASS_INDC, ' ')
+        let #PosnSeq    = 1
+        let $H_AcctCd   = rtrim(&RC.ACCT_CD, ' ')
+        let $H_GLPayType= ' '
+
+        do Post-Budgets
+
+    end-if
+
+FROM PS_POSITION_DATA P2,
+         PS_JOBCODE_TBL JC2,
+         PS_SAL_GRADE_TBL SG2
+WHERE $SetID =
+          (SELECT SCTL2.SETID
+             FROM PS_SET_CNTRL_REC SCTL2
+            WHERE SCTL2.SETCNTRLVALUE = P2.BUSINESS_UNIT
+              AND SCTL2.REC_GROUP_ID = 'HR_01'
+              AND SCTL2.RECNAME = 'DEPT_TBL')
+  AND P2.DEPTID IN (SELECT P2BUDDEP.DEPTID FROM PS_DEPT_TBL P2BUDDEP
+                     WHERE P2BUDDEP.SETID = $SetID
+                       AND P2BUDDEP.BUDGET_DEPTID = $DeptID
+                       AND P2BUDDEP.EFFDT = (SELECT MAX(P2BUDDEP1.EFFDT) FROM PS_DEPT_TBL P2BUDDEP1
+                                           WHERE P2BUDDEP1.SETID = P2BUDDEP.SETID
+                                             AND P2BUDDEP1.DEPTID = P2BUDDEP.DEPTID
+                                             AND P2BUDDEP1.EFFDT <= $ThruDate)
+                       AND P2BUDDEP.EFF_STATUS = 'A')
+  AND P2.EFF_STATUS   = 'A'
+  AND P2.POSN_STATUS = 'A'
+  AND P2.BUDGETED_POSN = 'Y'
+  AND P2.EFFDT =
+        (SELECT MAX(P2S.EFFDT)
+           FROM PS_POSITION_DATA P2S
+           WHERE P2S.POSITION_NBR = P2.POSITION_NBR
+                 AND P2S.EFFDT <= $ThruDate)
+  AND JC2.SETID =
+          (SELECT SCTL3.SETID
+             FROM PS_SET_CNTRL_REC SCTL3
+            WHERE SCTL3.SETCNTRLVALUE = P2.BUSINESS_UNIT
+              AND SCTL3.REC_GROUP_ID = 'HR_02'
+              AND SCTL3.RECNAME = 'JOBCODE_TBL')
+  AND JC2.JOBCODE = P2.JOBCODE
+  AND JC2.EFFDT =
+        (SELECT MAX(JC2S.EFFDT)
+           FROM PS_JOBCODE_TBL JC2S
+           WHERE     JC2S.SETID      = JC2.SETID
+                 AND JC2S.JOBCODE    = JC2.JOBCODE
+                 AND JC2S.EFFDT <= $ThruDate)
+  AND JC2.EFF_STATUS     = 'A'
+  AND SG2.SETID          = JC2.SETID_SALARY
+  AND SG2.SAL_ADMIN_PLAN = JC2.SAL_ADMIN_PLAN
+  AND SG2.GRADE          = JC2.GRADE
+  AND SG2.EFFDT =
+        (SELECT MAX(SG2S.EFFDT)
+           FROM PS_SAL_GRADE_TBL SG2S
+           WHERE     SG2S.SETID           = SG2.SETID
+                 AND SG2S.SAL_ADMIN_PLAN  = SG2.SAL_ADMIN_PLAN
+                 AND SG2S.GRADE           = SG2.GRADE
+                 AND SG2S.EFFDT          <= $FromDate)
+  AND SG2.EFF_STATUS = 'A'
+  AND P2.POSITION_NBR NOT IN
+                (SELECT DB3.POSITION_NBR
+                   FROM PS_DEPT_BUDGET DB3
+                  WHERE DB3.SETID  = $SetID
+                    AND DB3.DEPTID = $DeptId
+                    AND DB3.FISCAL_YEAR = #FiscalYear)
+End-SELECT
+
+
+End-Procedure
+
+
+!***********************************************************************
+! CHECK-IF-POSN-IN-FILLED-ARRAY                                        *
+!***********************************************************************
+Begin-Procedure Check-if-Posn-in-Filled-Array
+
+    let #Store_Count       = 0
+
+    WHILE #Store_Count < #PosnEntries
+
+       get $Filled_Posn From Filled_Posns(#Store_Count)
+           Store_Filled_Posn
+
+       let $Filled_Posn = rtrim($Filled_Posn, ' ')
+       if $CheckPosn = $Filled_Posn
+           let $Posn-Stored = 'Y'
+       end-if
+
+       add 1 to #Store_Count
+
+    END-WHILE
+
+End-Procedure
+
+!***********************************************************************
+! CHECK-TRANSFERED-POSN                                                *
+! Checks to determine if a vacant position was transfered to another   *
+! department durint the fiscal year.  Look of a position record with   *
+! same position number in another department past the  known effdt     *
+! in the P2 POSITION_DATA query.                                       *
+!***********************************************************************
+Begin-Procedure Check-Transfered-Posn
+
+        let $NewDate = ''
+
+Begin-SELECT
+
+P3.EFFDT
+
+        let $NewDate = &P3.EFFDT
+
+ FROM PS_POSITION_DATA P3
+WHERE $SetID <>
+       (SELECT SCTL4.SETID
+          FROM PS_SET_CNTRL_REC SCTL4
+         WHERE SCTL4.SETCNTRLVALUE = P3.BUSINESS_UNIT
+           AND SCTL4.REC_GROUP_ID = 'HR_01'
+           AND SCTL4.RECNAME = 'DEPT_TBL')
+  AND P3.DEPTID       <> $Chk_DeptID
+  AND P3.POSITION_NBR =  $CheckPosn
+  AND P3.EFFDT =
+        (SELECT MIN(P3S.EFFDT)
+           FROM PS_POSITION_DATA P3S
+          WHERE P3S.POSITION_NBR =  P3.POSITION_NBR
+                AND P3S.EFFDT       >  $LowerDate
+                AND P3S.EFFDT       <= $ThruDate)
+
+End-SELECT
+
+        if $NewDate <> ''
+                let $UpperDate = $NewDate
+        else
+                let $UpperDate = $ThruDate
+        end-if
+
+End-Procedure
+
+
+!***********************************************************************
+! PROCESS-DEPT-SUMMARY                                                 *
+! Create department level records for options that require department  *
+! level records in addition to one or more other levels.               *
+!***********************************************************************
+Begin-Procedure Process-Dept-Summary
+
+  let $CurBudgetLev  =  'D'
+  let $H_Posn_Pool   =  ' '
+  let $H_Posn        =  ' '
+  let $H_EmplID      =  ' '
+  let #H_EmplRCD     =  0
+  let $H_ErnCd       =  ' '
+  let $H_AcctCd      =  rtrim(&RC.ACCT_CD, ' ')
+  let $H_GLPayType   =  ' '
+  let #CurSeq        =  1
+  if &RC.POPULATE_BUD_AMT = 'Y'
+    let #BudAmt      =  #Dept_BudAmt_Total
+    let #ErnCap      =  #Dept_BudAmt_Total
+    let #BudPercent  =  0
+  else
+    let #BudAmt      =  0
+    let #ErnCap      =  0
+    let #BudPercent  =  100
+  end-if
+  do Ins-Earn-Lev
+  do Ins-Dept-Lev
+
+End-Procedure
+
+
+!***********************************************************************
+! PROCESS-DEPT-ONLY                                                    *
+! Create department level records for the department only option.      *
+!***********************************************************************
+Begin-Procedure Process-Dept-Only
+
+  let $CurBudgetLev  =  'D'
+  let $H_Posn_Pool   =  ' '
+  let $H_Posn        =  ' '
+  let $H_EmplID      =  ' '
+  let #H_EmplRCD     =  0
+  let $H_ErnCd       =  ' '
+  let $H_GLPayType   =  ' '
+
+  if &RC.POPULATE_BUD_AMT = 'Y'
+
+    let #BudPercent  =  0
+    let #DeptEntry   =  0
+    while #DeptEntry < #Entries
+      get $H_AcctCd
+          #BudAmt    From Store_by_AcctCd(#DeptEntry)
+          Store_Acct_Cd
+          Store_Earn_Amt
+      let #DeptEntry =  #DeptEntry + 1
+      let #CurSeq    =  #DeptEntry
+      do Ins-Earn-Lev
+    end-while
+    let #ErnCap        =  #Dept_BudAmt_Total
+    do Ins-Dept-Lev
+
+  else
+    let $H_AcctCd    =  rtrim(&RC.ACCT_CD, ' ')
+    let #BudAmt      =  0
+    let #BudPercent  =  100
+    let #CurSeq      =  1
+    do Ins-Earn-Lev
+    let #ErnCap      =  0
+    do Ins-Dept-Lev
+  end-if
+
+End-Procedure
+
+
+!***********************************************************************
+! PROCESS-ALL-POSITIONS                                                *
+!                                                                      *
+!***********************************************************************
+Begin-Procedure Process-All-Positions
+
+Begin-SELECT
+
+P5.POSITION_NBR
+P5.FTE
+P5.BUDGETED_POSN
+P5.STATUS_DT
+P5.CLASS_INDC
+SG3.MID_RT_ANNUAL
+P5.DEPTID
+
+        let #Max_FTE            = &P5.FTE
+        let $Chk_DeptID         = &P5.DEPTID
+
+! Calculate an adjusted FTE based on a position becoming approved during
+! the from/thru period
+
+        let $StatusDt = &P5.STATUS_DT
+        do Format-DateTime ($StatusDt, $StatusDt_Cmp, {DEFCMP},'','')
+        if $StatusDt_Cmp > $FromDate_Cmp
+                let $LowerDate = $StatusDt
+        else
+                let $LowerDate = $FromDate
+        end-if
+
+        let $CheckPosn = rtrim(&P5.POSITION_NBR, ' ')
+        do Check-Transfered-Posn
+
+        do Convert-To-DTU-Date($LowerDate, $LowerDate_Dtu)
+        do Convert-To-DTU-Date($UpperDate, $UpperDate_Dtu)
+        do dtu-diff-days($LowerDate_Dtu, $UpperDate_Dtu, #NumDays)
+        let #Annual_Factor = round(((#NumDays + 1) / {daysinyear}), 6)
+        let #Adj_FTE = round((#Annual_Factor * #Max_FTE), 6)
+
+
+        let $CurBudgetLev = 'P'                                 !Position Level
+        let #CurFTE       = #Adj_FTE
+        let #CurSal       = round((&SG3.MID_RT_ANNUAL * #Annual_Factor), 2)
+        let #Adjustment   = round((#CurSal  * #Percent_Increase / 100),2)
+        let #CurSal       = #CurSal + #Adjustment
+        let $SavePos      = &P5.POSITION_NBR
+        let $H_ErnCd      = ' '
+        let $H_ClassIndc  = rtrim(&P5.CLASS_INDC, ' ')
+        let #PosnSeq      = 1
+        let $H_AcctCd     = rtrim(&RC.ACCT_CD, ' ')
+        let $H_GLPayType  = ' '
+
+        do Post-Budgets
+
+FROM PS_POSITION_DATA P5,
+     PS_JOBCODE_TBL JC3,
+     PS_SAL_GRADE_TBL SG3
+WHERE $SetID =
+          (SELECT SCTL6.SETID
+             FROM PS_SET_CNTRL_REC SCTL6
+            WHERE SCTL6.SETCNTRLVALUE = P5.BUSINESS_UNIT
+              AND SCTL6.REC_GROUP_ID  = 'HR_01'
+              AND SCTL6.RECNAME       = 'DEPT_TBL')
+  AND P5.DEPTID IN (SELECT P5BUDDEP.DEPTID FROM PS_DEPT_TBL P5BUDDEP
+                     WHERE P5BUDDEP.SETID = $SetID
+                       AND P5BUDDEP.BUDGET_DEPTID = $DeptID
+                       AND P5BUDDEP.EFFDT = (SELECT MAX(P5BUDDEP1.EFFDT) FROM PS_DEPT_TBL P5BUDDEP1
+                                           WHERE P5BUDDEP1.SETID = P5BUDDEP.SETID
+                                             AND P5BUDDEP1.DEPTID = P5BUDDEP.DEPTID
+                                             AND P5BUDDEP1.EFFDT <= $ThruDate)
+                       AND P5BUDDEP.EFF_STATUS = 'A')
+  AND P5.EFF_STATUS    = 'A'
+  AND P5.POSN_STATUS   = 'A'
+  AND P5.BUDGETED_POSN = 'Y'
+  AND P5.EFFDT =
+        (SELECT MAX(P5S.EFFDT)
+           FROM PS_POSITION_DATA P5S
+           WHERE P5S.POSITION_NBR = P5.POSITION_NBR
+             AND P5S.EFFDT       <= $ThruDate)
+  AND JC3.SETID =
+          (SELECT SCTL7.SETID
+             FROM PS_SET_CNTRL_REC SCTL7
+            WHERE SCTL7.SETCNTRLVALUE = P5.BUSINESS_UNIT
+              AND SCTL7.REC_GROUP_ID  = 'HR_02'
+              AND SCTL7.RECNAME       = 'JOBCODE_TBL')
+  AND JC3.JOBCODE = P5.JOBCODE
+  AND JC3.EFFDT =
+        (SELECT MAX(JC3S.EFFDT)
+           FROM PS_JOBCODE_TBL JC3S
+           WHERE JC3S.SETID      = JC3.SETID
+             AND JC3S.JOBCODE    = JC3.JOBCODE
+             AND JC3S.EFFDT <= $ThruDate)
+  AND JC3.EFF_STATUS     = 'A'
+  AND SG3.SETID          = JC3.SETID_SALARY
+  AND SG3.SAL_ADMIN_PLAN = JC3.SAL_ADMIN_PLAN
+  AND SG3.GRADE          = JC3.GRADE
+  AND SG3.EFFDT =
+        (SELECT MAX(SG3S.EFFDT)
+           FROM PS_SAL_GRADE_TBL SG3S
+           WHERE SG3S.SETID           = SG3.SETID
+             AND SG3S.SAL_ADMIN_PLAN  = SG3.SAL_ADMIN_PLAN
+             AND SG3S.GRADE           = SG3.GRADE
+             AND SG3S.EFFDT          <= $FromDate)
+  AND SG3.EFF_STATUS = 'A'
+End-SELECT
+
+End-Procedure
+
+
+!***********************************************************************
+! PROCESS-POSN-POOLS                                                   *
+!                                                                      *
+!***********************************************************************
+Begin-Procedure Process-Posn-Pools
+
+Begin-SELECT
+
+P6.POSITION_POOL_ID
+P6.POSITION_NBR
+P6.FTE
+P6.BUDGETED_POSN
+P6.STATUS_DT
+P6.CLASS_INDC
+SG4.MID_RT_ANNUAL
+P6.DEPTID
+
+        let #Max_FTE            = &P6.FTE
+        let $Chk_DeptID         = &P6.DEPTID
+
+! Calculate an adjusted FTE based on a position becoming approved during
+! the from/thru period
+
+        let $StatusDt = &P6.STATUS_DT
+        do Format-DateTime ($StatusDt, $StatusDt_Cmp, {DEFCMP},'','')
+        if $StatusDt_Cmp > $FromDate_Cmp
+                let $LowerDate = $StatusDt
+        else
+                let $LowerDate = $FromDate
+        end-if
+
+        let $CheckPosn = rtrim(&P6.POSITION_NBR, ' ')
+        do Check-Transfered-Posn
+
+        do Convert-To-DTU-Date($LowerDate, $LowerDate_Dtu)
+        do Convert-To-DTU-Date($UpperDate, $UpperDate_Dtu)
+        do dtu-diff-days($LowerDate_Dtu, $UpperDate_Dtu, #NumDays)
+        let #Annual_Factor = round(((#NumDays + 1) / {daysinyear}), 6)
+        let #Adj_FTE = round((#Annual_Factor * #Max_FTE), 6)
+
+
+        let $CurBudgetLev = 'O'                                 !Pool Level
+        let #CurFTE       = #Adj_FTE
+        let #CurSal       = round((&SG4.MID_RT_ANNUAL * #Annual_Factor), 2)
+        let #Adjustment   = round((#CurSal  * #Percent_Increase / 100),2)
+        let #CurSal       = #CurSal + #Adjustment
+        let $SavePool     = &P6.POSITION_POOL_ID
+        let $SavePos      = &P6.POSITION_NBR
+        let $H_ErnCd      = ' '
+        let $H_ClassIndc  = rtrim(&P6.CLASS_INDC, ' ')
+        let #PoolSeq      = 1
+        let $H_AcctCd     = rtrim(&RC.ACCT_CD, ' ')
+        let $H_GLPayType  = ' '
+
+        do Post-Budgets
+
+FROM PS_POSITION_DATA P6,
+     PS_JOBCODE_TBL JC4,
+     PS_SAL_GRADE_TBL SG4
+WHERE $SetID =
+          (SELECT SCTL8.SETID
+             FROM PS_SET_CNTRL_REC SCTL8
+            WHERE SCTL8.SETCNTRLVALUE = P6.BUSINESS_UNIT
+              AND SCTL8.REC_GROUP_ID  = 'HR_01'
+              AND SCTL8.RECNAME       = 'DEPT_TBL')
+  AND P6.DEPTID IN (SELECT P6BUDDEP.DEPTID FROM PS_DEPT_TBL P6BUDDEP
+                     WHERE P6BUDDEP.SETID = $SetID
+                       AND P6BUDDEP.BUDGET_DEPTID = $DeptID
+                       AND P6BUDDEP.EFFDT = (SELECT MAX(P6BUDDEP1.EFFDT) FROM PS_DEPT_TBL P6BUDDEP1
+                                           WHERE P6BUDDEP1.SETID = P6BUDDEP.SETID
+                                             AND P6BUDDEP1.DEPTID = P6BUDDEP.DEPTID
+                                             AND P6BUDDEP1.EFFDT <= $ThruDate)
+                       AND P6BUDDEP.EFF_STATUS = 'A')
+  AND P6.EFF_STATUS    = 'A'
+  AND P6.POSN_STATUS   = 'A'
+  AND P6.BUDGETED_POSN = 'Y'
+  AND P6.POSITION_POOL_ID <> ' '
+  AND P6.EFFDT =
+        (SELECT MAX(P6S.EFFDT)
+           FROM PS_POSITION_DATA P6S
+           WHERE P6S.POSITION_NBR = P6.POSITION_NBR
+             AND P6S.EFFDT       <= $ThruDate)
+  AND JC4.SETID =
+          (SELECT SCTL9.SETID
+             FROM PS_SET_CNTRL_REC SCTL9
+            WHERE SCTL9.SETCNTRLVALUE = P6.BUSINESS_UNIT
+              AND SCTL9.REC_GROUP_ID  = 'HR_02'
+              AND SCTL9.RECNAME       = 'JOBCODE_TBL')
+  AND JC4.JOBCODE = P6.JOBCODE
+  AND JC4.EFFDT =
+        (SELECT MAX(JC4S.EFFDT)
+           FROM PS_JOBCODE_TBL JC4S
+           WHERE JC4S.SETID      = JC4.SETID
+             AND JC4S.JOBCODE    = JC4.JOBCODE
+             AND JC4S.EFFDT     <= $ThruDate)
+  AND JC4.EFF_STATUS     = 'A'
+  AND SG4.SETID          = JC4.SETID_SALARY
+  AND SG4.SAL_ADMIN_PLAN = JC4.SAL_ADMIN_PLAN
+  AND SG4.GRADE          = JC4.GRADE
+  AND SG4.EFFDT =
+        (SELECT MAX(SG4S.EFFDT)
+           FROM PS_SAL_GRADE_TBL SG4S
+           WHERE SG4S.SETID           = SG4.SETID
+             AND SG4S.SAL_ADMIN_PLAN  = SG4.SAL_ADMIN_PLAN
+             AND SG4S.GRADE           = SG4.GRADE
+             AND SG4S.EFFDT          <= $FromDate)
+  AND SG4.EFF_STATUS = 'A'
+ORDER BY P6.POSITION_POOL_ID
+End-SELECT
+
+End-Procedure
+
+
+!***********************************************************************
+! PROCESS-POSNS-WITH-NO-POOL                                           *
+!                                                                      *
+!***********************************************************************
+Begin-Procedure Process-Posns-With-No-Pool
+
+Begin-SELECT
+
+P7.POSITION_POOL_ID
+P7.POSITION_NBR
+P7.FTE
+P7.BUDGETED_POSN
+P7.STATUS_DT
+P7.CLASS_INDC
+SG5.MID_RT_ANNUAL
+P7.DEPTID
+
+        let #Max_FTE            = &P7.FTE
+        let $Chk_DeptID         = &P7.DEPTID
+
+! Calculate an adjusted FTE based on a position becoming approved during
+! the from/thru period
+
+        let $StatusDt = &P7.STATUS_DT
+        do Format-DateTime ($StatusDt, $StatusDt_Cmp, {DEFCMP},'','')
+        if $StatusDt_Cmp > $FromDate_Cmp
+                let $LowerDate = $StatusDt
+        else
+                let $LowerDate = $FromDate
+        end-if
+
+        let $CheckPosn = rtrim(&P7.POSITION_NBR, ' ')
+        do Check-Transfered-Posn
+
+        do Convert-To-DTU-Date($LowerDate, $LowerDate_Dtu)
+        do Convert-To-DTU-Date($UpperDate, $UpperDate_Dtu)
+        do dtu-diff-days($LowerDate_Dtu, $UpperDate_Dtu, #NumDays)
+        let #Annual_Factor = round(((#NumDays + 1) / {daysinyear}), 6)
+        let #Adj_FTE = round((#Annual_Factor * #Max_FTE), 6)
+
+
+        let $CurBudgetLev = 'P'                                 !Position Level
+        let #CurFTE       = #Adj_FTE
+        let #CurSal       = round((&SG5.MID_RT_ANNUAL * #Annual_Factor), 2)
+        let #Adjustment   = round((#CurSal  * #Percent_Increase / 100),2)
+        let #CurSal       = #CurSal + #Adjustment
+        let $SavePool     = ' '
+        let $SavePos      = &P7.POSITION_NBR
+        let $H_ErnCd      = ' '
+        let $H_ClassIndc  = rtrim(&P7.CLASS_INDC, ' ')
+        let #PoolSeq      = 1
+        let $H_AcctCd     = rtrim(&RC.ACCT_CD, ' ')
+        let $H_GLPayType  = ' '
+
+        let $Store-Info-Only = 'Y'
+        do Post-Budgets
+
+FROM PS_POSITION_DATA P7,
+     PS_JOBCODE_TBL JC5,
+     PS_SAL_GRADE_TBL SG5
+WHERE $SetID =
+          (SELECT SCTL10.SETID
+             FROM PS_SET_CNTRL_REC SCTL10
+            WHERE SCTL10.SETCNTRLVALUE = P7.BUSINESS_UNIT
+              AND SCTL10.REC_GROUP_ID  = 'HR_01'
+              AND SCTL10.RECNAME       = 'DEPT_TBL')
+  AND P7.DEPTID IN (SELECT P7BUDDEP.DEPTID FROM PS_DEPT_TBL P7BUDDEP
+                     WHERE P7BUDDEP.SETID = $SetID
+                       AND P7BUDDEP.BUDGET_DEPTID = $DeptID
+                       AND P7BUDDEP.EFFDT = (SELECT MAX(P7BUDDEP1.EFFDT) FROM PS_DEPT_TBL P7BUDDEP1
+                                           WHERE P7BUDDEP1.SETID = P7BUDDEP.SETID
+                                             AND P7BUDDEP1.DEPTID = P7BUDDEP.DEPTID
+                                             AND P7BUDDEP1.EFFDT <= $ThruDate)
+                       AND P7BUDDEP.EFF_STATUS = 'A')
+  AND P7.EFF_STATUS    = 'A'
+  AND P7.POSN_STATUS   = 'A'
+  AND P7.BUDGETED_POSN = 'Y'
+  AND P7.POSITION_POOL_ID = ' '
+  AND P7.EFFDT =
+        (SELECT MAX(P7S.EFFDT)
+           FROM PS_POSITION_DATA P7S
+           WHERE P7S.POSITION_NBR = P7.POSITION_NBR
+             AND P7S.EFFDT       <= $ThruDate)
+  AND JC5.SETID =
+          (SELECT SCTL11.SETID
+             FROM PS_SET_CNTRL_REC SCTL11
+            WHERE SCTL11.SETCNTRLVALUE = P7.BUSINESS_UNIT
+              AND SCTL11.REC_GROUP_ID  = 'HR_02'
+              AND SCTL11.RECNAME       = 'JOBCODE_TBL')
+  AND JC5.JOBCODE = P7.JOBCODE
+  AND JC5.EFFDT =
+        (SELECT MAX(JC5S.EFFDT)
+           FROM PS_JOBCODE_TBL JC5S
+           WHERE JC5S.SETID      = JC5.SETID
+             AND JC5S.JOBCODE    = JC5.JOBCODE
+             AND JC5S.EFFDT     <= $ThruDate)
+  AND JC5.EFF_STATUS     = 'A'
+  AND SG5.SETID          = JC5.SETID_SALARY
+  AND SG5.SAL_ADMIN_PLAN = JC5.SAL_ADMIN_PLAN
+  AND SG5.GRADE          = JC5.GRADE
+  AND SG5.EFFDT =
+        (SELECT MAX(SG5S.EFFDT)
+           FROM PS_SAL_GRADE_TBL SG5S
+           WHERE SG5S.SETID           = SG5.SETID
+             AND SG5S.SAL_ADMIN_PLAN  = SG5.SAL_ADMIN_PLAN
+             AND SG5S.GRADE           = SG5.GRADE
+             AND SG5S.EFFDT          <= $FromDate)
+  AND SG5.EFF_STATUS = 'A'
+ORDER BY P7.POSITION_POOL_ID
+End-SELECT
+
+End-Procedure
+
+
+!***********************************************************************
+! WRAPUP                                                               *
+! This paragraph ends the report process and updates the status of the *
+! job in the process scheduler.                                        *
+!***********************************************************************
+Begin-Procedure Wrapup
+
+  do Delete-Run-Control
+  do Reset
+  do Successful-EOJ
+
+End-Procedure
+
+
+!****************************************************************************
+! DELETE-RUN-CONTROL                                                        *
+! Deletes run control information from run control table.                   *
+!****************************************************************************
+Begin-Procedure Delete-Run-Control
+
+
+let $SQL-STATEMENT = 'BUD005.SQR, DELETE, PS_RUN_CNTL_BLOAD'
+begin-sql on-error=SQL-Error
+DELETE FROM PS_RUN_CNTL_BLOAD
+WHERE OPRID       = $Prcs_OprID
+  AND RUN_CNTL_ID = $Prcs_Run_Cntl_ID
+end-sql
+
+let $SQL-STATEMENT = 'BUD005.SQR, DELETE, PS_RUN_CNTL_BUDEPT'
+begin-sql on-error=SQL-Error
+DELETE FROM PS_RUN_CNTL_BUDEPT
+WHERE OPRID       = $Prcs_OprID
+  AND RUN_CNTL_ID = $Prcs_Run_Cntl_ID
+end-sql
+
+End-Procedure
+
+!***********************************************************************
+! SQCs                                                                 *
+!***********************************************************************
+#include 'reset.sqc'     !Reset printer procedure
+#include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#include 'datetime.sqc'  !Routines for date and time formatting
+#include 'number.sqc'    !Routines to format numbers
+#include 'prcsapi.sqc'   !Update Process API
+#include 'prcsdef.sqc'   !Update Process Request variable declare
+#include 'blrnctl1.sqc'  !Get run control parameters.  This will change
+#include 'blgetval.sqc'  !Formats run control parameters.  This will also
+#include 'eoj.sqc'       !Updates process scheduler status
+#include 'datemath.sqc'
+#include 'askftd.sqc'
+#include 'getactrs.sqc'
+#include 'getdptnm.sqc'

@@ -1,0 +1,506 @@
+!***********************************************************************
+!  TAX915:    W-3 Transmittal - Totals Report                          *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+!                                                                      *
+! This module contains confidential and proprietary information        *
+! of Oracle; it is not to be copied, reproduced, or transmitted        *
+! in any form, by any means, in whole or in part, nor is it to         *
+! be used for any purpose other than that for which it is              *
+! expressly provided under the applicable license agreement.           *
+!                                                                      *
+! Copyright (C) 2007 Oracle. All Rights Reserved.                      *
+!                                                                      *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!          $Date:  2007/01/17:11:35:50                                 !
+!       $Release:  HR9                                                 !
+!    $Resolution:  654914                                              !
+!                                                                      *
+!***********************************************************************
+
+#include 'setenv.sqc' !Set environment
+#include 'setup32.sqc' !Printer and page-size initialization
+
+begin-report
+  display ''
+  display 'Begin W-3 Transmittal - Totals Report'
+  do Init-Report
+  move 'W3  ' to $TaxFormSelect
+  do Process-Main
+  move 'W3SS' to $TaxFormSelect
+  do Process-Main
+  do Stdapi-Term
+  display ''
+  display 'End   W-3 Transmittal - Totals Report'
+end-report
+
+begin-procedure Init-Report
+  move 'TAX915' to $ReportID
+  move 'W-3 Transmittal - Totals Report' to $ReportTitle
+  do Init-DateTime
+  do Init-Number
+  do Stdapi-Init
+  do Get-Current-DateTime
+  do Initialization
+end-procedure
+
+begin-heading 7
+  #Include 'stdhdg01.sqc'
+  print 'Company'              (3,1)
+  print $A.W2_Reporting_Co     (,+2)
+  let $TaxYear = 'Tax Year ' || $CalYear
+  print $TaxYear               (3,)    center
+  print $TaxFormSelect         (+3,3)
+  print 'Box'                  (+1,3)
+  print 'Description'          (,10)
+  print 'Contents / Amount'    (,65)
+end-heading
+
+begin-procedure Initialization
+  do Get-Current-DateTime
+  move '1' to $MMLZero
+  move '1' to $Year4
+  do Format-DateTime($AsOfToday, $910Date, {DEFYMD},'','')
+
+  move $910Date to $AsOfYear xxxx   !extract the current year
+  move $AsOfYear  to #AsOfYear
+  move #AsOfYear  to #saveAsOfYear
+  subtract 1    from #AsOfYear
+  do Get-Tax-Reporting-Run-Controls
+
+  if &TX.Balance_Year <> #AsOfYear and $Prcs_Process_Instance = ''
+    display ''
+    display 'Current Year is not one greater than Tax Reporting Year.'
+    display 'Current Year is    ' noline
+    display  #saveAsOfYear  9999
+    display 'Tax Reporting Year ' noline
+    display &TX.Balance_Year
+    input $Answer maxlen=1 'Do you want to continue? (Y/N)'
+    uppercase $Answer
+    if $Answer <> 'Y'
+      stop
+    end-if
+  end-if
+end-procedure
+
+begin-procedure Process-Main
+  move &TX.Balance_Year to $CalYear 9999
+begin-SELECT DISTINCT
+A.W2_REPORTING_CO
+A.DESCR
+A.FEDERAL_EIN
+A.ADDRESS1
+A.ADDRESS2
+A.CITY
+A.STATE
+A.POSTAL
+A.COUNTRY
+A.OTHER_EIN
+
+  move &A.W2_Reporting_Co to $A.W2_Reporting_Co
+
+  do Zero-W3SS-Totals
+  do Get-W2-Count
+  if #W2SS-Count > 0
+    do Load-W3SS-Totals
+    move ' ' to $TaxForm_ID
+    do Print-W3
+    NEW-PAGE
+  end-if
+
+FROM  PS_W2_COMPANY A
+WHERE A.CALENDAR_YEAR   = &TX.Balance_Year
+  AND A.W2_REPORTING_CO = A.COMPANY
+  AND A.W2_REPORTING_CO <> ' '
+  AND A.TAXFORM_ID IN ('W','I','M','S')
+ORDER BY A.W2_REPORTING_CO
+end-SELECT
+end-procedure
+
+begin-procedure Get-W2-Count
+  move 0 to #W2-Count
+begin-SELECT DISTINCT
+EE.TAXFORM_ID             () on-break level=1 print=never after=After-TAXFORM
+EE.EMPLID
+
+  if ($TaxFormSelect = 'W3  '
+      and &EE.TaxForm_ID = 'W')
+  or ($TaxFormSelect = 'W3SS'
+      and (&EE.TaxForm_ID = 'I'
+          or &EE.TaxForm_ID = 'M'
+          or &EE.TaxForm_ID = 'S'))
+    add 1 to #W2-Count
+  end-if
+  move &EE.TaxForm_ID      to $TaxForm_ID
+
+FROM  PS_YE_EE EE, PS_W2_COMPANY C1
+WHERE C1.W2_REPORTING_CO = &A.W2_Reporting_Co
+  AND EE.COMPANY         = C1.COMPANY
+  AND EE.CALENDAR_YEAR   = C1.CALENDAR_YEAR
+  AND C1.TAXFORM_ID      = 'W'
+  AND EE.TAXFORM_ID      IN ('W','I','M','S')
+  AND EE.CALENDAR_YEAR   = &TX.Balance_Year
+  AND EE.PROCESS_FLAG   <> 'V'
+ORDER BY EE.TAXFORM_ID
+end-SELECT
+end-procedure
+
+begin-procedure After-TAXFORM
+
+  if #W2-Count > 0
+    do Load-Amounts
+    do Get-Third-Party-Sick
+    if $TaxFormSelect = 'W3SS'
+      do Accum-W3SS-Totals
+    end-if
+    do Print-W3
+    NEW-PAGE
+    move 0 to #W2-Count
+  end-if
+
+end-procedure
+
+begin-procedure Load-Amounts
+  do Zero-Amounts
+  do assign-year-end-variables
+begin-SELECT
+C2.W2_REPORTING_CO
+D.BOX
+#ifdef DB2ALL
+DECIMAL(SUM(D.W2_AMOUNT),15,3) &D.W2_Amount
+#else
+SUM(D.W2_AMOUNT) &D.W2_Amount
+#endif
+  move &D.W2_Amount to #Amount
+
+! If box 12 or 14, don't rtrim trailing spaces from fetched Box value
+! otherwise values won't match w2.sqc YE variable values
+   let $D.Box = &D.Box
+   move $D.Box to $Box xx
+   let $Pos3 = substr($D.Box, 3,1)
+   if $Box = $YE_Box12_StartPos  or
+      $Box = $YE_Other
+     and $Pos3 > ' '
+     let $D.Box = &D.Box
+     let $D.Box = rpad($D.Box,4,' ')
+   else
+     let $D.Box = RTRIM(&D.Box,' ')
+   end-if
+   evaluate $D.Box
+     when = $YE_Fed_Wages                        !Federal wages
+       move #Amount to #01
+       break
+     when = $YE_Fed_Tax                          !Federal tax
+       move #Amount to #02
+       break
+     when = $YE_SS_Wages                         !SS wages
+       move #Amount to #03
+       break
+     when = $YE_SS_Tax                           !SS Tax
+       move #Amount to #04
+       break
+     when = $YE_Med_Wages                        !Medicare wages
+       move #Amount to #05
+       break
+     when = $YE_Med_Tax                          !Medicare tax
+       move #Amount to #06
+       break
+     when = $YE_SS_Tips                          !SS tips
+       move #Amount to #07
+       break
+     when = $YE_Alloc_Tips                       !Allocated tips
+       move #Amount to #08
+       break
+     when = $YE_Adv_EIC                          !EIC
+       move #Amount to #09
+       break
+     when = $YE_Dep_Care                         !Dependent care
+       move #Amount to #10
+       break
+     when = $YE_Non_Qual_457_Y                   !non-qualified 457
+       add  #Amount to #11AB
+       break
+     when = $YE_Non_Qual_457_N                   !non-qualified non-457
+       add  #Amount to #11AB
+       move 'Y' to $Non457
+       break
+     when = $YE_401K                             !401(k)
+       add  #Amount to #12
+       break
+     when = $YE_403B                             !403(b)
+       add  #Amount to #12
+       break
+     when = $YE_408K6                            !408(k)(6)
+       add  #Amount to #12
+       break
+     when = $YE_457B                             !457(b)
+       add  #Amount to #12
+       break
+     when = $YE_501C18D                          !501(c)(18)(D)
+       add  #Amount to #12
+       break
+     when = $YE_408P_Simple_Retirement           !408(p)
+       add  #Amount to #12
+       break
+     when = $YE_409A_Def_NQ_Def_Comp             !409A Deferred NQ Def Comp
+       add  #Amount to #12
+       break
+     when = $YE_Roth_401K                        !Roth Contrib to 401(k)
+       add  #Amount to #12
+       break
+     when = $YE_Roth_403B                        !Roth Contrib to 403(b)
+       add  #Amount to #12
+       break
+   end-evaluate
+
+FROM  PS_YE_AMOUNTS D, PS_YE_EE E1, PS_W2_COMPANY C2
+WHERE C2.W2_REPORTING_CO = &A.W2_Reporting_Co
+  AND D.COMPANY          = C2.COMPANY
+  AND D.CALENDAR_YEAR    = C2.CALENDAR_YEAR
+  AND C2.TAXFORM_ID      = 'W'
+  AND D.CALENDAR_YEAR    = &TX.Balance_Year
+  AND D.SEQUENCE_NUMBER  = 1
+  AND D.BOX IN($YE_Fed_Wages,
+               $YE_Fed_Tax,
+               $YE_SS_Wages,
+               $YE_SS_Tax,
+               $YE_Med_Wages,
+               $YE_Med_Tax,
+               $YE_SS_Tips,
+               $YE_Alloc_Tips,
+               $YE_Adv_EIC,
+               $YE_Dep_Care,
+               $YE_Non_Qual_457_Y,
+               $YE_Non_Qual_457_N,
+               $YE_401K,
+               $YE_403B,
+               $YE_408K6,
+               $YE_457B,
+               $YE_501C18D,
+               $YE_408P_Simple_Retirement,
+               $YE_409A_Def_NQ_Def_Comp,
+               $YE_Roth_401K,
+               $YE_Roth_403B
+               )
+  AND D.COMPANY          = E1.COMPANY
+  AND D.EMPLID           = E1.EMPLID
+  AND D.TAXFORM_ID       = E1.TAXFORM_ID
+  AND D.CALENDAR_YEAR    = E1.CALENDAR_YEAR
+  AND D.TAXFORM_ID       = $TaxForm_ID
+  AND E1.PROCESS_FLAG   <> 'V'
+GROUP BY C2.W2_REPORTING_CO, D.BOX
+end-SELECT
+end-procedure
+
+Begin-Procedure Get-Third-Party-Sick
+   Let $Third_party_sick = 'N'
+Begin-Select
+TSI.COUNTRY
+
+   Let $Third_party_sick = 'Y'
+
+FROM PS_INSTALLATION TSI
+WHERE EXISTS (SELECT 'X'
+              FROM  PS_YE_EE TSE, PS_YE_DATA TS, PS_W2_COMPANY TSC
+              WHERE TSC.W2_REPORTING_CO   = &A.W2_Reporting_Co
+                AND TSC.COMPANY           = TS.COMPANY
+                AND TSC.CALENDAR_YEAR     = TS.CALENDAR_YEAR
+                AND TS.CALENDAR_YEAR      = &TX.Balance_Year
+                AND TS.SEQUENCE_NUMBER    = 1
+                AND TS.COMPANY            = TSE.COMPANY
+                AND TS.EMPLID             = TSE.EMPLID
+                AND TS.TAXFORM_ID         = TSE.TAXFORM_ID
+                AND TS.CALENDAR_YEAR      = TSE.CALENDAR_YEAR
+                AND TSE.PROCESS_FLAG      <> 'V'
+                AND TS.THIRDPARTY_SICKPAY = 'Y')
+End-Select
+End-Procedure
+
+begin-procedure Zero-Amounts
+  move '' to $FedEIN
+  move '' to $OtherEIN
+  move 0 to #01
+  move 0 to #02
+  move 0 to #03
+  move 0 to #04
+  move 0 to #05
+  move 0 to #06
+  move 0 to #07
+  move 0 to #08
+  move 0 to #09
+  move 0 to #10
+  move 0 to #11AB
+  move 0 to #12
+end-procedure
+
+begin-procedure Zero-W3SS-Totals
+  move 0 to #W2SS-Count
+  move 0 to #01-SS
+  move 0 to #02-SS
+  move 0 to #03-SS
+  move 0 to #04-SS
+  move 0 to #05-SS
+  move 0 to #06-SS
+  move 0 to #07-SS
+  move 0 to #08-SS
+  move 0 to #09-SS
+  move 0 to #10-SS
+  move 0 to #11AB-SS
+  move 0 to #12-SS
+end-procedure
+
+begin-procedure Accum-W3SS-Totals
+  add #W2-Count to #W2SS-Count
+  add #01 to #01-SS
+  add #02 to #02-SS
+  add #03 to #03-SS
+  add #04 to #04-SS
+  add #05 to #05-SS
+  add #06 to #06-SS
+  add #07 to #07-SS
+  add #08 to #08-SS
+  add #09 to #09-SS
+  add #10 to #10-SS
+  add #11AB to #11AB-SS
+  add #12 to #12-SS
+end-procedure
+
+begin-procedure Load-W3SS-Totals
+  move #W2SS-Count to #W2-Count
+  move #01-SS to #01
+  move #02-SS to #02
+  move #03-SS to #03
+  move #04-SS to #04
+  move #05-SS to #05
+  move #06-SS to #06
+  move #07-SS to #07
+  move #08-SS to #08
+  move #09-SS to #09
+  move #10-SS to #10
+  move #11AB-SS to #11AB
+  move #12-SS to #12
+end-procedure
+
+begin-procedure Print-W3
+
+  if $TaxForm_ID <> ' '
+    move 'TAXFORM_ID'  to $FieldName
+    move $TaxForm_ID   to $FieldValue
+    do Read-Translate-Table
+    move $XlatShortName to $TaxForm_Name
+
+    if $TaxForm_ID <> 'W'
+      let $TaxForm_Name = RTRIM($TaxForm_Name,' ') || ' (only)'
+    end-if
+  else
+    move 'W-2AS, W-2GU and W-2VI' to $TaxForm_Name
+  end-if
+
+  print 'b     Third party sick pay           '  (+2,4)
+  if $Third_party_sick = 'Y'
+    print 'Yes'                                  (,65)
+  else
+    print 'No'                                   (,65)
+  end-if
+
+  print 'c     Total number of statements     '  (+2,4)
+  print $TaxForm_Name                            (,40)
+  print #W2-Count                                (,76)   edit 999999
+
+  move &A.Federal_EIN to $FedEIN 099999999
+  print 'e     Employer identification number '  (+2,4)
+  print $FedEIN                                  (,65)   edit xx-xxxxxxx
+
+  print 'f     Employer name                  '  (+2,4)
+  print &A.Descr                                 (,65)
+
+  let $City = RTRIM(&A.City,' ')
+  print 'g     Employer address               '  (+2,4)
+  print &A.Address1                              (,65)
+  print $City                                    (+1,65)
+  print &A.State                                 ()       edit ,bxx
+
+  Move &A.Postal to $Zip
+
+  if &A.Country <> 'USA'
+    print $Zip                                   (,+1)
+    print &A.Country                             (,+1)
+  else
+    move $Zip            to $ZipExtsn ~~~~~~xxxx
+    if instr($Zip,'-',6) = 0
+    and $ZipExtsn <> '    '
+      let $Zip = substr($Zip,1,5) || '-' || substr($Zip,6,4)
+    end-if
+    print $Zip                                      (,+1)
+  end-if
+
+  print 'h     Other EIN used this year'         (+2,4)
+  if &A.Other_EIN <> 0
+    move &A.Other_EIN to $OtherEIN 099999999
+    print $OtherEIN                              (,65)    edit xx-xxxxxxx
+  end-if
+
+  move '99999999999999.99' to $Fmt
+
+  print '1     Wages, tips, other compensation'  (+4,4)
+  do Format-Number(#01, $out, $Fmt)
+  print $out  (,65)
+
+  print '2     Federal income tax withheld    '  (+2,4)
+  do Format-Number(#02, $out, $Fmt)
+  print $out  (,65)
+
+  print '3     Social security wages          '  (+2,4)
+  do Format-Number(#03, $out, $Fmt)
+  print $out  (,65)
+
+  print '4     Social security tax withheld   '  (+2,4)
+  do Format-Number(#04, $out, $Fmt)
+  print $out  (,65)
+
+  print '5     Medicare wages and tips        '  (+2,4)
+  do Format-Number(#05, $out, $Fmt)
+  print $out  (,65)
+
+  print '6     Medicare tax withheld          '  (+2,4)
+  do Format-Number(#06, $out, $Fmt)
+  print $out  (,65)
+
+  print '7     Social security tips           '  (+2,4)
+  do Format-Number(#07, $out, $Fmt)
+  print $out  (,65)
+
+  print '8     Allocated tips                 '  (+2,4)
+  do Format-Number(#08, $out, $Fmt)
+  print $out  (,65)
+
+  print '9     Advance EIC payments           '  (+2,4)
+  do Format-Number(#09, $out, $Fmt)
+  print $out  (,65)
+
+  print '10    Dependent care benefits        '  (+2,4)
+  do Format-Number(#10, $out, $Fmt)
+  print $out  (,65)
+
+  print '11    Nonqualified plans             '  (+2,4)
+  do Format-Number(#11AB, $out, $Fmt)
+  print $out  (,65)
+
+  print '12    Deferred compensation          '  (+2,4)
+  print '      (W-2 Box 12 codes D-H, S, Y, AA and BB)'  (+1,4)
+  do Format-Number(#12, $out, $Fmt)
+  print $out  (,65)
+end-procedure
+
+#Include 'taxrnctl.sqc'  !Get-Tax-Reporting-Run-Controls procedure
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'stdapi.sqc'    !Update Process API
+#Include 'w2.sqc'        !Routine for W2 Year End Box variables
+#Include 'readxlat.sqc'  !Read-Translate-Table procedure

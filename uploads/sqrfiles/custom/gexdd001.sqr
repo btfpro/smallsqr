@@ -1,0 +1,1213 @@
+!***********************************************************************
+!  GEXDD001: SAMPLE PROGRAM(DDP001)                                    *
+!           Write Direct Deposit Transmittal file                      *
+!           Discription: Creates one file containing direct deposit    *
+!               and Prenotification records for each Company/Transit#  *
+!               combination within RunID.  To create a report of all   *
+!  MULTI CO     prenotification records run DDP005 before executing    *
+!               this program.  To create prenotification memos run     *
+!               DDP006 prior to this program.                          *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module is the confidential and proprietary information of       *
+! GiantEagle, Inc.; it is not to be copied, reproduced, or transmitted *
+! in any form, by any means, in whole or in part, nor is it to be used *
+! for any purpose other than that for which it is expressly provided   *
+! without the written permission of GiantEagle.                        *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+!  $Date:: 10/08/97 10:00a      $                                      *
+!  $Revision:: 1                $                                      *
+!  $Workfile:: GEXDD001.SQR      $                                     *
+!                                                                      *
+!***********************************************************************
+!***********************************************************************
+!                         MODIFICATION HISTORY                         *
+!***********************************************************************
+!  ID#     INITIALS    DATE         DESCRIPTION OF THE CHANGE          *        
+!***********************************************************************
+!  gpyi003   SXK      10/08/1997    INITIAL CREATION                   *
+!            SXK      09/08/1998    Added OUTFILE variable             *
+!                                                                      *
+!            GXD      10/15/1998    Setup Run Control                  *
+!            SXK      11/11/1998    Added file Extension               *
+!            GXD      01/26/1999    1) Hard coded $File_CompanyName    *
+!                                   2) Changed $Batch_CompanyID format *
+!            JNB      02/01/1999    Hard coded GEI Ein '1'||'250698270'*
+!                                   for the file header                * 
+!            GXD      02/25/1999    Hard coded $TransitRouting# and    *
+!                                   $Alt_Trace values                  *
+!            JNB      02/29/2000    Retrofitted to 7.5                 *
+!                                                                      *
+!  HR10306   GBD      08/27/2002    v8.3 Upgrade: Fields added and     *
+!                                   removed from tables - rewrote some *
+!                                   Sql and program code.              *
+!                                                                      *
+!            AXL      08/28/2002    Accommodate new run control values *
+!                                   for annual bonus processing.       *
+!                                                                      *
+!            CWB      09/16/2003    Do not include bonus amounts when  *
+!                                   running on-cycle with same pay end *
+!                                   date as the bonus run.             *  
+!                                                                      * 
+!            CWB      06/09/2004    Modify logic to create             *
+!                                   $TransmitTime for file header      *
+!                                                                      * 
+!            AXL      09/06/2005    Added TAX-05C mods.                *
+!                                                                      *
+!            AXL      11/16/2005    Added TAX-05D mods.                *
+!            MXR      03/20/2007    SCT # 2062821 added procdure to print*
+!                                   header when pre notes.             *
+!            NRR      09/10/2007    Emplid to Ssn conversion ITG-42070 *
+!           vendaxg   08/25/2008   Changed Code for S3#11135374	       *
+! GEX_SEC_REENG 2015-04-29 Vahini Katta                                *
+! Changes related to gex_emplid_mapp/7 digit emplid                    *
+!***********************************************************************
+
+#include 'setenv.sqc'    !Set environment
+#include 'setup01.sqc'   !Printer and page-size initialization
+#include 'getcodta.sqc'  !Get-Company-Data procedure
+#include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#include 'payinit.sqc'   !Report Initialization and Timing
+#include 'datetime.sqc'  !Routines for date and time formatting
+#include 'number.sqc'    !Routines to format numbers
+#include 'stdapi.sqc'    !Update Process API
+!#include 'payrnctl.sqc'  !Get-Run-Control procedure
+#include 'gexpyrcl.sqc'  !Get gex custom Run-Control !AXL-08/28/2002
+#Include 'gexxx922.sqc'
+#include 'tranctrl.sqc'
+#include 'askaod.sqc'    !Ask-As-Of-Date procedure   !AXL-08/28/2002
+#Include 'getgeid.sqc'   !Get 7 digit Emplid !vendnrr 09-10-2007  ITG-42070	
+begin-report
+  do Init-Report
+  do Stdapi-Term
+end-report
+
+begin-procedure Init-Report
+
+  display 'Creating Direct Deposit Transmittal Files'
+
+  do Init-DateTime
+  do Init-Number
+  do Stdapi-Init
+  do Create-Array
+
+  move 'N' to $CyclePrompts     !Don't prompt for On/Off cycle in PAYINIT
+  do Payroll-Report-Initialization
+
+end-procedure
+
+
+begin-PROCEDURE Create-Array
+
+  move 8 to #lastIndex  !Index of last digit in Transit Routing Number
+  create-array name=Weights size=1 field=Factor:number:9
+  put 3 7 1 3 7 1 3 7 into Weights(0)                              -
+			   Factor(0) Factor(1) Factor(2) Factor(3) -
+			   Factor(4) Factor(5) Factor(6) Factor(7)
+
+end-PROCEDURE  !Create-Array
+
+
+begin-PROCEDURE Report
+
+  if $Prcs_Process_Instance = ''
+!AXL 8/28/2002 Determine OFF_CYCLE and CHECK_DT if applicble - Begin
+    while 1=1
+       input $off_cycle  'Enter Y for Off Cycle or N for On Cycle '
+      Uppercase $off_cycle
+       if rtrim($off_cycle,' ') ='N' or 
+          rtrim($off_cycle,' ') ='Y' 
+         Break
+       End-if 
+     end-while
+
+    evaluate $off_cycle
+       when = 'Y'
+        show  'Enter Check Date for Bonus Run '
+        Do Ask-As-Of-Date
+        let $check_dt= $AsOfDate
+        break
+       when-other 
+        !No action necessary. Check Dt resolves to main select CHECK_DT
+        break
+    end-evaluate
+    !AXL 8/28/2002 End
+    input $Answer  'Enter Prenote Date ({Prompt-Date})' type=char
+
+    move '1' to $MMLZero
+!    do Format-DateTime($Answer, $out, {Prompt-Mask}, '', '')
+    do Format-DateTime($Answer, $out, {Prompt-Mask}, '', 'native')    !GBD 08/27/2002 - Error: Bad Mask
+
+    if {Prompt-Mask} = {DEFMDY}
+      let $mm = substr($out, 1, 2)
+    else !DEFYMD or DEFDMY
+      let $mm = substr($out, 4, 2)
+    end-if
+
+    do Format-DateTime($Answer, $Prenote_Date, {Prompt-Mask}, '', 'native')
+
+    display 'PRENOTE DATE ' noline
+    display  $Prenote_Date
+
+    input $CustDiscrData 'Enter Description (20 character max)'
+  !SXK 11/11/98 Added file extension to facilitate run a and run b
+    let $extension = ''
+    while RTRIM($extension,' ') = ''
+      input $extension 'Enter File Extension (3 characters max)'
+    end-while
+       
+  else
+    do Select-Parameters                         ! CWB 09/16/2003
+    move $RC_PAYINIT.Prenote_Dt to $Prenote_Date
+    move $RC_PAYINIT.Text20     to $CustDiscrData
+
+    move $RC_PAYINIT.OFF_CYCLE  to $OFF_CYCLE	!AXL 8/28/2002  
+    move $RC_PAYINIT.CHECK_DT	to $CHECK_DT    !AXL 8/28/2002
+    ! Off_Cycle status determines whether or not to use $RC_PAYINIT.CHECK_DT  
+    ! in Write-Batch-Header procedure
+
+ !SXK 11/11/98 Added file extension to facilitate run a and run b
+    do GEXXX922-Select-Parameters
+    move $GEX_RC_PAY.gex_file_ext to $extension
+  end-if
+
+  !AXL 8/28/2002 Begin
+  if $OFF_CYCLE = 'N'
+       !Normal processing
+       let $where_clause = 'A.PAY_CONFIRM_RUN = '  ||
+                           '''' ||
+                           'Y'  ||
+                           '''' ||
+                           ' AND  A.PAY_CHECKS_RUN = '  ||
+                           '''' ||
+                           'N'  ||
+                           '''' 
+! CWB 09/16/2003 BEGIN     
+!       let $where_clause2 = '1=1'
+       let $where_clause2 = ' E.OFF_CYCLE = '  ||
+                            '''' ||
+                            'N'  ||
+                            '''' 
+! CWB 09/16/2003 END      
+    else
+       !Bonus processing
+       
+       let $where_clause = '1=1'
+       let $where_clause2 = 'E.OFF_CYCLE  ='      ||
+                            ''''  ||
+                            &RC_PAYINIT.OFF_CYCLE ||
+                             ''''  ||
+                            ' AND '||
+                            'E.CHECK_DT = '       ||
+                            '''' ||
+                            &RC_PAYINIT.CHECK_DT  ||
+                            ''''
+
+    end-if
+    !AXL 8/28/2002 End
+  move 'X' to $Details_Processed
+  move 'N' to $FileOpen
+  move 'N' to $BatchOpen
+  move 'N' to $NewFile
+  move 'N' to $NewBatch
+  move  0  to #filenum
+  move  0  to #Batch#
+  move 'GIANT EAGLE INC' to $File_CompanyName
+
+begin-SELECT
+
+A.COMPANY
+A.PAYGROUP
+A.PAY_END_DT
+A.CHECK_DT
+!B.TRANSIT#
+C.BANK_CD
+!B.ACCOUNT_NUM
+C.ACCOUNT_EC_ID
+C.DD_ACCOUNT_NBR
+CT.ALT_BANK_CD
+!C.DESCR                                        ! originating bank name
+
+!GBD 08/27/2002 Begin
+  if isblank(&CT.ALT_BANK_CD)
+     move &C.BANK_CD        to $Transit#
+     move 'SB.BANK_CD'      to $Transit_to_Use
+  else
+     move &CT.ALT_BANK_CD   to $Transit#
+     move 'BTB.ALT_BANK_CD' to $Transit_to_Use
+  end-if
+  if isblank(&C.DD_ACCOUNT_NBR)
+     move &C.ACCOUNT_EC_ID  to $Account#
+  else
+     move &C.DD_ACCOUNT_NBR to $Account#
+  end-if
+
+  Do Get-Transit-Descr
+
+!GBD 08/27/2002 End
+
+  if $PriorCompany <> &A.Company
+
+    if $FileOpen ='Y'
+
+	if #BatchEntryCount > 0
+	  do Write-Offset-Record
+	end-if
+
+	if $Details_Processed = 'Y'
+	    do Write-Prenotes
+	end-if
+
+	if $BatchOpen ='Y'
+	  do Write-Batch-Control
+	end-if
+    else
+	if $Details_Processed = 'N'             !First time equals X
+	  do Write-Prenotes
+
+	  if $BatchOpen ='Y'
+	    do Write-Batch-Control
+	  end-if
+	end-if
+    end-if
+
+    move 'Y'        to $NewBatch
+    move &A.Company to $PriorCompany
+    move &A.Company to $Company
+    do Get-Company-Data
+    move $CompanyName to $Batch_CompanyName
+    UPPERCASE $Batch_CompanyName
+    move &CT.Federal_EIN    to $Federal_EIN
+!    let $Batch_CompanyID = '1' || $Federal_EIN
+    let $Batch_CompanyID = $Federal_EIN || ' '
+  end-if
+
+!  if &B.Transit# <> $priorTransit#
+  if $Transit#  <> $priorTransit#                !GBD 08/27/2002
+
+    if $FileOpen ='Y'
+
+	if #BatchEntryCount > 0
+	  do Write-Offset-Record
+	end-if
+
+	if $Details_Processed = 'Y'
+	    do Write-Prenotes
+	end-if
+
+	if $BatchOpen ='Y'
+	  do Write-Batch-Control
+	end-if
+
+	do Write-File-Control
+	do Close-File
+    else
+	if $Details_Processed = 'N'       !First time equals X
+	  do Write-Prenotes
+
+	  if $FileOpen ='Y'
+
+	    if $BatchOpen ='Y'
+	      do Write-Batch-Control
+	    end-if
+
+	    do Write-File-Control
+	    do Close-File
+	  end-if
+	end-if
+    end-if
+
+    move 'Y'         to $NewFile
+    move 'Y'         to $NewBatch
+!    move &B.Transit# to $priorTransit#      
+    move $Transit#   to $priorTransit#       !GBD 08/27/2002
+  end-if
+
+!  move &B.Account# to $priorAccount# 
+  move $Account#     to $priorAccount#       !GBD 08/27/2002
+
+  do Process-Entry-Detail
+
+FROM PS_PAY_CALENDAR A,
+     PS_PAYGROUP_TBL B,
+     PS_SRC_BANK     C,
+     PS_BANK_EC_TBL  CT
+WHERE [$SlctCalendar]
+  AND A.PAYGROUP         = B.PAYGROUP
+  AND A.COMPANY          = B.COMPANY
+  AND B.EFFDT            =
+      (SELECT MAX(EFFDT)
+	 FROM PS_PAYGROUP_TBL
+	WHERE COMPANY    = A.COMPANY
+	  AND PAYGROUP   = A.PAYGROUP
+	  AND EFF_STATUS = 'A'
+          AND EFFDT      <= A.PAY_END_DT)
+!  AND B.TRANSIT#         = C.TRANSIT#        GBD 08/27/2002
+  !AND A.PAY_CONFIRM_RUN  = 'Y'		 AXL 8/28/02
+  !AND A.PAY_CHECKS_RUN   = 'N'		 AXL 8/28/02
+  AND [$where_clause]			!AXL 08/28/02
+!GBD 08/27/2002 Added
+  AND C.SRC_BANK_ID      = B.SRC_BANK_ID
+  AND CT.BANK_CD         = C.BANK_CD
+  !VENDAXG Changed for S311135374 - Begin
+  !AND BT.COUNTRY_CD      = 'USA'	!
+  AND CT.COUNTRY_CD      = 'USA'	
+  !VENDAXG Changed for S311135374 - End
+   
+ORDER BY A.COMPANY,
+!	 B.TRANSIT#,                          GBD 08/27/2002
+         C.BANK_CD,
+	 A.PAYGROUP
+end-SELECT
+
+  if $FileOpen ='Y'
+
+    if #BatchEntryCount > 0
+      do Write-Offset-Record
+    end-if
+
+    do Write-Prenotes
+
+    if $BatchOpen = 'Y'
+      do Write-Batch-Control
+    end-if
+
+    do Write-File-Control
+    do Close-File
+  else
+
+    if $NewFile = 'Y'
+      move 'N' to $NewFile
+      do Start-New-File
+      do Start-New-Batch
+      do Write-Prenotes
+      do Write-Batch-Control
+      do Write-File-Control
+      do Close-File
+    end-if
+  end-if
+
+end-PROCEDURE
+
+
+begin-procedure Process-Entry-Detail
+
+  move 'N' to $Details_Processed
+
+begin-SELECT
+E.EMPLID
+E.NAME
+F.ACCOUNT_TYPE
+F.PAYCHECK_NBR
+F.ACCOUNT_NUM
+!F.TRANSIT#
+F.BANK_CD                            !GBD 08/27/2002
+F.DEPOSIT_AMOUNT
+E.EMPL_RCD
+E.PAY_END_DT
+F.PAYGROUP
+F.PAGE_NUM
+F.LINE_NUM
+
+  move 'Y' to $Details_Processed
+  !AXL 11/16//2005 TAX O5D - Begin
+  move &F.Deposit_Amount to #Temp_Amount
+  multiply 100 times #Temp_Amount                  !Remove decimal
+  let #Temp_TotBatchCreditAmt = #Temp_Amount + #TotBatchCreditAmt
+  if #Temp_TotBatchCreditAmt > 9999999999
+
+    if $FileOpen ='Y'
+
+      if #BatchEntryCount > 0
+        do Write-Offset-Record
+      end-if
+
+      do Write-Prenotes
+
+      if $BatchOpen = 'Y'
+        do Write-Batch-Control
+      end-if
+
+      move 'Y'         to $NewBatch
+    end-if
+
+  end-if
+  !AXL 11/16//2005 TAX O5D - End
+  if $NewFile = 'Y'
+    move 'N' to $NewFile
+    do Start-New-File
+  end-if
+
+  if $NewBatch = 'Y'
+    move 'N' to $NewBatch
+    do Start-New-Batch
+  end-if
+
+  do Write-Entry-Detail
+  do Check-Prenote-Status
+
+FROM  PS_PAY_CHECK      E,
+      PS_PAY_DISTRIBUTN F
+WHERE E.COMPANY         = &A.Company
+  AND F.COMPANY         = &A.Company
+  AND E.PAYGROUP        = &A.PayGroup
+  AND F.PAYGROUP        = &A.PayGroup
+  AND E.PAY_END_DT      = &A.Pay_End_Dt
+  AND F.PAY_END_DT      = &A.Pay_End_Dt
+  AND F.PAGE_NUM           = E.PAGE_NUM
+  AND F.LINE_NUM           = E.LINE_NUM
+  AND F.OFF_CYCLE       = E.OFF_CYCLE
+  AND F.SEPCHK          = E.SEPCHK
+  AND F.ACCOUNT_TYPE    <> '$'            !not ISSUE CHECK
+  AND [$WHERE_CLAUSE2]			!AXL 08/28/02
+ORDER BY F.PAYCHECK_NBR
+end-SELECT
+
+end-procedure
+
+
+begin-procedure Start-New-File
+
+    move 0 to #TotBatchCreditAmt
+    move 0 to #TotBatchDebitAmt
+    move 0 to #BatchEntryHash
+    move 0 to #TotFileDebitAmt
+    move 0 to #TotFileCreditAmt
+    move 0 to #FileEntryHash
+    move 0 to #BlockCount
+    move 0 to #BatchEntryCount     !Batch control
+    move 0 to #Temp_TotBatchCreditAmt	 !AXL 11/16//2005 TAX O5D - Add
+    move 0 to #FileEntryCount      !file control
+    move 0 to #FileBatchCount      !file control
+    move 0 to #FileBlockCount      !file control
+    move 0 to #Batch#
+
+    do Get-File-header-Company
+    do Open-File
+    do Write-File-Header
+
+end-procedure
+
+
+begin-procedure Start-New-Batch
+
+    move 0 to #TotBatchCreditAmt
+    move 0 to #TotBatchDebitAmt
+    move 0 to #BatchEntryHash
+    move 0 to #BatchEntryCount     !Batch control
+    move 0 to #Temp_TotBatchCreditAmt	 !AXL 11/16//2005 TAX O5D - Add
+    move 'Y' to $BatchOpen
+    do Write-Batch-Header
+
+end-procedure
+
+
+begin-PROCEDURE Get-File-header-Company
+
+  if $Prcs_Process_Instance = ''
+    display  'New Transit# is ' noline
+    display   $PriorTransit#
+    input $File_Co 'Enter 3 Digit Company Code for File Header' type=char
+    uppercase $File_Co
+  else
+    do Select-Parameters-File-Co
+  end-if
+
+  move $File_Co   to $Company
+  do Get-Company-Data
+!  move $CompanyName to $File_CompanyName
+!  uppercase $File_CompanyName
+  move &CT.Federal_EIN    to $Federal_EIN
+  let $File_CompanyID = '1' || $Federal_EIN
+
+end-procedure
+
+
+begin-procedure Select-Parameters-File-Co
+
+begin-select
+
+P1.COMPANY
+
+FROM  PS_RC_DDP001 P1
+WHERE P1.OPRID          = $Prcs_OprID
+AND   P1.RUN_CNTL_ID    = $Prcs_Run_Cntl_ID
+!AND   P1.TRANSIT#       = $PriorTransit#
+AND   P1.BANK_CD        = $PriorTransit#
+end-select
+
+  let  $File_Co = &P1.Company
+
+end-procedure
+
+
+begin-PROCEDURE Open-File
+!SXK 11/11/98 Commented out
+!  add 1 to #filenum
+!  do Format-Number(#filenum, $filenum, '009')
+!  let $FileName = 'gexdd001' || '.' || $FileNum
+  let $FileName = 'gexdd001' || '.' || $Extension
+  let $FileName = '{OUTFILE}' || $FileName !***|| '{FILESUFFIX}'
+
+  display $filename
+
+  open $filename as 1 for-writing record=94:fixed
+  move 'Y' to $FileOpen
+
+end-PROCEDURE
+
+
+begin-procedure Write-File-Header
+
+  move '1'                    to $RecordType
+  move '01'                   to $PriorityCode
+
+! GXD - 02/25/1999 Begin
+!  move ' '                    to $TransitRouting#
+!  concat &B.Transit#        with $TransitRouting#
+  move ' 043000122'           to $TransitRouting#
+! GXD - 02/25/1999 End
+
+  do Format-DateTime($AsOfToday, $out, {DEFCMP}, '', '')
+  let $TransmitDate = substr($out, 3, 2) || substr($out, 5, 2) || substr($out, 7, 2)
+
+  move '0' to $Time24
+  move '1' to $TLZero
+  move ''  to $TDelimiter
+  do Format-DateTime($SysDateTime, $out, {DEFDATE}, 'time', '')
+!  let $Time1 = substr($out, 9, 1)
+  let $Time1 = substr($out, 10, 1)     ! CWB 60/09/2004
+  if $Time1 = ' '
+    move '0' to $Time1
+  end-if
+!  let $Time2 = substr($out,10, 1)
+  let $Time2 = substr($out,11, 1)       ! CWB 60/09/2004 
+!  let $Time3 = substr($out, 11, 2)
+  let $Time3 = substr($out, 12, 2)      ! CWB 60/09/2004
+  let $TransmitTime = $Time1 || $Time2 || $Time3
+
+  show '$TransmitDate: ' $TransmitDate
+  show '$TransmitTime: ' $TransmitTime
+
+  move 'A'                    to $FileModifier
+  move '094'                  to $RecordSize
+  move '10'                   to $BlockingFactor
+  move '1'                    to $FormatCode
+!  move &C.Descr               to $OrigBank
+  move &C.BANK_NM             to $OrigBank      ! GBD 08/27/2002
+  move '        '             to $Reference     ! 8 spaces
+  uppercase $OrigBank
+
+  add 1 to #BlockCount
+! JNB 02/01/1999
+  move '1250698270' to $File_CompanyID
+
+  write 1 from  $RecordType:1             -
+		$PriorityCode:2           -
+		$TransitRouting#:10       -      ! Immediate Destination
+		$File_CompanyID:10        -
+		$TransmitDate:6           -
+		$TransmitTime:4           -
+		$FileModifier:1           -
+		$RecordSize:3             -
+		$BlockingFactor:2         -
+		$FormatCode:1             -
+		$OrigBank:23              -
+		$File_CompanyName:23      -
+		$Reference:8
+
+! JNB 02/01/1999
+  move ' ' to $File_CompanyID  
+end-procedure
+
+
+begin-procedure Write-Batch-Header
+
+  move '5'                    to $RecordType
+  move '220'                  to $ServiceClassCode
+  move 'PPD'                  to $StandardEntryClass
+  move 'DIR DEP'              to $CoEntryDescr
+
+  do Format-DateTime(&A.Pay_End_Dt, $out, {DEFCMP}, '', '')
+  let $CoDescrDt = substr($out, 3, 2) || substr($out, 5, 2) || substr($out, 7, 2)
+
+
+  !AXL 8/28/02 - Begin
+  !do Format-DateTime(&A.Check_Dt, $out, {DEFCMP}, '', '')
+  if $OFF_CYCLE = 'N'
+       let $check_dt_prn = &A.Check_Dt
+  else
+       let $check_dt_prn = $CHECK_DT
+  end-if
+  do Format-DateTime($Check_Dt_Prn, $out, {DEFCMP}, '', '')
+  !AXL 8/28/02 - End
+  let $EffEntryDt = substr($out, 3, 2) || substr($out, 5, 2) || substr($out, 7, 2)
+
+  move '   '                  to $SettlementData
+  move '1'                    to $StatusCode
+!  move &B.Transit#            to $TransitRouting#
+  move $Transit#              to $TransitRouting#         !GBD 08/27/2002
+
+  add 1 to #Batch#
+  do Format-Number(#Batch#, $Batch#, '0000009')
+
+  add 1 to #FileBatchCount
+  add 1 to #BlockCount
+
+! GXD - 02/25/1999 Begin
+  move '04300012' to $TransitRouting#
+! GXD - 02/25/1999 End
+
+  write 1 from  $RecordType:1          -
+		$ServiceClassCode:3    -
+		$Batch_CompanyName:16  -
+		$CustDiscrData:20      -
+		$Batch_CompanyID:10       -
+		$StandardEntryClass:3  -
+		$CoEntryDescr:10       -
+		$CoDescrDt:6           -
+		$EffEntryDt:6          -
+		$SettlementData:3      -
+		$StatusCode:1          -
+		$TransitRouting#:8     -    ! originating DFI ID
+		$Batch#:7
+
+end-procedure
+
+
+begin-procedure Write-Entry-Detail
+
+  move '6'  to $RecordType
+  move '0'  to $CheckDigit
+  move ' '  to $DiscrData
+  move '0'  to $AddendaIndicator
+  move ' '  to $Trace#
+  move &E.EmplID to $EmplID                   ! or SSN ?
+  move &E.Name to $Name
+  uppercase $Name
+
+  if &F.Account_Type = 'C'
+    move '22' to $TransactionCode           !DDA Automatic Credit
+  else   !Savings
+    move '32' to $TransactionCode           !TDA Automatic Credit
+  end-if
+
+!  move &F.Transit# to $TransitRouting#
+  move &F.BANK_CD to $TransitRouting#         !GBD 08/27/2002
+  do Calc-DFI-CheckDigit
+!  move &F.Transit# to $hashTransit# xxxxxxxx  !Only first eight numbers
+  move &F.BANK_CD to $hashTransit# xxxxxxxx   !GBD 08/27/2002
+  move $hashTransit# to #hashTransit#
+  add #hashTransit# to #BatchEntryHash
+
+  move &F.Deposit_Amount to #Amount
+  multiply 100 times #Amount                  !Remove decimal
+  do Format-Number(#Amount, $Amount, '0000000009')
+  add #Amount to #TotBatchCreditAmt
+  add #Amount to #TotBatchDebitAmt            ! for offset record
+
+  add 1 to #BatchEntryCount
+  add 1 to #BlockCount
+
+  if #BlockCount = 10
+    move 0 to #BlockCount
+    add  1 to #FileBlockCount
+  end-if
+
+  add 1     to #Trace#
+  move #Trace# to $Trace# 099999999999999
+
+!  let $Transit_Temp = substr(&B.Transit#, 0, 8)
+  let $Transit_Temp = substr($Transit#, 0, 8)               !GBD 08/27/2002
+  do Format-Number(#Trace#, $Trace_Temp, '0999999')
+
+! GXD - 02/25/1999 Begin
+!  let $Alt_Trace = $Transit_Temp || $Trace_Temp
+  let $Alt_Trace = '04300012' || $Trace_Temp
+! GXD - 02/25/1999 End
+  
+  move ' ' to $filler
+  !do Get-Gex-Mapp-EmpIid ($EmplID,$emplid_out)  !vendnrr 09-10-2007  ITG-42070 !GEX_SEC_REENG 2015-04-29 Vahini Katta
+  !show '$emplid_out  :' $emplid_out
+  write 1 from  $RecordType:1           -                   ! 01
+		$TransactionCode:2      -                   ! 02
+!		&F.Transit#:8           -                   ! 04
+                &F.BANK_CD:8            -                   ! GBD 08/27/2002
+		$CheckDigit:1           -                   ! 12
+!		&F.Account#:17          -                   ! 13
+                &F.ACCOUNT_NUM:17       -                   !GBD 08/27/2002
+		$Amount:10              -                   ! 30
+		$filler:5               -                   ! 40   
+		!$EmplID:10             -                   ! 45 vendnrr 09-10-2007  ITG-42070
+		!$emplid_out:10          -                  !    vendnrr 09-10-2007  ITG-42070 !GEX_SEC_REENG 2015-04-29 Vahini Katta
+    $EmplID:10              -                   !GEX_SEC_REENG 2015-04-29 Vahini Katta
+		$Name:22                -                   ! 55
+		$DiscrData:2            -                   ! 77
+		$AddendaIndicator:1     -                   ! 79
+!               $Trace#:15                                  ! 80
+		$Alt_Trace:15                               ! 80
+
+end-procedure
+
+
+begin-procedure Check-Prenote-Status
+
+begin-SELECT LOOPS=1
+D.EFFDT
+D.PRENOTE_STATUS
+D.PRENOTE_DATE                              !GBD 08/27/2002
+
+  if &D.Prenote_Status = 'S'                ! if submitted in previous payroll
+    and &E.Pay_End_Dt >= &D.PRENOTE_DATE    ! and prenotification period has passed
+    do Complete-Prenote-Status
+  end-if
+
+FROM PS_DIR_DEP_DISTRIB D
+WHERE EMPLID    = &E.Emplid
+!  AND EMPL_RCD = &E.Empl_Rcd#               GBD 08/27/2002
+  AND EFFDT    <= &E.Pay_End_Dt
+  AND BANK_CD   = &F.BANK_CD                !GBD 08/27/2002
+  AND ACCOUNT_NUM = &F.ACCOUNT_NUM          !GBD 08/27/2002
+!  AND TRANSIT#  = &F.Transit#
+!  AND ACCOUNT_NUM  = &F.Account#
+ORDER BY EFFDT DESC
+end-SELECT
+
+end-procedure
+
+
+begin-procedure Complete-Prenote-Status
+
+begin-SQL
+UPDATE PS_DIR_DEP_DISTRIB
+  SET PRENOTE_STATUS = 'C',
+      LAST_ACTION    = 'C',               !GBD 08/27/2002
+      LAST_UPDATE_DATE = $AsOfToday       !GBD 08/27/2002
+WHERE EMPLID    = &E.Emplid
+!  AND EMPL_RCD = &E.Empl_Rcd#            !GBD 08/27/2002 Removed
+  AND EFFDT     = &D.Effdt
+!  AND TRANSIT#  = &F.Transit#
+!  AND ACCOUNT_NUM  = &F.Account#
+  AND BANK_CD     = &F.BANK_CD            !GBD 08/27/2002
+  AND ACCOUNT_NUM = &F.ACCOUNT_NUM        !GBD 08/27/2002
+end-SQL
+
+end-procedure
+
+
+begin-PROCEDURE Close-File
+
+  if #BlockCount <> 0 and #BlockCount <> 10
+    do Complete-Block
+  end-if
+
+  close 1
+  move 'N' to $FileOpen
+
+end-PROCEDURE
+
+
+begin-procedure Write-Offset-Record
+
+  move '6'                to $RecordType
+  move '27'               to $TransactionCode        !DDA Automatic Debit
+  move '0'                to $CheckDigit
+  do Format-Number(#TotBatchDebitAmt, $Amount, '0000000009')
+  move ' '                to $DiscrData
+  move '0'                to $AddendaIndicator
+  add 1     to #Trace#
+
+  let $Transit_Temp = substr($priorTransit#, 0, 8)
+  do Format-Number(#Trace#, $Trace_Temp, '0999999')
+
+! GXD - 02/25/1999 Begin
+!  let $Alt_Trace = $Transit_Temp || $Trace_Temp
+  let $Alt_Trace = '04300012' || $Trace_Temp
+! GXD - 02/25/1999 End
+
+  add 1 to #BatchEntryCount
+
+  move $priorAccount# to $CoAccount#
+  move $priorTransit# to $TransitRouting#
+  do Calc-DFI-CheckDigit
+
+!  move &B.Transit# to $hashTransit# xxxxxxxx    !Only first eight numbers
+  move $priorTransit# to $hashTransit# xxxxxxxx  !GBD 08/27/2002
+  move $hashTransit# to #hashTransit#
+  add #hashTransit# to #BatchEntryHash
+
+  add 1 to #BlockCount
+
+  if #BlockCount = 10
+    move 0 to #BlockCount
+    add  1 to #FileBlockCount
+  end-if
+
+  write 1 from  $RecordType:1           -
+		$TransactionCode:2      -
+		$priorTransit#:8        -              ! company
+		$CheckDigit:1           -
+		$CoAccount#:17          -              ! company
+		$Amount:10              -
+		$Batch_CompanyID:15     -
+		$Batch_CompanyName:22   -
+		$DiscrData:2            -
+		$AddendaIndicator:1     -
+!               $Trace#:15
+		$Alt_Trace:15
+
+end-procedure
+
+
+begin-procedure Write-Prenotes
+
+    move '6'           to $RecordType
+    move '0'           to $CheckDigit
+    move ' '           to $DiscrData
+    move '0'           to $AddendaIndicator
+    move '0000000000'  to $Amount
+
+begin-SELECT
+DD.EMPLID
+!DD.EMPL_RCD                                  GBD 08/27/2002 Removed
+DD.EFFDT
+DD.PRIORITY
+PD.NAME
+DD.ACCOUNT_TYPE
+DD.ACCOUNT_NUM
+DD.BANK_CD
+SB.BANK_CD
+BTB.ALT_BANK_CD
+!DD.TRANSIT#
+!PT.TRANSIT#
+
+!GBD 08/27/2002 Begin
+  if isblank(&BTB.ALT_BANK_CD)
+     move &SB.BANK_CD        to $TransitNbr
+  else
+     move &BTB.ALT_BANK_CD   to $TransitNbr
+  end-if
+!GBD 08/27/2002 End
+
+  if $NewFile = 'Y'
+    move 'N' to $NewFile
+    do Start-New-File
+    do Start-New-Batch  !  isdvmxr 20/03/2007
+    else  !isdvmxr 04/06/2007
+      if $NewBatch = 'Y'
+         move 'N' to $NewBatch
+          do Start-New-Batch
+      end-if
+  end-if   !isdvmxr
+    move '6'           to $RecordType
+    move '0'           to $CheckDigit
+    move ' '           to $DiscrData
+    move '0'           to $AddendaIndicator
+    move '0000000000'  to $Amount
+ ! end-if
+
+  move &DD.EmplID to $EmplID                   ! or SSN ?
+  move &PD.Name to $Name
+  UPPERCASE $Name
+
+  if &DD.Account_Type = 'C'
+    move '23' to $TransactionCode           !DDA Prenote Credit
+  else
+    move '33' to $TransactionCode           !TDA Prenote Credit
+  end-if
+
+  do Update-Prenote-Status     !Change prenote-status to submitted
+
+!  move &DD.Transit# to $TransitRouting#
+  move &DD.BANK_CD      to $TransitRouting#         !GBD 08/27/2002
+  do Calc-DFI-CheckDigit
+
+!  move  &DD.Transit#    to $hashTransit# xxxxxxxx  !Only first eight numbers
+  move  &DD.BANK_CD     to $hashTransit# xxxxxxxx   !GBD 08/27/2002
+  move  $hashTransit#   to #hashTransit#
+  add   #hashTransit#   to #BatchEntryHash
+
+  add 1 to #BatchEntryCount
+  add 1 to #BlockCount
+
+  if #BlockCount = 10
+    move 0 to #BlockCount
+    add  1 to #FileBlockCount
+  end-if
+
+  add 1     to #Trace#
+  move #Trace# to $Trace# 099999999999999
+
+!GBD 08/27/2002 Begin
+!  let $Transit_Temp = substr(&PT.Transit#, 0, 8)
+!  do Format-Number(#Trace#, $Trace_Temp, '0999999')
+  let $Transit_Temp = substr($TransitNbr, 0, 8)
+  do Format-Number(#Trace#, $Trace_Temp, '0999999')
+!GBD 08/27/2002 End
+
+! GXD - 02/25/1999 Begin
+!  let $Alt_Trace = $Transit_Temp || $Trace_Temp
+  let $Alt_Trace = '04300012' || $Trace_Temp
+! GXD - 02/25/1999 End
+ !do Get-Gex-Mapp-EmpIid ($EmplID,$emplid_out)  !vendnrr 09-10-2007  ITG-42070 !GEX_SEC_REENG 2015-04-29 Vahini Katta
+ !show '$emplid_out 2  :' $emplid_out
+  WRITE 1 from  $RecordType:1           -
+		$TransactionCode:2      -
+!		&DD.Transit#:8          -
+                &DD.BANK_CD:8           -             !GBD 08/27/2002
+		$CheckDigit:1           -
+!		&DD.Account#:17         -
+                &DD.ACCOUNT_NUM:17      -             !GBD 08/27/2002
+ 		$Amount:10              -
+		!$EmplID:15             -             !vendnrr 09-10-2007  ITG-42070
+		!$emplid_out:15          -             !vendnrr 09-10-2007  ITG-42070 !GEX_SEC_REENG 2015-04-29 Vahini Katta
+    $EmplID:15              -             !GEX_SEC_REENG 2015-04-29 Vahini Katta
+		$Name:22                -
+		$DiscrData:2            -
+		$AddendaIndicator:1     -
+!               $Trace#:15
+		$Alt_Trace:15
+
+FROM PS_DIR_DEP_DISTRIB DD,
+     PS_PERSONAL_DATA   PD,
+     PS_PAYGROUP_TBL    PT,
+     PS_JOB              J,
+     PS_DIRECT_DEPOSIT  PS,               !GBD 08/27/2002
+     PS_SRC_BANK        SB,               !GBD 08/27/2002
+     PS_BANK_EC_TBL    BTB                !GBD 08/27/2002
+WHERE DD.EMPLID           = PD.EMPLID
+  AND PS.EMPLID           = PD.EMPLID     !GBD 08/27/2002
+  AND DD.PRENOTE_STATUS   = 'N'           !Not Submitted
+  AND DD.PRENOTE_REQD     = 'Y'
+  AND DD.ACCOUNT_TYPE    <> '$'           !not ISSUE CHECK
+!GBD 08/27/2002 Begin
+!  AND DD.EFFDT           <= &A.Pay_End_Dt
+  AND DD.EFFDT =
+      (SELECT MAX(DD1.EFFDT)
+       FROM PS_DIR_DEP_DISTRIB DD1
+       WHERE DD.EMPLID    = DD1.EMPLID
+       AND DD1.EFFDT <= &A.Pay_End_Dt)
+  AND  J.EMPLID          = PS.EMPLID      
+!GBD 08/27/2002 End
+  AND  J.EMPLID          = DD.EMPLID
+!  AND  J.EMPL_RCD        = DD.EMPL_RCD
+  AND  J.EFFDT =
+	(SELECT MAX(EFFDT)
+	  FROM  PS_JOB
+	 WHERE  EMPLID    = J.EMPLID
+	   AND  EMPL_RCD  = J.EMPL_RCD
+	   AND  EFFDT    <= &A.Pay_End_Dt)
+   AND J.EFFSEQ =
+	(SELECT MAX(EFFSEQ)
+	 FROM   PS_JOB
+	 WHERE  EMPLID    = J.EMPLID
+	   AND  EMPL_RCD  = J.EMPL_RCD
+	   AND  EFFDT     = J.EFFDT)
+  AND PS.EFF_STATUS       = 'A'             !GBD 08/27/2002
+  AND PS.EFFDT            = DD.EFFDT        !GBD 08/27/2002 
+  AND PT.COMPANY          = J.COMPANY
+  AND PT.PAYGROUP         = J.PAYGROUP
+  AND PT.EFFDT =
+	(SELECT MAX(EFFDT)
+	  FROM  PS_PAYGROUP_TBL
+	 WHERE  COMPANY   = PT.COMPANY
+	   AND  PAYGROUP  = PT.PAYGROUP
+	   AND  EFFDT    <= &A.Pay_End_Dt)
+  AND PT.COMPANY          = $PriorCompany
+!GBD 08/27/2002 Begin
+!  AND PT.TRANSIT#         = $priorTransit#
+  AND SB.SRC_BANK_ID      = PT.SRC_BANK_ID
+  AND BTB.BANK_CD         = SB.BANK_CD
+  AND BTB.COUNTRY_CD      = 'USA'
+  AND [$Transit_to_Use]   = $priorTransit#
+!GBD 08/27/2002 End
+end-SELECT
+
+end-PROCEDURE
+
+
+begin-procedure Write-Batch-Control
+
+  move '8'                    to $RecordType
+  move '220'                  to $ServiceClassCode
+
+  add  #BatchEntryCount       to #FileEntryCount
+  do Format-Number(#BatchEntryCount, $BatchEntryCount, '000009')
+  move 0 to #BatchEntryCount
+
+  add  #BatchEntryHash        to #FileEntryHash
+  do Format-Number(#BatchEntryHash, $TestEntryHash, '09999999999999999')
+  concat '*' with $TestEntryHash
+  find '*' in $TestEntryHash 0 #Loc
+
+  if #Loc > 10
+    subtract 10 from #loc
+    extract $BatchEntryHash   from $TestEntryHash #loc 10
+  else
+    do Format-Number(#BatchEntryHash, $BatchFileEntryHash, '0999999999')
+  end-if
+
+  add  #TotBatchDebitAmt      to #TotFileDebitAmt
+  do Format-Number(#TotBatchDebitAmt, $TotBatchDebitAmt, '000000000009')
+
+  add  #TotBatchCreditAmt     to #TotFileCreditAmt
+  do Format-Number(#TotBatchCreditAmt, $TotBatchCreditAmt, '000000000009')
+
+  move ' '                    to $Reserved1
+  move ' '                    to $Reserved2
+  move $priorTransit#         to $TransitRouting#
+  do Format-Number(#Batch#, $Batch#, '0000009')
+
+  add 1 to #BlockCount
+
+  if #BlockCount = 10
+    move 0 to #BlockCount
+    add  1 to #FileBlockCount
+  end-if
+
+! GXD - 02/25/1999 Begin
+  move '04300012' to $TransitRouting#
+! GXD - 02/25/1999 End
+
+  write 1 from  $RecordType:1                -
+		$ServiceClassCode:3          -
+		$BatchEntryCount:6           -
+		$BatchEntryHash:10           -
+		$TotBatchDebitAmt:12         -
+		$TotBatchCreditAmt:12        -
+		$Batch_CompanyID:10          -
+		$Reserved1:19                -
+		$Reserved2:6                 -
+		$TransitRouting#:8           -
+		$Batch#:7
+
+  move 'N' to $BatchOpen
+end-procedure
+
+
+begin-procedure Write-File-Control
+
+  move '9'                    to $RecordType
+  do Format-Number(#FileBatchCount, $FileBatchCount, '000009')
+  do Format-Number(#FileEntryCount, $FileEntryCount, '00000009')
+
+  do Format-Number(#FileEntryHash, $TestEntryHash, '09999999999999999')
+  concat '*' with $TestEntryHash
+  find '*' in $TestEntryHash 0 #Loc
+
+  if #Loc > 10
+    subtract 10 from #loc
+    extract $FileEntryHash from $TestEntryHash #loc 10
+  else
+    do Format-Number(#FileEntryHash, $FileEntryHash, '0999999999')
+  end-if
+
+  do Format-Number(#TotFileDebitAmt, $TotFileDebitAmt, '000000000009')
+  do Format-Number(#TotFileCreditAmt, $TotFileCreditAmt, '000000000009')
+  move ' '                    to $Reserved1
+
+  add 1 to #BlockCount
+
+  if #BlockCount = 10
+    move 0 to #BlockCount
+    add  1 to #FileBlockCount
+  else
+    if #BlockCount > 0
+      add  1 to #FileBlockCount
+    end-if
+  end-if
+
+  do Format-Number(#FileBlockCount, $FileBlockCount, '000009')
+
+  write 1 from  $RecordType:1            -
+		$FileBatchCount:6        -
+		$FileBlockCount:6        -
+		$FileEntryCount:8        -
+		$FileEntryHash:10        -
+		$TotFileDebitAmt:12      -
+		$TotFileCreditAmt:12     -
+		$Reserved1:39
+
+end-procedure
+
+
+begin-procedure Complete-Block
+
+  move '999999999999999999999999999999' to $ThirtyNines
+
+  while #BlockCount < 10
+    write 1 from  $ThirtyNines:30        -
+		  $ThirtyNines:30        -
+		  $ThirtyNines:30        -
+		  $ThirtyNines:4
+    add 1 to #BlockCount
+  end-while
+
+end-procedure
+
+
+begin-PROCEDURE Calc-DFI-CheckDigit
+
+  move 0 to #CheckDigit
+  move 0 to #i
+
+  while #i <= #lastIndex
+    extract $digit from $TransitRouting# #i 1
+!    move $digit to #digit 9    ! JNB 02/29/2000
+    move $digit to #digit       ! JNB 02/29/2000
+    get #factor from Weights(0) Factor(#i)
+    multiply #factor times #digit
+    add #digit to #CheckDigit
+    add 1 to #i
+  end-while
+
+  while #CheckDigit > 9
+    subtract 10 from #CheckDigit
+  end-while
+
+  do Format-Number(#CheckDigit, $CheckDigit, '9')
+  move $CheckDigit to #tempDigit
+  move 10 to #CheckDigit
+  subtract #tempDigit from #CheckDigit
+
+  while #CheckDigit > 9
+    subtract 10 from #CheckDigit
+  end-while
+
+  do Format-Number(#CheckDigit, $CheckDigit, '9')
+
+end-PROCEDURE  !Calc-DFI-CheckDigit
+
+
+begin-PROCEDURE Update-Prenote-Status
+
+begin-SQL
+UPDATE PS_DIR_DEP_DISTRIB
+  SET PRENOTE_STATUS = 'S',
+      PRENOTE_DATE   = $Prenote_Date,
+      LAST_ACTION    = 'C',                !GBD 08/27/2002
+      LAST_UPDATE_DATE = $AsOfToday        !GBD 08/27/2002
+WHERE EMPLID    = &DD.Emplid
+!  AND EMPL_RCD = &DD.Empl_Rcd#             GBD 08/27/2002 Removed
+  AND EFFDT     = &DD.EffDt
+  AND PRIORITY  = &DD.Priority
+end-SQL
+
+end-PROCEDURE
+
+!GBD 08/27/2002 Added Procedure to get Transit Descr
+begin-procedure Get-Transit-Descr
+
+begin-SELECT
+C.BANK_NM
+ FROM PS_BANK_EC_TBL C
+WHERE C.BANK_CD = $Transit#
+  AND C.COUNTRY_CD = 'USA'
+end-SELECT
+
+end-procedure

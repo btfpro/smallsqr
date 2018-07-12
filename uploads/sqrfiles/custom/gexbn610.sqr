@@ -1,0 +1,1365 @@
+!***********************************************************************
+!  GEXBN610:  DREYFUS CENSUS                                           *
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module is the confidential and proprietary information of       *
+! Giant Eagle, Inc.; it is not to be copied, reproduced,or transmitted *
+! in any form, by any means, in whole or in part, nor is it to be used *
+! for any purpose other than that for which it is expressly provided   *
+! without the written permission of Giant Eagle.                       *
+!                                                                      *
+! Copyright (c) 1997-1998 Giant Eagle,Inc. All Rights Reserved         *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+! GEXBN610:             Dreyfus Census                                 *
+!                                                                      *
+! Narrative:            This program will generate a report and file   *
+!                       of financial information on the savings plan   *
+!                       participants and potentially eligible in order *
+!                       to complete the compliance testing.            *
+!                                                                      *
+! #Debugx Used:         #debug9 paragraph trace                        *
+!                       #debug8 key variable values                    *
+!                       #debug7 data returned from sql calls           *
+!                                                                      *
+! SQL Tables:           PAY_CALENDAR                                   *
+!                       GEX_DREYFUS_TBL                                *
+!                       GEX_DREYFUS_MAP                                *
+!                       BEN_PROG_PARTIC                                *
+!                       BEN_DEFN_OPTN                                  *
+!                       PERSONAL_DATA                                  *
+!                       EMPLOYMENT                                     *
+!                       JOB                                            *
+!                       EARNINGS_BAL                                   *
+!                       SAVINGS_PLAN                                   *
+!                                                                      *
+! Written by:           Jim Hutchison                                  *
+!                                                                      *
+! Normally Run:         Monthly                                        *
+!                                                                      *
+! Control Parms:        FOR WHERE CLAUSE:                              *
+!                         Multiple Dreyfus Plans (to exclude)          *
+!                         As Of Date                                   *
+!                                                                      *
+!***********************************************************************
+!                         MODIFICATION HISTORY                         *
+!***********************************************************************
+!  INIT   ID#   DATE         DESCRIPTION OF THE CHANGE                 *
+!***********************************************************************
+!  JDH          10/06/99     Initial Creation                          *
+!                                                                      *
+!  JDH          11/09/99     Sum balances for ALL companies worked     *
+!                             by an employee.                          *
+!                                                                      *
+!  AXL          04/13/2000   Modified to get union_cd from job_labor   *
+!                            (Original 7.5 retro-fit lost?)            *
+!                                                                      *
+!  AXL          10/04/2000   Added COL to list of Union Codes          *
+!                                                                      *
+!  AXL          06/07/2001   Added TOL to list of Union Codes          *
+!                                                                      *
+!  AXL          10/08/2001   Re-tooled to address various issues       *
+!                            including capturing terms, newhires, &    *
+!                            transfers.                                *
+!                                                                      *
+!  PSR          08/12/2002   Modified to get union_cd from job         * 
+!                            - Upgrade 8.3                             *
+!                                                                      *
+!  PSR          08/27/2002   EMPL_RCD is now part of the key for       *
+!                            PS_EARNINGS_BAL - Upgrade 8.3             *
+!                                                                      *
+!  CJH          02/26/2003   Remove empl_rcd from earnings_bal join -  *
+!                            need to sum across jobs                   *
+!                                                                      *
+!  SCM          03/25/2003   Saved off the plan number to write to the *
+!                            trailer record because the previous plan# *
+!                            was getting written.                      *
+!                                                                      *
+!  GBD          07/17/2003   Added code to email dat file when produced*
+!								       *
+!  SRC  10802   10/15/2004   Added UNION_CD = 'MOD'                    *
+!                                                                      *
+!  CXA ITG34016 10/20/2005   Added UNION_CD = 'GGO'                    *
+!                                                                      *
+!  MXR ITG33710 10/24/2006   Modify Trailer record and add totals      *
+!								       *
+!  DXS ITG39878 02/20/2007   Changed column settings		       *
+!			     Changed heading section                   *
+!			     Changes in procedure P100-Initialization  *
+!			     Changed file width from 80 to 90          *
+!                            P160-Print-Cover-Page, corrected variable *
+!			     Added logic in P200-Main-Process          *
+!                            Created two new procedure Get-New-Erncd   *
+!			     and New-Earnings-Balance		       *
+!			     Changes to P500-OUTPUT and Insert-Temp-Info*
+!                            to select and insert new field GEX_GRS_YTD*
+!			     Added logic to P230-Write-Detail-Record   *
+!			     Changes in P235-Print-Record	       *
+!			     Changes in P240-Write-Trailer-Record      *
+!								       *
+! ISDVNPK 08/25/2007 Modified for upgrade 9.0 added BN_PERSON
+!                                            		               *
+! GEX-MXT      03/24/2008     Fixed for REHIRE DT issue in 9.0         *
+! ISDVASS      04/09/2008     used $year_end_dt instead of sysdate to  * 
+!                             get rehire_dt from custom SQC            *
+!***********************************************************************
+
+
+#include 'setenv.sqc'    !Set environment
+#Include 'setup02.sqc'   !Printer and Page-Size Initialization (Portrait)
+
+
+#define #column1     1
+#define #column2    11
+#define #column3    24
+#define #column4    42
+#define #column5    60
+#define #column6    78
+#define #column7   102
+#define #column8   111
+#define #column9   125
+#define #column10   135	! DXS, 02/20/07, added this.
+
+
+Begin-Heading 8
+#debug9 Show 'Begin-Heading'
+  #Include 'stdhdg01.sqc'
+
+  print 'PLAN'                (6,{#column1})
+  print '  COMPENSATION'      ( ,{#column3})
+  print '  COMPENSATION'      ( ,{#column4})
+  print '  COMPENSATION'      ( ,{#column5})	! DXS, 02/20/07, Added
+  print 'EMPL'                ( ,{#column6})
+  print 'UNION'               ( ,{#column7})
+
+  If $year_end_run <> 'Y'
+    print 'POTENTIALLY'       ( ,{#column8})
+  End-If
+
+  print 'NUMBER'              (7,{#column1})
+  print 'EMPLID'              ( ,{#column2})
+  print '      AMOUNT-1'      ( ,{#column3})
+  print '      AMOUNT-2'      ( ,{#column4})
+  print '      AMOUNT-3'      ( ,{#column5})	! DXS, 02/20/07, Added
+  print 'NAME'                ( ,{#column6})	! DXS, changed col number
+  print 'TYPE'                ( ,{#column7})	! DXS, changed col number
+  print 'CODE'                ( ,{#column8})	! DXS, changed col number
+
+  If $year_end_run <> 'Y'
+    print 'ELIGIBLE'          ( ,{#column9})	! DXS, changed col number
+  End-If
+
+  print 'EXCLUDE'             ( ,{#column10})	! DXS, changed col number
+
+  print '-'                   (8,{#column1},6)   fill
+  print '-'                   ( ,{#column2},9)   fill
+  print '-'                   ( ,{#column3},14)  fill
+  print '-'                   ( ,{#column4},14)  fill
+  print '-'                   ( ,{#column5},14)  fill	! DXS, 02/20/07, Added 
+  print '-'                   ( ,{#column6},30)  fill	! DXS, changed col number
+  print '-'                   ( ,{#column7},4)   fill	! DXS, changed col number
+  print '-'                   ( ,{#column8},5)   fill	! DXS, changed col number
+
+  If $year_end_run <> 'Y'
+    print '-'                 ( ,{#column9},11)  fill	! DXS, changed col number
+  End-If
+
+  print '-'                   ( ,{#column10},7)   fill	! DXS, changed col number
+  
+End-Heading
+!***********************************************************************
+!***********************************************************************
+Begin-Report
+#debug9 Show 'Begin-Report'
+  Do P100-Initialization
+  Do Truncate-Temp-Tbl		!AXL 10/8/2001 New procedure
+  Do P200-Main-Process
+  Do P500-output
+  Do P300-Finalization
+End-Report
+!***********************************************************************
+!***********************************************************************
+Begin-Procedure P100-Initialization
+#debug9 Show 'P100-Initialization'
+  Do Init-DateTime           !datetime.sqc
+  Do Init-Number             !number.sqc
+  Do Get-Current-DateTime    !curdttim.sqc
+  Do Stdapi-Init             !stdapi.sqc
+
+  Let $ReportID      = 'GEXBN610'
+  Let $ReportTitle   = 'DREYFUS CENSUS'
+
+  Show '$ReportID    = ' $ReportID
+  Show '$ReportTitle = ' $ReportTitle
+
+  Let $GEXXX934_Dreyfus_Plan_Alias = 'GEX_DREYFUS_PLAN'
+
+  ! DXS, 02/20/07, Removed extra logic when run via SQRW
+  If $prcs_process_instance = ''
+ 	let $Prcs_OprID = 'HRBATCH'
+	Let $Prcs_Run_Cntl_ID = 'gexbn610_a'
+  End-If
+
+    Do GEXRCBN1-SELECT-PARAMETERS
+
+    Let $X000_Where_Select_AsOfDate = &GEX_RC_BEN.AsOfDate
+    If Rtrim (&GEX_RC_BEN.AsOfDate, ' ') = ''
+      Let $X000_Where_Select_AsOfDate = $AsOfToday
+    End-If
+
+    Do GEXXX934-Select-Dreyfus-Plan-Parameters
+ 
+
+  date-time () HH:MI:SS &timeBegan
+  date-time () MM/DD/YYYY &dateBegan
+  show ' '
+  show 'Report Began at ' &timeBegan ' on ' &dateBegan
+
+  Do Format-DateTime($X000_Where_Select_AsOfDate, $X000_Report_Heading_AsOfDate, {DEFDATE}, '', '')
+  Let $X000_Order_By = 'Dreyfus Plan, Emplid'
+
+  Do P140-Open-File
+  Do P150-Get-Last-Confirmed-Pay
+  Do P160-Print-Cover-Page
+End-Procedure
+!***********************************************************************
+!***********************************************************************
+Begin-Procedure P140-Open-File
+#debug9 Show 'P140-Open-File'
+      Show 'P140-Open-File'
+  Let $file1 = '{OUTFILE}' || Lower($ReportID) || '.dat'
+ ! Let $file1 = 'c:\isdvdxs\' || Lower($ReportID) || '.dat' ! DXS, 02/20/07, for testing
+
+  Open $file1
+       As 1
+       For-Writing
+       Record=90:Fixed	! DXS, 02/20/07, changed 80 to 90
+       Status=#filestat
+
+  If #filestat != 0
+     Show 'Error opening output file.  Program terminating.'
+     Stop
+  End-If
+End-Procedure
+!***********************************************************************
+!***********************************************************************
+Begin-Procedure P150-Get-Last-Confirmed-Pay
+#debug9 Show 'P150-Get-Last-Confirmed-Pay'
+      Show 'P150-Get-Last-Confirmed-Pay'
+Begin-Select Loops=1
+PAY_END_DT
+TO_CHAR(PAY_END_DT,'YYYY') &balance_year
+TO_CHAR(PAY_END_DT,'MM')   &balance_period
+
+  Let $pay_end_dt     = &PAY_END_DT
+  Let $balance_year   = &balance_year
+  Let $balance_period = &balance_period
+  Let #balance_year   = $balance_year
+  Let #balance_period = $balance_period
+  Let $year_begin_dt  = '01-JAN-' || $balance_year
+  Let $year_end_dt    = '31-DEC-' || $balance_year
+  Let #balance_year_minus1   = #balance_year - 1
+  Let $balance_year_minus1 = to_char(#balance_year_minus1)
+
+  !AXL 10/8/2001 - Begin
+
+  Let $new_hire_cutoff_dt = '02-DEC-' || $balance_year_minus1
+  Do format-datetime($new_hire_cutoff_dt,$new_hire_cutoff_dt_cmp,{DEFCMP},'','')   
+  #debug8 show '$new_hire_cutoff_dt_cmp = '   $new_hire_cutoff_dt_cmp
+  #debug8 show '$new_hire_cutoff_dt ' $new_hire_cutoff_dt
+
+  !AXL 10/8/2001 - End
+
+  If #balance_period = 12
+    Let $year_end_run = 'Y'
+  Else
+    Let $year_end_run = 'N'
+  End-If
+
+  Do Format-DateTime($pay_end_dt, $payend, {DEFMDY}, '', '')
+
+  Let $Year4 = '1'
+  Do Format-DateTime($pay_end_dt, $payenddt, {DEFMDY}, '', '')
+
+  Let $pay_end_dt_MMDDYYYY = Substr($payenddt,1,2) || Substr($payenddt,4,2) || Substr($payenddt,7,4)
+  Let $pay_end_dt_YYMMDD = Substr($payenddt,9,2) || Substr($payenddt,1,2) || Substr($payenddt,4,2)
+
+  show ' '
+  show 'Last confirmed pay end date:  ' $pay_end_dt
+  show ' '
+
+FROM   PS_PAY_CALENDAR
+
+WHERE  PAY_END_DT              =
+      (SELECT MAX(PAY_END_DT)
+       FROM   PS_PAY_CALENDAR
+       WHERE  PAY_END_DT      <= $X000_WHERE_SELECT_ASOFDATE
+       AND    PAY_CONFIRM_RUN  = 'Y')
+AND    PAY_CONFIRM_RUN         = 'Y'
+End-Select
+End-Procedure
+!***********************************************************************
+!***********************************************************************
+begin-procedure P160-Print-Cover-Page
+#debug9 Show 'P160-Print-Cover-Page'
+
+ !Show 'P160-Print-Cover-Page'
+  Print 'RUN CONTROL INFORMATION FOR THIS REPORT RUN:'            (+5,1)
+  Print '$Prcs_OprID          ='                                  (+2,5)
+  Print $Prcs_OprID                                               (0,+2)
+  Print '$Prcs_Run_Cntl_ID    ='                                  (+1,5)
+  Print $Prcs_Run_Cntl_ID                                         (0,+2)
+
+  Print 'SELECTION CRITERIA FOR THIS REPORT RUN:'                 (+5,2)
+  Print '$GEXXX934_EXCLUDE_DREYFUS_PLAN_CRITERIA = '              (+2,5)
+  Print $GEXXX934_EXCLUDE_DREYFUS_PLAN_DISPLAY_CRITERIA           (0,+2)
+
+  Print 'As Of Date :'                                            (+2,5)
+  Print $X000_Where_Select_AsOfDate                               (0,+2)	! DXS, 02/20/07, Corrected variable.
+  
+  Print 'SORT ORDER FOR THIS REPORT RUN:'                         (+5,2)
+  Print $X000_Order_By                                            (+2,5)
+
+  Let #PAGE-COUNT = 0
+  New-Page
+End-Procedure
+!***********************************************************************
+!***********************************************************************
+!AXL 10/8/2001 - Begin
+!*********************************************************************
+begin-procedure Truncate-Temp-Tbl
+!*********************************************************************
+begin-sql 
+
+delete from sysadm.ps_gex_r_gexbn610
+
+end-sql
+
+end-procedure
+!AXL 10/8/2001 - End
+
+!*********************************************************************
+Begin-Procedure P200-Main-Process
+!*********************************************************************
+#debug9 Show 'P200-Main-Process'
+    ! Show 'P200-Main-Process ***********************************************************'
+Begin-Select
+J.EMPLID
+J.EMPL_RCD
+J.COMPANY
+J.ELIG_CONFIG1
+PD.NAME
+BNPER.HIGHLY_COMP_EMPL_P   !PD.HIGHLY_COMP_EMPL_P     ! ISDVNPK 08/25/2007 Modified for upgrade 9.0 added BN_PERSON
+PD.BIRTHDATE
+!AXL 04/13/2000 Begin
+!E.UNION_CD
+J.UNION_CD
+!AXL 04/13/2000 End
+E.HIRE_DT
+!E.REHIRE_DT		!GEX-MXT COMMENTED FOR REHIRE DATE LOGIC IN 9.0
+E.TERMINATION_DT
+SYSDATE        &GEXJOB_REH_ASOFDATE 	!GEX-MXT ADDED FOR REHIRE DATE LOGIC IN 9.0
+
+  Let $emplid       = &J.EMPLID
+  Let #empl_rcd     = &J.EMPL_RCD
+  Let $company      = &J.COMPANY
+  Let $name         = &PD.NAME
+  Let $config1      = Substr(&J.ELIG_CONFIG1,1,3)
+  
+  ! GEX-MXT 03/24/2008 Fixed for REHIRE DT-BEGIN
+   let $GEXJOB_REH_EMPLID = $emplid
+   let #GEXJOB_REH_EMPLRCD = #EMPL_RCD
+!   let $GEXJOB_REH_ASOFDATE = &GEXJOB_REH_ASOFDATE
+    Let $GEXJOB_REH_ASOFDATE = $year_end_dt                   ! ISDVASS used $year_end_dt instead of sysdate
+   do Get-Job-Rehire-Dt
+   if $GEXJOB_REH_REHIRE_DT <> ''
+     let $GEXJOB_REH_REHIRE_DT = datetostr(strtodate($GEXJOB_REH_REHIRE_DT,'DD-MON-YYYY'),'DD-MON-YYYY') 
+   end-if
+  ! GEX-MXT 03/24/2008 Fixed for REHIRE DT-END 
+  
+  show '$emplid '   &J.EMPLID
+  show '#empl_rcd ' &J.EMPL_RCD
+  show '$company '  &J.COMPANY
+  show '$name '     &PD.NAME
+  show '$config1 '  &J.ELIG_CONFIG1
+  show 'E.TERMINATION_DT ' &E.TERMINATION_DT 
+  !show 'E.HIRE_DT ' &E.REHIRE_DT
+  !show 'E.REHIRE_DT ' &E.REHIRE_DT
+  show 'HIRE_DT ' $GEXJOB_REH_REHIRE_DT			! GEX-MXT 03/24/2008 Fixed for REHIRE DT
+  show 'REHIRE_DT ' $GEXJOB_REH_REHIRE_DT		! GEX-MXT 03/24/2008 Fixed for REHIRE DT
+
+  If &bnper.highly_comp_empl_p = 'H'   ! &pd.highly_comp_empl_p = 'H'
+    Let $empl_type  = '2'
+  Else
+    Let $empl_type  = '0'
+  End-If
+!AXL 04/13/2000 Begin
+  If &J.UNION_CD   = 'NON' or
+     &J.UNION_CD   = 'SEC' or
+     &J.UNION_CD   = 'CBT' or
+     &J.UNION_CD   = 'COL' or	!AXL - 10/4/2000 - Add
+     &J.UNION_CD   = 'TOL' or 	!AXL - 06/6/2001 - T.45.0755 Toledo Add
+     &J.UNION_CD   = 'HGN' or	!AXL - 10/8/2001 - Add
+     &J.UNION_CD   = 'MOD' or   !CSR - 10/14/2004 - Add
+     &J.UNION_CD   = 'GGO'      !CXA - 10/20/2005 - Add
+
+!AXL 04/13/2000 End
+    Let $union_cd   = '0'
+  Else
+    Let $union_cd   = '1'
+  End-If
+
+  !AXL 10/8/2001 - Begin
+  !Let $erncd_criteria = 'EB.ERNCD              IN (''BON'',''' || $ERNCD_SPCL || ''')'
+  !Do P210-Earnings-Balance
+  !AXL 10/8/2001 - End
+
+  do Convert-To-DTU-Date(&PD.BIRTHDATE, $birthdate_dtu)
+  do Convert-To-DTU-Date(&E.HIRE_DT, $hire_dt_dtu)
+  do Convert-To-DTU-Date($year_end_dt, $year_end_dt_dtu)
+  do dtu-diff-years($birthdate_dtu, $year_end_dt_dtu, #age)
+  do dtu-diff-years($hire_dt_dtu, $year_end_dt_dtu, #service_years)
+
+  !AXL 10/8/2001 - Begin
+  Do P175-Max-Check-For-Partic-Row
+  Do P190-Check-Against-Map
+  If $Partic_Row_Flag='N'
+     Do P180-Any-Partic-Row
+     Do P190-Check-Against-Map
+  End-if
+ 
+  Let $erncd_criteria = 'EB.ERNCD              IN (''BON'',''' || $ERNCD_SPCL || ''')'
+  Do P210-Earnings-Balance
+
+  show '$Partic_Row_Flag ' $Partic_Row_Flag 
+
+  If $Partic_Row_Flag='Y'
+   #debug9 show 'Doing P250-Check-For-Enrollment'
+     Do P250-Check-For-Enrollment
+
+     ! DXS, 02/20/07. New Changes 
+     ! get the balance for the new code.
+     Let $erncd_criteria = 'NEW.ERNCD = ''' || $ERNCD_SPCL || ''''
+     #debug9 show 'Doing New-Earnings-Balance'
+     Do New-Earnings-Balance
+
+     do Insert-Temp-Info
+  End-if
+
+  #ifdef debug8
+    show '$year_end_run ' $year_end_run 
+    show '$enrolled  ' $enrolled
+    show '#dedcd-hours '   #dedcd-hours
+    show '#service_years ' #service_years 
+    show '#age '      #age      
+    show '$config1 '      $config1
+    show ' '
+  #endif
+ 
+  !AXL 10/8/2001 - Move next section to new procedure Begin
+  !If $year_end_run = 'Y'
+  !  If $enrolled = 'Y'
+  !    Do P280-Exclude-Run-Control-Eligibles
+  !   !Do P230-Write-Detail-Record
+  !  End-If
+  !Else
+  !  If $enrolled = 'Y'
+  !    Do P280-Exclude-Run-Control-Eligibles
+  !    !Do P230-Write-Detail-Record
+  !  Else
+  !    If #dedcd-hours   >= 750   And
+  !	 #service_years >= 1     And
+  !	 #age           >= 21    And
+  !	 $config1       <> 'SAV'
+  !	Do P280-Exclude-Run-Control-Eligibles
+  !    End-If
+  !  End-If
+  !End-If
+  !AXL 10/8/2001 - Move next section to new procedure End
+  !AXL 10/8/2001 - End
+
+FROM   PS_PERSONAL_DATA    PD,
+       PS_EMPLOYMENT       E,
+       PS_JOB              J,
+       PS_BN_PERSON        BNPER  ! ISDVNPK 08/25/2007 Modified for upgrade 9.0 added BN_PERSON
+!AXL 10/8/2001 - Remove from main sel - Begin
+      ! PS_BEN_PROG_PARTIC  BPP		
+
+!WHERE  BPP.BENEFIT_PROGRAM     = $BENEFIT_PROGRAM
+
+!AND    BPP.EFFDT               =
+!      (SELECT MAX(EFFDT)
+!       FROM   PS_BEN_PROG_PARTIC
+!       WHERE  EMPLID           = BPP.EMPLID
+!       AND    EMPL_RCD        = BPP.EMPL_RCD
+!       AND    EFFDT           <= $year_end_dt)
+!AND    J.EMPLID                = BPP.EMPLID
+!AND    J.EMPL_RCD             = BPP.EMPL_RCD
+!AXL 10/8/2001 - Remove from main sel - End
+
+WHERE PD.EMPLID               = J.EMPLID 
+AND   BNPER.EMPLID = PD.EMPLID     ! ISDVNPK 08/25/2007 Modified for upgrade 9.0 added BN_PERSON  
+AND    E.EMPLID                = J.EMPLID
+AND    E.EMPL_RCD             = J.EMPL_RCD
+
+AND    J.EFFDT                 =
+      (SELECT MAX(EFFDT)
+       FROM   PS_JOB
+       WHERE  EMPLID           = J.EMPLID
+       AND    EMPL_RCD        = J.EMPL_RCD
+       AND    EFFDT           <= $year_end_dt)
+
+AND    J.EFFSEQ                =
+      (SELECT MAX(EFFSEQ)
+       FROM   PS_JOB
+       WHERE  EMPLID           = J.EMPLID
+       AND    EMPL_RCD        = J.EMPL_RCD
+       AND    EFFDT            = J.EFFDT)
+
+!AXL 10/8/2001 - new term code exclusion - Begin
+AND    (E.TERMINATION_DT IS NULL OR
+       (E.TERMINATION_DT between $year_begin_dt and $year_end_dt) )
+!AXL 10/8/2001 - new term code exclusion - End
+
+AND J.COMPANY > '399' 		!AXL 10/8/2001 Exclude IND
+! and j.emplid = '176626259'	! DXS, testing
+ORDER BY J.EMPLID
+
+End-Select
+     !Show 'P200-Main-Process #################################################################'
+End-Procedure
+!***********************************************************************
+!*********************************************************************
+Begin-Procedure P175-Max-Check-For-Partic-Row
+!*********************************************************************
+!Determine the max row
+#debug9 Show 'P175-Max-Check-For-Partic-Row'
+     
+   #ifdef debug8
+      show 'P175-Max-Check-For-Partic-Row '
+      show '$BENEFIT_PROGRAM ' $BENEFIT_PROGRAM
+      show '$EMPLID '  $EMPLID 
+      show '#EMPL_RCD ' #EMPL_RCD
+   #endif
+
+   Let $BENEFIT_PROGRAM = ' '
+	
+Begin-Select
+BPP.BENEFIT_PROGRAM
+        Let $BENEFIT_PROGRAM = &BPP.BENEFIT_PROGRAM
+
+FROM PS_BEN_PROG_PARTIC  BPP
+
+WHERE  BPP.EMPLID              = $EMPLID
+AND    BPP.EMPL_RCD           = #EMPL_RCD
+
+AND    BPP.EFFDT               =
+      (SELECT MAX(EFFDT)
+       FROM   PS_BEN_PROG_PARTIC
+       WHERE  EMPLID           = BPP.EMPLID
+       AND    EMPL_RCD        = BPP.EMPL_RCD
+       AND    EFFDT            < $year_begin_dt)
+
+End-Select
+	#debug8 show '$BENEFIT_PROGRAM ' $BENEFIT_PROGRAM
+
+End-Procedure
+!***********************************************************************
+!*********************************************************************
+Begin-Procedure P180-Any-Partic-Row
+!*********************************************************************
+!Find any qualifying row
+#debug9 Show 'P180-Any-Partic-Row'
+   
+   Let $BENEFIT_PROGRAM = ' '
+	
+Begin-Select
+BPPX.BENEFIT_PROGRAM
+	
+        Let $BENEFIT_PROGRAM = &BPPX.BENEFIT_PROGRAM
+
+FROM PS_BEN_PROG_PARTIC  BPPX
+
+WHERE  BPPX.EMPLID              = $EMPLID
+AND    BPPX.EMPL_RCD           = #EMPL_RCD
+
+AND    BPPX.EFFDT between $year_begin_dt and  $year_end_dt
+
+End-Select
+!***********************************************************************
+End-Procedure
+!***********************************************************************
+!*********************************************************************
+Begin-Procedure P190-Check-Against-Map
+!*********************************************************************
+!Check Benifit pgm against qualifying codes
+#debug9 Show 'P190-Check-Against-Map'
+
+  Let $Partic_Row_Flag='N'
+	#debug8 show '$BENEFIT_PROGRAM ' $BENEFIT_PROGRAM
+Begin-Select DISTINCT
+GDT.GEX_DREYFUS_PLAN
+BDO.BENEFIT_PROGRAM
+GDT.ERNCD_SPCL
+  
+  Let $dreyfus_plan    = &GDT.GEX_DREYFUS_PLAN
+  Let $erncd_spcl      = &GDT.ERNCD_SPCL
+  Let $Partic_Row_Flag='Y'
+
+  #ifdef debug8
+    show '$dreyfus_plan '   &GDT.GEX_DREYFUS_PLAN
+    show 'benefit_program ' &BDO.BENEFIT_PROGRAM
+    show '$erncd_spcl '     &GDT.ERNCD_SPCL
+  #endif
+
+FROM   PS_BEN_DEFN_OPTN    BDO,
+       PS_GEX_DREYFUS_TBL  GDT,
+       PS_GEX_DREYFUS_MAP  GDM
+
+WHERE  BDO.BENEFIT_PROGRAM     = $BENEFIT_PROGRAM
+AND    GDT.GEX_DREYFUS_PLAN    = GDM.GEX_DREYFUS_PLAN
+AND    GDM.PLAN_TYPE           = '40'
+
+AND    BDO.PLAN_TYPE           = GDM.PLAN_TYPE
+AND    BDO.BENEFIT_PLAN        = GDM.BENEFIT_PLAN
+
+AND    BDO.EFFDT               =
+      (SELECT MAX(EFFDT)
+       FROM   PS_BEN_DEFN_OPTN
+       WHERE  BENEFIT_PROGRAM  = BDO.BENEFIT_PROGRAM
+       AND    PLAN_TYPE        = BDO.PLAN_TYPE
+       AND    BENEFIT_PLAN     = BDO.BENEFIT_PLAN
+       AND    EFFDT           <= $year_end_dt)
+
+!ORDER BY GDT.GEX_DREYFUS_PLAN
+
+End-Select
+!***********************************************************************
+End-Procedure
+!***********************************************************************
+!*********************************************************************
+Begin-Procedure P210-Earnings-Balance
+!*********************************************************************
+#debug9 Show 'P210-Earnings-Balance'
+
+  Let #comp-amt-1  = 0
+  Let #comp-amt-2  = 0
+  Let #dedcd-hours = 0
+ 
+  #ifdef debug8
+    show 'P210-Earnings-Balance $emplid ' $EMPLID
+    show '#balance_year ' #balance_year
+    show '#balance_period ' #balance_period
+    show '[$erncd_criteria] ' $erncd_criteria
+  #endif
+
+Begin-Select
+EB.ERNCD
+SUM(EB.HRS_YTD) &EB.HRS_YTD
+SUM(EB.GRS_YTD) &EB.GRS_YTD
+
+  If &EB.ERNCD = 'BON'
+    Let #comp-amt-2 = &EB.GRS_YTD
+  End-If
+
+  If &EB.ERNCD = $ERNCD_SPCL
+    Let #dedcd-hours = &EB.HRS_YTD
+    Let #comp-amt-1  = &EB.GRS_YTD
+  End-If
+
+FROM   PS_EARNINGS_BAL EB
+
+WHERE  EB.EMPLID              = $EMPLID
+! CJH - 02/26/2003 - remove empl_rcd from join - need to sum across jobs
+!AND    EB.EMPL_RCD            = #empl_rcd
+! CJH - 02/26/2003 - end
+AND    EB.BALANCE_ID          = 'CY'
+AND    EB.BALANCE_YEAR        = #balance_year
+AND    EB.BALANCE_PERIOD      =
+      (SELECT MAX(BALANCE_PERIOD)
+       FROM   PS_EARNINGS_BAL
+       WHERE  EMPLID          = EB.EMPLID
+       AND    EMPL_RCD        = EB.EMPL_RCD    ! keep empl_rcd for determining correct period
+       AND    COMPANY         = EB.COMPANY
+       AND    BALANCE_ID      = EB.BALANCE_ID
+       AND    BALANCE_YEAR    = EB.BALANCE_YEAR
+       AND    BALANCE_PERIOD <= #balance_period
+       AND    SPCL_BALANCE    = EB.SPCL_BALANCE
+       AND    ERNCD           = EB.ERNCD)
+AND    EB.SPCL_BALANCE        = 'Y'
+AND    EB.COMPANY   > '999'    !AXL 10/8/2001 exclude ind.
+AND   [$erncd_criteria]
+GROUP BY EB.ERNCD
+End-Select
+  Move #comp-amt-1 To $num-in 09999999.99
+  Let $comp-amt-1 = Substr($num-in,1,8) || Substr($num-in,10,2)
+  Move #comp-amt-2 To $num-in 09999999.99
+  Let $comp-amt-2 = Substr($num-in,1,8) || Substr($num-in,10,2)
+!***********************************************************************
+End-Procedure
+
+
+
+! DXS, 02/20/2007, New procedure 
+!*********************************************************************
+Begin-Procedure New-Earnings-Balance
+!*********************************************************************
+#debug9 Show 'New-Earnings-Balance'
+
+  Let #comp-amt-3  = 0
+ 
+  #ifdef debug8
+    show 'New-Earnings-Balance $emplid ' $EMPLID
+    show '#balance_year ' #balance_year
+    show '#balance_period ' #balance_period
+    show '$erncd_criteria ' $erncd_criteria
+  #endif
+
+Begin-Select
+NEW.ERNCD
+! SUM(NEW.HRS_YTD) &NEW.HRS_YTD
+SUM(NEW.GRS_YTD) &NEW.GRS_YTD
+
+	move &NEW.GRS_YTD to #comp-amt-3
+	#debug8 show '#comp-amt-3 ' #comp-amt-3
+
+FROM   PS_EARNINGS_BAL NEW
+WHERE  NEW.EMPLID              = $EMPLID
+AND    NEW.BALANCE_ID          = 'CY'
+AND    NEW.BALANCE_YEAR        = #balance_year
+AND    NEW.BALANCE_PERIOD      =
+      (SELECT MAX(NEW1.BALANCE_PERIOD)
+       FROM   PS_EARNINGS_BAL NEW1
+       WHERE  NEW1.EMPLID          = NEW.EMPLID
+       AND    NEW1.EMPL_RCD        = NEW.EMPL_RCD 
+       AND    NEW1.COMPANY         = NEW.COMPANY
+       AND    NEW1.BALANCE_ID      = NEW.BALANCE_ID
+       AND    NEW1.BALANCE_YEAR    = NEW.BALANCE_YEAR
+       AND    NEW1.BALANCE_PERIOD <= #balance_period
+       AND    NEW1.SPCL_BALANCE    = NEW.SPCL_BALANCE
+       AND    NEW1.ERNCD           = NEW.ERNCD)
+AND    NEW.SPCL_BALANCE        = 'Y'
+AND    NEW.COMPANY   > '999'
+AND   [$erncd_criteria]
+GROUP BY NEW.ERNCD
+End-Select
+  Move #comp-amt-3 To $num-in 09999999.99
+  Let $comp-amt-3 = Substr($num-in,1,8) || Substr($num-in,10,2)
+	
+#debug8 show 'final #comp-amt-3 ' #comp-amt-3
+End-Procedure
+
+
+
+
+!***********************************************************************
+!AXL 10/8/2001 New Insert Proc - Begin 
+!***********************************************************************
+Begin-Procedure Insert-Temp-Info
+!***********************************************************************+
+ 
+Begin-SQL  
+  Insert Into sysadm.ps_gex_r_gexbn610
+    Values ($DREYFUS_PLAN,
+            $benefit_program,
+            $emplid,
+            #empl_rcd,
+	    #COMP-AMT-1,
+            #COMP-AMT-2,
+	    #COMP-AMT-3,	! DXS, 02/20/07, Added new field
+            $EMPL_TYPE,
+            $UNION_CD,
+            #dedcd-hours,
+            #service_years,
+            #age,
+            $config1,
+            $year_end_run,
+            $enrolled,
+            $exclude_flag)
+            
+End-SQL
+!***********************************************************************
+End-Procedure
+!***********************************************************************
+!AXL 10/8/2001 New Insert Proc - End
+
+!*********************************************************************
+Begin-Procedure P500-OUTPUT
+!*********************************************************************
+#debug9 Show 'P500-OUTPUT'
+         !  Show 'P500-OUTPUT SSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSS'
+Begin-Select DISTINCT
+TMP.GEX_DREYFUS_PLAN  ()  On-Break  Level=1
+				    Print=Never
+				    Before=P220-Write-Header-Record
+				    After=P240-Write-Trailer-Record
+TMP.BENEFIT_PROGRAM
+TMP.EMPLID
+PERS.NAME
+TMP.EMPL_RCD
+TMP.GRS_YTD		!comp1
+TMP.GRS_YTD_ADJ		!comp2
+TMP.GEX_GRS_YTD		!comp3, DXS, 02/20/07, Selecting new field
+TMP.EMPL_TYPE
+TMP.UNION_CD
+TMP.HRS_YTD
+TMP.SERVICE_YEARS
+TMP.AGE
+TMP.ELIG_CONFIG1
+TMP.GEX_REPORT_FLAG	!YEAR_END_RUN Flag
+TMP.GEX_STAT_FLAG	!Enrolled Flag
+TMP.GEX_INCL_EXCL	!Excludable Flag
+EMP.HIRE_DT
+ Do format-datetime (&EMP.HIRE_DT,$hireDt_cmp,{DEFCMP},'','')
+!EMP.REHIRE_DT		!GEX-MXT COMMENTED FOR REHIRE DATE LOGIC IN 9.0
+! Do format-datetime (&EMP.REHIRE_DT,$RehireDt_cmp,{DEFCMP},'','')   !GEX-MXT COMMENTED FOR REHIRE DATE LOGIC IN 9.0
+SYSDATE        &GEXJOB_REH_ASOFDATE1 	!GEX-MXT ADDED FOR REHIRE DATE LOGIC IN 9.0
+
+  
+  
+   ! GEX-MXT 03/24/2008 Fixed for REHIRE DT
+   let $GEXJOB_REH_EMPLID = &TMP.EMPLID
+   let #GEXJOB_REH_EMPLRCD = &TMP.EMPL_RCD
+   let $GEXJOB_REH_ASOFDATE = &GEXJOB_REH_ASOFDATE1
+   do Get-Job-Rehire-Dt
+   if $GEXJOB_REH_REHIRE_DT <> ''
+     let $GEXJOB_REH_REHIRE_DT = strtodate($GEXJOB_REH_REHIRE_DT,'DD-MON-YYYY')
+     Do format-datetime ($GEXJOB_REH_REHIRE_DT,$RehireDt_cmp,{DEFCMP},'','')
+     else                            ! ISDVNPK 04/14/2008
+     let $GEXJOB_REH_REHIRE_DT = ''  ! ISDVNPK 04/14/2008
+     Do format-datetime ($GEXJOB_REH_REHIRE_DT,$RehireDt_cmp,{DEFCMP},'','')  ! ISDVNPK 04/14/2008
+   end-if                                         
+  ! GEX-MXT 03/24/2008 Fixed for REHIRE DT 
+
+  !GEX-MXT MODIFIED FOR REHIRE DATE LOGIC-BEGIN
+  !if isblank(&EMP.REHIRE_DT) = 1
+  !   let $emp_hire = $hireDt_cmp
+  !else
+  !   let $emp_hire = $rehireDt_cmp
+  !end-if
+  
+  if isblank($GEXJOB_REH_REHIRE_DT) = 1
+     let $emp_hire = $hireDt_cmp   
+  else
+     let $emp_hire = $rehireDt_cmp    
+  end-if
+  !GEX-MXT MODIFIED FOR REHIRE DATE LOGIC-END
+
+  #debug7 show  '$emp_hire & $new_hire_cutoff_dt_cmp ' $emp_hire ' '  $new_hire_cutoff_dt_cmp
+
+  Let $Save_Tmp_Gex_Dreyfus_Plan = &TMP.GEX_DREYFUS_PLAN            !SCM 07/14/2003
+
+  If &TMP.GEX_REPORT_FLAG = 'Y'			!Year Run
+    If &TMP.GEX_STAT_FLAG = 'Y'
+	#debug9 show 'Doing First P280-Exclude-Run-Control-Eligibles'
+      Do P280-Exclude-Run-Control-Eligibles
+    End-If
+  Else						!Not Year End
+    If &TMP.GEX_STAT_FLAG = 'Y'			!Enrolled
+    	#debug9 show 'Doing Second P280-Exclude-Run-Control-Eligibles'
+      Do P280-Exclude-Run-Control-Eligibles
+    Else					!Not Enrolled
+      If &TMP.HRS_YTD  		>= 750   And
+	 &TMP.SERVICE_YEARS 	>= 1     And
+	 &TMP.AGE      		>= 21    And
+	 &TMP.ELIG_config1     	<> 'SAV' And
+         $emp_hire < $new_hire_cutoff_dt_cmp    !Weed out newhires
+	#debug9 show 'Doing Third P280-Exclude-Run-Control-Eligibles'
+	Do P280-Exclude-Run-Control-Eligibles
+      End-If
+    End-If
+  End-If
+
+     ! show '  TMP.GRS_YTD   ============================== ' &TMP.GRS_YTD  
+     ! show '  TMP.GRS_YTD_ADJ   ============================== ' &TMP.GRS_YTD_ADJ
+                                                                         
+FROM sysadm.PS_GEX_R_GEXBN610 TMP,
+     PS_EMPLOYMENT  EMP,
+     PS_PERSONAL_DATA PERS
+WHERE  TMP.EMPLID 	= EMP.EMPLID
+  AND  TMP.EMPL_RCD    = EMP.EMPL_RCD
+  AND  EMP.EMPLID	= PERS.EMPLID
+ORDER BY TMP.GEX_DREYFUS_PLAN, TMP.EMPLID
+       
+end-select
+  !Show 'P500-OUTPUT EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE'
+!***********************************************************************
+END-PROCEDURE
+!***********************************************************************
+!*********************************************************************
+Begin-Procedure P220-Write-Header-Record
+!*********************************************************************
+#debug9 Show 'P220-Write-Header-Record'
+
+  Write 1 From '971':3
+	       ' ':2
+	       &TMP.GEX_DREYFUS_PLAN:6
+	       ' ':12
+	       'DEFINE':6
+	       ' ':4
+	       $pay_end_dt_YYMMDD:6
+	       '.971':4
+	       ' ':37
+    Status=#filestat
+
+  If #filestat != 0
+     Show 'Error writing header record to output file.  Program terminating.'
+     Stop
+  Else
+    !Add 1 To #benefit-plan-count  ! MXR ITG33710 10/24/2006
+    Add 1 To #recs-written
+  End-If
+     show '$tmp.grs_ytd_tot'  $tmp.grs_ytd_tot ' / ' $tmp.grs_ytd_tot
+   let $tmp.grs_ytd_tot = 0
+   let $tmp.grs_ytd_adj_tot = 0
+      let $tmp.gex_grs_ytd_tot = 0	! DXS, 02/20/07. New field initialize
+
+!***********************************************************************  
+End-Procedure
+!***********************************************************************
+!*********************************************************************
+Begin-Procedure P230-Write-Detail-Record
+!*********************************************************************
+#debug9 Show 'P230-Write-Detail-Record'
+
+  
+  Let $Data-Found-Flag = 'Y'
+  ! ITG33710 10/24/2006  START 
+  
+  move  &tmp.grs_ytd to #tmp.grs_ytd
+  let #tmp.grs_ytd_tot = #tmp.grs_ytd + #tmp.grs_ytd_tot
+  
+       ! show '========#tmp.grs_ytd_tot==========='#tmp.grs_ytd_tot
+        
+  Move #tmp.grs_ytd_tot To $num-in-ytd 099999999.99	! DXS, changed 09999999.99 to 099999999.99
+  Let $tmp.grs_ytd_tot = Substr($num-in-ytd,1,9) || Substr($num-in-ytd,11,2) ! DXS, changed 8 to 9 and 10 to 11
+  
+       #debug8  show '<' $tmp.grs_ytd_tot  '>'
+           
+ 
+ 
+   ! ITG33710 10/24/2006  end
+     
+      
+  Move &tmp.grs_ytd To $num-in 09999999.99
+  Let $comp_amt_1 = Substr($num-in,1,8) || Substr($num-in,10,2)
+  
+  ! ITG33710 10/24/2006  START 
+  move  &tmp.grs_ytd_adj to #tmp.grs_ytd_adj
+ let #tmp.grs_ytd_adj_tot = #tmp.grs_ytd_adj + #tmp.grs_ytd_adj_tot
+ 
+        ! show '=========#tmp.grs_ytd_adj_tot=========  ' #tmp.grs_ytd_adj_tot
+         
+  Move #tmp.grs_ytd_adj_tot To $num-in-adj-tot 09999999.99
+  Let $tmp.grs_ytd_adj_tot = Substr($num-in-adj-tot,1,8) || Substr($num-in-adj-tot,10,2)  
+     
+        ! show ' $tmp.grs_ytd_adj_tot       =   ' $tmp.grs_ytd_adj_tot
+        
+        ! ITG33710 10/24/2006  end
+  Move &tmp.grs_ytd_adj To $num-in 09999999.99
+  Let $comp_amt_2 = Substr($num-in,1,8) || Substr($num-in,10,2)
+
+
+
+! DXS, 02/20/07, New Addition  
+
+  move  &tmp.gex_grs_ytd to #tmp.gex_grs_ytd
+  let #tmp.gex_grs_ytd_tot = #tmp.gex_grs_ytd + #tmp.gex_grs_ytd_tot
+  
+  #debug8 show '#tmp.gex_grs_ytd_tot ' #tmp.gex_grs_ytd_tot
+        
+  Move #tmp.gex_grs_ytd_tot To $num-in-gex-ytd 099999999.99
+  Let $tmp.gex_grs_ytd_tot = Substr($num-in-gex-ytd,1,9) || Substr($num-in-gex-ytd,11,2)
+  
+  #debug8 show '<' $tmp.gex_grs_ytd_tot '>'
+           
+  Move &tmp.gex_grs_ytd To $num-in-gex 09999999.99
+  Let $comp_amt_3 = Substr($num-in-gex,1,8) || Substr($num-in-gex,10,2)
+! DXS, End
+
+
+  Write 1 From '971':3			!col 1
+	       '01':2			!col 4			
+	       &tmp.gex_dreyfus_plan:6	!col 6
+	       ' ':3			!col 12
+	       &tmp.emplid:9		!col 15
+	       $comp_amt_1:10		!col 24
+	       $comp_amt_2:10		!col 34
+	       $comp_amt_3:10		!col 44		! DXS, 02/20/07. Added this
+	       &pers.name:20		!col 54
+	       &tmp.empl_type:1		!col 74
+	       &tmp.union_cd:1		!col 75
+               &tmp.gex_incl_excl:1      !col 76
+	       ' ':4
+    Status=#filestat
+
+  If #filestat != 0
+     Show 'Error writing detail record to output file.  Program terminating.'
+     Stop
+  Else
+    Add 1 To #benefit-plan-count
+    Add 1 To #recs-written
+  End-If
+
+  Do P235-Print-Record       
+  
+  ! Show 'P230-Write-Detail-Record  end ' 
+  
+!***********************************************************************  
+End-Procedure
+!***********************************************************************
+!*********************************************************************
+Begin-Procedure P235-Print-Record
+!*********************************************************************
+#debug9 Show 'P235-Print-Record'
+  print &tmp.gex_dreyfus_plan   (+1,{#column1})
+  print &tmp.emplid            	(  ,{#column2})
+  print &tmp.grs_ytd        	(  ,{#column3})     Edit 999,999,990.00
+  print &tmp.grs_ytd_adj	(  ,{#column4})     Edit 999,999,990.00
+  print &tmp.gex_grs_ytd        (  ,{#column5})     Edit 999,999,990.00	! DXS, 02/20/07. Added this and 
+  print &pers.name              (  ,{#column6},30)			! pushed the following columns down 
+  print &tmp.empl_type         	(  ,{#column7})
+  print &tmp.union_cd          	(  ,{#column8})
+
+  If &tmp.GEX_STAT_FLAG = 'N'
+    print '*'             	(  ,{#column9})
+  End-If
+
+  print &tmp.gex_incl_excl      	(  ,{#column10})
+!***********************************************************************
+End-Procedure
+!***********************************************************************
+!*********************************************************************
+Begin-Procedure P240-Write-Trailer-Record
+!*********************************************************************
+#debug9 Show 'P240-Write-Trailer-Record'
+
+	#debug8 show '<' $tmp.grs_ytd_tot '>'
+	#debug8 show '<' $tmp.gex_grs_ytd_tot '>'
+
+  Move #benefit-plan-count To $benefit-plan-count 099999
+  Let #benefit-plan-count = 0
+  
+   let $num-in-ytd = 0
+   let $_num-in-ytd = 0
+   let $num-in-adj-tot = 0     
+   let $_num-in-adj-tot = 0    
+   
+  Write 1 From 'ZZZ':3
+	       ' ':2
+!	       &tmp.gex_dreyfus_plan:6                !SCM 07/14/2003
+               $Save_Tmp_Gex_Dreyfus_Plan:6           !SCM 07/14/2003
+	       'GIANT EAGLE INC':18		! DXS, changed 32 to 18
+	       $pay_end_dt_MMDDYYYY:8
+	       $benefit-plan-count:6
+	       $tmp.grs_ytd_tot:11		! DXS, changed 10 to 11
+	       $tmp.grs_ytd_adj_tot:10
+	       $tmp.gex_grs_ytd_tot:11		! DXS, 02/20/2007, Added this
+	       !' ':23
+    Status=#filestat
+
+  If #filestat != 0
+     Show 'Error writing trailer record to output file.  Program terminating.'
+     Stop
+  Else
+    Add 1 To #recs-written
+  End-If
+  
+  New-Page            
+  
+   let  $tmp.grs_ytd_tot = 0      
+   let $_tmp.grs_ytd_tot = 0      
+   let $num-in-ytd = 0             
+   let $_num-in-ytd = 0            
+   let #tmp.grs_ytd = 0           
+   let #_tmp.grs_ytd = 0          
+   let #tmp.grs_ytd_tot = 0       
+   let #_tmp.grs_ytd_tot = 0      
+                                   
+   let  $tmp.grs_ytd_adj_tot = 0       
+   let $_tmp.grs_ytd_adj_tot = 0       
+   let $num-in-adj-tot = 0             
+   let $_num-in-adj-tot = 0            
+   let #tmp.grs_ytd_adj = 0            
+   let #_tmp.grs_ytd_adj = 0           
+   let #tmp.grs_ytd_adj_tot = 0        
+   let #_tmp.grs_ytd_adj_tot = 0       
+  
+  ! DXS, 02/20/2007, Added this 
+   let  $tmp.gex_grs_ytd_tot = 0      
+   let  $num-in-gex-ytd = 0           
+   let  #tmp.gex_grs_ytd = 0           
+   let  #tmp.gex_grs_ytd_tot = 0       
+
+  
+             !  Show 'P240-Write-Trailer-Record end  '
+!***********************************************************************  
+End-Procedure
+!***********************************************************************
+!*********************************************************************
+Begin-Procedure P250-Check-For-Enrollment
+!*********************************************************************
+#debug9 Show 'P250-Check-For-Enrollment'
+  Let $enrolled = 'N'
+  let $exclude_flag=' '
+Begin-Select
+SP.BENEFIT_PLAN
+SP.EFFDT		&effdt
+   Do format-datetime (&effdt,$term_dt_cmp,{DEFCMP},'','')   
+SP.COVERAGE_ELECT
+SP.COVERAGE_BEGIN_DT	&Covg_Beg_Dt
+   Do format-datetime (&Covg_Beg_Dt,$Covg_Beg_Dt_cmp,{DEFCMP},'','')   	
+SP.COVERAGE_ELECT_DT	&Covg_Elec_Dt
+   Do format-datetime (&Covg_Elec_Dt,$Covg_Elec_Dt_cmp,{DEFCMP},'','')   	
+
+  Let $benefit_plan = &SP.BENEFIT_PLAN
+  
+  #ifdef debug8
+    display '&SP.COVERAGE_ELECT ' noline
+    display &SP.COVERAGE_ELECT
+    show '$benefit_plan ' $benefit_plan
+  #endif
+
+  Do format-datetime($year_end_dt,$year_end_dt_cmp,{DEFCMP},'','')   
+  
+  If &SP.COVERAGE_ELECT = 'E'
+    Do P270-Check-Dreyfus-Plan
+    #debug9 show 'Doing Get-New-Erncd'
+    do Get-New-Erncd			! DXS, 03/01/07
+  Else
+    #debug9 show 'Doing P260-Get-Elect-Row'
+    Do P260-Get-Elect-Row
+    #debug9 show 'Doing Get-New-Erncd'
+    do Get-New-Erncd			! DXS, 03/01/07
+    Do P270-Check-Dreyfus-Plan
+    !Do Convert-To-DTU-Date(&SP.EFFDT, $Term-Date)	AXL  doesn't work
+    If $term_dt_cmp < $year_begin_dt_cmp
+      Let $enrolled = 'N'
+    End-If
+  End-If
+  
+  #ifdef debug8
+    show 'emplid in P250-Check-For-Enrollment proc ' $emplid
+    display '&Covg_Beg_Dt ' noline
+    display &Covg_Beg_Dt
+
+    display '&Covg_Elec_Dt ' noline
+    display &Covg_Elec_Dt
+
+    display '$year_end_dt ' noline
+    display $year_end_dt
+  #endif
+
+  !AXL 01/20/2002 - Begin
+  Do format-datetime($year_end_dt,$year_end_dt_cmp,{DEFCMP},'','') 
+  #ifdef debug8
+     display '$Covg_Beg_Dt_cmp ' noline
+     display $Covg_Beg_Dt_cmp
+     display '$Covg_Elec_Dt_cmp ' noline
+     display $Covg_Elec_Dt_cmp
+  #endif
+  If $Covg_Beg_Dt_cmp > $year_end_dt_cmp
+     If $Covg_Elec_Dt_cmp <> '19000101'
+        let $exclude_flag='1'
+     end-if
+  end-if
+  !AXL 01/20/2002 - End
+
+  #ifdef debug8
+     display '$exclude_flag ' noline
+     display $exclude_flag
+  #endif
+
+FROM   PS_SAVINGS_PLAN     SP
+
+WHERE  SP.EMPLID              = $EMPLID
+AND    SP.EMPL_RCD           = #EMPL_RCD
+AND    SP.PLAN_TYPE           = '40'
+
+AND    SP.EFFDT               =
+      (SELECT MAX(EFFDT)
+       FROM   PS_SAVINGS_PLAN
+       WHERE  EMPLID          = SP.EMPLID
+       AND    EMPL_RCD       = SP.EMPL_RCD
+       AND    PLAN_TYPE       = '40'
+       AND    EFFDT          <= $year_end_dt)
+End-Select
+!***********************************************************************
+End-Procedure
+!***********************************************************************
+
+
+! DXS, 02/20/2007, New procedure 
+!***************************************
+begin-procedure Get-New-Erncd
+!***************************************
+	#debug8 show '$benefit_plan ' $benefit_plan
+
+begin-SELECT 
+sp_tbl.erncd_spcl &sp_tbl.erncd_spcl
+
+	move &sp_tbl.erncd_spcl to $ERNCD_SPCL
+	#debug8 show '$ERNCD_SPCL ' $ERNCD_SPCL
+ 
+from ps_savings_pln_tbl sp_tbl
+where sp_tbl.plan_type = '40'
+AND sp_tbl.benefit_plan = $benefit_plan
+AND sp_tbl.effdt = (SELECT MAX(sp_tbl_ed.effdt) 
+	 FROM ps_savings_pln_tbl sp_tbl_ed
+	 WHERE sp_tbl_ed.plan_type = sp_tbl.plan_type
+	 AND sp_tbl_ed.benefit_plan = sp_tbl.benefit_plan) 
+end-select
+end-procedure 
+
+
+
+!*********************************************************************
+Begin-Procedure P260-Get-Elect-Row
+! This gets the previous effdted row which is E
+!*********************************************************************
+#debug9 Show 'P260-Get-Elect-Row'
+Begin-Select
+SP2.BENEFIT_PLAN
+  Let $benefit_plan = &SP2.BENEFIT_PLAN
+  #debug8 show '$benefit_plan ' $benefit_plan
+FROM   PS_SAVINGS_PLAN  SP2
+WHERE  SP2.EMPLID             = $EMPLID
+AND    SP2.EMPL_RCD          = #EMPL_RCD
+AND    SP2.PLAN_TYPE          = '40'
+AND    SP2.COVERAGE_ELECT     = 'E'
+AND    SP2.EFFDT              =
+      (SELECT MAX(EFFDT)
+       FROM   PS_SAVINGS_PLAN
+       WHERE  EMPLID          = $EMPLID
+       AND    EMPL_RCD       = #EMPL_RCD
+       AND    PLAN_TYPE       = '40'
+       AND    COVERAGE_ELECT  = 'E'
+       AND    EFFDT          <= &EFFDT)
+End-Select
+End-Procedure
+
+!*********************************************************************
+Begin-Procedure P270-Check-Dreyfus-Plan
+!*********************************************************************
+#debug9 Show 'P270-Check-Dreyfus-Plan'
+Begin-Select
+'x'
+  Let $enrolled = 'Y'
+FROM   PS_GEX_DREYFUS_MAP  GDM2
+WHERE  GDM2.GEX_DREYFUS_PLAN  = $dreyfus_plan
+AND    GDM2.PLAN_TYPE         = '40'
+AND    GDM2.BENEFIT_PLAN      = $benefit_plan
+End-Select
+!***********************************************************************
+End-Procedure
+!***********************************************************************
+!*********************************************************************
+Begin-Procedure P280-Exclude-Run-Control-Eligibles
+!*********************************************************************
+#debug9 Show 'P280-Exclude-Run-Control-Eligibles'
+
+Begin-Select
+'y'
+  Do P230-Write-Detail-Record
+From   ps_gex_dreyfus_tbl
+Where  gex_dreyfus_plan = &tmp.gex_dreyfus_plan
+And   [$GEXXX934_EXCLUDE_DREYFUS_PLAN_CRITERIA]
+End-Select
+
+!***********************************************************************   
+End-Procedure
+!***********************************************************************
+!*********************************************************************
+Begin-Procedure P300-Finalization
+!*********************************************************************
+#debug9 Show 'P300-Finalization'
+  If $Data-Found-Flag <> 'Y'
+    Print 'NO DATA SELECTED FOR THIS REPORT RUN'        (25,) Center
+  End-If
+
+  Do Format-Number(#recs-written,$recs-written,'888,888,888')
+  Show $recs-written ' records written to ' $file1
+  Show ''
+
+  Do P310-Close-File
+  !Do P400-email-file          isdvmxr 10232006 for testing                            !GBD 07/17/2003
+
+  date-time () HH:MI:SS &timeEnded
+  date-time () MM/DD/YYYY &dateEnded
+  show 'Report Ended at ' &timeEnded ' on ' &dateEnded
+
+  Do Stdapi-Term             !stdapi.sqc
+  Show ' '
+  Show 'Successful end of report'
+End-Procedure
+!***********************************************************************
+!*********************************************************************
+Begin-Procedure P310-Close-File
+!*********************************************************************
+#debug9 Show 'P310-Close-File'
+  Close 1
+
+  If #filestat != 0
+     Show 'Error closing output file.  Program terminating.'
+     Stop
+  End-If
+End-Procedure
+!***********************************************************************
+!GBD 07/17/2003 Begin
+!*********************************************************************
+Begin-Procedure P400-email-file
+!*********************************************************************
+   do GEXXX951-Select-Oracle-Instance
+   let $db_name = lower($GEXXX951_Oracle_Instance)
+   Do GEXXX971-Select-Trans-Type-Parameters
+   if ($GEXXX971_EMAIL_ADDR_CRITERIA = '') and ($GEXXX971_FTP_ADDR_CRITERIA = '')
+      show 'Either no rows exist on GEX_INTFC_RULE/DATA for this Oprid/Run Control ID'
+      show 'or the most current rows under this ID have been set to inactive. Data will'
+      show 'not be sent.'
+   else
+      if $GEXXX971_GEX_TRANS_TYPE = 'E'
+         show $GEXXX971_EMAIL_ADDR_CRITERIA
+         show 'This is the email statement produced: '
+
+         let $UNIX_MAIL_COMMAND = '/usr/local/bin/todos -v ' || $file1 ||
+         ' &&/usr/local/bin/mailer.pl "'||$GEXXX971_EMAIL_ADDR_CRITERIA||'" "DREYFUS CENSUS" '||
+         '"$BINDIR/gexbn610_msg.sh" ' || $file1 || ' '
+         show $UNIX_MAIL_COMMAND
+      
+         CALL SYSTEM USING $UNIX_MAIL_COMMAND #system_status
+        
+         if #system_status <> 0
+            add 1 to #errorcount
+            display 'eMail of ' noline
+            display $file1 noline
+            display ' failed'
+            STOP
+         else
+            display $file1
+            display ' was emailed successfully'
+         end-if
+
+      end-if
+      if $GEXXX971_GEX_TRANS_TYPE = 'F'
+         show $GEXXX971_FTP_ADDR_CRITERIA
+         show 'Need to insert a Call FTP shell script to run ftp'
+      end-if
+   end-if
+End-Procedure
+!GBD 07/17/2003 End
+!***********************************************************************
+!*********************************************************************
+#include 'askaod.sqc'    !Ask for AsOfDate
+#include 'gexxx920.sqc'  !Get ben single row run control
+#include 'gexxx934.sqc'  !Get dreyfus plan run controls
+#Include 'stdapi.sqc'    !Process Scheduler Interface
+#Include 'curdttim.sqc'  !Get-Current-DateTime Procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'datemath.sqc'  !Routines for date math
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'gexxx951.sqc'  !Oracle Database Name             !GBD 07/17/2003
+#Include 'gexxx971.sqc'  !Email and FTP Parameters         !GBD 07/17/2003
+#include 'gexrehdt.sqc'	 !GEX-MXT 03/24/2008 Fixed for REHIRE DT

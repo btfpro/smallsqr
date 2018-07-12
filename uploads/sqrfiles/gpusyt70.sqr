@@ -1,0 +1,2742 @@
+!**********************************************************************!
+!  gpusyt70:  Create W-2c/W-3c Print Files - U.S. and Territories      !
+!**********************************************************************!
+!                                                                      !
+!               Confidentiality Information:                           !
+!                                                                      !
+!                                                                      !
+! This module contains confidential and proprietary information        !
+! of Oracle; it is not to be copied, reproduced, or transmitted        !
+! in any form, by any means, in whole or in part, nor is it to         !
+! be used for any purpose other than that for which it is              !
+! expressly provided under the applicable license agreement.           !
+!                                                                      !
+! Copyright (C) 2006 Oracle. All Rights Reserved.                      !
+!                                                                      !
+!**********************************************************************!
+!                                                                      !
+!          $Date:  2006/08/31:17:57:08                                 !
+!       $Release:  HR9                                                 !
+!      $Revision:  103                                                 !
+!                                                                      !
+!**********************************************************************!
+
+#include 'setenv.sqc'   !Set environment
+#DEFINE WCOLUMN1 4      !Set up first print column of form
+#DEFINE WCOLUMN2 42     !Set up mid-point column of form
+
+
+begin-setup
+    #Include 'setup03i.sqc'  !printer and page-size init
+end-setup
+
+
+begin-report
+
+  do Init-Report
+  do Stdapi-Term
+end-report
+
+begin-procedure Init-Report
+  display ''
+  display 'Printing W-2c'
+
+  let $t1 = DateToStr(DateNow(),'hh:mi:ss') 
+  display $t1
+
+  move 'GPUSYT70' to $ReportID
+  do Assign-Year-End-Variables
+  do Init-DateTime
+  do Init-Number
+  do Stdapi-Init
+  do Initialization
+
+  if &TX.GPUS_YE_ALIGNCOUNT > 0
+    do Print-Alignment-Forms
+  end-if
+
+  if &TX.GPUS_YE_REPRINT  = '2'
+    do Read-EEs
+  else
+    do Read-Employee-Data
+  end-if
+
+  if $EmployeeFound = 'N'
+   if &TX.GPUS_YE_ALIGNCOUNT > 0
+    new-page
+   end-if
+    display ' '
+    display '****** No Employee Records Selected ******'
+    display ' '
+    print '********************************'  (+3,1)
+    print '  No Employee Records Selected  '  (+1,1)
+    print '********************************'  (+1,1)
+  else
+    if &TX.GPUS_YE_REPRINT  = '1'
+      do Update-W2C-Parameters
+    else
+      do Update-Reg-Reprint-Status
+    end-if
+    display ''
+    display 'Upon successful conclusion of this program, '
+    display 'an output print file for the W-2c will be created '
+    display 'GPUSYT70.LIS contains print images for paper W-2cs.'
+    display ''
+    display 'Run the W-2c audit program(GPUSYT60) to get'
+    display 'the totals for the W-3c report.'
+    display ''
+    display '** NOTE: If you wish to save these files, rename them before'
+    display 'you run the next batch.'
+    display ''
+  end-if
+
+  let $t2 = DateToStr(DateNow(),'hh:mi:ss') 
+  display $t2
+
+
+end-procedure
+
+begin-procedure Initialization
+  do Get-Current-DateTime
+  move '1' to $MMLZero
+  move '1' to $Year4
+  do Format-DateTime($AsOfToday, $910Date, {DEFYMD},'','')
+
+  move $910Date to $AsOfYear xxxx   !extract the current year
+  move $AsOfYear  to #AsOfYear
+  move #AsOfYear  to #saveAsOfYear
+  subtract 1    from #AsOfYear
+
+  do Init-Values
+  do Get-W2C-Run-Controls
+  do Get-W2C-Parameters
+
+  if RTRIM(&TX.GPUS_PREPRTFORM ,' ') = ''
+    display '**************************************************************'
+    display 'Form ID not specified on Print Year End Correction Forms Page '
+    display 'Program stopped'
+    display '**************************************************************'
+    stop
+  end-if
+    move &TX.CALENDAR_YEAR  to $CalYear 9999
+    if &TX.CALENDAR_YEAR = 0
+      display ' '
+      display '****** No Employee Records Selected ******'
+      display ' '
+      print '********************************'  (+3,1)
+      print '  No Employee Records Selected  '  (+1,1)
+      print '********************************'  (+1,1)
+      stop
+   end-if
+    let $AsOfDate = $CalYear || '1231'
+    do Format-DateTime($AsOfDate, $AsOfDate, {DEFCMP}, '', 'native')
+    display $AsOfDate
+
+  do Load-W2C-PRT
+  let $First_time = 'Y'
+
+
+!  Short edge offset - negative or positive decipoints
+!     Modify the codes below to adjust up or down -
+!     PLC code &lnnZ not effective on HP4000 printers
+
+
+  let $LP8 = ''
+  #if {PRINTER_TYPE} = 'LINEPRINTER'
+  #ifndef EBCDIC
+    encode '<27>&l30Z' into $LP8
+  #else
+  !  encode '<39>&l30Z' into $LP8
+  #endif
+  #endif
+
+  print $LP8 () code
+
+  move &TX.GPUS_YE_EE_PERPAGE  to #EmployeesPerPage
+  if $Layout_Style = '10'
+    COLUMNS {WCOLUMN1}
+    move 2 to #FormsPerPage
+  else
+    move 1 to #FormsPerPage
+  end-if
+
+  if #EmployeesPerPage  > #FormsPerPage
+    display '*********************************************************'
+    display 'Employees Per Page specifed on Print Year End Correction '
+    display 'Forms Page  is greater than the number of forms per page '
+    display 'for the Form ID selected.                                '
+    display '*********************************************************'
+    stop
+  end-if
+
+begin-SELECT
+TEMP_SSN_MASK
+    FROM PS_INSTALLATION
+end-SELECT
+
+ create-array name=StateLocals size=50
+  field=Box:char
+  field=State:char
+  field=Amount:number
+  field=PrvAmount:number
+
+ create-array name=StateSWT size=50
+  field=State:char
+  field=SWT:char
+
+
+end-procedure
+
+
+begin-procedure Read-Employee-Data
+
+  move 'N' to $EmployeeFound
+
+
+begin-SELECT
+E.GPUS_TAX_EIN                   () ON-BREAK LEVEL=1 PRINT=NEVER BEFORE=BEFORE-COMPANY
+E.EMPLID                         () ON-BREAK LEVEL=2 PRINT=NEVER BEFORE=BEFORE-EMPLID
+E.SSN
+E.GPUS_YE_FNAME
+E.GPUS_YE_MNAME
+E.GPUS_YE_LNAME
+E.GPUS_YE_SUFFIX
+E.ADDRESS1
+E.ADDRESS2
+E.CITY
+E.STATE
+E.POSTAL
+E.COUNTRY
+E.GPUS_STATUTORYFLAG
+E.GPUS_PENSION_FLAG
+E.GPUS_3SICKPAY_FLAG
+E.GPUS_PSSN
+E.GPUS_YE_PFNAME
+E.GPUS_YE_PMNAME
+E.GPUS_YE_PLNAME
+E.GPUS_YE_PSUFFIX
+E.GPUS_PADDRESS1
+E.GPUS_PADDRESS2
+E.GPUS_PCITY
+E.GPUS_PSTATE
+E.GPUS_PPOSTAL
+E.GPUS_PCOUNTRY
+E.GPUS_PRV_STATUT_EE
+E.GPUS_PREV_PENSION
+E.GPUS_PREV_SICKPAY
+E.GPUS_YEC_BATCH_NBR
+E.GPUS_CAL_YEAR
+
+  move 'Y' to $EmployeeFound
+  move &E.GPUS_CAL_YEAR  to $ER_Year  9999
+
+  evaluate $Taxform_ID
+     when = '150'
+          let $ER_Year = $ER_Year || '     VI'
+     when = '130'
+          let $ER_Year = $ER_Year || '     GU'
+     when = '120'
+          let $ER_Year = $ER_Year || '     AS'
+  end-evaluate
+
+  do Process-W2C
+
+  if &TX.GPUS_YE_REPRINT  = '1'
+    do Update-W2-History
+  end-if
+FROM  PS_GPUS_YEC_DAT E
+  WHERE E.GPUS_YEC_STATUS       <> '30'
+  AND E.GPUS_TAXFORM_ID = $Taxform_ID
+  [$E.Batch_Nbr]
+  [$E.SelectedEEs]
+ORDER BY E.GPUS_TAX_EIN, E.SSN
+end-SELECT
+end-procedure
+
+begin-procedure Before-Company
+
+begin-SELECT
+A.GPUS_YE_RPT_CO
+A.DESCR
+A.GPUS_TAX_EIN
+A.ADDRESS1
+A.ADDRESS2
+A.CITY
+A.STATE
+A.POSTAL
+A.COUNTRY
+
+
+  move &A.Gpus_Tax_EIN    to $Tax_EIN 099999999
+  move $Tax_EIN           to $A.Tax_EIN xx-xxxxxxx
+  move &A.Descr           to $A.Descr
+  move &A.Address1        to $A.Address1
+  move &A.Address2        to $A.Address2
+  move &A.Country         to $A.Country
+  let  $A.City            =  RTRIM(&A.City,' ')
+  let  $A.State           =  RTRIM(&A.State,' ')
+  move &A.POSTAL          to $A.Postal
+  move &A.Gpus_Ye_Rpt_Co to $A.Gpus_Ye_Rpt_Co
+
+
+  UPPERCASE $A.Descr
+  UPPERCASE $A.Address1
+  UPPERCASE $A.Address2
+  UPPERCASE $A.Country
+  UPPERCASE $A.City
+
+FROM  PS_GPUS_YE_CO_TBL A, PS_GPUS_YE_EE0_VW B
+WHERE B.GPUS_TAX_EIN = &E.GPUS_TAX_EIN
+AND B.GPUS_YE_RPT_CO = A.GPUS_YE_RPT_CO
+AND B.EMPLID = &E.EMPLID
+AND B.GPUS_CAL_YEAR = &E.GPUS_CAL_YEAR
+
+end-SELECT
+end-procedure
+
+begin-procedure Before-EmplID
+
+  move &E.EMPLID   to $E.EmplID
+
+  move &E.SSN to $S123 xxx
+  if $S123 = &Temp_SSN_Mask or RTRIM(&E.SSN, ' ') = ''
+    move 'Applied For' to $E.SSN
+  else
+    move &E.SSN to $E.SSN xxx-xx-xxxx
+  end-if
+
+  move &E.GPUS_PSSN to $S123 xxx
+  if $S123 = &Temp_SSN_Mask or RTRIM(&E.GPUS_PSSN, ' ') = ''
+    move 'Applied For' to $E.Prv_SSN
+  else
+    move &E.GPUS_PSSN to $E.Prv_SSN xxx-xx-xxxx
+  end-if
+
+  let $E.FName = rtrim(&E.GPUS_YE_FNAME, ' ')  || ' ' || rtrim(&E.GPUS_YE_MNAME, ' ')
+  let $E.LName = rtrim(&E.GPUS_YE_LNAME, ' ')  || ' ' || rtrim(&E.GPUS_YE_SUFFIX, ' ')
+
+  move &E.Gpus_Statutoryflag to $E.Statutory_Ee
+  move &E.Gpus_Pension_Flag  to $E.Pension_Plan
+  move &E.Gpus_3SickPay_Flag to $E.ThirdParty_SickPay
+
+  move &E.Address1        to $E.Address1
+  move &E.Address2        to $E.Address2
+  move &E.Country         to $E.Country
+  let  $E.City            =  RTRIM(&E.City,' ')
+  let  $E.State           =  RTRIM(&E.State,' ')
+  move &E.Postal          to $E.Postal
+
+  let $E.Prv_FName = rtrim(&E.GPUS_YE_PFNAME, ' ') || ' ' || rtrim(&E.GPUS_YE_PMNAME, ' ')
+  let $E.Prv_FName  = SUBSTR($E.Prv_FName,1,17)
+  let $E.Prv_LName = rtrim(&E.GPUS_YE_PLNAME, ' ') || ' ' || rtrim(&E.GPUS_YE_PSUFFIX, ' ')
+  let $E.Prv_LName  = SUBSTR($E.Prv_LName,1,17)
+
+  move &E.Gpus_PAddress1        to $E.Prv_Address1
+  move &E.Gpus_PAddress2        to $E.Prv_Address2
+  move &E.Gpus_PCountry         to $E.Prv_Country
+  let  $E.Prv_City            =  RTRIM(&E.Gpus_PCity,' ')
+  let  $E.Prv_State           =  RTRIM(&E.Gpus_PState,' ')
+  move &E.Gpus_PPostal          to $E.Prv_Postal
+
+  move &E.Gpus_Prv_Statut_Ee    to $E.Prv_Statutory_Ee
+  move &E.Gpus_Prev_Pension    to $E.Prv_Pension_Plan
+  move &E.Gpus_Prev_Sickpay  to $E.Prv_ThirdParty_SickPay
+
+  uppercase $YE_Name
+  uppercase $E.Address1
+  uppercase $E.Address2
+  uppercase $E.Country
+  uppercase $E.City
+
+  uppercase $E.Prv_Name
+  uppercase $E.Prv_Address1
+  uppercase $E.Prv_Address2
+  uppercase $E.Prv_Country
+  uppercase $E.Prv_City
+
+end-procedure
+
+begin-procedure Process-W2C
+
+  move 0 to #LocalPrintCount
+  move 0 to #StateSWTCount
+  move '' to $Prev_State
+  move 0 to #StateLocalCount
+
+  do Load-Amounts
+  do Print-W2C
+
+end-procedure
+
+begin-procedure Print-W2C
+  move 1 to #j
+
+  while #j <= #FormsPerPage/#EmployeesPerPage  !loop for individual ee's
+    do Next-Form
+    do Print-Page1-Data
+    do Print-ER-Data
+    do Print-EE-Data
+
+    do Print-Fed-Amounts
+    if #StateLocalCount > 0
+        move 0 to #NextStateLoc
+        do Print-State-Local-Amounts
+    else
+          if $Print_Test_State_Local = 'Y'
+            do Print-Test-State-Local-Amounts
+          end-if
+    end-if
+    add 1 to #j
+  end-while
+
+  do Init-Values
+
+
+end-procedure
+
+begin-procedure Init-Values
+  move 0 to #Fed_Wages
+  move 0 to #Fed_Tax
+  move 0 to #SS_Wages
+  move 0 to #SS_Tax
+  move 0 to #Med_Wages
+  move 0 to #Med_Tax
+  move 0 to #SS_Tips
+  move 0 to #Alloc_Tips
+  move 0 to #Adv_EIC
+  move 0 to #Dep_Care
+  move 0  to #Non_Qual_457AB
+  move 0 to #BlankBoxCount
+  move 'N' to $AmtNon_Qual_457A
+  move 'N' to $AmtNon_Qual_457B
+  move 0 to #Uncoll_SS_Tax_On_Tips
+  move 0 to #Uncoll_Med_Tax_On_Tips
+  move 0 to #Group_Term_Life
+  move 0 to #401K
+  move 0 to #403B
+  move 0 to #408K6
+  move 0 to #457B
+  move 0 to #501C18D
+  move 0 to #Sick_Pay
+  move 0 to #Excise_Tax
+  move 0 to #Business_Exp
+  move 0 to #Uncoll_SS_Tax_GTL
+  move 0 to #Uncoll_Med_Tax_GTL
+  move 0 to #Excl_Moving_Exp
+  move 0 to #Nontaxable_Combat_Pay
+  move 0 to #Med_Svgs_Acct
+  move 0 to #408P_Simple_Retirement
+  move 0 to #Adoption_Exp
+  move 0 to #NonStatutory_Stock_Opt
+  move 0 to #NonQual_Def_Comp
+  move 0 to #Income_NonQual_Def_Comp
+  move 0 to #OtherA
+  move 0 to #OtherB
+  move 0 to #OtherC
+  move 0 to #OtherD
+  move 0 to #OtherE
+  move 0 to #OtherF
+  move 0 to #OtherG
+  move 0 to #OtherH
+  move 0 to #OtherI
+  move 0 to #OtherJ
+  move 0 to #OtherK
+  move 0 to #OtherL
+  move 0 to #OtherM
+  move 0 to #OtherN
+  move 0 to #OtherO
+  move 0 to #OtherP
+  move 0 to #OtherQ
+  move 0 to #OtherR
+  move 0 to #OtherS
+  move 0 to #OtherT
+  move 0 to #OtherU
+  move 0 to #OtherV
+  move 0 to #OtherW
+  move 0 to #OtherX
+  move 0 to #OtherY
+  move 0 to #OtherZ
+
+  move 0 to #Prv_Fed_Wages
+  move 0 to #Prv_Fed_Tax
+  move 0 to #Prv_SS_Wages
+  move 0 to #Prv_SS_Tax
+  move 0 to #Prv_Med_Wages
+  move 0 to #Prv_Med_Tax
+  move 0 to #Prv_SS_Tips
+  move 0 to #Prv_Alloc_Tips
+  move 0 to #Prv_Adv_EIC
+  move 0 to #Prv_Dep_Care
+  move 0  to #Prv_Non_Qual_457AB
+  move 'N' to $Prv_AmtNon_Qual_457A
+  move 'N' to $Prv_AmtNon_Qual_457B
+  move 0 to #Prv_Uncoll_SS_Tax_On_Tips
+  move 0 to #Prv_Uncoll_Med_Tax_On_Tips
+  move 0 to #Prv_Group_Term_Life
+  move 0 to #Prv_401K
+  move 0 to #Prv_403B
+  move 0 to #Prv_408K6
+  move 0 to #Prv_457B
+  move 0 to #Prv_501C18D
+  move 0 to #Prv_Sick_Pay
+  move 0 to #Prv_Excise_Tax
+  move 0 to #Prv_Business_Exp
+  move 0 to #Prv_Uncoll_SS_Tax_GTL
+  move 0 to #Prv_Uncoll_Med_Tax_GTL
+  move 0 to #Prv_Excl_Moving_Exp
+  move 0 to #Prv_Nontaxable_Combat_Pay
+  move 0 to #Prv_Med_Svgs_Acct
+  move 0 to #Prv_408P_Simple_Retirement
+  move 0 to #Prv_Adoption_Exp
+  move 0 to #Prv_NonStatutory_Stock_Opt
+  move 0 to #Prv_NonQual_Def_Comp
+  move 0 to #Prv_Income_NonQual_Def_Comp
+  move 0 to #Prv_OtherA
+  move 0 to #Prv_OtherB
+  move 0 to #Prv_OtherC
+  move 0 to #Prv_OtherD
+  move 0 to #Prv_OtherE
+  move 0 to #Prv_OtherF
+  move 0 to #Prv_OtherG
+  move 0 to #Prv_OtherH
+  move 0 to #Prv_OtherI
+  move 0 to #Prv_OtherJ
+  move 0 to #Prv_OtherK
+  move 0 to #Prv_OtherL
+  move 0 to #Prv_OtherM
+  move 0 to #Prv_OtherN
+  move 0 to #Prv_OtherO
+  move 0 to #Prv_OtherP
+  move 0 to #Prv_OtherQ
+  move 0 to #Prv_OtherR
+  move 0 to #Prv_OtherS
+  move 0 to #Prv_OtherT
+  move 0 to #Prv_OtherU
+  move 0 to #Prv_OtherV
+  move 0 to #Prv_OtherW
+  move 0 to #Prv_OtherX
+  move 0 to #Prv_OtherY
+  move 0 to #Prv_OtherZ
+  move 'N' to $Processed_A
+  move 'N' to $Processed_B
+  move 'N' to $Processed_C
+  move 'N' to $Processed_D
+  move 'N' to $Processed_E
+  move 'N' to $Processed_F
+  move 'N' to $Processed_G
+  move 'N' to $Processed_H
+  move 'N' to $Processed_I
+  move 'N' to $Processed_J
+  move 'N' to $Processed_K
+  move 'N' to $Processed_L
+  move 'N' to $Processed_M
+  move 'N' to $Processed_N
+  move 'N' to $Processed_O
+  move 'N' to $Processed_P
+  move 'N' to $Processed_Q
+  move 'N' to $Processed_R
+  move 'N' to $Processed_S
+  move 'N' to $Processed_T
+  move 'N' to $Processed_U
+  move 'N' to $Processed_V
+  move 'N' to $Processed_W
+  move 'N' to $Processed_X
+  move 'N' to $Processed_Y
+  move 'N' to $Processed_Z
+
+
+  clear-array name = StateSWT
+
+end-procedure
+
+begin-procedure Print-ER-Data
+
+
+  do Print-Value($ER_Year,#L_Year_and_Form,#C_Year_and_Form,$YE_W2C_Year_and_Form)
+  do Print-Value($A.Tax_EIN,#L_ER_EIN,#C_ER_EIN,$YE_W2C_ER_EIN)
+
+  do Print-Value($A.Descr,#L_ER_Name,#C_ER_Name,$YE_W2C_ER_Name)
+
+  let $A.Address1  = SUBSTR($A.Address1,1,35)
+  let $A.Address2  = SUBSTR($A.Address2,1,35)
+  do Print-Value($A.Address1,#L_ER_Address1,#C_ER_Address1,$YE_W2C_ER_Address1)
+  if RTRIM($A.Address2, ' ') <> ''
+    do Print-Value($A.Address2,#L_ER_Address2,#C_ER_Address2,$YE_W2C_ER_Address2)
+    move 'N' to $LineShift
+  else
+    move 'Y' to $LineShift
+  end-if
+  if #Align_Count = 0
+    if $A.Country = 'USA'
+      move $A.Postal           to $Zip
+      move $Zip                to $ZipExtsn ~~~~~~xxxx
+      if instr($Zip,'-',6) = 0
+      and $ZipExtsn <> '    '
+        let $Zip = substr($Zip,1,5) || '-' || substr($Zip,6,4)
+      end-if
+      let $State_City_Zip = $A.City || ', ' || $A.State || ' ' || $Zip
+    else
+      let $State_City_Zip = $A.City || ', ' || $A.State || ' ' ||
+              $A.Country || ' ' || $A.Postal
+    end-if
+  end-if
+  if $LineShift = 'Y'
+    let #PrintLine = #L_ER_Address2
+  else
+    let #PrintLine = #L_State_City_Zip
+  end-if
+  let $State_City_Zip  = SUBSTR($State_City_Zip,1,31)
+  do Print-Value($State_City_Zip,#PrintLine,#C_State_City_Zip,$YE_W2C_ER_State_City_Zip)
+
+end-procedure
+
+begin-procedure Print-EE-Data
+
+  let $YE_W2C_FName  = SUBSTR($E.FName,1,18)
+  let $YE_W2C_LName  = SUBSTR($E.LName,1,18)
+  let $E.Address1  = SUBSTR($E.Address1,1,37)
+  let $E.Address2  = SUBSTR($E.Address2,1,37)
+  let $E.City  = SUBSTR($E.City,1,20)
+  do Print-Value($YE_W2C_FName,#L_EE_FName,#C_EE_FName,$YE_W2C_EE_FName)
+  do Print-Value($YE_W2C_LName,#L_EE_LName,#C_EE_LName,$YE_W2C_EE_LName)
+  let $E.Address1 = RTRIM($E.Address1, ' ')
+  do Print-Value($E.Address1,#L_EE_Address1,#C_EE_Address1,$YE_W2C_EE_Address1)
+  let $E.Address2 = RTRIM($E.Address2, ' ')
+  if RTRIM($E.Address2, ' ') <> ''
+    do Print-Value($E.Address2,#L_EE_Address2,#C_EE_Address2,$YE_W2C_EE_Address2)
+    move 'N' to $LineShift
+  else
+    move 'Y' to $LineShift
+  end-if
+  if #Align_Count = 0
+    if $E.Country = 'USA'
+      move $E.Postal           to $Zip
+      move $Zip                to $ZipExtsn ~~~~~~xxxx
+      if instr($Zip,'-',6) = 0
+      and $ZipExtsn <> '    '
+        let $Zip = substr($Zip,1,5) || '-' || substr($Zip,6,4)
+      end-if
+      let $B4 = $E.City || ', ' || $E.State || ' ' || $Zip
+    else
+      let $B4 = $E.City || ', ' || $E.State || ' ' ||
+                $E.Country || ' ' || $E.Postal
+    end-if
+  end-if
+  if $LineShift = 'Y'
+    let #PrintLine = #L_EE_Address2
+  else
+    let #PrintLine = #L_EE_State_City_Zip
+  end-if
+  do Print-Value($B4,#PrintLine,#C_EE_State_City_Zip,$YE_W2C_EE_State_City_Zip)
+
+  do Print-Value($E.SSN,#L_EE_SSN,#C_EE_SSN,$YE_EE_SSN)
+
+
+end-procedure
+
+begin-procedure Load-Amounts
+
+begin-SELECT
+D.STATE
+D.GPUS_TAXFORM_BOX
+D.GPUS_YE_AMOUNT
+D.GPUS_YE_PAMOUNT
+
+  let $D.STATE = RTRIM(&D.STATE,' ')
+  if $D.STATE <> $Prev_State
+    if $Prev_State <> ''
+      do  Print-W2C
+      move 0 to #StateLocalCount
+    end-if
+    let $Prev_State = $D.STATE
+  end-if
+
+  move &D.GPUS_YE_AMOUNT to #Amount
+  move &D.GPUS_YE_PAMOUNT to #Prv_Amount
+  if #Amount <> #Prv_Amount
+
+   let $D.Box = RTRIM(&D.GPUS_TAXFORM_BOX,' ')
+   evaluate $D.Box
+     when = $YE_Fed_Wages                         !Federal wages
+       let  #Fed_Wages = #Amount
+       let  #Prv_Fed_Wages = #Prv_Amount
+       break
+     when = $YE_Fed_Tax                           !Federal tax
+       let  #Fed_Tax = #Amount
+       let  #Prv_Fed_Tax = #Prv_Amount
+       break
+     when = $YE_SS_Wages                          !SS wages
+       let  #SS_Wages = #Amount
+       let  #Prv_SS_Wages = #Prv_Amount
+       break
+     when = $YE_SS_Tax                            !SS Tax
+       let  #SS_Tax = #Amount
+       let  #Prv_SS_Tax = #Prv_Amount
+       break
+    when = $YE_Med_Wages                          !Medicare wages
+       let  #Med_Wages = #Amount
+       let  #Prv_Med_Wages = #Prv_Amount
+       break
+     when = $YE_Med_Tax                           !Medicare tax
+       let  #Med_Tax = #Amount
+       let  #Prv_Med_Tax = #Prv_Amount
+       break
+     when = $YE_SS_Tips                           !SS tips
+       let  #SS_Tips = #Amount
+       let  #Prv_SS_Tips = #Prv_Amount
+       break
+     when = $YE_Alloc_Tips                        !Allocated tips
+       let  #Alloc_Tips = #Amount
+       let  #Prv_Alloc_Tips = #Prv_Amount
+       break
+     when = $YE_Adv_EIC                           !EIC
+       add 1 to #BlankBoxCount
+       let  #Adv_EIC = #Amount
+       let  #Prv_Adv_EIC = #Prv_Amount
+       break
+     when = $YE_Dep_Care                          !Dependent care
+       add 1 to #BlankBoxCount
+       let  #Dep_Care = #Amount
+       let  #Prv_Dep_Care = #Prv_Amount
+       break
+     when = $YE_Non_Qual_457_Y                    !non-qualified 457
+       if #Non_Qual_457AB = 0
+         add 1 to #BlankBoxCount
+       end-if
+       add  #Amount to #Non_Qual_457AB
+       add  #Prv_Amount to #Prv_Non_Qual_457AB
+
+       if #Amount > 0
+         move 'Y' to $AmtNon_Qual_457A
+       end-if
+
+       if #Prv_Amount > 0
+         move 'Y' to $Prv_AmtNon_Qual_457A
+       end-if
+
+       break
+     when = $YE_Non_Qual_457_N                    !non-qualified non-457
+
+       if #Non_Qual_457AB = 0
+         add 1 to #BlankBoxCount
+       end-if
+       add  #Amount to #Non_Qual_457AB
+       add  #Prv_Amount to #Prv_Non_Qual_457AB
+
+       if #Amount > 0
+         move 'Y' to $AmtNon_Qual_457B
+       end-if
+
+       if #Prv_Amount > 0
+         move 'Y' to $Prv_AmtNon_Qual_457B
+       end-if
+
+       break
+     when = $YE_Uncoll_SS_Tax_On_Tips             !Uncoll SS tax on tips
+       add 1 to #BlankBoxCount
+       add  #Amount to #Uncoll_SS_Tax_On_Tips
+       add  #Prv_Amount to #Prv_Uncoll_SS_Tax_On_Tips
+       break
+     when = $YE_Uncoll_Med_Tax_On_Tips            !Uncoll Medi tax on tips
+       add 1 to #BlankBoxCount
+       add  #Amount to #Uncoll_Med_Tax_On_Tips
+       add  #Prv_Amount to #Prv_Uncoll_Med_Tax_On_Tips
+       break
+     when = $YE_Group_Term_Life                   !GTL
+       add 1 to #BlankBoxCount
+       add  #Amount to #Group_Term_Life
+       add  #Prv_Amount to #Prv_Group_Term_Life
+       break
+     when = $YE_401K                              !401(k)
+       add 1 to #BlankBoxCount
+       add  #Amount to #401K
+       add  #Prv_Amount to #Prv_401K
+       break
+     when = $YE_403B                              !403(b)
+       add 1 to #BlankBoxCount
+       add  #Amount to #403B
+       add  #Prv_Amount to #Prv_403B
+       break
+     when = $YE_408K6                             !408(k)(6)
+       add 1 to #BlankBoxCount
+       add  #Amount to #408K6
+       add  #Prv_Amount to #Prv_408K6
+       break
+     when = $YE_457B                              !457(b)
+       add 1 to #BlankBoxCount
+       add  #Amount to #457B
+       add  #Prv_Amount to #Prv_457B
+       break
+     when = $YE_501C18D                           !501(c)(18)(D)
+       add 1 to #BlankBoxCount
+       add  #Amount to #501C18D
+       add  #Prv_Amount to #Prv_501C18D
+       break
+     when = $YE_Sick_Pay                          !Sick pay
+       add 1 to #BlankBoxCount
+       add  #Amount to #Sick_Pay
+       add  #Prv_Amount to #Prv_Sick_Pay
+       break
+     when = $YE_Excise_Tax                        !Excise tax
+       add 1 to #BlankBoxCount
+       add  #Amount to #Excise_Tax
+       add  #Prv_Amount to #Prv_Excise_Tax
+       break
+     when = $YE_Business_Exp                      !Business expense
+       add 1 to #BlankBoxCount
+       add  #Amount to #Business_Exp
+       add  #Prv_Amount to #Prv_Business_Exp
+       break
+     when = $YE_Uncoll_SS_Tax_GTL                 !Uncoll SS tax - GTL
+       add 1 to #BlankBoxCount
+       add  #Amount to #Uncoll_SS_Tax_GTL
+       add  #Prv_Amount to #Prv_Uncoll_SS_Tax_GTL
+       break
+     when = $YE_Uncoll_Med_Tax_GTL                !Uncoll Medi tax - GTL
+       add 1 to #BlankBoxCount
+       add  #Amount to #Uncoll_Med_Tax_GTL
+       add  #Prv_Amount to #Prv_Uncoll_Med_Tax_GTL
+       break
+     when = $YE_Excl_Moving_Exp                   !Excl Moving Exp
+       add 1 to #BlankBoxCount
+       add  #Amount to #Excl_Moving_Exp
+       add  #Prv_Amount to #Prv_Excl_Moving_Exp
+       break
+     when = $YE_Nontaxable_Combat_Pay           !Nontaxable_Combat_Pay
+       add 1 to #BlankBoxCount
+       add  #Amount to #Nontaxable_Combat_Pay
+       add  #Prv_Amount to #Prv_Nontaxable_Combat_Pay
+       break
+     when = $YE_Med_Svgs_Acct                     !Medical spending acct
+       add 1 to #BlankBoxCount
+       add  #Amount to #Med_Svgs_Acct
+       add  #Prv_Amount to #Prv_Med_Svgs_Acct
+       break
+     when = $YE_408P_Simple_Retirement            !Section 418(p) simple
+       add 1 to #BlankBoxCount                    ! retirement
+       add  #Amount to #408P_Simple_Retirement
+       add  #Prv_Amount to #Prv_408P_Simple_Retirement
+       break
+     when = $YE_Adoption_Exp                      !Adoption expense
+       add 1 to #BlankBoxCount
+       add  #Amount to #Adoption_Exp
+       add  #Prv_Amount to #Prv_Adoption_Exp
+       break
+     when = $YE_NonStatutory_Stock_Opt            !Non-statutory stock option
+       add 1 to #BlankBoxCount
+       add  #Amount to #NonStatutory_Stock_Opt
+       add  #Prv_Amount to #Prv_NonStatutory_Stock_Opt
+       break
+     when = $YE_NonQual_Def_Comp            !NonQual_Def_Comp
+       add 1 to #BlankBoxCount
+       add  #Amount to #NonQual_Def_Comp
+       add  #Prv_Amount to #Prv_NonQual_Def_Comp
+       break
+     when = $YE_Income_NonQual_Def_Comp            !Income_NonQual_Def_Comp
+       add 1 to #BlankBoxCount
+       add  #Amount to #Income_NonQual_Def_Comp
+       add  #Prv_Amount to #Prv_Income_NonQual_Def_Comp
+       break
+     when = $YE_OtherA                                !CASDI
+       add 1 to #BlankBoxCount
+       add  #Amount to #OtherA
+       add  #Prv_Amount to #Prv_OtherA
+       break
+     when = $YE_OtherB                                !VPDI
+       add 1 to #BlankBoxCount
+       add  #Amount to #OtherB
+       add  #Prv_Amount to #Prv_OtherB
+       break
+     when = $YE_OtherC                                !WD
+       add 1 to #BlankBoxCount
+       add  #Amount to #OtherC
+       add  #Prv_Amount to #Prv_OtherC
+       break
+     when = $YE_OtherD                                !UI/HC
+       add 1 to #BlankBoxCount
+       add  #Amount to #OtherD
+       add  #Prv_Amount to #Prv_OtherD
+       break
+     when = $YE_OtherE                                !NJSDI
+       add 1 to #BlankBoxCount
+       add  #Amount to #OtherE
+       add  #Prv_Amount to #Prv_OtherE
+       break
+     when = $YE_OtherF                               !VPDI
+       add 1 to #BlankBoxCount
+       add  #Amount to #OtherF
+       add  #Prv_Amount to #Prv_OtherF
+       break
+     when = $YE_OtherG                                !PA EE unemployment
+       add 1 to #BlankBoxCount
+       add  #Amount to #OtherG
+       add  #Prv_Amount to #Prv_OtherG
+       break
+     when = $YE_OtherH
+       add 1 to #BlankBoxCount
+       add  #Amount to #OtherH
+       add  #Prv_Amount to #Prv_OtherH
+       break
+     when = $YE_OtherI
+       add 1 to #BlankBoxCount
+       add  #Amount to #OtherI
+       add  #Prv_Amount to #Prv_OtherI
+       break
+     when = $YE_OtherJ
+       add 1 to #BlankBoxCount
+       add  #Amount to #OtherJ
+       add  #Prv_Amount to #Prv_OtherJ
+       break
+     when = $YE_OtherK
+       add 1 to #BlankBoxCount
+       add  #Amount to #OtherK
+       add  #Prv_Amount to #Prv_OtherK
+       break
+     when = $YE_OtherL
+       add 1 to #BlankBoxCount
+       add  #Amount to #OtherL
+       add  #Prv_Amount to #Prv_OtherL
+       break
+     when = $YE_OtherM
+       add 1 to #BlankBoxCount
+       add  #Amount to #OtherM
+       add  #Prv_Amount to #Prv_OtherM
+       break
+     when = $YE_OtherN
+       add 1 to #BlankBoxCount
+       add  #Amount to #OtherN
+       add  #Prv_Amount to #Prv_OtherN
+       break
+     when = $YE_OtherO
+       add 1 to #BlankBoxCount
+       add  #Amount to #OtherO
+       add  #Prv_Amount to #Prv_OtherO
+       break
+     when = $YE_OtherP
+       add 1 to #BlankBoxCount
+       add  #Amount to #OtherP
+       add  #Prv_Amount to #Prv_OtherP
+       break
+     when = $YE_OtherQ
+       add 1 to #BlankBoxCount
+       add  #Amount to #OtherQ
+       add  #Prv_Amount to #Prv_OtherQ
+       break
+     when = $YE_OtherR
+       add 1 to #BlankBoxCount
+       add  #Amount to #OtherR
+       add  #Prv_Amount to #Prv_OtherR
+       break
+     when = $YE_OtherS
+       add 1 to #BlankBoxCount
+       add  #Amount to #OtherS
+       add  #Prv_Amount to #Prv_OtherS
+       break
+     when = $YE_OtherT
+       add 1 to #BlankBoxCount
+       add  #Amount to #OtherT
+       add  #Prv_Amount to #Prv_OtherT
+       break
+     when = $YE_OtherU
+       add 1 to #BlankBoxCount
+       add  #Amount to #OtherU
+       add  #Prv_Amount to #Prv_OtherU
+       break
+     when = $YE_OtherV
+       add 1 to #BlankBoxCount
+       add  #Amount to #OtherV
+       add  #Prv_Amount to #Prv_OtherV
+       break
+     when = $YE_OtherW
+       add 1 to #BlankBoxCount
+       add  #Amount to #OtherW
+       add  #Prv_Amount to #Prv_OtherW
+       break
+     when = $YE_OtherX
+       add 1 to #BlankBoxCount
+       add  #Amount to #OtherX
+       add  #Prv_Amount to #Prv_OtherX
+       break
+     when = $YE_OtherY
+       add 1 to #BlankBoxCount
+       add  #Amount to #OtherY
+       add  #Prv_Amount to #Prv_OtherY
+       break
+     when = $YE_OtherZ
+       add 1 to #BlankBoxCount
+       add  #Amount to #OtherZ
+       add  #Prv_Amount to #Prv_OtherZ
+       break
+     when = $YE_State_Wages                            !State wages
+       add 1 to #StateLocalCount
+       PUT &D.GPUS_TAXFORM_BOX      INTO STATELOCALS(#STATELOCALCOUNT) BOX
+       PUT &D.STATE    INTO STATELOCALS(#STATELOCALCOUNT) STATE
+       PUT #Amount INTO STATELOCALS(#STATELOCALCOUNT) AMOUNT
+       PUT #Prv_Amount INTO STATELOCALS(#STATELOCALCOUNT) PRVAMOUNT
+       break
+     when = $YE_State_Tax                                  !State tax
+         add 1 to #StateLocalCount
+         PUT &D.GPUS_TAXFORM_BOX      INTO STATELOCALS(#STATELOCALCOUNT) BOX
+         PUT &D.STATE    INTO STATELOCALS(#STATELOCALCOUNT) STATE
+         PUT #Amount INTO STATELOCALS(#STATELOCALCOUNT) AMOUNT
+         PUT #Prv_Amount INTO STATELOCALS(#STATELOCALCOUNT) PRVAMOUNT
+       break
+
+     when-other
+       move $D.Box to $Box xx
+         display 'UNKNOWN BOX IDENTIFIER:'
+         display $D.Box
+         display 'Processing Stopped'
+         STOP
+   end-evaluate
+
+  end-if
+
+
+FROM  PS_GPUS_YEC_AMT D
+WHERE D.GPUS_YEC_BATCH_NBR   = &E.GPUS_YEC_BATCH_NBR
+AND   D.GPUS_TAX_EIN         = &E.GPUS_TAX_EIN
+AND   D.EMPLID  = &E.EMPLID
+AND   D.GPUS_CAL_YEAR   = &E.GPUS_CAL_YEAR
+AND   D.GPUS_TAXFORM_ID = $Taxform_ID
+ORDER BY D.STATE, D.GPUS_TAXFORM_BOX
+end-SELECT
+end-procedure
+
+begin-procedure Print-Fed-Amounts
+
+  if #Fed_Wages <> #Prv_Fed_Wages
+    do Format-W2c-Number(#Prv_Fed_Wages, $out, $FFed_Wages)         !Federal wages
+    do Print-Value($out,#L_Fed_Wages,#C_Fed_Wages,$YE_Fed_Wages)
+
+    do Format-W2c-Number(#Fed_Wages, $out, $FFed_Wages)
+    print $out (,+5)
+
+  end-if
+
+
+  if #Fed_Tax <> #Prv_Fed_Tax
+
+    do Format-W2c-Number(#Prv_Fed_Tax, $out, $FFed_Tax)        !Federal tax
+    do Print-Value($out,#L_Fed_Tax,#C_Fed_Tax,$YE_Fed_Tax)
+
+    do Format-W2c-Number(#Fed_Tax, $out, $FFed_Tax)
+    print $out (,+5)
+
+  end-if
+
+  if #SS_Wages <> #Prv_SS_Wages
+
+    do Format-W2c-Number(#Prv_SS_Wages, $out, $FSS_Wages)
+    do Print-Value($out,#L_SS_Wages,#C_SS_Wages,$YE_SS_Wages)
+
+    do Format-W2c-Number(#SS_Wages, $out, $FSS_Wages)              !SS wages
+    print $out (,+5)
+
+  end-if
+
+  if #SS_Tax <> #Prv_SS_Tax
+
+    do Format-W2c-Number(#Prv_SS_Tax, $out, $FSS_Tax)
+    do Print-Value($out,#L_SS_Tax,#C_SS_Tax,$YE_SS_Tax)
+
+    do Format-W2c-Number(#SS_Tax, $out, $FSS_Tax)              !SS Tax
+    print $out (,+5)
+
+  end-if
+
+  if #Med_Wages <> #Prv_Med_Wages
+
+    do Format-W2c-Number(#Prv_Med_Wages, $out, $FMed_Wages)
+    do Print-Value($out,#L_Med_Wages,#C_Med_Wages,$YE_Med_Wages)
+
+    do Format-W2c-Number(#Med_Wages, $out, $FMed_Wages)              !Medicare wages
+    print $out (,+5)
+
+  end-if
+
+
+  if #Med_Tax <> #Prv_Med_Tax
+
+    do Format-W2c-Number(#Prv_Med_Tax, $out, $FMed_Tax)
+    do Print-Value($out,#L_Med_Tax,#C_Med_Tax,$YE_Med_Tax)
+
+    do Format-W2c-Number(#Med_Tax, $out, $FMed_Tax)              !Medicare tax
+    print $out (,+5)
+
+  end-if
+
+ if #Adv_EIC <> #Prv_Adv_EIC
+
+    do Format-W2c-Number(#Prv_Adv_EIC, $out, $FAdv_EIC)
+    do Print-Value($out,#L_Adv_EIC,#C_Adv_EIC,$YE_Adv_EIC)
+
+    do Format-W2c-Number(#Adv_EIC, $out, $FAdv_EIC)         !Advance EIC paymt
+    print $out (,+5)
+
+  end-if
+
+  if #Dep_Care <> #Prv_Dep_Care
+
+    do Format-W2c-Number(#Prv_Dep_Care, $out, $FDep_Care)
+    do Print-Value($out,#L_Dep_Care,#C_Dep_Care,$YE_Dep_Care)
+
+    do Format-W2c-Number(#Dep_Care, $out, $FDep_Care)         !Depend care
+    print $out (,+5)
+
+  end-if
+
+  if #Non_Qual_457AB <> #Prv_Non_Qual_457AB
+
+    if  $Prv_AmtNon_Qual_457A = 'Y'
+    and $Prv_AmtNon_Qual_457B = 'N' and $ER_Year = '2001'
+       print 'G' (,1)
+    end-if
+
+    do Format-W2c-Number(#Prv_Non_Qual_457AB, $out, $FNon_Qual_457)
+    do Print-Value($out,#L_Non_Qual_457,#C_Non_Qual_457,$YE_Non_Qual_457)
+
+    do Format-W2c-Number(#Non_Qual_457AB, $out, $FNon_Qual_457)         !Nonqual plans
+    print $out (,+5)
+
+    if  $AmtNon_Qual_457A = 'Y'
+    and $AmtNon_Qual_457B = 'N' and $ER_Year = '2001'
+       print 'G' (,17)
+    end-if
+
+  end-if
+
+  let #Other_Box_Line_Count = 1
+  let $Print_One_Page = 'Y'
+  do Print-Other-Box
+
+  do Print-Blank-Boxes
+
+  let #Other_Box_Line_Count = 0
+  let $Print_One_Page = 'N'
+  do Print-Other-Box
+
+end-procedure
+
+
+begin-procedure Print-Blank-Boxes
+
+  let #Blank_Line_Count = 1
+
+  if #Uncoll_SS_Tax_On_Tips <> #Prv_Uncoll_SS_Tax_On_Tips
+    let #Previous =  #Prv_Uncoll_SS_Tax_On_Tips
+    let #Current  =  #Uncoll_SS_Tax_On_Tips
+    let $Box_Text = substr($T_Uncoll_SS_Tax_On_Tips,1,1)
+    let $Box_Format  = $FUncoll_SS_Tax_On_Tips
+    do Print-Blank-Line
+  end-if
+  if #Uncoll_Med_Tax_On_Tips <> #Prv_Uncoll_Med_Tax_On_Tips
+    let #Previous =  #Prv_Uncoll_Med_Tax_On_Tips
+    let #Current  =  #Uncoll_Med_Tax_On_Tips
+    let $Box_Text = substr($T_Uncoll_Med_Tax_On_Tips,1,1)
+    let $Box_Format  = $FUncoll_Med_Tax_On_Tips
+    do Print-Blank-Line
+  end-if
+  if #Group_Term_Life <> #Prv_Group_Term_Life
+    let #Previous =  #Prv_Group_Term_Life
+    let #Current  =  #Group_Term_Life
+    let $Box_Text = substr($T_Group_Term_Life,1,1)
+    let $Box_Format  = $FGroup_Term_Life
+    do Print-Blank-Line
+  end-if
+  if #401K <> #Prv_401K
+    let #Previous =  #Prv_401K
+    let #Current  =  #401K
+    let $Box_Text = substr($T_401K,1,1)
+    let $Box_Format  = $F401K
+    do Print-Blank-Line
+  end-if
+  if #403B <> #Prv_403B
+    let #Previous =  #Prv_403B
+    let #Current  =  #403B
+    let $Box_Text = substr($T_403B,1,1)
+    let $Box_Format  = $F403B
+    do Print-Blank-Line
+  end-if
+  if #408K6 <> #Prv_408K6
+    let #Previous =  #Prv_408K6
+    let #Current  =  #408K6
+    let $Box_Text = substr($T_408K6,1,1)
+    let $Box_Format  = $F408K6
+    do Print-Blank-Line
+  end-if
+  if #457B <> #Prv_457B
+    let #Previous =  #Prv_457B
+    let #Current  =  #457B
+    let $Box_Text = substr($T_457B,1,1)
+    let $Box_Format  = $F457B
+    do Print-Blank-Line
+  end-if
+  if #501C18D <> #Prv_501C18D
+    let #Previous =  #Prv_501C18D
+    let #Current  =  #501C18D
+    let $Box_Text = substr($T_501C18D,1,1)
+    let $Box_Format  = $F501C18D
+    do Print-Blank-Line
+  end-if
+  if #Sick_Pay <> #Prv_Sick_Pay
+    let #Previous =  #Prv_Sick_Pay
+    let #Current  =  #Sick_Pay
+    let $Box_Text = substr($T_Sick_Pay,1,1)
+    let $Box_Format  = $FSick_Pay
+    do Print-Blank-Line
+  end-if
+  if #Excise_Tax <> #Prv_Excise_Tax
+    let #Previous =  #Prv_Excise_Tax
+    let #Current  =  #Excise_Tax
+    let $Box_Text = substr($T_Excise_Tax,1,1)
+    let $Box_Format  = $FExcise_Tax
+    do Print-Blank-Line
+  end-if
+  if #Business_Exp <> #Prv_Business_Exp
+    let #Previous =  #Prv_Business_Exp
+    let #Current  =  #Business_Exp
+    let $Box_Text = substr($T_Business_Exp,1,1)
+    let $Box_Format  = $FBusiness_Exp
+    do Print-Blank-Line
+  end-if
+  if #Uncoll_SS_Tax_GTL <> #Prv_Uncoll_SS_Tax_GTL
+    let #Previous =  #Prv_Uncoll_SS_Tax_GTL
+    let #Current  =  #Uncoll_SS_Tax_GTL
+    let $Box_Text = substr($T_Uncoll_SS_Tax_GTL,1,1)
+    let $Box_Format  = $FUncoll_SS_Tax_GTL
+    do Print-Blank-Line
+  end-if
+  if #Uncoll_Med_Tax_GTL <> #Prv_Uncoll_Med_Tax_GTL
+    let #Previous =  #Prv_Uncoll_Med_Tax_GTL
+    let #Current  =  #Uncoll_Med_Tax_GTL
+    let $Box_Text = substr($T_Uncoll_Med_Tax_GTL,1,1)
+    let $Box_Format  = $FUncoll_Med_Tax_GTL
+    do Print-Blank-Line
+  end-if
+  if #Excl_Moving_Exp <> #Prv_Excl_Moving_Exp
+    let #Previous =  #Prv_Excl_Moving_Exp
+    let #Current  =  #Excl_Moving_Exp
+    let $Box_Text = substr($T_Excl_Moving_Exp,1,1)
+    let $Box_Format  = $FExcl_Moving_Exp
+    do Print-Blank-Line
+  end-if
+  if #Nontaxable_Combat_Pay <> #Prv_Nontaxable_Combat_Pay
+    let #Previous =  #Prv_Nontaxable_Combat_Pay
+    let #Current  =  #Nontaxable_Combat_Pay
+    let $Box_Text = substr($T_Nontaxable_Combat_Pay,1,1)
+    let $Box_Format  = $FNontaxable_Combat_Pay
+    do Print-Blank-Line
+  end-if
+  if #Med_Svgs_Acct <> #Prv_Med_Svgs_Acct
+    let #Previous =  #Prv_Med_Svgs_Acct
+    let #Current  =  #Med_Svgs_Acct
+    let $Box_Text = substr($T_Med_Svgs_Acct ,1,1)
+    let $Box_Format  = $FMed_Svgs_Acct
+    do Print-Blank-Line
+  end-if
+  if #408P_Simple_Retirement <> #Prv_408P_Simple_Retirement
+    let #Previous =  #Prv_408P_Simple_Retirement
+    let #Current  =  #408P_Simple_Retirement
+    let $Box_Text = substr($T_408P_Simple_Retirement ,1,1)
+    let $Box_Format  = $F408P_Simple_Retirement
+    do Print-Blank-Line
+  end-if
+  if #Adoption_Exp <> #Prv_Adoption_Exp
+    let #Previous =  #Prv_Adoption_Exp
+    let #Current  =  #Adoption_Exp
+    let $Box_Text = substr($T_Adoption_Exp ,1,1)
+    let $Box_Format  = $FAdoption_Exp
+    do Print-Blank-Line
+  end-if
+  if #NonStatutory_Stock_Opt <> #Prv_NonStatutory_Stock_Opt
+    let #Previous =  #Prv_NonStatutory_Stock_Opt
+    let #Current  =  #NonStatutory_Stock_Opt
+    let $Box_Text = substr($T_NonStatutory_Stock_Opt ,1,1)
+    let $Box_Format  = $FNonStatutory_Stock_Opt
+    do Print-Blank-Line
+  end-if
+  if #NonQual_Def_Comp <> #Prv_NonQual_Def_Comp
+    let #Previous =  #Prv_NonQual_Def_Comp
+    let #Current  =  #NonQual_Def_Comp
+    let $Box_Text = substr($T_NonQual_Def_Comp ,1,1)
+    let $Box_Format  = $FNonQual_Def_Comp
+    do Print-Blank-Line
+  end-if
+  if #Income_NonQual_Def_Comp <> #Prv_Income_NonQual_Def_Comp
+    let #Previous =  #Prv_Income_NonQual_Def_Comp
+    let #Current  =  #Income_NonQual_Def_Comp
+    let $Box_Text = substr($T_Income_NonQual_Def_Comp ,1,1)
+    let $Box_Format  = $FIncome_NonQual_Def_Comp
+    do Print-Blank-Line
+  end-if
+
+
+
+end-procedure
+
+
+begin-procedure Print-Blank-Line
+
+  if #Blank_Line_Count = 0
+    do Next-Form
+    do Print-ER-Data
+    do Print-EE-Data
+
+    let #Other_Box_Line_Count = 1
+    let $Print_One_Page = 'Y'
+    do Print-Other-Box
+
+    add 1 to #Blank_Line_Count
+
+  end-if
+
+  evaluate #Blank_Line_Count
+    when = 1
+
+    do Format-W2c-Number(#Previous, $out, $Box_Format)   !First blank box
+    do Print-Value($Box_Text,#L_X1,#C_X1,'Box X1')
+    do Print-Value($out,#L_X1A,#C_X1A,'Box X1A')
+
+    print $Box_Text (,+4)
+    do Format-W2c-Number(#Current, $out, $Box_Format)
+    print $out (,)
+
+    add 1 to #Blank_Line_Count
+
+    break
+
+    when = 2
+
+    do Format-W2c-Number(#Previous, $out, $Box_Format)        !Second blank box
+    do Print-Value($Box_Text,#L_X2,#C_X2,'Box X2')
+    do Print-Value($out,#L_X2A,#C_X2A,'Box X2A')
+
+    print $Box_Text (,+4)
+    do Format-W2c-Number(#Current, $out, $Box_Format)
+    print $out (,)
+
+    add 1 to #Blank_Line_Count
+
+    break
+
+    when = 3
+
+    do Format-W2c-Number(#Previous, $out, $Box_Format)        !Third blank box
+    do Print-Value($Box_Text,#L_X3,#C_X3,'Box X3')
+    do Print-Value($out,#L_X3A,#C_X3A,'Box X3A')
+
+
+    print $Box_Text (,+4)
+    do Format-W2c-Number(#Current, $out, $Box_Format)
+    print $out (,)
+
+    add 1 to #Blank_Line_Count
+
+    break
+    when = 4
+
+    do Format-W2c-Number(#Previous, $out, $Box_Format)        !Fourth blank box
+    do Print-Value($Box_Text,#L_X4,#C_X4,'Box X4')
+    do Print-Value($out,#L_X4A,#C_X4A,'Box X4A')
+
+    print $Box_Text (,+4)
+    do Format-W2c-Number(#Current, $out, $Box_Format)
+    print $out (,)
+
+    let #Blank_Line_Count = 0
+
+    break
+
+    end-evaluate
+
+end-procedure
+
+begin-procedure Print-Other-Box
+
+  let $Process_More_Other_Box_Entries = 'Y'
+
+  if #OtherA <> #Prv_OtherA
+  and $Processed_A = 'N'
+    let #Previous_Oth =  #Prv_OtherA
+    let #Current_Oth  =  #OtherA
+    let $Box_Text_Oth = $T_OtherA
+    let $Box_Format_Oth  = $FOtherA
+    do Print-Other-Box-Line
+    let $Processed_A = 'Y'
+  end-if
+  if #OtherB <> #Prv_OtherB
+  and $Processed_B = 'N'
+    let #Previous_Oth =  #Prv_OtherB
+    let #Current_Oth  =  #OtherB
+    let $Box_Text_Oth = $T_OtherB
+    let $Box_Format_Oth  = $FOtherB
+    do Print-Other-Box-Line
+    let $Processed_B = 'Y'
+  end-if
+  if #OtherC <> #Prv_OtherC
+  and $Processed_C = 'N'
+  and $Process_More_Other_Box_Entries = 'Y'
+    let #Previous_Oth =  #Prv_OtherC
+    let #Current_Oth  =  #OtherC
+    let $Box_Text_Oth = $T_OtherC
+    let $Box_Format_Oth  = $FOtherC
+    do Print-Other-Box-Line
+    let $Processed_C = 'Y'
+  end-if
+  if #OtherD <> #Prv_OtherD
+  and $Processed_D = 'N'
+  and $Process_More_Other_Box_Entries = 'Y'
+    let #Previous_Oth =  #Prv_OtherD
+    let #Current_Oth  =  #OtherD
+    let $Box_Text_Oth = $T_OtherD
+    let $Box_Format_Oth  = $FOtherD
+    do Print-Other-Box-Line
+    let $Processed_D = 'Y'
+  end-if
+  if #OtherE <> #Prv_OtherE
+  and $Processed_E = 'N'
+  and $Process_More_Other_Box_Entries = 'Y'
+    let #Previous_Oth =  #Prv_OtherE
+    let #Current_Oth  =  #OtherE
+    let $Box_Text_Oth = $T_OtherE
+    let $Box_Format_Oth  = $FOtherE
+    do Print-Other-Box-Line
+    let $Processed_E = 'Y'
+  end-if
+  if #OtherF <> #Prv_OtherF
+  and $Processed_F = 'N'
+  and $Process_More_Other_Box_Entries = 'Y'
+    let #Previous_Oth =  #Prv_OtherF
+    let #Current_Oth  =  #OtherF
+    let $Box_Text_Oth = $T_OtherF
+    let $Box_Format_Oth  = $FOtherF
+    do Print-Other-Box-Line
+    let $Processed_F = 'Y'
+  end-if
+  if #OtherG <> #Prv_OtherG
+  and $Processed_G = 'N'
+  and $Process_More_Other_Box_Entries = 'Y'
+    let #Previous_Oth =  #Prv_OtherG
+    let #Current_Oth  =  #OtherG
+    let $Box_Text_Oth = $T_OtherG
+    let $Box_Format_Oth  = $FOtherG
+    do Print-Other-Box-Line
+    let $Processed_G = 'Y'
+  end-if
+  if #OtherH <> #Prv_OtherH
+  and $Processed_H = 'N'
+  and $Process_More_Other_Box_Entries = 'Y'
+    let #Previous_Oth =  #Prv_OtherH
+    let #Current_Oth  =  #OtherH
+    let $Box_Text_Oth = $T_OtherH
+    let $Box_Format_Oth  = $FOtherH
+    do Print-Other-Box-Line
+    let $Processed_H = 'Y'
+  end-if
+  if #OtherI <> #Prv_OtherI
+  and $Processed_I = 'N'
+  and $Process_More_Other_Box_Entries = 'Y'
+    let #Previous_Oth =  #Prv_OtherI
+    let #Current_Oth  =  #OtherI
+    let $Box_Text_Oth = $T_OtherI
+    let $Box_Format_Oth  = $FOtherI
+    do Print-Other-Box-Line
+    let $Processed_I = 'Y'
+  end-if
+  if #OtherJ <> #Prv_OtherJ
+  and $Processed_J = 'N'
+  and $Process_More_Other_Box_Entries = 'Y'
+    let #Previous_Oth =  #Prv_OtherJ
+    let #Current_Oth  =  #OtherJ
+    let $Box_Text_Oth = $T_OtherJ
+    let $Box_Format_Oth  = $FOtherJ
+    do Print-Other-Box-Line
+    let $Processed_J = 'Y'
+  end-if
+  if #OtherK <> #Prv_OtherK
+  and $Processed_K = 'N'
+  and $Process_More_Other_Box_Entries = 'Y'
+    let #Previous_Oth =  #Prv_OtherK
+    let #Current_Oth  =  #OtherK
+    let $Box_Text_Oth = $T_OtherK
+    let $Box_Format_Oth  = $FOtherK
+    do Print-Other-Box-Line
+    let $Processed_K = 'Y'
+  end-if
+  if #OtherL <> #Prv_OtherL
+  and $Processed_L = 'N'
+  and $Process_More_Other_Box_Entries = 'Y'
+    let #Previous_Oth =  #Prv_OtherL
+    let #Current_Oth  =  #OtherL
+    let $Box_Text_Oth = $T_OtherL
+    let $Box_Format_Oth  = $FOtherL
+    do Print-Other-Box-Line
+    let $Processed_L = 'Y'
+  end-if
+  if #OtherM <> #Prv_OtherM
+  and $Processed_M = 'N'
+  and $Process_More_Other_Box_Entries = 'Y'
+    let #Previous_Oth =  #Prv_OtherM
+    let #Current_Oth  =  #OtherM
+    let $Box_Text_Oth = $T_OtherM
+    let $Box_Format_Oth  = $FOtherM
+    do Print-Other-Box-Line
+    let $Processed_M = 'Y'
+  end-if
+  if #OtherN <> #Prv_OtherN
+  and $Processed_N = 'N'
+  and $Process_More_Other_Box_Entries = 'Y'
+    let #Previous_Oth =  #Prv_OtherN
+    let #Current_Oth  =  #OtherN
+    let $Box_Text_Oth = $T_OtherN
+    let $Box_Format_Oth  = $FOtherN
+    do Print-Other-Box-Line
+    let $Processed_N = 'Y'
+  end-if
+  if #OtherO <> #Prv_OtherO
+  and $Processed_O = 'N'
+  and $Process_More_Other_Box_Entries = 'Y'
+    let #Previous_Oth =  #Prv_OtherO
+    let #Current_Oth  =  #OtherO
+    let $Box_Text_Oth = $T_OtherO
+    let $Box_Format_Oth  = $FOtherO
+    do Print-Other-Box-Line
+    let $Processed_O = 'Y'
+  end-if
+  if #OtherP <> #Prv_OtherP
+  and $Processed_P = 'N'
+  and $Process_More_Other_Box_Entries = 'Y'
+    let #Previous_Oth =  #Prv_OtherP
+    let #Current_Oth  =  #OtherP
+    let $Box_Text_Oth = $T_OtherP
+    let $Box_Format_Oth  = $FOtherP
+    do Print-Other-Box-Line
+    let $Processed_P = 'Y'
+  end-if
+  if #OtherQ <> #Prv_OtherQ
+  and $Processed_Q = 'N'
+  and $Process_More_Other_Box_Entries = 'Y'
+    let #Previous_Oth =  #Prv_OtherQ
+    let #Current_Oth  =  #OtherQ
+    let $Box_Text_Oth = $T_OtherQ
+    let $Box_Format_Oth  = $FOtherQ
+    do Print-Other-Box-Line
+    let $Processed_Q = 'Y'
+  end-if
+  if #OtherR <> #Prv_OtherR
+  and $Processed_R = 'N'
+  and $Process_More_Other_Box_Entries = 'Y'
+    let #Previous_Oth =  #Prv_OtherR
+    let #Current_Oth  =  #OtherR
+    let $Box_Text_Oth = $T_OtherR
+    let $Box_Format_Oth  = $FOtherR
+    do Print-Other-Box-Line
+    let $Processed_R = 'Y'
+  end-if
+  if #OtherS <> #Prv_OtherS
+  and $Processed_S = 'N'
+  and $Process_More_Other_Box_Entries = 'Y'
+    let #Previous_Oth =  #Prv_OtherS
+    let #Current_Oth  =  #OtherS
+    let $Box_Text_Oth = $T_OtherS
+    let $Box_Format_Oth  = $FOtherS
+    do Print-Other-Box-Line
+    let $Processed_S = 'Y'
+  end-if
+  if #OtherT <> #Prv_OtherT
+  and $Processed_T = 'N'
+  and $Process_More_Other_Box_Entries = 'Y'
+    let #Previous_Oth =  #Prv_OtherT
+    let #Current_Oth  =  #OtherT
+    let $Box_Text_Oth = $T_OtherT
+    let $Box_Format_Oth  = $FOtherT
+    do Print-Other-Box-Line
+    let $Processed_T = 'Y'
+  end-if
+  if #OtherU <> #Prv_OtherU
+  and $Processed_U = 'N'
+  and $Process_More_Other_Box_Entries = 'Y'
+    let #Previous_Oth =  #Prv_OtherU
+    let #Current_Oth  =  #OtherU
+    let $Box_Text_Oth = $T_OtherU
+    let $Box_Format_Oth  = $FOtherU
+    do Print-Other-Box-Line
+    let $Processed_U = 'Y'
+  end-if
+  if #OtherV <> #Prv_OtherV
+  and $Processed_V = 'N'
+  and $Process_More_Other_Box_Entries = 'Y'
+    let #Previous =  #Prv_OtherV
+    let #Current_Oth  =  #OtherV
+    let $Box_Text_Oth = $T_OtherV
+    let $Box_Format_Oth  = $FOtherV
+    do Print-Other-Box-Line
+    let $Processed_V = 'Y'
+  end-if
+  if #OtherW <> #Prv_OtherW
+  and $Processed_W = 'N'
+  and $Process_More_Other_Box_Entries = 'Y'
+    let #Previous_Oth =  #Prv_OtherW
+    let #Current_Oth  =  #OtherW
+    let $Box_Text_Oth = $T_OtherW
+    let $Box_Format_Oth  = $FOtherW
+    do Print-Other-Box-Line
+    let $Processed_W = 'Y'
+  end-if
+  if #OtherX <> #Prv_OtherX
+  and $Processed_X = 'N'
+  and $Process_More_Other_Box_Entries = 'Y'
+    let #Previous_Oth =  #Prv_OtherX
+    let #Current_Oth  =  #OtherX
+    let $Box_Text_Oth = $T_OtherX
+    let $Box_Format_Oth  = $FOtherX
+    do Print-Other-Box-Line
+    let $Processed_X = 'Y'
+  end-if
+  if #OtherY <> #Prv_OtherY
+  and $Processed_Y = 'N'
+  and $Process_More_Other_Box_Entries = 'Y'
+    let #Previous_Oth =  #Prv_OtherY
+    let #Current_Oth  =  #OtherY
+    let $Box_Text_Oth = $T_OtherY
+    let $Box_Format_Oth  = $FOtherY
+    do Print-Other-Box-Line
+    let $Processed_Y = 'Y'
+  end-if
+  if #OtherZ <> #Prv_OtherZ
+  and $Processed_Z = 'N'
+  and $Process_More_Other_Box_Entries = 'Y'
+    let #Previous_Oth =  #Prv_OtherZ
+    let #Current_Oth  =  #OtherZ
+    let $Box_Text_Oth = $T_OtherZ
+    let $Box_Format_Oth  = $FOtherZ
+    do Print-Other-Box-Line
+    let $Processed_Z = 'Y'
+  end-if
+
+end-procedure
+
+
+begin-procedure Print-Other-Box-Line
+
+  if #Other_Box_Line_Count = 0
+    do Next-Form
+    do Print-ER-Data
+    do Print-EE-Data
+    add 1 to #Other_Box_Line_Count
+    let $Process_More_Other_Box_Entries = 'Y'
+  end-if
+
+  evaluate #Other_Box_Line_Count
+    when = 1
+
+    do Format-W2c-Number(#Previous_Oth, $out, $Box_Format_Oth)   !First blank box
+    do Print-Value($Box_Text_Oth,#L_Y1,#C_Y1,'Box Y1')
+    do Print-Value($out,#L_Y1A,#C_Y1A,'Box Y1A')
+
+    do Format-W2c-Number(#Current_Oth, $out, $Box_Format_Oth)
+    print $out (,+3)
+
+    add 1 to #Other_Box_Line_Count
+
+    break
+
+    when = 2
+
+    do Format-W2c-Number(#Previous_Oth, $out, $Box_Format_Oth)        !Second blank box
+    do Print-Value($Box_Text_Oth,#L_Y2,#C_Y2,'Box Y2')
+    do Print-Value($out,#L_Y2A,#C_Y2A,'Box Y2A')
+
+    do Format-W2c-Number(#Current_Oth, $out, $Box_Format_Oth)
+    print $out (,+3)
+
+    let #Other_Box_Line_Count = 0
+    if $Print_One_Page = 'Y'
+       let $Process_More_Other_Box_Entries = 'N'
+    end-if
+
+    break
+
+    end-evaluate
+
+end-procedure
+
+begin-procedure Print-State-Local-Amounts
+    move 1 to #NextStateLoc
+
+    get $Box $State #Amount #PrvAmount
+                    from StateLocals(#NextStateLoc)
+    let $Prv_Box = RTRIM($Box,' ')
+    let $Prv_State = RTRIM($State,' ')
+
+    while #NextStateLoc <= #StateLocalCount
+
+    let $Box = RTRIM($Box,' ')
+    let $State = RTRIM($State,' ')
+    evaluate $Box
+
+    when = $YE_State_Wages                                           !State wages
+      if $State <> $Prv_State
+        do Next-Form
+        do Print-ER-Data
+        do Print-EE-Data
+      end-if
+
+      if RTRIM($State,' ') <> ''
+        do Get-State-SWT
+      end-if
+
+      do Print-Value($S.EMPLOYER_ID_SWT,#L_ER_State_ID,#C_ER_State_ID,$YE_W2C_ER_State_ID)
+                                                                     !State employer ID
+      do Print-Value($State,#L_State_Wages,#C_State_Wages,$YE_State_Wages)
+
+      do Format-W2c-Number(#PrvAmount, $out, $FState_WagesA)         !State wages
+      do Print-Value($out,#L_State_WagesA,#C_State_WagesA,$YE_State_Wages)
+
+      do Format-W2c-Number(#Amount, $out, $FState_WagesA)
+      print $out (,+5)
+
+      let $Prv_Box = RTRIM($Box,' ')
+      let $Prv_State = RTRIM($State,' ')
+      add 1 to #NextStateLoc
+
+      if #NextStateLoc <= #StateLocalCount
+         get $Box $State #Amount #PrvAmount
+                     from StateLocals(#NextStateLoc)
+     end-if
+      break
+    when = $YE_State_Tax                                               !State taxes
+      if $State <> $Prv_State or $Prv_Box = $YE_Local_Wages  or $Prv_Box = $YE_W2_Local_Tax
+        do Next-Form
+        do Print-ER-Data
+        do Print-EE-Data
+      end-if
+
+      if $Prv_Box <> $YE_State_Wages or $State <> $Prv_State
+
+
+        if RTRIM($State,' ') <> ''
+          do Get-State-SWT
+        end-if
+
+
+      end-if
+
+
+      do Print-Value($S.EMPLOYER_ID_SWT,#L_ER_State_ID,#C_ER_State_ID,$YE_W2C_ER_State_ID)
+                                                                     !State employer ID
+      do Print-Value($State,#L_State_Wages,#C_State_Wages,$YE_State_Wages)
+
+      do Format-W2c-Number(#PrvAmount, $out, $FState_Tax)            !State taxes
+      do Print-Value($out,#L_State_Tax,#C_State_Tax,$YE_State_Tax)
+
+      do Format-W2c-Number(#Amount, $out, $FState_Tax)
+      print $out (,+5)
+
+      let $Prv_Box = RTRIM($Box,' ')
+      let $Prv_State = RTRIM($State,' ')
+      let $Prv_Locality = RTRIM($Locality,' ')
+      add 1 to #NextStateLoc
+
+     if #NextStateLoc <= #StateLocalCount
+      get $Box $State #Amount #PrvAmount
+                  from StateLocals(#NextStateLoc)
+     end-if
+      break
+
+  end-evaluate
+end-while
+end-procedure
+
+begin-procedure Print-Test-State-Local-Amounts
+
+     let #PrvAmount = 0.00
+     let #Amount = 99999999.99
+
+     do Print-Value('XXXXXXXXX' ,#L_ER_State_ID,#C_ER_State_ID,$YE_W2C_ER_State_ID) !State employer ID
+     do Print-Value('XX',#L_State_Wages,#C_State_Wages,$YE_State_Wages)
+
+     do Format-W2c-Number(#PrvAmount, $out, $FState_WagesA)         !State wages
+     do Print-Value($out,#L_State_WagesA,#C_State_WagesA,$YE_State_Wages)
+
+     do Format-W2c-Number(#Amount, $out, $FState_WagesA)
+     print $out (,+5)
+
+     do Format-W2c-Number(#PrvAmount, $out, $FState_Tax)          !State taxes
+     do Print-Value($out,#L_State_Tax,#C_State_Tax,$YE_State_Tax)
+
+     do Format-W2c-Number(#Amount, $out, $FState_Tax)
+     print $out (,+5)
+
+    let $Print_Test_State_Local = 'N'
+  end-procedure
+
+
+begin-procedure Print-Page1-Data
+  if #Align_Count > 0
+    do Print-Value('S',#L_Prv_Statut_EE,#C_Prv_Statut_EE,$YE_W2C_Prv_Statut_EE)
+    do Print-Value('P',#L_Prv_Retire_Plan,#C_Prv_Retire_Plan,$YE_W2C_Prv_Retire_Plan)
+    do Print-Value('T',#L_Prv_3rd_Party_Sick_Pay,#C_Prv_3rd_Party_Sick_Pay,$YE_W2C_Prv_3rd_Party_Sick_Pay)
+    do Print-Value('S',#L_Statut_EE,#C_Statut_EE,$YE_W2C_Statut_EE)
+    do Print-Value('P',#L_Retire_Plan,#C_Retire_Plan,$YE_W2C_Retire_Plan)
+    do Print-Value('T',#L_3rd_Party_Sick_Pay,#C_3rd_Party_Sick_Pay,$YE_W2C_3rd_Party_Sick_Pay)
+  end-if
+
+
+  let $YE_Name  = $E.FName || ' ' || $E.LName
+  let $Prv_Name = $E.Prv_FName || ' ' || $E.Prv_LName
+  UPPERCASE $Prv_Name
+
+  if ($YE_Name <> $Prv_Name)
+    do Print-Value('X',#L_EE_Corrected_Name,#C_EE_Corrected_Name,$YE_W2C_EE_Corrected_Name)
+    do Print-Value($Prv_Name,#L_EE_Incorrect_Name,#C_EE_Incorrect_Name,$YE_EE_Incorrect_Name)
+  end-if
+
+
+  if ($E.SSN <> $E.Prv_SSN)
+    do Print-Value($E.Prv_SSN,#L_EE_Incorrect_SSN,#C_EE_Incorrect_SSN,$YE_W2C_EE_Incorrect_SSN)
+  end-if
+
+
+  if ($E.Prv_Statutory_Ee <> $E.Statutory_Ee)
+  or ($E.Prv_Pension_Plan <> $E.Pension_Plan)
+
+
+     if $E.Prv_Statutory_Ee = 'Y'
+
+       do Print-Value('X',#L_Prv_Statut_EE,#C_Prv_Statut_EE,$YE_W2C_Prv_Statut_EE)
+     end-if
+     if $E.Prv_Pension_Plan = 'Y'
+       do Print-Value('X',#L_Prv_Retire_Plan,#C_Prv_Retire_Plan,$YE_W2C_Prv_Retire_Plan)
+     end-if
+     if $E.Prv_ThirdParty_SickPay = 'Y'
+       do Print-Value('X',#L_Prv_3rd_Party_Sick_Pay,#C_Prv_3rd_Party_Sick_Pay,$YE_W2C_3rd_Party_Sick_Pay)
+     end-if
+     if $E.Statutory_Ee = 'Y'
+       do Print-Value('X',#L_Statut_EE,#C_Statut_EE,$YE_W2C_Statut_EE)
+     end-if
+     if $E.Pension_Plan = 'Y'
+       do Print-Value('X',#L_Retire_Plan,#C_Retire_Plan,$YE_W2C_Retire_Plan)
+     end-if
+     if $E.ThirdParty_SickPay = 'Y'
+      do Print-Value('X',#L_3rd_Party_Sick_Pay,#C_3rd_Party_Sick_Pay,$YE_W2C_3rd_Party_Sick_Pay)
+     end-if
+  end-if
+
+
+
+end-procedure
+
+begin-procedure Load-W2C-PRT
+
+begin-SELECT
+F.GPUS_LAYOUT_FORMAT
+F.GPUS_TOP_MARGIN
+F.GPUS_TOP_SPLIT
+F.GPUS_CENTER_SPLIT
+F.GPUS_BOTTOM_SPLIT
+F.GPUS_LAST_PRT_LINE
+
+  let $Layout_Style = RTRIM(&F.Gpus_Layout_Format,' ')
+
+  move &F.Gpus_Top_Margin       to #Top_Margin
+  move &F.Gpus_Top_Split        to #Top_Split
+  move &F.Gpus_Center_Split     to #Center_Split
+  move &F.Gpus_Bottom_Split     to #Bottom_Split
+  move &F.Gpus_Last_Prt_Line  to #Last_Print_Line
+
+
+! encode '<27>E<27>(0N<27>&l6D<27>&l0E<27>&l66F' into $SetupString
+! print $SetupString (1,1)
+!            |    |       |       |       |
+!            |    |       |       |        --> 66 text lines
+!            |    |       |        --> top margin = 0 lines
+!            |    |        --> 6 lines per inch
+!            |     --> ISO 8859-1 symbol set
+!             --> Reset
+
+FROM  PS_GPUS_YE_PRT_FRM F
+WHERE F.GPUS_PREPRTFORM = &TX.GPUS_PREPRTFORM
+  AND F.GPUS_TAXFORM_ID = $W2c_Taxform_ID
+  AND F.EFFDT   =
+      (SELECT MAX(EFFDT)
+       FROM   PS_GPUS_YE_TXFRM
+       WHERE  GPUS_TAXFORM_ID = F.GPUS_TAXFORM_ID
+         AND  EFFDT  <= $AsOfDate)
+end-SELECT
+
+begin-SELECT
+P.GPUS_TAXFORM_BOX
+P.GPUS_PRINT_LINE
+P.GPUS_PRINT_COLUMN
+P.GPUS_PRINT_FORMAT
+P.GPUS_PRINT_TEXT
+
+  let $P.Gpus_Taxform_Box = RTRIM(&P.Gpus_Taxform_Box,' ')
+
+  evaluate $P.Gpus_Taxform_Box
+    when = $YE_Fed_Wages                                         !Federal wages
+      move &P.Gpus_Print_Line   to #L_Fed_Wages                  ! previous
+      move &P.Gpus_Print_Column    to #C_Fed_Wages
+      let $FFed_Wages = RTRIM(&P.Gpus_Print_Format,' ')
+      break
+    when = $YE_Fed_Tax                                           !Federal tax
+      move &P.Gpus_Print_Line   to #L_Fed_Tax                    ! previous
+      move &P.Gpus_Print_Column    to #C_Fed_Tax
+      let $FFed_Tax = RTRIM(&P.Gpus_Print_Format,' ')
+      break
+    when = $YE_SS_Wages                                         !SS wages
+      move &P.Gpus_Print_Line     to #L_SS_Wages                ! previous
+      move &P.Gpus_Print_Column   to #C_SS_Wages
+      let $FSS_Wages = RTRIM(&P.Gpus_Print_Format,' ')
+      break
+    when = $YE_SS_Tax                                            !SS Tax
+      move &P.Gpus_Print_Line     to #L_SS_Tax                   ! previous
+      move &P.Gpus_Print_Column   to #C_SS_Tax
+      let $FSS_Tax = RTRIM(&P.Gpus_Print_Format,' ')
+      break
+    when = $YE_Med_Wages                                        !Medicare wages
+      move &P.Gpus_Print_Line     to #L_Med_Wages               ! previous
+      move &P.Gpus_Print_Column   to #C_Med_Wages
+      let $FMed_Wages = RTRIM(&P.Gpus_Print_Format,' ')
+      break
+    when = $YE_Med_Tax                                          !Medicare tax
+      move &P.Gpus_Print_Line     to #L_Med_Tax                 ! previous
+      move &P.Gpus_Print_Column   to #C_Med_Tax
+      let $FMed_Tax = RTRIM(&P.Gpus_Print_Format,' ')
+      break
+    when = $YE_SS_Tips                                          !SS tips
+      move &P.Gpus_Print_Line    to #L_SS_Tips                  ! previous
+      move &P.Gpus_Print_Column  to #C_SS_Tips
+      let $FSS_Tips = RTRIM(&P.Gpus_Print_Format,' ')
+      break
+    when = $YE_Alloc_Tips                                       !Allocated tips
+      move &P.Gpus_Print_Line    to #L_Alloc_Tips               ! previous
+      move &P.Gpus_Print_Column  to #C_Alloc_Tips
+      let $FAlloc_Tips = RTRIM(&P.Gpus_Print_Format,' ')
+      break
+    when = $YE_Adv_EIC                                          !Advance EIC paymt
+      move &P.Gpus_Print_Line     to #L_Adv_EIC                 ! previous
+      move &P.Gpus_Print_Column   to #C_Adv_EIC
+      let $FAdv_EIC  = RTRIM(&P.Gpus_Print_Format,' ')
+      break
+    when = $YE_Dep_Care                                         !Depend care
+      move &P.Gpus_Print_Line     to #L_Dep_Care                ! previous
+      move &P.Gpus_Print_Column   to #C_Dep_Care
+      let $FDep_Care  = RTRIM(&P.Gpus_Print_Format,' ')
+      break
+    when = $YE_Non_Qual_457                                     !Nonqual plans
+      move &P.Gpus_Print_Line     to #L_Non_Qual_457            ! previous
+      move &P.Gpus_Print_Column   to #C_Non_Qual_457
+      let $FNon_Qual_457  = RTRIM(&P.Gpus_Print_Format,' ')
+      break
+    when = $YE_Uncoll_SS_Tax_On_Tips                            !Uncoll SS tax on tips
+      let $FUncoll_SS_Tax_On_Tips  = RTRIM(&P.Gpus_Print_Format,' ')
+      let $T_Uncoll_SS_Tax_On_Tips = RTRIM(&P.Gpus_Print_Text,' ')
+      break
+    when = $YE_Uncoll_Med_Tax_On_Tips                           !Uncoll Medi tax on tips
+      let $FUncoll_Med_Tax_On_Tips  = RTRIM(&P.Gpus_Print_Format,' ')
+      let $T_Uncoll_Med_Tax_On_Tips = RTRIM(&P.Gpus_Print_Text,' ')
+      break
+    when = $YE_Group_Term_Life                                  !GTL
+      let $FGroup_Term_Life  = RTRIM(&P.Gpus_Print_Format,' ')
+      let $T_Group_Term_Life = RTRIM(&P.Gpus_Print_Text,' ')
+      break
+    when = $YE_401K                                             !401(k)
+      let $F401K  = RTRIM(&P.Gpus_Print_Format,' ')
+      let $T_401K = RTRIM(&P.Gpus_Print_Text,' ')
+      break
+    when = $YE_403B                                             !403(b)
+      let $F403B  = RTRIM(&P.Gpus_Print_Format,' ')
+      let $T_403B = RTRIM(&P.Gpus_Print_Text,' ')
+      break
+    when = $YE_408K6                                            !408(k)(6)
+      let $F408K6  = RTRIM(&P.Gpus_Print_Format,' ')
+      let $T_408K6 = RTRIM(&P.Gpus_Print_Text,' ')
+      break
+    when = $YE_457B                                             !457(b)
+      let $F457B  = RTRIM(&P.Gpus_Print_Format,' ')
+      let $T_457B = RTRIM(&P.Gpus_Print_Text,' ')
+      break
+    when = $YE_501C18D                                          !501(c)(18)(D)
+      let $F501C18D  = RTRIM(&P.Gpus_Print_Format,' ')
+      let $T_501C18D = RTRIM(&P.Gpus_Print_Text,' ')
+      break
+    when = $YE_Sick_Pay                                         !Sick pay
+      let $FSick_Pay  = RTRIM(&P.Gpus_Print_Format,' ')
+      let $T_Sick_Pay = RTRIM(&P.Gpus_Print_Text,' ')
+      break
+    when = $YE_Excise_Tax                                       !Excise tax
+      let $FExcise_Tax  = RTRIM(&P.Gpus_Print_Format,' ')
+      let $T_Excise_Tax = RTRIM(&P.Gpus_Print_Text,' ')
+      break
+    when = $YE_Business_Exp                                     !Business expense
+      let $FBusiness_Exp  = RTRIM(&P.Gpus_Print_Format,' ')
+      let $T_Business_Exp = RTRIM(&P.Gpus_Print_Text,' ')
+      break
+    when = $YE_Uncoll_SS_Tax_GTL                                !Uncoll SS tax - GTL
+      let $FUncoll_SS_Tax_GTL  = RTRIM(&P.Gpus_Print_Format,' ')
+      let $T_Uncoll_SS_Tax_GTL = RTRIM(&P.Gpus_Print_Text,' ')
+      break
+    when = $YE_Uncoll_Med_Tax_GTL                               !Uncoll Medi tax - GTL
+      let $FUncoll_Med_Tax_GTL  = RTRIM(&P.Gpus_Print_Format,' ')
+      let $T_Uncoll_Med_Tax_GTL = RTRIM(&P.Gpus_Print_Text,' ')
+      break
+    when = $YE_Excl_Moving_Exp                                  !Excl Moving Exp
+      let $FExcl_Moving_Exp  = RTRIM(&P.Gpus_Print_Format,' ')
+      let $T_Excl_Moving_Exp = RTRIM(&P.Gpus_Print_Text,' ')
+      break
+    when = $YE_Nontaxable_Combat_Pay                           !Nontaxable_Combat_Pay
+      let $FNontaxable_Combat_Pay  = RTRIM(&P.Gpus_Print_Format,' ')
+      let $T_Nontaxable_Combat_Pay = RTRIM(&P.Gpus_Print_Text,' ')
+      break
+    when = $YE_Med_Svgs_Acct                                    !Medical spending acct
+      let $FMed_Svgs_Acct  = RTRIM(&P.Gpus_Print_Format,' ')
+      let $T_Med_Svgs_Acct = RTRIM(&P.Gpus_Print_Text,' ')
+      break
+    when = $YE_408P_Simple_Retirement                                 !Section 418(p) simple
+      let $F408P_Simple_Retirement  = RTRIM(&P.Gpus_Print_Format,' ')    ! retirement
+      let $T_408P_Simple_Retirement = RTRIM(&P.Gpus_Print_Text,' ')
+      break
+    when = $YE_Adoption_Exp                                     !Adoption expense
+      let $FAdoption_Exp  = RTRIM(&P.Gpus_Print_Format,' ')
+      let $T_Adoption_Exp = RTRIM(&P.Gpus_Print_Text,' ')
+      break
+    when = $YE_NonStatutory_Stock_Opt                            !Non-statutory stock options
+      let $FNonStatutory_Stock_Opt  = RTRIM(&P.Gpus_Print_Format,' ')
+      let $T_NonStatutory_Stock_Opt = RTRIM(&P.Gpus_Print_Text,' ')
+      break
+    when = $YE_NonQual_Def_Comp                            !NonQual_Def_Comp
+      let $FNonQual_Def_Comp  = RTRIM(&P.Gpus_Print_Format,' ')
+      let $T_NonQual_Def_Comp = RTRIM(&P.Gpus_Print_Text,' ')
+      break
+    when = $YE_Income_NonQual_Def_Comp  
+      let $FIncome_NonQual_Def_Comp  = RTRIM(&P.Gpus_Print_Format,' ')
+      let $T_Income_NonQual_Def_Comp = RTRIM(&P.Gpus_Print_Text,' ')
+      break
+    when = $YE_OtherA                                           !CASDI
+    when = $YE_OtherB                                           !VPDI
+    when = $YE_OtherC                                           !WD
+    when = $YE_OtherD                                           !UI/HC
+    when = $YE_OtherE                                           !NJSDI
+    when = $YE_OtherF                                           !VPDI
+    when = $YE_OtherG
+    when = $YE_OtherH
+    when = $YE_OtherI
+    when = $YE_OtherJ
+    when = $YE_OtherK
+    when = $YE_OtherL
+    when = $YE_OtherM
+    when = $YE_OtherN
+    when = $YE_OtherO
+    when = $YE_OtherP
+    when = $YE_OtherQ
+    when = $YE_OtherR
+    when = $YE_OtherS
+    when = $YE_OtherT
+    when = $YE_OtherU
+    when = $YE_OtherV
+    when = $YE_OtherW
+    when = $YE_OtherX
+    when = $YE_OtherY
+    when = $YE_OtherZ
+      do Process-Other-Print-Parameters
+      break
+    when = $YE_State_Wages_Name                                 !State wages name
+      move &P.Gpus_Print_Line     to #L_State_Wages
+      move &P.Gpus_Print_Column   to #C_State_Wages
+      let $FState_Wages = RTRIM(&P.Gpus_Print_Format,' ')
+      break
+    when = $YE_State_Wages                                      !State wages
+      move &P.Gpus_Print_Line     to #L_State_WagesA
+      move &P.Gpus_Print_Column   to #C_State_WagesA
+      let $FState_WagesA = RTRIM(&P.Gpus_Print_Format,' ')
+      break
+    when = $YE_State_Tax                                        !State tax
+      move &P.Gpus_Print_Line     to #L_State_Tax
+      move &P.Gpus_Print_Column   to #C_State_Tax
+      let $FState_Tax = RTRIM(&P.Gpus_Print_Format,' ')
+      break
+    when = $YE_W2C_Year_and_Form                                !Year/form
+      move &P.Gpus_Print_Line     to #L_Year_and_Form
+      move &P.Gpus_Print_Column   to #C_Year_and_Form
+      let $FA = RTRIM(&P.Gpus_Print_Format,' ')
+      break
+    when = $YE_W2C_EE_FName
+      move &P.Gpus_Print_Line     to #L_EE_FName
+      move &P.Gpus_Print_Column   to #C_EE_FName
+      let $FEE_FName = RTRIM(&P.Gpus_Print_Format,' ')
+      break
+    when = $YE_W2C_EE_LName
+      move &P.Gpus_Print_Line     to #L_EE_LName
+      move &P.Gpus_Print_Column   to #C_EE_LName
+      let $FEE_LName = RTRIM(&P.Gpus_Print_Format,' ')
+      break
+    when = $YE_W2C_EE_Address1
+      move &P.Gpus_Print_Line     to #L_EE_Address1
+      move &P.Gpus_Print_Column   to #C_EE_Address1
+      let $FB2 = RTRIM(&P.Gpus_Print_Format,' ')
+      break
+    when = $YE_W2C_EE_Address2
+      move &P.Gpus_Print_Line     to #L_EE_Address2
+      move &P.Gpus_Print_Column   to #C_EE_Address2
+      let $FB3 = RTRIM(&P.Gpus_Print_Format,' ')
+      break
+    when = $YE_W2C_EE_State_City_Zip
+      move &P.Gpus_Print_Line     to #L_EE_State_City_Zip
+      move &P.Gpus_Print_Column   to #C_EE_State_City_Zip
+      let $FB4 = RTRIM(&P.Gpus_Print_Format,' ')
+      break
+    when = $YE_W2C_EE_Corrected_Name
+      move &P.Gpus_Print_Line     to #L_EE_Corrected_Name
+      move &P.Gpus_Print_Column   to #C_EE_Corrected_Name
+      let $FB4 = RTRIM(&P.Gpus_Print_Format,' ')
+      break
+    when = $YE_W2C_ER_Name
+      move &P.Gpus_Print_Line     to #L_ER_Name
+      move &P.Gpus_Print_Column   to #C_ER_Name
+      let $FER_Name = RTRIM(&P.Gpus_Print_Format,' ')
+      break
+    when = $YE_W2C_ER_Address1
+      move &P.Gpus_Print_Line     to #L_ER_Address1
+      move &P.Gpus_Print_Column   to #C_ER_Address1
+      let $FER_Address1 = RTRIM(&P.Gpus_Print_Format,' ')
+      break
+    when = $YE_W2C_ER_Address2
+      move &P.Gpus_Print_Line     to #L_ER_Address2
+      move &P.Gpus_Print_Column   to #C_ER_Address2
+      let $FER_Address2 = RTRIM(&P.Gpus_Print_Format,' ')
+      break
+    when = $YE_W2C_ER_State_City_Zip
+      move &P.Gpus_Print_Line     to #L_State_City_Zip
+      move &P.Gpus_Print_Column   to #C_State_City_Zip
+      let $FState_City_Zip = RTRIM(&P.Gpus_Print_Format,' ')
+      break
+    when = $YE_W2C_EE_SSN
+      move &P.Gpus_Print_Line     to #L_EE_SSN
+      move &P.Gpus_Print_Column   to #C_EE_SSN
+      let $FD = RTRIM(&P.Gpus_Print_Format,' ')
+      break
+    when = $YE_W2C_ER_EIN
+      move &P.Gpus_Print_Line     to #L_ER_EIN
+      move &P.Gpus_Print_Column   to #C_ER_EIN
+      let $FF = RTRIM(&P.Gpus_Print_Format,' ')
+      break
+    when = $YE_W2C_ER_State_ID                                   !SWT
+      move &P.Gpus_Print_Line     to #L_ER_State_ID
+      move &P.Gpus_Print_Column   to #C_ER_State_ID
+      let $FG = RTRIM(&P.Gpus_Print_Format,' ')
+      break
+    when = $YE_W2C_Prv_Statut_EE                                !Prv Statutory EE checkbox
+      move &P.Gpus_Print_Line     to #L_Prv_Statut_EE
+      move &P.Gpus_Print_Column   to #C_Prv_Statut_EE
+      break
+    when = $YE_W2C_Prv_Retire_Plan                              !Prv Pension plan checkbox
+      move &P.Gpus_Print_Line     to #L_Prv_Retire_Plan
+      move &P.Gpus_Print_Column   to #C_Prv_Retire_Plan
+      break
+    when = $YE_W2C_Prv_3rd_Party_Sick_Pay                       !Prv 3rd party sickpay checkbox
+      move &P.Gpus_Print_Line     to #L_Prv_3rd_Party_Sick_Pay
+      move &P.Gpus_Print_Column   to #C_Prv_3rd_Party_Sick_Pay
+      break
+    when = $YE_W2C_Statut_EE                                    !Statutory EE checkbox
+      move &P.Gpus_Print_Line     to #L_Statut_EE
+      move &P.Gpus_Print_Column   to #C_Statut_EE
+      break
+    when = $YE_W2C_Retire_Plan                                  !Pension plan checkbox
+      move &P.Gpus_Print_Line     to #L_Retire_Plan
+      move &P.Gpus_Print_Column   to #C_Retire_Plan
+      break
+    when = $YE_W2C_3rd_Party_Sick_Pay                           !3rd party sickpay checkbox
+      move &P.Gpus_Print_Line     to #L_3rd_Party_Sick_Pay
+      move &P.Gpus_Print_Column   to #C_3rd_Party_Sick_Pay
+      break
+    when = $YE_W2C_ER_Use                                       !Employer use
+      move &P.Gpus_Print_Line     to #L_ER_Use
+      move &P.Gpus_Print_Column   to #C_ER_Use
+      break
+    when = $YE_W2C_EE_Incorrect_SSN                             !EE incorrect SSN
+      move &P.Gpus_Print_Line     to #L_EE_Incorrect_SSN
+      move &P.Gpus_Print_Column   to #C_EE_Incorrect_SSN
+      break
+    when = $YE_W2C_EE_Incorrect_Name                            !EE incorrect name
+      move &P.Gpus_Print_Line     to #L_EE_Incorrect_Name
+      move &P.Gpus_Print_Column   to #C_EE_Incorrect_Name
+      break
+
+    when = $YE_W2C_Blank_Box_First_Line_Descr                   !First blank box- description
+      move &P.Gpus_Print_Line     to #L_X1
+      move &P.Gpus_Print_Column   to #C_X1
+      break
+    when = $YE_W2C_Blank_Box_First_Line_Amt                     !First blank box - dollar amts
+      move &P.Gpus_Print_Line     to #L_X1A
+      move &P.Gpus_Print_Column   to #C_X1A
+      break
+    when = $YE_W2C_Blank_Box_Second_Line_Descr                  !Second blank box - description
+      move &P.Gpus_Print_Line     to #L_X2
+      move &P.Gpus_Print_Column   to #C_X2
+      break
+    when = $YE_W2C_Blank_Box_Second_Line_Amt                    !Second blank box- dollar amts
+      move &P.Gpus_Print_Line     to #L_X2A
+      move &P.Gpus_Print_Column   to #C_X2A
+      break
+    when = $YE_W2C_Blank_Box_Third_Line_Descr                   !Third blank box - description
+      move &P.Gpus_Print_Line     to #L_X3
+      move &P.Gpus_Print_Column   to #C_X3
+      break
+    when = $YE_W2C_Blank_Box_Third_Line_Amt                     !Third blank box - dollar amts
+      move &P.Gpus_Print_Line     to #L_X3A
+      move &P.Gpus_Print_Column   to #C_X3A
+      break
+    when = $YE_W2C_Blank_Box_Fourth_Line_Descr                  !Fourth blank box - description
+      move &P.Gpus_Print_Line     to #L_X4
+      move &P.Gpus_Print_Column   to #C_X4
+      break
+    when = $YE_W2C_Blank_Box_Fourth_Line_Amt                    !Fourth blank box - dollar amts
+      move &P.Gpus_Print_Line     to #L_X4A
+      move &P.Gpus_Print_Column   to #C_X4A
+      break
+    when = $YE_W2C_Other_Box_First_Line_Descr                  !First blank box- description
+      move &P.Gpus_Print_Line     to #L_Y1
+      move &P.Gpus_Print_Column   to #C_Y1
+      break
+    when = $YE_W2C_Other_Box_First_Line_Amt                    !First blank box - dollar amts
+      move &P.Gpus_Print_Line     to #L_Y1A
+      move &P.Gpus_Print_Column   to #C_Y1A
+      break
+    when = $YE_W2C_Other_Box_Second_Line_Descr                 !Second blank box - description
+      move &P.Gpus_Print_Line     to #L_Y2
+      move &P.Gpus_Print_Column   to #C_Y2
+      break
+    when = $YE_W2C_Other_Box_Second_Line_Amt                   !Second blank box- dollar amts
+      move &P.Gpus_Print_Line     to #L_Y2A
+      move &P.Gpus_Print_Column   to #C_Y2A
+      break
+    when-other
+        move $P.Gpus_Taxform_Box to $Box xx
+      break
+  end-evaluate
+
+FROM  PS_GPUS_YE_PRT_BOX P
+WHERE P.GPUS_PREPRTFORM = &TX.GPUS_PREPRTFORM
+  AND P.GPUS_TAXFORM_ID = $W2c_Taxform_ID
+  AND P.EFFDT   =
+      (SELECT MAX(EFFDT)
+       FROM   PS_GPUS_YE_TXFRM
+       WHERE  GPUS_TAXFORM_ID = $W2c_Taxform_ID
+         AND  EFFDT  <= $AsOfDate)
+ORDER BY P.GPUS_TAXFORM_BOX
+end-SELECT
+end-procedure
+
+begin-procedure Process-Other-Print-Parameters
+
+  evaluate $P.Gpus_Taxform_Box
+    when = $YE_OtherA                                   !CASDI
+      let $FOtherA  = RTRIM(&P.Gpus_Print_Format,' ')
+      let $T_OtherA = RTRIM(&P.Gpus_Print_Text,' ')
+      break
+    when = $YE_OtherB                                   !VPDI
+      let $FOtherB  = RTRIM(&P.Gpus_Print_Format,' ')
+      let $T_OtherB = RTRIM(&P.Gpus_Print_Text,' ')
+      break
+    when = $YE_OtherC                                   !WD
+      let $FOtherC  = RTRIM(&P.Gpus_Print_Format,' ')
+      let $T_OtherC = RTRIM(&P.Gpus_Print_Text,' ')
+      break
+    when = $YE_OtherD                                   !UI/HC
+      let $FOtherD  = RTRIM(&P.Gpus_Print_Format,' ')
+      let $T_OtherD = RTRIM(&P.Gpus_Print_Text,' ')
+      break
+    when = $YE_OtherE                                    !NJSDI
+      let $FOtherE  = RTRIM(&P.Gpus_Print_Format,' ')
+      let $T_OtherE = RTRIM(&P.Gpus_Print_Text,' ')
+      break
+    when = $YE_OtherF                                   !VPDI
+      let $FOtherF  = RTRIM(&P.Gpus_Print_Format,' ')
+      let $T_OtherF = RTRIM(&P.Gpus_Print_Text,' ')
+      break
+    when = $YE_OtherG
+      let $FOtherG  = RTRIM(&P.Gpus_Print_Format,' ')
+      let $T_OtherG = RTRIM(&P.Gpus_Print_Text,' ')
+      break
+    when = $YE_OtherH
+      let $FOtherH  = RTRIM(&P.Gpus_Print_Format,' ')
+      let $T_OtherH = RTRIM(&P.Gpus_Print_Text,' ')
+      break
+    when = $YE_OtherI
+      let $FOtherI  = RTRIM(&P.Gpus_Print_Format,' ')
+      let $T_OtherI = RTRIM(&P.Gpus_Print_Text,' ')
+      break
+    when = $YE_OtherJ
+      let $FOtherJ  = RTRIM(&P.Gpus_Print_Format,' ')
+      let $T_OtherJ = RTRIM(&P.Gpus_Print_Text,' ')
+      break
+    when = $YE_OtherK
+      let $FOtherK  = RTRIM(&P.Gpus_Print_Format,' ')
+      let $T_OtherK = RTRIM(&P.Gpus_Print_Text,' ')
+      break
+    when = $YE_OtherL
+      let $FOtherL  = RTRIM(&P.Gpus_Print_Format,' ')
+      let $T_OtherL = RTRIM(&P.Gpus_Print_Text,' ')
+      break
+    when = $YE_OtherM
+      let $FOtherM  = RTRIM(&P.Gpus_Print_Format,' ')
+      let $T_OtherM = RTRIM(&P.Gpus_Print_Text,' ')
+      break
+    when = $YE_OtherN
+      let $FOtherN  = RTRIM(&P.Gpus_Print_Format,' ')
+      let $T_OtherN = RTRIM(&P.Gpus_Print_Text,' ')
+      break
+    when = $YE_OtherO
+      let $FOtherO  = RTRIM(&P.Gpus_Print_Format,' ')
+      let $T_OtherO = RTRIM(&P.Gpus_Print_Text,' ')
+      break
+    when = $YE_OtherP
+      let $FOtherP  = RTRIM(&P.Gpus_Print_Format,' ')
+      let $T_OtherP = RTRIM(&P.Gpus_Print_Text,' ')
+      break
+    when = $YE_OtherQ
+      let $FOtherQ  = RTRIM(&P.Gpus_Print_Format,' ')
+      let $T_OtherQ = RTRIM(&P.Gpus_Print_Text,' ')
+      break
+    when = $YE_OtherR
+      let $FOtherR  = RTRIM(&P.Gpus_Print_Format,' ')
+      let $T_OtherR = RTRIM(&P.Gpus_Print_Text,' ')
+      break
+    when = $YE_OtherS
+      let $FOtherS  = RTRIM(&P.Gpus_Print_Format,' ')
+      let $T_OtherS = RTRIM(&P.Gpus_Print_Text,' ')
+      break
+    when = $YE_OtherT
+      let $FOtherT  = RTRIM(&P.Gpus_Print_Format,' ')
+      let $T_OtherT = RTRIM(&P.Gpus_Print_Text,' ')
+      break
+    when = $YE_OtherU
+      let $FOtherU  = RTRIM(&P.Gpus_Print_Format,' ')
+      let $T_OtherU = RTRIM(&P.Gpus_Print_Text,' ')
+      break
+    when = $YE_OtherV
+      let $FOtherV  = RTRIM(&P.Gpus_Print_Format,' ')
+      let $T_OtherV = RTRIM(&P.Gpus_Print_Text,' ')
+      break
+    when = $YE_OtherW
+      let $FOtherW  = RTRIM(&P.Gpus_Print_Format,' ')
+      let $T_OtherW = RTRIM(&P.Gpus_Print_Text,' ')
+      break
+    when = $YE_OtherX
+      let $FOtherX  = RTRIM(&P.Gpus_Print_Format,' ')
+      let $T_OtherX = RTRIM(&P.Gpus_Print_Text,' ')
+      break
+    when = $YE_OtherY
+      let $FOtherY  = RTRIM(&P.Gpus_Print_Format,' ')
+      let $T_OtherY = RTRIM(&P.Gpus_Print_Text,' ')
+      break
+    when = $YE_OtherZ
+      let $FOtherZ  = RTRIM(&P.Gpus_Print_Format,' ')
+      let $T_OtherZ = RTRIM(&P.Gpus_Print_Text,' ')
+      break
+  end-evaluate
+
+end-procedure
+
+
+begin-procedure Load-Test-Data
+
+  let $A.Tax_EIN =
+         LPAD($x,TO_NUMBER(SUBSTR($FF,3,INSTR($FF,')',1)-2)),'X')
+
+  let $A.Descr =
+         LPAD($x,TO_NUMBER(SUBSTR($FER_Name,3,INSTR($FER_Name,')',1)-2)),'X')
+
+  let $A.Address1 =
+         LPAD($x,TO_NUMBER(SUBSTR($FER_Address1,3,INSTR($FER_Address1,')',1)-2)),'X')
+
+  let $A.Address2 =
+         LPAD($x,TO_NUMBER(SUBSTR($FER_Address2,3,INSTR($FER_Address2,')',1)-2)),'X')
+
+  let $State_City_Zip =
+         LPAD($x,TO_NUMBER(SUBSTR($FState_City_Zip,3,INSTR($FState_City_Zip,')',1)-2)),'X')
+
+  let $ER_Year = '9999'
+
+  let $E.SSN =
+         LPAD($x,TO_NUMBER(SUBSTR($FD,3,INSTR($FD,')',1)-2)),'X')
+
+  let $E.Prv_SSN = 'YYYYYYYYYYY'
+
+  let $E.W2C_Name =
+         LPAD($x,TO_NUMBER(SUBSTR($FB1,3,INSTR($FB1,')',1)-2)),'X')
+
+  let $E.Prv_W2C_Name = 'YYYYYYYYYYYYYYYYYYYYYYYYYYYYYY'
+
+  let $E.Address1 =
+         LPAD($x,TO_NUMBER(SUBSTR($FB2F1,3,INSTR($FB2,')',1)-2)),'X')
+
+  let $E.Address2 =
+         LPAD($x,TO_NUMBER(SUBSTR($FB3,3,INSTR($FB3,')',1)-2)),'X')
+
+  let $B4 =
+         LPAD($x,TO_NUMBER(SUBSTR($FB4,3,INSTR($FB4,')',1)-2)),'X')
+
+  let #Fed_Wages = 99999999.99                       !Federal wages
+  let #Prv_Fed_Wages = 0.00
+
+  let #Fed_Tax = 0.00                                !Federal tax
+  let #Prv_Fed_Tax = 99999999.99
+
+  let #SS_Wages = 99999999.99                        !SS wages
+  let #Prv_SS_Wages = 0.00
+
+  let #SS_Tax = 0                                    !SS Tax
+  let #Prv_SS_Tax = 99999999.99
+
+  let #Med_Wages = 99999999.99                       !Medicare wages
+  let #Prv_Med_Wages = 0.00
+
+  let #Med_Tax = 0                                   !Medicare tax
+  let #Prv_Med_Tax = 99999999.99
+
+  if $Taxform_ID = '110' !'W'
+  or $Taxform_ID = '150' !'I'
+     let #Adv_EIC = 99999999.99                      !EIC
+  end-if
+  let #Prv_Adv_EIC = 0.00
+
+  let #Dep_Care = 0                                  !Dep care
+  if $Taxform_ID = '110' !'W'
+      let #Prv_Dep_Care = 99999999.99
+  end-if
+
+
+  if $Taxform_ID = '110' !'W'
+    let $Print_Test_State_Local = 'Y'
+
+    let $E.W2_State =
+         LPAD($x,TO_NUMBER(SUBSTR($FState,3,INSTR($FState,')',1)-2)),'X')
+
+    let $E.Employer_ID_SWT =
+         LPAD($x,TO_NUMBER(SUBSTR($FState_ID,3,INSTR($FState_ID,')',1)-2)),'X')
+
+    move $FState_WagesA to $State_Wages
+    let $State_Wages = TRANSLATE($State_Wages,'Bb','99')      !State wages
+    move $State_Wages to #Prv_State_Wages                     ! previous
+    move $State_Wages to #State_Wages                         ! current
+
+    move $FState_Tax to $State_Tax
+    let $State_Tax = TRANSLATE($State_Tax,'Bb','99')          !State tax
+    move $State_Tax to #Prv_State_Tax                         ! previous
+    move $State_Tax to #State_Tax                             ! current
+
+   end-if
+
+
+  move 0 to #StateLocalCount
+
+end-procedure
+
+begin-procedure Print-Alignment-Forms
+  move &TX.GPUS_YE_ALIGNCOUNT  to #Align_Count
+  let #Align_Count = #Align_Count * #FormsPerPage
+  move #EmployeesPerPage to #temp
+  move #FormsPerPage to #EmployeesPerPage
+  move 1 to #k
+  while #k <= #Align_Count
+    do Load-Test-Data
+    do Print-W2C
+    add 1 to #k
+  end-while
+  move 0 to #Align_Count
+  move #temp to #EmployeesPerPage
+  move '' to $priorState
+
+end-procedure
+
+begin-procedure Print-Value($String,#Line,#Col,$Identifier)
+
+  if #Line > 0
+    print $String (#Line,#Col)
+  else
+    display ''
+    display '***************************************'
+    display 'Print Line not defined for ' noline
+    display $Identifier
+    display 'in Tax Form Print Parameters Table.'
+    display 'Program Stopped.'
+    display '***************************************'
+    display ''
+    stop
+  end-if
+end-procedure
+
+
+begin-procedure Read-EEs
+let $FirstEE = 'Y'
+
+begin-SELECT
+C.EMPLID
+C.GPUS_YEC_BATCH_NBR
+C.GPUS_RECENT_BATCH
+  move &C.EMPLID  to $SelectedEmplID
+  move &C.GPUS_YEC_BATCH_NBR to #W2c_Batch_Nbr
+  move &C.GPUS_YEC_BATCH_NBR to $W2c_Batch_Nbr
+  move &C.GPUS_RECENT_BATCH to $GPUS_RECENT_BATCH
+  move &C.EMPLID  to $ReprintCheck
+  let $ReprintCheck = rtrim(&C.EMPLID ,' ')
+
+  if isnull(rtrim($ReprintCheck,'')) and $FirstEE = 'Y'
+    do Get-Reprint-Info
+  else
+    let $E.SelectedEEs = 'AND E.EMPLID = '''
+    let $E.SelectedEEs = $E.SelectedEEs || RTRIM($SelectedEmplID  , ' ') || ''''
+
+        let $E.Batch_Nbr = 'AND E.GPUS_YEC_BATCH_NBR = (SELECT MAX(GPUS_YEC_BATCH_NBR) FROM ' ||
+       'PS_GPUS_YEC_DAT WHERE E.GPUS_TAX_EIN = GPUS_TAX_EIN ' ||
+       'AND E.EMPLID = EMPLID AND E.GPUS_YEC_STATUS = GPUS_YEC_STATUS)'
+
+    end-if
+  do Read-Employee-Data
+  let $FirstEE = 'N'
+
+FROM  PS_GPUS_RC_YE4 C
+WHERE C.OPRID         = $Prcs_OprID
+  AND C.RUN_CNTL_ID   = $Prcs_Run_Cntl_ID
+end-SELECT
+
+end-procedure
+
+begin-procedure Get-Reprint-Info
+begin-SELECT
+CC.GPUS_YEC_BAT_OPEN
+
+FROM PS_GPUS_YEC_BATCH CC
+WHERE CC.GPUS_YEC_BATCH_NBR=&C.GPUS_YEC_BATCH_NBR
+AND CC.GPUS_CAL_YEAR=$CalYear
+AND CC.GPUS_TAXFORM_ID=$Taxform_ID
+end-SELECT
+
+  if &CC.GPUS_YEC_BAT_OPEN  = 'Y'
+    do Get-Most-Recent-Batch
+  end-if
+  if $W2c_Batch_Nbr <> ''
+  let $E.Batch_Nbr = 'AND E.GPUS_YEC_BATCH_NBR = ' || $W2c_Batch_Nbr
+  end-if
+end-procedure
+
+
+begin-procedure Get-Most-Recent-Batch
+begin-SELECT
+
+COUNT(*)   &W2cCount
+
+FROM PS_GPUS_YEC_DAT CT
+WHERE CT.GPUS_YEC_BATCH_NBR = &YEC_BATCH.GPUS_YEC_BATCH_NBR
+AND   CT.GPUS_TAXFORM_ID = $Taxform_ID
+
+end-SELECT
+
+ if &W2cCount > 0
+    let #W2c_Batch_Nbr = &YEC_BATCH.GPUS_YEC_BATCH_NBR
+else
+    let #W2c_Batch_Nbr = &YEC_BATCH.GPUS_YEC_BATCH_NBR  - 1
+end-if
+
+let $W2c_Batch_Nbr_X = #W2c_Batch_Nbr
+unstring $W2c_Batch_Nbr_X by '.' into $W2c_Batch_Nbr $zeros
+end-procedure
+
+
+begin-procedure Get-State-SWT
+ evaluate $Taxform_ID
+        when = '110'
+             move '10' to $Taxform_ID_SWT
+        when = '150'
+             move '50' to $Taxform_ID_SWT
+        when = '130'
+             move '30' to $Taxform_ID_SWT
+        when = '120'
+            move '20' to $Taxform_ID_SWT
+ end-evaluate
+
+begin-SELECT
+S.GPUS_SWT_EIN
+
+
+   PUT $State INTO STATESWT(#StateSWTCount) State
+   PUT &S.GPUS_SWT_EIN INTO STATESWT(#StateSWTCount) SWT
+   let $S.EMPLOYER_ID_SWT = SUBSTR(&S.GPUS_SWT_EIN,1,18)
+   add 1 to #StateSWTCount
+
+FROM PS_GPUS_YE_EE5_VW S
+WHERE S.GPUS_TAX_EIN = &E.GPUS_TAX_EIN
+AND S.GPUS_CAL_YEAR = &E.GPUS_CAL_YEAR
+AND S.GPUS_YE_STATE = $State
+AND S.EMPLID = &E.EMPLID
+AND S.GPUS_TAXFORM_ID = $Taxform_ID_SWT
+end-SELECT
+
+
+end-procedure
+
+begin-procedure Get-W2C-Run-Controls
+  do Get-Tax-Reporting-Run-Controls
+
+  move &TX.GPUS_TAXFORM_ID to $Taxform_ID
+
+     evaluate &TX.GPUS_TAXFORM_ID
+       when = '10'
+            move '110' to $W2c_Taxform_ID
+       when = '50'
+            move '150' to $W2c_Taxform_ID
+       when = '30'
+            move '130' to $W2c_Taxform_ID
+       when = '20'
+            move '120' to $W2c_Taxform_ID
+       when = '110'
+            move '110' to $W2c_Taxform_ID
+       when = '150'
+            move '150' to $W2c_Taxform_ID
+       when = '130'
+            move '130' to $W2c_Taxform_ID
+       when = '120'
+            move '120' to $W2c_Taxform_ID
+    end-evaluate
+
+
+end-procedure
+
+begin-procedure Get-W2C-Parameters
+
+begin-select
+YEC_BATCH.GPUS_YEC_BATCH_NBR
+YEC_BATCH.GPUS_CAL_YEAR
+    FROM  PS_GPUS_YEC_BATCH YEC_BATCH
+    WHERE YEC_BATCH.GPUS_TAXFORM_ID = $Taxform_ID
+end-SELECT
+
+    move &YEC_BATCH.GPUS_YEC_BATCH_NBR to #W2c_Batch_Nbr
+    move &YEC_BATCH.GPUS_YEC_BATCH_NBR to $W2c_Batch_Nbr
+
+    move &YEC_BATCH.GPUS_CAL_YEAR   to $W2C_Batch_Yr 9999
+    move &YEC_BATCH.GPUS_CAL_YEAR   to #W2C_Batch_Yr
+    if $W2c_Batch_Nbr <> ''
+    let $E.Batch_Nbr = 'AND E.GPUS_YEC_BATCH_NBR = ' || $W2c_Batch_Nbr
+    end-if
+end-procedure
+
+
+begin-procedure Update-W2-History
+
+ let $W2c_Error = 'Update-W2-History '
+evaluate $Taxform_ID
+       when = '110'
+            move '10' to $Taxform_ID_EE
+       when = '150'
+            move '50' to $Taxform_ID_EE
+       when = '130'
+            move '30' to $Taxform_ID_EE
+       when = '120'
+            move '20' to $Taxform_ID_EE
+ end-evaluate
+ begin-SQL on-error=Error-W2c-Processing
+    UPDATE PS_GPUS_YE_EE
+    SET GPUS_YE_STATUS = '30'
+       WHERE EMPLID = &E.EMPLID
+        AND GPUS_CAL_YEAR = &E.GPUS_CAL_YEAR
+        AND GPUS_TAXFORM_ID = $Taxform_ID_EE
+        AND GPUS_TAX_EIN IN (SELECT GPUS_TAX_EIN FROM PS_GPUS_YE_EE0_VW VW
+                                WHERE VW.GPUS_TAX_EIN = &E.GPUS_TAX_EIN
+                                AND VW.GPUS_CAL_YEAR = &E.GPUS_CAL_YEAR);
+ end-SQL
+end-procedure
+
+
+
+begin-procedure Update-W2C-Parameters
+
+ let $W2c_Error = 'Update-W2C-Parameters  '
+ begin-SQL on-error=Error-W2c-Processing
+  UPDATE PS_GPUS_YEC_DAT
+   SET GPUS_YEC_STATUS = '20'
+  WHERE GPUS_YEC_BATCH_NBR = &YEC_BATCH.GPUS_YEC_BATCH_NBR
+  AND GPUS_TAXFORM_ID = $Taxform_ID
+  AND GPUS_YEC_STATUS <> '30';
+end-SQL
+
+  do Update-Yec-Batch
+
+end-procedure
+
+begin-procedure Update-Reg-Reprint-Status
+
+ let $W2c_Error = 'Update-Reg-Reprint-Status '
+
+ begin-SQL on-error=Error-W2c-Processing
+  UPDATE PS_GPUS_RC_YE2
+   SET GPUS_YE_REPRINT  = '1';
+ end-SQL
+
+ let $W2c_Error = 'Delete-W2c-EE  '
+
+ begin-SQL on-error=Error-W2c-Processing
+  DELETE FROM  PS_GPUS_RC_YE4
+  WHERE OPRID         = $Prcs_OprID
+  AND RUN_CNTL_ID   = $Prcs_Run_Cntl_ID
+ end-SQL
+
+
+end-procedure
+
+begin-procedure Update-Yec-Batch
+let $W2c_Error = 'Update-Yec-Batch'
+begin-SQL on-error=Error-W2c-Processing
+UPDATE PS_GPUS_YEC_BATCH
+ SET GPUS_YEC_BAT_OPEN ='N'
+  WHERE GPUS_CAL_YEAR = #W2c_Batch_Yr
+  AND GPUS_TAXFORM_ID= $Taxform_ID
+  AND GPUS_YEC_BATCH_NBR=#W2c_Batch_Nbr;
+end-SQL
+end-procedure
+
+
+begin-procedure Error-W2c-Processing
+  display 'W2c Processing Error ' noline
+end-procedure
+
+
+begin-procedure Next-Form
+
+  if $first_time = 'N'
+     new-page
+  end-if
+  next-column
+  do Print-Value(' ',#Top_Margin,1,'Top Margin')
+  next-listing
+  do Print-Value(' ',#Last_Print_Line,1,'Last Print Line')
+
+
+  let $First_time = 'N'
+
+end-procedure
+
+
+begin-procedure Format-W2c-Number(#in, :$out, $mask)
+
+  if #in <> 0
+    move #in to $out :$mask
+    let $out = translate($out,',.',$_Delimiters)
+  else
+      let $out = '           0'
+  end-if
+
+
+end-procedure
+
+
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'stdapi.sqc'    !Update Process API
+#Include 'gpusw2c.sqc'
+#Include 'gpusrntl.sqc'  !Retrieve data from Tax Reporting Run Control record

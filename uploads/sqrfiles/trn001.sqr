@@ -1,0 +1,654 @@
+
+!***********************************************************************
+!  TRN001:  Training Letter Data Extract                               *
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+!                                                                      *
+! This module contains confidential and proprietary information        *
+! of Oracle; it is not to be copied, reproduced, or transmitted        *
+! in any form, by any means, in whole or in part, nor is it to         *
+! be used for any purpose other than that for which it is              *
+! expressly provided under the applicable license agreement.           *
+!                                                                      *
+! Copyright (C) 2006 Oracle. All Rights Reserved.                      *
+!                                                                      *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!          $Date:  2006/07/19:15:40:20                                 !
+!       $Release:  HR9                                                 !
+!      $Revision:  101                                                 !
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+! This SQR is a 'shell' program that creates several output files that *
+! may be used to perform a mail merge using a word processing package  *
+! to print letters to notify training students of the following        *
+! actions:                                                             *
+!                                                                      *
+! 1.  Confirmation of enrollment in a course session.                  *
+! 2.  Notice of course session rescheduling.                           *
+! 3.  Notice of course cancellation.                                   *
+!                                                                      *
+! This program performs these steps:                                   *
+!                                                                      *
+! 1.  Reads CRSE_SESSN_TBL, looking for sessions where RESCHEDULED=Y.  *
+!     Reads TRAINING, looking for students enrolled in the             *
+!     rescheduled session; sets LETTER_CD to 'RSC' ('reschedule');     *
+!     sets CRSE_SESSN_TBL.RESCHEDULED=N.                               *
+!                                                                      *
+! 2.  Reads the TRAINING table for letters to be printed, i.e., any    *
+!     records that have a blank letter printed date and a letter code  *
+!     of 'CON' (confirmation), 'RSC' (reschedule), or 'CAN'            *
+!     (cancellation) and session_status <> COMPLETED.*
+!                                                                      *
+! 3.  For the letters to be printed, updates the letter printed date   *
+!     with the date this program is run.                               *
+!                                                                      *
+! 4.  Creates one output file for each type of letter to be printed.   *
+!     These output files contain all the data (in comma-separated      *
+!     variable (CSV) format) required for a word processing package    *
+!     to use as input to print the letters.                            *
+!***********************************************************************
+
+#include 'setenv.sqc'    !Set environment
+#include 'setup06.sqc'   !Printer and page-size initialization
+
+#define CRSE_SESS_DATES
+#define TRN_FACIL_TBL
+#define TRN_ROOM_TBL
+! #define PERSONAL_DATA
+#include 'rellang.sqc'
+#define RELLANG_PROG
+
+begin-report
+  do Init-DateTime
+  do Init-Number
+  do Get-Current-DateTime
+  do Init-Report
+  do Process-Main
+  do Stdapi-Term
+end-report
+
+
+begin-procedure Init-Report
+  move 'TRN001' to $ReportID
+  move 'Training Letter Data Extract' to $ReportTitle
+  display $ReportTitle
+  do Set-MonthDDYYYY
+  move 'LTR' to $AppPrefix  !3 character to group files by application
+  move 'LTR' to $OutputFile !3 character to group files created by program
+
+! Process Scheduler setup
+  do Stdapi-Init
+  let $language_cd = $CURR_LANGUAGE_CD
+  if $prcs_process_instance = ''
+    !No Prompt
+  else
+     do Get-Values
+  end-if
+
+end-procedure
+
+
+begin-procedure Get-Values
+begin-SELECT
+RCT.FROMDATE
+  do Format-DateTime(&RCT.FROMDATE, $Fromdate, {DEFDATE}, '', '')
+RCT.THRUDATE
+RCT.COURSE_AND_DATE
+RCT.FROMDATE_CRSE
+RCT.THRUDATE_CRSE
+RCT.COURSE
+RCT.SESSION_NBR
+ FROM PS_RUN_CNTL_TRN001 RCT
+ !-- begin resolution 151585
+   WHERE RCT.OPRID = $prcs_oprid
+   AND RCT.RUN_CNTL_ID = $prcs_run_cntl_id
+   !-- End resolution 151585
+end-SELECT
+end-procedure
+
+
+begin-procedure Set-MonthDDYYYY
+! Format to pass the current date for merging with letters as
+! Month DD, YYYY format
+
+  move '1' to $MMLZero
+  move '1' to $DDLZero
+  move '1' to $Year4
+  do Format-DateTime($AsOfToday, $out, {DEFMDY},'','')
+  let $MonthCd =  {ps-substr}($out, 1, 2)
+  do Get-Month-Name ($MonthCd, $MonthName)
+  let $Current_Date = $MonthName || ' ' || {ps-substr}($out,4,2) || ', ' || {ps-substr}($out,7,4)
+end-procedure
+
+
+begin-procedure Process-Main
+  do Reschedule-Students
+  do Create-Extract
+
+!DG
+  if rtrim($prcsoutputdir,' ') <> ''
+       do Write-Done
+  end-if
+
+end-procedure
+
+
+!***********************************************************************
+! Reschedule-Students searches CRSE_SESSN_TBL for sessions that have   *
+! been rescheduled (RESCHEDULED=Y).  It then searches TRAINING         *
+! for students enrolled or waitlisted for that session and sets        *
+! LETTER_CD=RSC; sets CRSE_SESSN_TBL.RESCHEDULED=N.                    *
+!***********************************************************************
+
+begin-procedure Reschedule-Students
+begin-SELECT
+S1.COURSE
+  let $Crse = &S1.COURSE
+S1.SESSION_NBR
+  let $Sess = &S1.SESSION_NBR
+S1.RESCHEDULED
+  do Find-Students
+  do Update-Session
+ FROM  PS_CRSE_SESSN_TBL S1
+WHERE  S1.RESCHEDULED = 'Y'
+ AND ((S1.COURSE_START_DT BETWEEN &RCT.FROMDATE AND &RCT.THRUDATE)
+  OR  (S1.COURSE = &RCT.COURSE_AND_DATE
+       AND S1.COURSE_START_DT BETWEEN &RCT.FROMDATE_CRSE AND &RCT.THRUDATE_CRSE)
+  OR  (S1.COURSE = &RCT.COURSE
+       AND S1.SESSION_NBR = &RCT.SESSION_NBR))
+end-SELECT
+end-procedure
+
+
+begin-procedure Find-Students
+begin-SELECT
+T1.EMPLID
+T1.COURSE
+T1.SESSION_NBR
+T1.LETTER_CD
+  do Update-Students
+ FROM  PS_TRAINING T1
+WHERE  T1.COURSE = $Crse
+  AND  T1.SESSION_NBR = $Sess
+end-SELECT
+end-procedure
+
+
+begin-procedure Update-Students
+  let $sql-statement = 'TRN001.SQR,Update-Students,PS_Training'
+begin-SQL On-Error=SQL-Error
+UPDATE  PS_TRAINING
+   SET  LETTER_CD         = 'RSC'
+ WHERE  EMPLID            = &T1.Emplid
+  !AND  NON_EMPLOYEE_ID   = &T1.Non_Employee_ID
+   AND  COURSE            = &T1.Course
+   AND  SESSION_NBR       = &T1.Session_Nbr
+end-SQL
+end-procedure
+
+
+begin-procedure Update-Session
+  let $sql-statement = 'TRN001.SQR,Update-Session,PS_Crse_Sessn_Tbl'
+begin-SQL On-Error=SQL-Error
+UPDATE  PS_CRSE_SESSN_TBL
+   SET  RESCHEDULED       = 'N'
+ WHERE  COURSE            = $Crse
+   AND  SESSION_NBR       = $Sess
+end-SQL
+end-procedure
+
+
+!***********************************************************************
+! Create-Extract scans TRAINING for letters to be printed (LETTER_CD   *
+! isn't blank and LETTER_PRINTED_DT is blank).  It sets                *
+! LETTER_PRINTED_DT to today's date and creates one ASCII file for     *
+! confirmation and reschedule letters and another file for cancellation*
+! letters.                                                             *
+!***********************************************************************
+
+begin-procedure Create-Extract
+  move ' ' to $Prior_Letter_Cd
+begin-SELECT
+T.LETTER_CD
+  if &T.Letter_Cd <> $Prior_Letter_Cd          !when letter code changes
+    let $Letter_Cd = rtrim(&T.Letter_Cd,' ')   !start a new report file
+    move '{IMPORTPREFIX}'   to   $FileName
+
+    do Get-prcsoutputdir
+    if (rtrim($prcsoutputdir,' ') <> '')
+       move $prcsoutputdir to $Filename
+    end-if
+
+
+    concat $AppPrefix     with $FileName
+    concat $Letter_Cd     with $FileName
+    concat '.'            with $Filename
+    concat $OutputFile    with $Filename
+    concat '{IMPORTSUFFIX}' with $Filename
+    NEW-REPORT $Filename
+    if $Letter_Cd = 'CON'
+      move 'SystemDate,Line1,Line2,Line3,Line4,Line5,Line6,Salutation,Course,Course_Title,Course_Start_Dt,Course_End_Dt,Sessn_Start_Time,Sessn_End_Time,Line7,Line8,Line9,Line10,Line11,Line12,Line13' to $ioarea
+    end-if
+    if $Letter_Cd = 'RSC'
+      move 'SystemDate,Line1,Line2,Line3,Line4,Line5,Line6,Salutation,Course,Course_Title,Course_Start_Dt,Course_End_Dt,Sessn_Start_Time,Sessn_End_Time,Line7,Line8,Line9,Line10,Line11,Line12' to $ioarea
+    end-if
+    if $Letter_Cd = 'CAN'
+      move 'SystemDate,Line1,Line2,Line3,Line4,Line5,Line6,Salutation,Course,Course_Title,Course_Start_Dt' to $ioarea
+    end-if
+    print $ioarea (1,1)
+    NEXT-LISTING
+    move &T.Letter_Cd to $Prior_Letter_Cd
+  end-if
+T.EMPLID
+  let $EmplID = &T.EMPLID
+  do Get-Empl-Pers-Data
+T.COURSE_START_DT
+  do Format-DateTime(&T.Course_Start_Dt, $Start_Dt, {DEFDATE}, '', '')
+T.COURSE
+  let $Course = rtrim(&T.Course, ' ')
+T.SESSION_NBR
+  let $Session = rtrim(&T.Session_Nbr, ' ')
+T.COURSE_TITLE
+  let $Course_Title = rtrim(&T.Course_Title, ' ')
+  do Get-Session-Data
+  do Print-Record
+  do Update-Training
+  NEXT-LISTING
+    FROM   PS_TRAINING T,
+           PS_CRSE_SESSN_TBL CS
+   WHERE   T.LETTER_PRINTED_DT IS NULL
+     AND   T.LETTER_CD         IN ('CON','RSC','CAN')
+     AND   T.COURSE = CS.COURSE
+     AND   T.SESSION_NBR = CS.SESSION_NBR
+     AND   CS.SESSION_STATUS <> 'C'
+     AND ((CS.COURSE_START_DT BETWEEN &RCT.FROMDATE AND &RCT.THRUDATE)
+      OR  (CS.COURSE = &RCT.COURSE_AND_DATE
+           AND CS.COURSE_START_DT BETWEEN &RCT.FROMDATE_CRSE AND &RCT.THRUDATE_CRSE)
+      OR  (CS.COURSE = &RCT.COURSE
+           AND CS.SESSION_NBR = &RCT.SESSION_NBR))
+ORDER BY  T.LETTER_CD
+end-SELECT
+end-procedure
+
+
+begin-procedure Get-Session-Data
+begin-SELECT
+SD.COURSE
+SD.SESSION_NBR
+SD.CUT_SESSION_NBR
+S.COURSE_END_DT
+  do Format-DateTime(&S.Course_End_Dt, $End_Dt, {DEFDATE}, '', '')
+SD.FACILITY
+
+  if rtrim(&SD.Facility, ' ') <> '' or &SD.Facility <> ' '
+    do Get-Facility-Name
+    let $facility-name = rtrim($F.Descr,' ')
+    move $facility-name to   $Line7
+    concat '  '         with $Line7
+  end-if
+SD.ROOM_CD
+  if rtrim(&SD.Room_Cd, ' ') <> '' or &SD.Room_Cd <> ' '
+    do Get-Room-Name
+    if rtrim(&R.BUILDING, ' ') <> '' or &R.BUILDING <> ' '
+      let $building = rtrim($R.BUILDING,' ')
+      concat 'Bldg ' with $Line7
+      concat $building with $Line7
+      concat '  '    with $Line7
+    end-if
+    if rtrim(&R.FLOOR, ' ') <> '' or &R.FLOOR <> ' '
+      let $floor = rtrim($R.FLOOR,' ')
+      concat 'Floor ' with $Line7
+      concat $Floor with $Line7
+      concat '  '    with $Line7
+    end-if
+    if rtrim(&R.ROOM_NBR, ' ') <> '' or &R.ROOM_NBR <> ' '
+      let $room_nbr = rtrim($R.ROOM_NBR,' ')
+      concat 'Room ' with $Line7
+      concat $room_nbr with $Line7
+    end-if
+  end-if
+SD.ADDRESS1
+SD.ADDRESS2
+SD.ADDRESS3
+SD.ADDRESS4
+SD.NUM1
+SD.NUM2
+SD.HOUSE_TYPE
+SD.ADDR_FIELD1
+SD.ADDR_FIELD2
+SD.ADDR_FIELD3
+SD.POSTAL
+SD.CITY
+SD.STATE
+SD.COUNTY
+SD.COUNTRY
+SD.GEO_CODE
+SD.IN_CITY_LIMIT
+
+S.COURSE
+S.SESSION_NBR
+
+   !* Set global variabel to be used in Adformat.sqc
+   let $ADDRESS1        = RTRIM(&SD.ADDRESS1,' ')
+   let $ADDRESS2        = RTRIM(&SD.ADDRESS2,' ')
+   let $ADDRESS3        = RTRIM(&SD.ADDRESS3,' ')
+   let $ADDRESS4        = RTRIM(&SD.ADDRESS4,' ')
+   let $HOUSE_TYPE      = RTRIM(&SD.HOUSE_TYPE,' ')
+   let $ADDR_FIELD1     = RTRIM(&SD.ADDR_FIELD1,' ')
+   let $ADDR_FIELD2     = RTRIM(&SD.ADDR_FIELD2,' ')
+   let $ADDR_FIELD3     = RTRIM(&SD.ADDR_FIELD3,' ')
+   let $NUM1            = RTRIM(&SD.NUM1,' ')
+   let $NUM2            = RTRIM(&SD.NUM2,' ')
+   let $CITY            = RTRIM(&SD.CITY,' ')
+   let $STATE           = RTRIM(&SD.STATE,' ')
+   let $POSTAL          = RTRIM(&SD.POSTAL,' ')
+   let $COUNTY          = RTRIM(&SD.COUNTY,' ')
+   let $COUNTRY         = RTRIM(&SD.COUNTRY,' ')
+   let $GEO_CODE        = RTRIM(&SD.GEO_CODE,' ')
+   let $IN_CITY_LIMIT   = RTRIM(&SD.IN_CITY_LIMIT,' ')
+
+   do Get_Related_CRSE_SESS_DATES(&SD.COURSE, &SD.CUT_SESSION_NBR, &SD.SESSION_NBR)
+
+   let $NAME = ''
+   do ADFORMAT
+   do Compress-Address
+
+  move $ADDLINE1  to $Line8
+  move $ADDLINE2  to $Line9
+  move $ADDLINE3  to $Line10
+  move $ADDLINE31 to $Line11
+  move $ADDLINE4  to $Line12
+
+
+  if $Letter_Cd = 'CON'
+    move &F.DESCRLONG to $Line13
+  end-if
+
+{DATETIMEOUT-PREFIX}S.SESSN_START_TIME{DATETIMEOUT-SUFFIX} &Sessn_Start_Time
+  if length(&Sessn_Start_Time) > 15
+    move '1' to $Year4
+    do Format-DateTime(&Sessn_Start_Time,$start-time,{DEFMDY},'time','')
+    let $start-time = {ps-substr}($start-time,12,20)
+    do Format-Times($start-time, $start-time)
+  else
+    do Format-Times(&Sessn_Start_Time, $start-time)
+  end-if
+{DATETIMEOUT-PREFIX}S.SESSN_END_TIME{DATETIMEOUT-SUFFIX} &Sessn_End_Time
+  if length(&Sessn_End_Time) > 15
+    move '1' to $Year4
+    do Format-DateTime(&Sessn_End_Time, $end-time, {DEFMDY}, 'time', '')
+    let $end-time = {ps-substr}($end-time,12,20)
+    do Format-Times($end-time, $end-time)
+  else
+    do Format-Times(&Sessn_End_Time, $end-time)
+  end-if
+    FROM  PS_CRSE_SESSN_TBL S,
+          PS_CRSE_SESS_DATES SD,
+          PS_CRS_1ST_SESS_VW SV
+   WHERE  S.COURSE      = $Course
+     AND  S.SESSION_NBR = $Session
+     AND  S.SESSION_STATUS <> 'C'
+     AND  S.COURSE = SD.COURSE
+     AND  S.SESSION_NBR = SD.SESSION_NBR
+     AND  S.COURSE_START_DT = SD.SESSN_START_DT
+     AND  SD.COURSE = SV.COURSE
+     AND  SD.SESSION_NBR = SV.SESSION_NBR
+     AND  SD.SESSN_START_DT = SV.SESSN_START_DT
+     AND  SD.SESSN_START_TIME = SV.SESSN_START_TIME
+end-SELECT
+end-procedure
+
+
+begin-procedure Format-Times ($timeIn, :$timeOut)
+  extract $time-hour   from $timeIn 0 2
+  extract $time-min    from $timeIn 3 2
+  let #time-hour     = $time-hour
+  if #time-hour >= 12
+    move 'PM' to $am-pm
+  else
+    move 'AM' to $am-pm
+  end-if
+  if #time-hour > 12
+    subtract 12 from #time-hour
+!    let $timeOut   = #time-hour
+    move #time-hour to $timeout 99
+  else
+    let $timeOut   = $time-hour
+  end-if
+  let $timeOut   = ltrim($timeOut, '0')
+  let $timeOut   = ltrim($timeOut, ' ')
+  if #time-hour < 10
+    let $timeOut   = {ps-substr}($timeOut,1,1)
+  else
+    let $timeOut   = {ps-substr}($timeOut,1,2)
+  end-if
+  concat ':'        with $timeOut
+  concat $time-min with $timeOut
+  concat ' '        with $timeOut
+  concat $am-pm     with $timeOut
+
+end-procedure
+
+
+!***********************************************************************
+! Student can be an employee or a non-employee. Address is             *
+! obtained from PERSONAL_ADDRESS.                                      *
+!***********************************************************************
+
+begin-procedure Get-Empl-Pers-Data
+begin-SELECT
+P.EMPLID
+P.NAME
+
+ move &P.NAME to $NAME
+ move $NAME to $FName
+  do Rotate-Name
+
+   Do Get-Empl-Address ($Emplid,'HOME', $AddressFound)
+
+   Let $COUNTRY  = $GETADDR_Country
+   let $ADDRESS1 = $GETADDR_Address1
+   let $ADDRESS2 = $GETADDR_Address2
+   let $ADDRESS3 = $GETADDR_Address3
+   let $ADDRESS4 = $GETADDR_Address4
+   let $HOUSE_TYPE = $GETADDR_HOUSE_TYPE
+   let $ADDR_FIELD1 = $GETADDR_ADDR_FIELD1
+   let $ADDR_FIELD2 = $GETADDR_ADDR_FIELD2
+   let $ADDR_FIELD3 = $GETADDR_ADDR_FIELD3
+   let $NUM1 = $GETADDR_NUM1
+   let $NUM2 =$GETADDR_NUM2
+   let $CITY = $GETADDR_CITY
+   let $STATE =$GETADDR_STATE
+   let $POSTAL = $GETADDR_POSTAL
+   let $COUNTY = $GETADDR_COUNTY
+   let $GEO_CODE =$GETADDR_GEO_CODE
+   let $IN_CITY_LIMIT =$GETADDR_IN_CITY_LIMIT
+
+   do ADFORMAT                ! Formats the address based on Country
+   do Compress-Address         ! Removes blank lines from the formatted address
+  move $ADDLINE1  to $Line1
+  move $ADDLINE2  to $Line2
+  move $ADDLINE3  to $Line3
+  move $ADDLINE31 to $Line4
+  move $ADDLINE4  to $Line5
+  move $ADDLINE5  to $Line6
+
+  do Get-First-Name
+
+ FROM  PS_PERSON_NAME P
+WHERE  P.EMPLID = $EmplID
+
+end-SELECT
+end-procedure
+
+
+begin-procedure Get-First-Name
+  find ',' in $FName 0 #locf
+  add 1 to #locf
+  find ' ' in $FName #locf #spLocn
+  if #spLocn = -1              !no Middle Initial
+    move 41 to #spLocn
+  end-if
+  subtract #locf from #spLocn  !derive the length of First Name
+  extract $FirstName from $FName #locf #spLocn
+  move $FirstName to $Salutation
+end-procedure
+
+
+begin-procedure Get-Facility-Name
+begin-SELECT
+F.DESCR
+F.FACILITY
+F.DESCRLONG
+
+   let $TRN_FACIL_TBL-DESCR = &F.DESCR
+   do Get_Related_TRN_FACIL_TBL(&F.FACILITY)
+   let $F.DESCR = $TRN_FACIL_TBL-DESCR
+
+ FROM PS_TRN_FACIL_TBL F
+WHERE F.FACILITY = &SD.Facility
+end-SELECT
+end-procedure
+
+begin-procedure Get-Room-Name
+begin-SELECT
+R.FACILITY
+R.ROOM_CD
+R.ROOM_NBR
+R.BUILDING
+R.FLOOR
+
+   let $TRN_ROOM_TBL-ROOM_NBR = &R.ROOM_NBR
+   let $TRN_ROOM_TBL-BUILDING = &R.BUILDING
+   let $TRN_ROOM_TBL-FLOOR = &R.FLOOR
+   do Get_Related_TRN_ROOM_TBL(&R.FACILITY, &R.ROOM_CD)
+   let $R.ROOM_NBR = $TRN_ROOM_TBL-ROOM_NBR
+   let $R.BUILDING = $TRN_ROOM_TBL-BUILDING
+   let $R.FLOOR = $TRN_ROOM_TBL-FLOOR
+
+ FROM PS_TRN_ROOM_TBL R
+WHERE R.FACILITY=&SD.Facility
+AND R.ROOM_CD=&SD.Room_Cd
+end-SELECT
+end-procedure
+
+begin-procedure Print-Record
+  if $Letter_Cd = 'CON'
+    do Print-Section1
+    do Print-Section2
+    do Print-Section3
+    do Print-Section4
+  end-if
+  if $Letter_Cd = 'RSC'
+    do Print-Section1
+    do Print-Section2
+    do Print-Section3
+  end-if
+
+  if $Letter_Cd = 'CAN'
+    do Print-Section1
+    do Print-Section3
+  end-if
+end-procedure
+
+
+begin-procedure Print-Section1
+  print '"'                 (1,1)
+  print $Current_Date       ()
+  print '","'               ()
+  print $Line1              ()
+  print '","'               ()
+  print $Line2              ()
+  print '","'               ()
+  print $Line3              ()
+  print '","'               ()
+  print $Line4              ()
+  print '","'               ()
+  print $Line5              ()
+  print '","'               ()
+  print $Line6              ()
+  print '","'               ()
+  print $Salutation         ()
+  print '","'               ()
+  print $Course             ()
+  print '","'               ()
+  print $Course_Title       ()
+  print '","'               ()
+  print $Start_Dt  ()
+end-procedure
+
+
+begin-procedure Print-Section2
+  print '","'               ()
+  print $End_Dt    ()
+  print '","'               ()
+  print $start-time         ()
+  print '","'               ()
+  print $end-time           ()
+  print '","'               ()
+  print $Line7              ()
+  print '","'               ()
+  print $Line8              ()
+  print '","'               ()
+  print $Line9              ()
+  print '","'               ()
+  print $Line10             ()
+  print '","'               ()
+  print $Line11             ()
+  print '","'               ()
+  print $Line12             ()
+end-procedure
+
+
+begin-procedure Print-Section3
+  print '"'                 ()
+end-procedure
+
+
+begin-procedure Print-Section4
+  print ',"'                ()
+  print $Line13             ()
+  print '"'                 ()
+end-procedure
+
+
+begin-procedure Update-Training
+let $sql-statement = 'TRN001.SQR,Update-Training,Update,PS_Training'
+begin-SQL On-Error=SQL-Error
+UPDATE PS_TRAINING
+   SET  LETTER_PRINTED_DT = $AsOfToday
+ WHERE  EMPLID            = $EmplID
+   AND  COURSE            = $Course
+   AND  SESSION_NBR       = $Session
+end-SQL
+end-procedure
+
+
+begin-procedure Write-Done
+! Create a temporary output file so that a Windows-based word processing
+! package such as Word for Windows can detect that the SQR report has
+! completed processing.
+
+  open '{IMPORTPREFIX}DONEFLG.TMP{IMPORTSUFFIX}' as 1 for-writing record=4
+  move 'DONE' TO $ioarea
+  write 1 from $ioarea
+  close 1
+end-procedure
+
+#include 'stdapi.sqc'    !Routine to update run status
+#include 'hrrnctl1.sqc'  !Get run control parameter values
+#include 'hrgetval.sqc'  !Get values mask routines
+#Include 'rotname1.sqc'  !Rotate-Name procedure
+#Include 'getmonnm.sqc'  !Get-Month-Name procedure
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'getaddr.sqc'   !Get Current Address for Employee
+#Include 'adformat.sqc'  !Global address format
+#Include 'sqrtrans.sqc'  !Translate SQR strings to given language
+#include 'getlogou.sqc'  !get current logoutputdir

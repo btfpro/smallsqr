@@ -1,0 +1,572 @@
+!**********************************************************
+!  FSA003:  Flexible Spending Account Check Print Module  *
+!**********************************************************
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+!                                                                      *
+! This module contains confidential and proprietary information        *
+! of Oracle; it is not to be copied, reproduced, or transmitted        *
+! in any form, by any means, in whole or in part, nor is it to         *
+! be used for any purpose other than that for which it is              *
+! expressly provided under the applicable license agreement.           *
+!                                                                      *
+! Copyright (C) 2006 Oracle. All Rights Reserved.                      *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+!                $Date:  2006/04/25:05:52:36                           !
+!             $Release:  HR9                                           !
+!            $Revision:  102                                           !
+!                                                                      *
+!***********************************************************************
+!This program accomplishes the following:
+!  1.  Accesses PS_Pay_Form_Tbl to retrieve Form_ID
+!      Note:  During
+!      FSA Check Preparation (program FSA003), the operator will be prompted
+!      for a Form_ID to be used for the check stock.  Each check stock
+!      to be used currently requires a separate execution of FSA003 (the
+!      check preparation program), although two calendar years and multiple
+!      Benefit Programs can be processed with one execution of FSA003 on
+!      a single check stock.
+!  2.  The program then selects all PS_FSA_RunCtl records which use the
+!      Form_ID above and which have their FSA_Run_Status
+!      indicators set to "C" (for "Calculated").  The program will use the
+!      FSA_Run_ID in each of these run control records to locate matching
+!      values in one or more PS_Ben_Defn_Pgm records, and process the
+!      resulting Benefit_Program(s) as a group.  The processing programs
+!      will also use Calendar_Year in the retrieved PS_FSA_RunCtl record(s)
+!      to select only those claims for that particular Calendar_Year.
+!  3.  Retrieves all recently updated-for-payment FSA Claims for the
+!      control elements above.
+!  4.  PS_FSA_RunCtl is updated to signify the run has finished.
+!
+!This program acts on all claims with FSA_PayMt_Status of "R" (Pay This Run).
+!At the conclusion of the program, FSA_PayMt_Status is set to "F" (for
+!"Fully Paid") or "P" (for "Pended") based on whether or not the claim
+!has been paid in full or not.  All "Pended" claims are available for
+!payment during subsequent runs if sufficient balance and minimum-check
+!conditions are met.
+!
+!Check Numbers are assigned in program FSA002 to result in the following
+!order for printing:
+!
+!  Form ID
+!    Calendar Year
+!      Run ID
+!        Benefit Program
+!          Plan Type (Health Care, Dependent Day Care)
+!            Benefit Plan
+!              Employee ID
+!
+!Within a particular check, the line items are ordered by Claim ID.
+!
+!Consequently, the following results:
+!
+! All checks for a particular calendar year are grouped together.
+! All Benefit Programs with the same Run_ID are grouped together, but
+!   separately within the Run_ID.
+! All checks for a particular Plan_Type (e.g., Health Care) are grouped
+!   together within the "parent" Benefit_Program.
+! All checks for a particular Benefit_Plan are grouped within the Plan_Type;
+!   however, there will typically be just a single Benefit_Plan for a
+!   customer installation.
+! Lastly, all checks for one participant will be grouped together within
+!   tha Plan_Type/Benefit_Plan.
+!***********************************************************************
+
+#Include 'setenv.sqc'  !Set Database Environment
+
+Begin-Setup
+  #Include 'ptpsp125.sqc'
+End-Setup
+
+!***************************************************************************
+begin-program
+!***************************************************************************
+
+  do Init-Report
+
+  if $FormID <> ''
+    do Process-Main
+  end-if
+
+  do StdAPI-Term
+
+end-program
+
+
+!***************************************************************************
+begin-procedure Init-Report
+!***************************************************************************
+
+  do Init-DateTime
+  do Init-Number
+  do Load-NumberLits-Array  !load literals for converting Net Pay to words
+
+  move 'FSA003' to $ReportID
+  move 'FSA Claim Payment Module' to $ReportTitle
+  display $ReportTitle
+
+  do StdAPI-Init
+
+  if $prcs_process_instance = ''
+    do Ask-Values
+  else
+    do Get-Values
+  end-if
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Ask-Values
+!***************************************************************************
+  do Ask-FormID
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Ask-FormID
+!***************************************************************************
+  display ''
+  display 'Please enter the Form Identifier for the FSA check stock'
+  display 'you are using for this run.'
+  display ''
+
+  while 1 = 1
+    input $FormID maxlen=6 'Enter Form Identifier'
+    display ''
+
+    if $FormID = ''
+      break
+    end-if
+
+    uppercase $FormID
+    do Edit-FormID
+
+    if Rtrim(&Z.Form_ID, ' ') = $FormID
+      break
+    else
+      display 'Invalid Form Identifier.'
+      display 'Enter a valid identifier or leave blank to terminate'
+      display 'this program.'
+      display ''
+    end-if
+
+  end-while
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Edit-FormID
+!***************************************************************************
+
+begin-SELECT
+Z.FORM_ID
+FROM  PS_PAY_FORM_TBL Z
+WHERE FORM_ID = $FormID
+end-SELECT
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Get-Values
+!***************************************************************************
+  do Select-Parameters
+  do Get-FormID
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Process-Main
+!***************************************************************************
+
+  let $Checks_Were_Printed = 'N'
+
+begin-SELECT
+A.FORM_ID,
+A.LAST_FORM_USED,
+B.CALENDAR_YEAR,
+B.FSA_RUN_ID,
+B.CHECK_DT
+
+  let $Checks_Were_Printed = 'F'
+
+  move  &B.Calendar_Year to $tmp
+  let $in = $tmp ||'0101'
+  do Format-DateTime($in, $YearBegin, {DEFCMP},'','native')
+  let $in = $tmp ||'1231'
+  do Format-DateTime($in, $YearEnd, {DEFCMP},'','native')
+
+  do Retrieve-Benefit-Table-Records
+
+FROM  PS_PAY_FORM_TBL A,
+      PS_FSA_RUNCTL   B
+WHERE A.FORM_ID         = $FormID
+  AND B.FORM_ID         = A.FORM_ID
+  AND B.FSA_RUN_STATUS  = 'C'  !Calculated
+ORDER BY A.FORM_ID,
+         B.CALENDAR_YEAR,
+         B.FSA_RUN_ID
+end-SELECT
+
+  if $Checks_Were_Printed = 'Y'           !At least one check printed
+     do Update-FSA_RunCtl
+  end-if
+  if $Checks_Were_Printed = 'N'           !Form ID invalid
+     Display 'Form ID ('  noline
+     Display $FormID     noline
+     Display ') not Found in either FSA_RunCtl or Pay_Form_Tbl.'
+     Display '>>> Correct and Retry'
+  end-if
+  if $Checks_Were_Printed = 'F'           !Form found but no checks
+     Display 'No checks found for the Form ID ('   noline
+     Display $FormID                               noline
+     Display ') entered.'
+     Display '>>> Correct and Retry'
+  end-if
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Retrieve-Benefit-Table-Records
+!***************************************************************************
+begin-SELECT
+C.BENEFIT_PROGRAM,
+C.DESCR,
+C.DESCRSHORT,
+D.PLAN_TYPE,
+D.BENEFIT_PLAN,
+O.SETID,
+O.BALANCE_ID
+
+  do Get-BalanceID-Date-Range
+  do Print-Checks
+
+FROM  PS_BEN_DEFN_PGM    C,
+      PS_BEN_DEFN_OPTN   D,
+      PS_FSA_BENEF_TBL   O
+WHERE C.EFFDT =
+      (SELECT MAX(EFFDT)
+       FROM   PS_BEN_DEFN_PGM
+       WHERE  BENEFIT_PROGRAM = C.BENEFIT_PROGRAM
+         AND  EFFDT          <= $YearEnd)
+  AND C.EFF_STATUS      = 'A'
+  AND C.FSA_RUN_ID      = &B.FSA_Run_ID
+  AND D.BENEFIT_PROGRAM = C.BENEFIT_PROGRAM
+  AND D.EFFDT           = C.EFFDT
+  AND D.PLAN_TYPE    LIKE '6%'
+  AND D.OPTION_TYPE     = 'O'
+  AND O.PLAN_TYPE = D.PLAN_TYPE
+  AND O.BENEFIT_PLAN = D.BENEFIT_PLAN
+  AND O.EFFDT <= (SELECT MAX(O1.EFFDT)
+                     FROM PS_FSA_BENEF_TBL O1
+                     WHERE O1.PLAN_TYPE = O.PLAN_TYPE
+                       AND O1.BENEFIT_PLAN = O.BENEFIT_PLAN
+                       AND O1.EFFDT <= C.EFFDT)
+ORDER BY C.BENEFIT_PROGRAM,
+         D.PLAN_TYPE,
+         D.BENEFIT_PLAN
+end-SELECT
+end-procedure
+
+
+!****************************************
+begin-procedure Get-BalanceID-Date-Range
+!****************************************
+
+begin-SELECT
+MIN(P.BEGIN_DT)      &BeginDt,
+MAX(P.END_DT)        &EndDt,
+
+   let $YearBegin = &BeginDt
+   let $YearEnd = &EndDt
+
+FROM  PS_BALANCE_ID_DEF P
+WHERE P.SETID = &O.Setid
+  AND P.BALANCE_ID = &O.Balance_ID
+  AND P.BALANCE_YEAR = &B.Calendar_Year
+end-SELECT
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Print-Checks
+!***************************************************************************
+
+#ifdef DebugF
+  display 'FLOW : Print-Checks'
+  display '       =============================================='
+#end-if
+
+begin-SELECT
+G.PAYCHECK_NBR,
+G.CHECK_DT,
+G.FSA_CHECK_AMT,
+G.EMPLID,
+G.EMPL_RCD,
+G.PLAN_TYPE,
+G.BENEFIT_PLAN,
+G.FORM_ID,
+L.NAME
+
+#ifdef DebugD
+  display 'DATA : CHECK: '     noline
+  display &b.calendar_year     noline
+  display '  '                 noline
+  display &c.benefit_program   noline
+  display '  '                 noline
+  display &d.plan_type         noline
+  display '  '                 noline
+  display &d.benefit_plan      noline
+  display '  '                 noline
+  display &g.emplid            noline
+  display '  '                 noline
+  display &g.PAYCHECK_NBR
+#end-if
+
+  do Get-Empl-Address (&G.EMPLID,$AddrType, $AddressFound)
+  do Print-Claim-Payment
+  do Get-Claim-Detail
+
+  if $AmtPended = 'Y'
+    print '* Remaining amount has been pended awaiting additional ' (+1,1)
+    print 'contributions to your account.'                          ()
+    move 'N' to $AmtPended
+  end-if
+
+  NEW-PAGE
+  do Update-Claim-Status-Flags
+
+  let $Checks_Were_Printed = 'Y'
+
+FROM  PS_FSA_PAYMENT    G,
+      PS_PERSON_NAME    L
+WHERE G.FORM_ID            = $FormID
+  AND G.FSA_PAYMENT_STATUS = 'R'  !Pay This Run
+  AND G.CALENDAR_YEAR      = &B.Calendar_Year
+  AND G.PLAN_TYPE          = &D.Plan_Type
+  AND G.BENEFIT_PLAN       = &D.Benefit_Plan
+  AND G.BENEFIT_PROGRAM    = &C.Benefit_Program
+  AND L.EMPLID             = G.EMPLID
+ORDER BY G.PAYCHECK_NBR
+end-SELECT
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Print-Claim-Payment
+!***************************************************************************
+
+  move &G.FSA_Check_Amt to #NetPay
+  do Net-Pay-In-Words  !convert numbers to words
+
+  let $Name = RTrim(&L.Name,' ')
+
+!Print those fields for the Check itself
+  do Format-DateTime(&G.Check_Dt, $out, {DEFDATE}, '', '')
+  print $out                     (8,84)
+  do Format-Number(&G.PAYCHECK_NBR, $out, '099999999999999')
+  print $out                     (0,106)
+  print $Name                    (14,25)
+
+  print  $GETADDR_Address1       (+1,25)
+
+  if RTRIM($GETADDR_Address2, ' ') <> ''
+    print  $GETADDR_Address2     (+1,25)
+  end-if
+
+  let $city = RTRIM($GETADDR_City, ' ')
+  print  $city                   (+1,25)
+  print  ','                     (0,0)
+  print  $GETADDR_State          (0,+2)
+  print  $GETADDR_Postal         (0,+2)
+
+  do Format-Number(#NetPay, $out, '$$$,$$$,$$$,$$9.99')
+  print $out                     (17,90)
+  print $NetInWords              (21,25)
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Get-Claim-Detail
+!***************************************************************************
+
+#ifdef DebugF
+  display 'FLOW : Get-Claim-Detail'
+  display '       =============================================='
+#end-if
+
+  Let $Detail_Headers  = 'Y'
+
+begin-SELECT
+J.SVC_TYPE,
+J.SVC_FROM_DT
+J.SVC_TO_DT
+J.SVC_PROVIDER,
+J.CLAIMID,
+J.FSA_CLAIM_SUB_AMT,
+J.FSA_CLAIM_APR_AMT,
+J.FSA_CLAIM_PD_TO_DT,
+I.FSA_CLAIM_AMT_PD,
+X.FIELDNAME
+X.FIELDVALUE
+
+#ifdef DebugD
+  display 'DATA : CLAIM: '     noline
+  display &j.claimid           noline
+  display '  '                 noline
+  display &j.svc_from_dt
+#end-if
+
+  let $FieldName = &X.FIELDNAME
+  let $FieldValue = &X.FIELDVALUE
+  do Read-Translate-Table
+
+  if $Detail_Headers = 'Y'
+    do Print-Headers
+    Let $Detail_Headers = 'N'
+  end-if
+
+  do Print-Line-Item
+
+FROM  PS_FSA_PAYMT_CLAIM I,
+      PS_FSA_CLAIM       J,
+      PSXLATITEM         X
+WHERE I.FORM_ID          = $FormID
+  AND I.PAYCHECK_NBR           = &G.PAYCHECK_NBR
+  AND I.CHECK_DT         = &G.Check_Dt
+  AND I.PLAN_TYPE        = &G.Plan_Type
+  AND I.BENEFIT_PLAN     = &G.Benefit_Plan
+  AND J.CLAIMID          = I.CLAIMID
+  AND J.PLAN_TYPE        = I.PLAN_TYPE
+  AND J.BENEFIT_PLAN     = I.BENEFIT_PLAN
+  AND J.EMPLID           = &G.EmplID
+  AND J.PLAN_TYPE        = &G.Plan_Type
+  AND J.BENEFIT_PLAN     = &G.Benefit_Plan
+  AND J.FSA_CLAIM_STATUS IN ('P','F')  !Pended or Fully Processed
+  AND X.FIELDNAME        = 'SVC_TYPE'
+  AND X.FIELDVALUE       = J.SVC_TYPE
+  AND X.EFFDT =
+      (SELECT MAX(EFFDT)
+       FROM   PSXLATITEM
+       WHERE  FIELDNAME  = X.FIELDNAME
+         AND  FIELDVALUE = X.FIELDVALUE
+         AND  EFFDT     <= J.SVC_TO_DT)
+  AND X.EFF_STATUS = 'A'
+end-SELECT
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Print-Headers
+!***************************************************************************
+
+  print 'Check Date'                       (36,1)
+  do Format-DateTime(&G.Check_Dt, $out, {DEFMDY},'','')
+  print $out                               (0,+2)
+  print '  Check No.'                      (0,+2)
+  print &G.PAYCHECK_NBR                          (0,+2) edit 099999999999999
+  print $Name                              (0,+2)
+  print 'ID: '                             (0,+2)
+  print &G.EmplID                          ()
+  print 'Reimbursement for '               (+2,1)
+
+  if &D.Plan_Type = '60'
+    print 'Health Care Claims for '        ()
+  else
+    print 'Dependent Day Care Claims for ' ()
+  end-if
+
+  print &B.Calendar_Year                   () edit xxxx
+  print '          <--------- Service ---------->                        ' (+2,1)
+  print '<- Claim Amounts- >   <-- Claims Paid -->'                        ()
+  print 'Claim ID  Type            From        To       Provider         ' (+1,1)
+  print 'Submitted  Approved   To-Date  This Check'                        ()
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Print-Line-Item
+!***************************************************************************
+
+  print &J.ClaimID           (+1,1)
+  print &J.Svc_Type          (0,11)
+  print '-'                  ()
+  print $XlatShortName       ()
+  do Format-DateTime(&J.Svc_From_Dt, $out, {DEFMDY},'','')
+  print $out                               (0,25)
+  do Format-DateTime(&J.Svc_To_Dt, $out, {DEFMDY},'','')
+  print $out                    (0,36)
+  print &J.Svc_Provider         (0,48)
+  print &J.FSA_Claim_Sub_Amt    (0,66)  edit 99,999.99
+  print &J.FSA_Claim_Apr_Amt    (0,76)  edit 99,999.99
+  print &J.FSA_Claim_Pd_To_Dt   (0,86)  edit 99,999.99
+  print &I.FSA_Claim_Amt_Pd     (0,96)  edit 99,999.99
+
+  if &J.FSA_Claim_Apr_Amt > &J.FSA_Claim_Pd_To_Dt
+    print '*'                   (0,95)
+    move 'Y' to $AmtPended
+  end-if
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Update-Claim-Status-Flags
+!***************************************************************************
+
+let $sql-statement = 'FSA003.SQR,Update-Claim-Status-Flags,FSA_Payment,Update'
+begin-SQL on-error=SQL-Error
+UPDATE PS_FSA_PAYMENT
+  SET FSA_PAYMENT_STATUS = 'P'                        !Paid
+WHERE FSA_PAYMENT_STATUS = 'R'                        !Pay This Run
+  AND PAYCHECK_NBR          = &G.PAYCHECK_NBR
+  AND CHECK_DT        = &G.Check_Dt
+  AND FORM_ID         = &G.Form_ID
+  AND EMPLID          = &G.EmplID;
+end-SQL
+
+end-procedure
+
+
+!***************************************************************************
+begin-procedure Update-FSA_RunCtl
+!***************************************************************************
+
+let $sql-statement = 'FSA003.SQR,Update-FSA_RunCtl,FSA_Runctl,Update'
+begin-SQL on-error=SQL-Error
+UPDATE PS_FSA_RUNCTL
+   SET FSA_RUN_STATUS = 'F'
+ WHERE FSA_RUN_STATUS = 'C'
+   AND FORM_ID = $FormID;
+end-SQL
+
+end-procedure
+
+
+!***************************************************************************
+#Include 'ldnumlit.sqc'  !Load-NumberLits-Array procedure
+#Include 'netinwds.sqc'  !Net-Pay-In-Words procedure
+#Include 'readxlat.sqc'  !get translates for fieldname, value
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+
+#Include 'stdapi.sqc'    !Update Process API
+#Include 'bnrunctl.sqc'  !Get application run control parameters
+#Include 'bngetval.sqc'  !Get BEN values mask routines
+#Include 'getaddr.sqc'   !Get current address for specified address type
+
+!***************************** End of Report ***************************

@@ -1,0 +1,1154 @@
+!***********************************************************************
+! GEXPYVHR:  AP Voucher File Creation                                  *
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module is the confidential and proprietary information of       *
+! Giant Eagle, Inc.; it is not to be copied, reproduced,or transmitted *
+! in any form, by any means, in whole or in part, nor is it to be used *
+! for any purpose other than that for which it is expressly provided   *
+! without the written permission of Giant Eagle.                       *
+!                                                                      *
+! Copyright (c) 1997-1998 Giant Eagle,Inc. All Rights Reserved         *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+! GEXPYVHR :            AP Voucher File Creation                       *
+!                                                                      *
+! Narrative:            This program creates a weekly report and file  *
+!                       of AP Vouchers.                                *
+!                                                                      *
+! #Debugx Used:         #debug9 paragraph trace                        *
+!                               #debug8 key variable values            *
+!                               #debug7 data returned from sql calls   *
+!                                                                      *
+! Written by:           Sreeni Kutam                                   *
+!                                                                      *
+! Normally Run:         Weekly                                         *
+!                                                                      *
+! Control Parms:                FOR WHERE CLAUSE:                      *
+!                         AP Vendor ID                                 *
+!                                 Quarter(s)                           *
+!                                 DeptID(s)                            *
+!                                 As Of Date                           *
+!                                                                      *
+!***********************************************************************
+!                         MODIFICATION HISTORY                         *
+!***********************************************************************
+! INITIALS      DATE            DESCRIPTION OF THE CHANGE              *
+!***********************************************************************
+! SXK           05/12/99        Initial Creation                       *
+!                                                                      *
+! SXK           10/09/1999      Modified to have same AP business Unit *
+!				for corporate,warehouse,gemco and gemco*
+!				pharmacy for company GEI               *
+!				Also modified to have same ap business *
+!				unit for warehouse,Retail MArkets and  *
+!				retail pharmacy                        *
+!				Also, modified to have company field   *
+!                               Report sort order is changed to        *
+!				company,business_unit,ap_Vendor_id     *
+!                                                                      *
+! SXK           10/13/1999      Modified to look at due date also while*
+!				sending file                           *
+!                                                                      *
+! SXK           10/21/1999      Modified to have invoice_dt = pay end  *
+!                               date condition instead of              *
+!                               substr(invoice_id)                     *
+!                                                                      *
+! AXL           08/08/2000	Added code to handle new Columbus      *
+!                               division.                              *
+!                                                                      *
+! CJH           09/12/2000      Add AP_BUSINESS_UNIT to PS_GEX_DEPT_TBL*
+!                                                                      *
+! CJH           10/24/2000      Correct ORDER BY on reports, bus unit  *
+!                               sub-select.                            *
+!                                                                      *
+! CJH           02/13/2001      Add order to gex_dept_tbl select       *
+!                                                                      *
+! AXL           04/27/2001      Add logic to check AP ORIGIN overrides *
+!                               on new GEX_DEDUCT_AP tbl.              *
+!                               Add #debug displays.                   *
+!                                                                      *
+! AXL           05/16/2001      Exclude Independents from AP Origin    *
+!                               override logic.                        *
+!                                                                      *
+! AXL           06/13/2001      Adjust GL Business Unit logic          *
+!                                                                      *
+! AXL           07/05/2001      Use HR deptid from PS_GEX_DISTRIB_TBL  *
+!                               to process GL Business Unit.           *
+!                                                                      *
+! AXL           09/13/2001      Correction to GL Business Unit logic.  *
+!                                                                      *
+! AXL           02/13/2006      Correction to Business Unit validation *
+!                               in the main procedure.                 *
+! GEX ISDVNPK   06/23/2008 To process for Manually added Vouchers      * 
+!***********************************************************************
+
+#include 'setenv.sqc' !Set environment
+#include 'setup02.sqc'
+
+!*********************************************************************
+!Initial processing, retrieving current dates and calls the main 
+!procedure to do the processing.                                     
+!*********************************************************************
+begin-report
+  !do Set-Optimizer-Goal
+  do Init-DateTime
+  do Init-Number
+  do stdapi-init
+  do Get-Calendar-Year-Id
+  move 'GEXPYVHR' to $ReportID
+  move 'AP VOUCHER FILE' to $ReportTitle
+  display $ReportTitle noline
+  display '  ' noline
+
+  do Get-Current-DateTime
+
+  let $sev-error = 'N'
+  let $firstcomp = 'Y'
+  let $firstrec = 'Y'
+  let #tot_count = 0
+  let #write_recs = 0
+  
+  Let $GEXXX902_Deptid_Alias = 'D.DEPTID'
+
+  Let $GEXXX953_Ap_Vendor_Id_Alias = 'V.AP_VENDOR_ID_10'
+  Let $GEXXX953_Address_Seq_Num_Alias = 'V.ADDRESS_SEQ_NUM'
+
+  If $prcs_process_instance = ''
+    Do P110-SQRW-Run-Controls
+  Else
+    Do P120-Process-Scheduler-Run-Controls
+  End-If
+  Do Select-Pay-End-Dt  
+  
+! CJH - 10/19/2000 - begin
+  if $in-option = 'F'
+     let $X000_Order_By = 'ORDER BY V.AP_VENDOR_ID_10, V.ADDRESS_SEQ_NUM, V.COMPANY, V.BUSINESS_UNIT'
+  else
+     let $X000_Order_By = 'ORDER BY V.COMPANY, V.BUSINESS_UNIT, V.AP_VENDOR_ID_10, V.ADDRESS_SEQ_NUM'
+  end-if
+!  Let $X000_Order_By = 'ORDER BY V.AP_VENDOR_ID_10, V.ADDRESS_SEQ_NUM, D.DEPTID, V.BUSINESS_UNIT'
+! CJH - 10/19/2000 - end
+
+  Do Format-DateTime($X000_Where_Select_AsOfDate, $X000_Report_Heading_AsOfDate, {DEFDATE}, '', '')
+
+  Do P130-Print-Cover-Page
+
+  do Report
+  do Commit-Transaction
+  date-time () hh:mi:ss &timeEnded
+  display 'Report Ended: ' noline
+  display &timeEnded
+  do stdapi-term
+end-report
+
+!begin-procedure Set-Optimizer-Goal
+!  Begin-SQL
+!    Alter Session Set OPTIMIZER_GOAL=RULE;
+!  End-SQL
+!end-procedure
+
+Begin-Procedure P110-SQRW-Run-Controls
+#debug9 Show 'P110-SQRW-Run-Controls'
+  Do Ask-As-Of-Date
+  Let $X000_WHERE_SELECT_ASOFDATE = $AsOfDate
+  display $X000_WHERE_SELECT_ASOFDATE
+  Let $GEXXX953_Ap_Vendor_Id_Alias = 'V.AP_VENDOR_ID_10'
+  Let $GEXXX953_Address_Seq_Num_Alias = 'V.ADDRESS_SEQ_NUM'
+
+  Display 'Enter Report (R) or File (F) to produce either a report or a file.'
+  Input $In-Option Maxlen=1 'Option'
+ 
+  Let $DeptidString = ''''
+  Display 'Enter Deptid or leave blank to exit.'
+  While 1=1
+    Input $In-Deptid Maxlen=4 'Deptid'
+    Uppercase $In-Deptid
+    If Rtrim($In-Deptid, ' ') = ''
+      Concat '''' With $DeptidString
+      Break
+    End-If
+    If $DeptidString <> ''''
+      Concat ''',''' With $DeptidString
+    End-If
+    Concat $In-Deptid With $DeptidString
+  End-While
+	   
+  If $DeptidString = ''''''
+    Let $GEXXX902_INCLUDE_DEPTID_CRITERIA = '1=1'
+    Let $GEXXX902_INCLUDE_DEPTID_DISPLAY_CRITERIA = 'ALL'
+  Else
+    Let $GEXXX902_INCLUDE_DEPTID_CRITERIA = $GEXXX902_Deptid_Alias || ' In (' || $DeptidString || ')'
+    Let $GEXXX902_INCLUDE_DEPTID_DISPLAY_CRITERIA = $GEXXX902_INCLUDE_DEPTID_CRITERIA
+  End-If
+
+  Let $AddressSeqNumString = ''''
+  Display 'Enter Address Seq Num or leave blank to exit.'
+  While 1=1
+    Input $In-Address Maxlen=15 'Address Seq Num'
+    Uppercase $In-Address
+    If Rtrim($In-Address, ' ') = ''
+      Concat '''' With $AddressSeqNumString
+      Break
+    End-If
+    If $AddressSeqNumString <> ''''
+      Concat ''',''' With $AddressSeqNUmString
+    End-If
+    Concat $In-Address With $AddressSeqNumString
+  End-While
+
+  If $AddressSeqNumString = ''''''
+    Let $GEXXX953_INCLUDE_ADDRESS_SEQ_NUM_CRITERIA = '1=1'
+    Let $GEXXX953_INCLUDE_ADDRESS_SEQ_NUM_DISPLAY_CRITERIA = 'ALL'
+  Else
+    Let $GEXXX953_INCLUDE_ADDRESS_SEQ_NUM_CRITERIA = $GEXXX953_Address_Seq_Num_Alias || ' In (' || $AddressSeqNumString || ')'
+    Let $GEXXX953_INCLUDE_ADDRESS_SEQ_NUM_DISPLAY_CRITERIA = $GEXXX953_INCLUDE_ADDRESS_SEQ_NUM_CRITERIA
+  End-If
+  
+  Let $ApVendorString = ''''
+  Display 'Enter Ap Vendor Id or leave blank to exit.'
+  While 1=1
+    Input $In-ApVendor Maxlen=15 'Ap Vendor Id'
+    Uppercase $In-ApVendor
+    If Rtrim($In-Apvendor, ' ') = ''
+      Concat '''' With $ApVendorString
+      Break
+    End-If
+    If $ApVendorString <> ''''
+      Concat ''',''' With $ApVendorString
+    End-If
+    Concat $In-ApVendor With $ApVendorString
+  End-While
+
+  If $ApVendorString = ''''''
+    Let $GEXXX953_INCLUDE_AP_VENDOR_ID_CRITERIA = '1=1'
+    Let $GEXXX953_INCLUDE_AP_VENDOR_ID_DISPLAY_CRITERIA = 'ALL'
+  Else
+    Let $GEXXX953_INCLUDE_AP_VENDOR_ID_CRITERIA = $GEXXX953_Ap_Vendor_id_Alias || ' In (' || $ApVendorString || ')'
+    Let $GEXXX953_INCLUDE_AP_VENDOR_ID_DISPLAY_CRITERIA = $GEXXX953_INCLUDE_AP_VENDOR_ID_CRITERIA
+  End-If
+
+End-Procedure
+
+
+Begin-Procedure P120-Process-Scheduler-Run-Controls
+#debug9 Show 'P120-Process-Scheduler-Run-Controls'
+  
+  Do GEXXX922-Select-Parameters
+  
+  move $GEX_RC_PAY.REPORT_TYPE to $In-Option
+
+  Let $X000_Where_Select_AsOfDate = $GEX_RC_PAY.AsOfDate
+  If Rtrim ($GEX_RC_PAY.AsOfDate, ' ') = ''
+    Let $X000_Where_Select_AsOfDate = $AsOfToday
+  End-If
+
+  Let $GEXXX902_Deptid_Alias = 'D.DEPTID'
+  Do GEXXX902-Select-Deptid-Parameters
+
+  Let $GEXXX953_Ap_Vendor_Id_Alias = 'V.AP_VENDOR_ID_10'
+  Let $GEXXX953_Address_Seq_Num_Alias = 'V.ADDRESS_SEQ_NUM'
+  Do GEXXX953-Select-Ap-Vendor-Id-Parameters
+
+  Let #GEX_RC_PAY.Balance_Qtr = 0 
+  
+End-Procedure
+
+!************************************
+begin-procedure P130-Print-Cover-Page
+#debug9 Show 'P130-Print-Cover-Page'
+  Print 'RUN CONTROL INFORMATION FOR THIS REPORT RUN:'            (+5,1)
+  Print '$Prcs_OprID          ='                                  (+2,5)
+  Print $Prcs_OprID                                               (0,+2)
+  Print '$Prcs_Run_Cntl_ID    ='                                  (+1,5)
+  Print $Prcs_Run_Cntl_ID                                         (0,+2)
+
+  Print 'SELECTION CRITERIA FOR THIS REPORT RUN:'                 (+5,2)
+
+!  Print '$GEXXX953_INCLUDE_ADDRESS_SEQ_NUM_CRITERIA             =' (+1,5)
+!  Print $GEXXX953_INCLUDE_ADDRESS_SEQ_NUM_CRITERIA                 (0,+2)
+  
+  Print '$GEXXX953_INCLUDE_AP_VENDOR_ID_CRITERIA             ='   (+1,5)
+  Print $GEXXX953_INCLUDE_AP_VENDOR_ID_CRITERIA                   (0,+2)
+
+  Print '$GEXXX902_INCLUDE_DEPTID_CRITERIA                   ='   (+1,5)
+  Print $GEXXX902_INCLUDE_DEPTID_CRITERIA                         (0,+2)
+
+!  Print '$GEX_RC_PAY.BALANCE_QTR                             ='   (+1,5)
+!  Print #GEX_RC_PAY.Balance_Qtr                                   (0,+2)
+
+  Print 'As Of Date :'                      (+2,5)
+  Print $X000_Report_Heading_AsOfDate       (0,+2)
+  print 'Option: ' (+1,5)
+  print $in-option (0,+2)
+  Print 'SORT ORDER FOR THIS REPORT RUN:'   (+5,2)
+  Print $X000_Order_By                      (+2,5)
+
+  Let #PAGE-COUNT = 0
+  NEW-PAGE
+  Let #PAGE-COUNT = 1
+End-Procedure
+
+begin-procedure Report
+  date-time () hh:mi:ss &timeBegan
+  display 'Report Began: ' noline
+  display &timeBegan
+
+ move 'N' to $Errorfound
+
+ if $sev-error = 'Y'
+    goto Report-exit
+ end-if
+  
+ do process-data
+
+Report-Exit:
+
+  If $Data-Found-Flag <> 'Y'
+    Print 'NO DATA SELECTED FOR THIS REPORT RUN'        (25,) Center
+  End-If
+
+  display #InputTran 99999 noline
+  display ' Transactions Processed: '
+
+end-procedure
+
+!*********************************************************************
+!Prints the header information in the report.
+!*********************************************************************
+
+begin-heading 7
+
+ #Include 'stdhdg01.sqc'
+
+
+  print 'COMPANY'               (+2,01)
+  print 'BUSINESS UNIT'          (0,12)
+  print 'AP VENDOR ID'           (0,30)
+  print 'NAME'                   (0,48)
+  print 'AP ORIGIN'             (0,83)	!AXL 4/27/2001 New field request
+  print 'INVOICE ID'            (0,95) 
+  print 'INVOICE DT'            (0,115)
+  print '  DUE DATE'            (0,128)
+  print 'GL DEPT'               (0,142)
+  print 'GL ACCT'               (0,150)
+!  print 'GL PRODUCT'            (0,159)
+  print 'GROSS AMT'             (0,160)
+
+  print '-'                   (+1,01,172) FILL
+
+end-heading
+
+!*********************************************************************
+! Select all valid Employees for a specific selections
+!*********************************************************************
+
+begin-procedure process-data
+
+display 'Begin process'
+!SXK - 10/19/1999 Begin
+if $in-option = 'F'
+ let $order_by = 'ORDER BY V.AP_VENDOR_ID_10, V.ADDRESS_SEQ_NUM, V.COMPANY, V.BUSINESS_UNIT'
+else
+ let $order_by = 'ORDER BY V.COMPANY, V.BUSINESS_UNIT, V.AP_VENDOR_ID_10, V.ADDRESS_SEQ_NUM'
+end-if
+!SXK - 10/19/1999 End
+
+!display $GEXXX953_INCLUDE_ADDRESS_SEQ_NUM_CRITERIA
+display $GEXXX953_INCLUDE_AP_VENDOR_ID_CRITERIA
+display $GEXXX902_INCLUDE_DEPTID_CRITERIA
+display $order_by
+
+move 'NEXT' to $voucher_id
+
+Let $Data-Found-Flag = 'N'
+
+if $In-Option = 'F'
+let $filename = '{OUTFILE}'||'gexpyvhr.dat'
+open $filename as 1
+     for-writing record=680
+
+if #writestat != 0
+   display 'Error Opening output file.  Program terminating.'
+   stop
+end-if
+end-if
+display $pay_end_Dt
+do Convert-to-dtu-date($pay_end_dt,$pay_end_dt_dtu)
+let $pay_yy = substr($pay_end_dt_dtu,1,4)
+let $pay_mm = substr($pay_end_dt_dtu,6,2)
+let $pay_dd = substr($pay_end_dt_dtu,9,2)
+let $payenddt = $pay_mm||$pay_dd||$pay_yy
+
+move 'N' to $rowfound
+
+let #inputtran = 0
+
+begin-select ON-ERROR=SQL-Error-Found('Process-data')
+
+V.INVOICE_ID
+  move &V.INVOICE_ID to $invoice_id
+
+V.INVOICE_DT
+  move &V.INVOICE_DT to $invoice_dt
+
+V.ENTERED_DT
+  move &V.ENTERED_DT to $entered_dt
+
+V.BUSINESS_UNIT
+  move &V.BUSINESS_UNIT to $business_unit_v	!AXL 06/13/2001 Rename $var
+V.COMPANY
+  move &V.COMPANY to $company
+
+V.AP_VENDOR_ID_10
+  move &V.AP_VENDOR_ID_10 to $ap_vendor_id
+
+V.ADDRESS_SEQ_NUM
+  move &V.ADDRESS_SEQ_NUM to #address_seq_num
+
+V.MESSAGE_TEXT_WRK
+  move &V.MESSAGE_TEXT_WRK  to $message
+
+V.DUE_DT
+  move &V.DUE_DT to $due_dt
+V.ORIG_SOURCE
+
+V.DEDCD			! AXL 04/27/2001 New Field
+V.GEX_AP_ORIGIN !GEX ISDVNPK  01/29/2008
+
+! 09/12/2000 - CJH - Add AP Business Unit to initial select.  If the AP Business Unit is
+!                    populated, use it, otherwise use the $business_unit for the
+!                    $ap_business_unit value.
+!                    Remove all of the hardcoded business unit assignments
+
+!  if Rtrim($division,' ') = ''
+
+
+!     if rtrim($business_unit,' ') = '05435'
+!        move '00009' to $ap_business_unit
+!     else
+!        move $business_unit to $ap_business_unit
+!     end-if
+!  else
+!     !SXK 10/09/1999 added corporate, video and whs division to be in 10000
+!     if $division = 'GEM' or $division = 'GPH' or $division = 'VDO'
+!        or ($division = 'WHS' and $company = 'GEI') or $division = 'COR'
+!        move '10000' to $ap_business_unit
+!     else
+!        if $division = 'RMC' or $division = 'RPH' 
+!           or ($division = 'WHS' and $company = 'TMK') !SXK 10/09/1999 Added whs division
+!           move '20000' to $ap_business_unit
+!        else
+!           if rtrim($business_unit,' ') = '05435'
+!              move '00009' to $ap_business_unit
+!           else
+!              if $division = 'COL' 			!AXL 08/08/2000 Added COL division
+!                 move '40000' to $ap_business_unit	!AXL 08/08/2000 Added COL division
+!              else
+!                 move $business_unit to $ap_business_unit
+!              end-if
+!           end-if
+!        end-if
+!     end-if
+
+
+ !GEX ISDVNPK  06/23/2008 To process for Manually added Vouchers
+ If rtrim(&V.GEX_AP_ORIGIN, ' ') = ''
+  do select-dept-info   !GEX ISDVNPK  01/29/2008    
+         !GEX ISDVNPK  01/29/2008
+         if Rtrim($gex_bus_unit_ap,' ') = ''
+            move $business_unit_v to $ap_business_unit	!AXL 06/13/2001 Rename $var
+         else
+            move $gex_bus_unit_ap to $ap_business_unit
+         end-if
+         !GEX ISDVNPK  01/29/2008
+!  end-if
+! 09/12/2000 - CJH - end
+
+  !GEX ISDVNPK  01/29/2008
+  !AXL  4/13/2001  Begin
+  if &V.COMPANY > '999'   !AXL 5/16/2001 Does not apply to Independants
+     if &V.ORIG_SOURCE ='DED' or &V.ORIG_SOURCE ='GRN'
+        do get-ap-override
+        if isblank(&X.GEX_AP_ORIGIN) = 0	! Not blank - Override with Deduction Tbl value
+          let $origin = &X.GEX_AP_ORIGIN
+        end-if
+     end-if
+  !GEX ISDVNPK  01/29/2008
+  end-if
+  !AXL  4/13/2001  End    
+  
+    else
+     move $business_unit_v to $ap_business_unit	!AXL 06/13/2001 Rename $var
+     Let $origin = &V.GEX_AP_ORIGIN !GEX ISDVNPK  01/29/2008
+   end-if
+  !GEX ISDVNPK  06/23/2008 To process for Manually added Vouchers
+  
+  let $opr = 'APBTH' || $origin
+
+  Do Select-Distrib-Sum
+
+  Do Select-Gross-Amt
+  if $In-Option = 'F'
+     Do Write-Header-Record
+
+     Do Write-Trailer1
+  end-if
+
+  Do Select-Distrib-Tbl
+  
+  Let $Data-Found-Flag = 'Y' 
+  move 'Y' to $rowfound
+  add 1 to #inputtran
+
+FROM  PS_GEX_VOUCHER_TBL V
+
+WHERE [$GEXXX953_INCLUDE_AP_VENDOR_ID_CRITERIA] 
+! CJH - 10/24/2000 - begin
+AND   V.BUSINESS_UNIT in ((select D.BUSINESS_UNIT
+                from ps_gex_dept_tbl d
+                where [$GEXXX902_INCLUDE_DEPTID_CRITERIA]
+                and d.effdt = (select max(effdt)
+                from ps_gex_dept_tbl
+                where deptid = d.deptid
+                and business_unit = d.business_unit
+                and effdt <= $pay_end_dt))
+              UNION
+                (select D.GEX_BUS_UNIT_AP
+                from ps_gex_dept_tbl d
+                where d.effdt = (select max(effdt)
+                from ps_gex_dept_tbl
+                where deptid = d.deptid
+                !and business_unit = d.gex_Bus_unit_ap		 AXL 2/13/2006 - Bad selection Criteria
+		and gex_Bus_unit_ap = d.gex_Bus_unit_ap		!AXL 2/13/2006 - Correct qualifier
+                and effdt <= $pay_end_dt)))
+! CJH - 10/24/2000 - end
+!SXK 10/21/1999 Begin
+and v.invoice_dt = $pay_end_dt
+!SXK 10/21/1999 End
+!sxk 10/09/1999 added company in the order by clause
+!SXK modified to have dynamic order by based on either File option or
+!Report option
+[$order_by]
+
+
+end-select
+
+if $rowfound = 'N'
+   display 'No Employees found for this Report.' 
+   print '** NO DATA SELECTED FOR THIS REPORT RUN **'  (25,) center
+else
+   
+   print 'Total Number of Vouchers: ' (+2,1)
+   print #inputtran (,160)
+   print 'Grand Total ' (+2,1)
+   print #total_amt (,160) edit 999999999.99
+   
+end-if
+
+end-procedure
+
+begin-procedure select-dept-info
+let $dept_info_found = 'N'
+begin-select loops=1
+!D1.DEPTID
+!  move &D1.DEPTID to $deptid
+
+D1.GEX_AP_ORIGIN
+  move &D1.gex_ap_ORIGIN to $origin
+D1.GEX_COMPANY_DIV_CD
+  move &D1.GEX_COMPANY_DIV_CD to $division
+! 09/12/2000 - CJH - add GEX_BUS_UNIT_AP to select
+D1.GEX_BUS_UNIT_AP
+  move &D1.GEX_BUS_UNIT_AP to $gex_bus_unit_ap
+! 09/12/2000 - CJH - end
+
+  move 'Y' to $dept_info_found
+
+from ps_gex_dept_tbl d1, ps_dept_tbl cd
+! CJH - 09/12/2000 - begin
+! where d1.business_unit = $business_unit
+where (d1.business_unit = $business_unit_v or
+       d1.gex_bus_unit_ap = $business_unit_v)  !AXL 06/13/2001 Rename $var
+! CJH - 09/12/2000 - end
+!SXK 10/09/1999 Begin
+and d1.deptid = cd.deptid
+and cd.company = $company
+and cd.effdt = (select max(effdt)
+		from ps_dept_tbl 
+		where deptid = cd.deptid
+		and effdt <= $pay_end_Dt)
+!SXK 10/09/1999 End
+and d1.effdt = (select max(effdt)
+   		from ps_geX_dept_tbl
+		where deptid = d1.deptid
+		and effdt <= $pay_end_dt)
+! CJH - 02/13/2001 - begin
+order by d1.deptid asc
+! CJH - 02/13/2001 - end
+end-select
+if $dept_info_found = 'N'
+   show 'Dept Info is not found for business unit:'
+   show $business_unit_v		!AXL 06/13/2001 Rename $var
+   show $company
+   show $pay_end_dt
+   stop
+end-if
+! GEX ISDVNPK 06/24/2008
+! If the SQR bombs with the above error then GEX_DEPT_TBL is missing AP origin for the  above BUSINESS UNIT, COMPANY 
+! AP ORIGIN needs to be added by the USERS in the GEX_DEPT_TBL and after that this process can be rerun
+! GEX ISDVNPK 06/24/2008
+end-procedure   
+
+!AXL  4/13/2001  Begin
+!*********************************************************************
+begin-procedure Get-AP-Override
+!*********************************************************************
+#debug9 Show 'Get-AP-Override'
+
+  let $ap_origin_found = 'N'
+begin-select 
+
+X.GEX_AP_ORIGIN
+
+  move 'Y' to $ap_origin_found
+
+  #debug8 display 'Override found for DEDCD: ' noline
+  #debug8 display &v.dedcd
+  
+FROM PS_GENL_DED_TBL  x
+WHERE X.EFFDT =
+        (SELECT MAX(EFFDT) FROM PS_GENL_DED_TBL
+        WHERE X.DEDCD = DEDCD
+        AND EFFDT <= $pay_end_Dt)
+AND dedcd  = &v.dedcd 
+ 
+end-select
+
+end-procedure   
+!AXL  4/13/2001  End
+
+!*************************************
+begin-procedure Select-Distrib-Sum
+move 0 to #distrib_num
+
+begin-select
+gd.distrib_num
+
+  add 1 to #distrib_num
+  
+from ps_gex_distrib_tbl gd
+where gd.ap_vendor_id_10 = &V.AP_VENDOR_ID_10
+and   gd.address_seq_num = &V.ADDRESS_SEQ_NUM
+and   gd.company = &V.COMPANY
+and   gd.business_unit = &V.BUSINESS_UNIT
+and   gd.invoice_dt = &V.INVOICE_DT
+and   gd.invoice_id = &V.INVOICE_ID
+and   gd.due_dt = &V.DUE_DT
+
+end-select
+
+if #distrib_num = 0
+   display 'NO info found in Distribution Table'
+   display &v.ap_vendor_id_10
+   display &v.address_seq_num
+   display &v.company
+   display &v.business_unit
+   display &v.invoice_dt
+   display &v.invoice_id
+   display &v.due_dt
+end-if
+end-procedure
+
+!*************************************
+begin-procedure Select-Gross-Amt
+move 0 to #voucher_amt
+
+begin-select
+sum(ga.gross_amt)        &ga.gross_amt
+
+   move &ga.gross_amt to #voucher_amt
+  
+from ps_gex_distrib_tbl ga
+where ga.ap_vendor_id_10 = &V.AP_VENDOR_ID_10
+and   ga.address_seq_num = &V.ADDRESS_SEQ_NUM
+and   ga.company = &V.COMPANY
+and   ga.business_unit = &V.BUSINESS_UNIT
+and   ga.invoice_dt = &V.INVOICE_DT
+and   ga.invoice_id = &V.INVOICE_ID
+and   ga.due_dt = &V.DUE_DT
+
+end-select
+
+if #voucher_amt = 0
+   display 'NO info found in Distribution Table - 1'
+   display &v.ap_vendor_id_10
+   display &v.address_seq_num
+   display &v.company
+   display &v.business_unit
+   display &v.invoice_dt
+   display &v.invoice_id
+   display &v.due_dt
+end-if
+end-procedure
+
+!*********************************************************************
+begin-procedure Select-Distrib-Tbl
+move 0 to #distrib_line_num 
+begin-select
+DB.AP_VENDOR_ID_10
+
+DB.ADDRESS_SEQ_NUM
+
+DB.BUSINESS_UNIT
+
+DB.INVOICE_ID
+
+DB.INVOICE_DT
+
+DB.DISTRIB_NUM
+
+DB.DEPARTMENT
+  move &DB.DEPARTMENT to $department
+DB.ACCOUNT
+  move &DB.ACCOUNT to $account
+DB.PRODUCT
+  move &DB.PRODUCT to $product
+
+DB.GROSS_AMT
+  move &DB.GROSS_AMT to #db.gross_amt
+  add 1 to #distrib_line_num
+!AXL 7/5/2001 New HR DEPTID field - Begin
+DB.DEPTID
+  move &DB.DEPTID to $deptid
+!AXL 7/5/2001 New HR DEPTID field - End
+
+  Do Get-GL-BU		!AXL 06/13/2001 New sub procedure
+
+  Do Write-Trailer2
+
+FROM PS_GEX_DISTRIB_TBL DB
+WHERE DB.AP_VENDOR_ID_10 = &V.AP_VENDOR_ID_10
+AND   DB.ADDRESS_SEQ_NUM = &V.ADDRESS_SEQ_NUM
+AND   DB.COMPANY         = &V.COMPANY
+AND   DB.BUSINESS_UNIT   = &V.BUSINESS_UNIT
+AND   DB.INVOICE_ID      = &V.INVOICE_ID
+AND   DB.INVOICE_DT      = &V.INVOICE_DT
+and   db.due_dt          = &V.DUE_DT
+
+end-select
+if #distrib_line_num = 0
+   display 'NO info found in Distribution Table - 2'
+   display &v.ap_vendor_id_10
+   display &v.address_seq_num
+   display &v.company
+   display &v.business_unit
+   display &v.invoice_dt
+   display &v.invoice_id
+   display &v.due_dt
+end-if
+print 'Total for this voucher: ' (+2,1)
+print #voucher_amt (,159) edit 999999999.99
+add #voucher_amt to #total_amt
+position (+1)
+
+end-procedure
+
+!AXL 06/13/2001 New sub procedure to secure GL BU - Begin
+!*********************************************************************
+begin-procedure Get-GL-BU
+!*********************************************************************
+
+    let $business_unit = ' '   
+
+Begin-SELECT
+
+GL2.BUSINESS_UNIT
+ move &GL2.BUSINESS_UNIT to $business_unit
+
+FROM PS_DEPT_TBL GL,
+     PS_GEX_DEPT_TBL GL2
+WHERE   GL.DEPTID = $deptid	!AXL 7/5/2001 use HR deptid instead of GL deptid
+    AND GL2.SETID  = GL.SETID
+    AND GL2.DEPTID = GL.DEPTID
+    AND GL2.EFFDT  = GL.EFFDT
+    AND GL.EFFDT =
+        (SELECT MAX(EFFDT) FROM PS_DEPT_TBL
+        WHERE GL.SETID  = SETID
+          AND GL.DEPTID = DEPTID
+          AND EFFDT <= $pay_end_dt)
+
+end-select
+
+end-procedure
+!AXL 06/13/2001 New sub procedure to secure GL BU - End
+
+!*********************************************************************
+! Write Record Information to a file
+!*********************************************************************
+begin-procedure Write-Header-Record
+
+  add 1 to #write_header
+
+  move '000' to $header_record
+  
+  move ' '                to $filler
+  move '+00000000000.00'  to $filler2
+  move '000000.00000000' to $filler1
+
+  let $inv_dd = substr($invoice_dt,1,2)
+  let $inv_mm = substr($invoice_dt,4,3)
+  let $inv_yy = substr($invoice_dt,10,2)
+  let $invoice_all = $inv_dd||'-'||$inv_mm||'-'||$inv_yy||' '
+
+  if #address_seq_num = 0
+     move '000' to $address_seq_num
+  else
+     move #address_seq_num to $address_seq_num 009
+  end-if
+  
+!  if #vchr_ttl_lines = 0
+     let $vchr_ttl_lines = '00001'
+!  else
+!     move #vchr_ttl_lines to $vchr_ttl_lines 99999
+!  end-if
+
+  if #voucher_amt = 0
+     let $voucher_amt = '+00000000000.00'
+  else
+    if #voucher_amt < 0
+     move #voucher_amt to $voucher_amt  000000000000.99
+    else
+     move #voucher_amt to $voucher_amt  00000000000.99
+     let $voucher_amt = '+'||$voucher_amt
+    end-if
+  end-if
+
+  if #dscnt_amt = 0
+     let $dscnt_amt = '+00000000000.00'
+  else
+
+    if #dscnt_amt < 0
+      move #dscnt_amt to $dscnt_amt     000000000000.99
+    else     
+      move #dscnt_amt to $dscnt_amt     00000000000.99
+     let $dscnt_amt = '+'||$dscnt_amt
+    end-if
+  end-if
+
+  if #freight_amt = 0
+     let $freight_amt = '+00000000000.00'
+  else
+    if #freight_amt < 0
+     move #freight_amt to $freight_amt  000000000000.99
+    else
+     move #freight_amt to $freight_amt  00000000000.99
+     let $freight_amt = '+'||$freight_amt
+    end-if
+  end-if
+
+  if rtrim($due_dt,' ') = ''
+     let $due_all = ' '
+  else
+     let $due_beg = substr($due_dt,1,7)
+     let $due_end = substr($due_dt,10,2)
+     let $due_all = $due_beg||$due_end||' '
+  end-if
+
+  if rtrim($dscnt_due_dt,' ') = ''
+     let $dscnt_all = ' '
+  else
+     let $dscnt_beg = substr($dscnt_due_dt,1,7)
+     let $dscnt_end = substr($dscnt_due_dt,10,2)
+     let $dscnt_all = $dscnt_beg||$dscnt_end||' '
+  end-if
+  
+  if rtrim($entered_dt,' ') = ''
+     let $enter_all = ' '
+  else
+     let $enter_beg = substr($entered_dt,1,7)
+     let $enter_end = substr($entered_dt,10,2)
+     let $enter_all = $enter_beg||$enter_end||' '
+  end-if
+
+  !AXL 4/27/2001  New debug stmts Begin
+  #debug8 display 'inserting hdr rec'
+  #debug8 display 'vendor id: ' noline
+  #debug8 display $ap_vendor_id
+  #debug8 display 'invoice id: ' noline
+  #debug8 display $invoice_id
+  #debug8 display 'hdr rec dedcd: ' noline
+  #debug8 display &v.dedcd
+  #debug8 display 'origin: ' noline
+  #debug8 display $origin
+  #debug8 display '$voucher_amt: ' noline
+  #debug8 display $voucher_amt
+  !AXL 4/27/2001  New debug stmts End
+
+  write 1 from $header_record:3
+	       $ap_business_unit:5
+	       $voucher_id:8
+	       $invoice_id:16
+	       $invoice_all:10
+	       '   GE':5
+	       $ap_vendor_id:10
+	       $address_seq_num:3
+	       $filler:6
+	       $origin:3
+	       $opr:8
+	       $vchr_ttl_lines:5
+	       $enter_all:10
+	       'P':1
+	       $filler:10
+	       $filler:8                   
+	       $voucher_amt:15
+	       $dscnt_amt:15
+	       $filler:8
+	       $filler2:15
+	       $filler:8
+	       $freight_amt:15
+	       $due_all:10
+	       $dscnt_all:10
+	       '   00':5
+	       $enter_all:10
+	       $filler:3
+	       $filler:5
+	       $filler1:15
+	       $filler2:15
+	       'N':1
+	       'N':1
+	       'EX':2
+	       $filler:25
+	       $address_seq_num:3
+	       'T':1
+	       'U':1
+	       'U':1
+	       'P':1
+	       ' ':96
+	       '+0.00':5
+	       ' ':15
+	       'USA':3
+	       'USA':3
+	       ' ':262
+
+
+end-procedure
+
+!*********************************************************************
+begin-procedure Write-Trailer1
+
+  move '001' to $row_id
+
+  move '+000000000.0000' to $filler3
+  move '+00000000.00000' to $filler4
+
+!  if #voucher_line_num = 0 
+     let $voucher_line_num = '00001'
+!  else
+!     move #voucher_line_num to $voucher_line_num 00009
+!  end-if
+
+  if rtrim($po_id,' ') = ''
+     let $po_id = ' '
+  end-if
+
+  if #voucher_amt = 0
+     let $merch_amt = '+00000000000.00'
+  else 
+
+    if #voucher_amt < 0
+     move #voucher_amt to $merch_amt 000000000000.99  
+    else
+     move #voucher_amt to $merch_amt 00000000000.99  
+     let $merch_amt = '+'||$merch_amt
+    end-if
+  end-if
+
+  if #distrib_num = 0
+     move '00000' to $total_distribs
+  else
+     move #distrib_num to $total_distribs 00009
+  end-if
+
+write 1 from $row_id:3
+	     $ap_business_unit:5
+	     $voucher_id:8
+	     $voucher_line_num:5
+	     $filler:5
+	     $po_id:10
+	     '00000':5
+	     '000':3
+	     $message:30
+	     $merch_amt:15
+	     $filler:23
+	     $filler3:15
+	     $filler2:15
+	     $filler:3
+	     $filler4:15
+	     $filler:2
+	     'N':1
+	     $filler:4
+	     'N':1
+	     $filler:8
+	     '+0.00':5
+	     $filler:15
+	     '00000':5
+	     '000':3
+	     'N':1
+	     $filler:10
+	     $total_distribs:5
+	     $filler:460
+
+end-procedure
+
+!***************************************************
+begin-procedure Write-Trailer2
+
+move '002' to $row_id
+if #distrib_line_num = 0
+   move '00000' to $distrib_line_num
+else
+   move #distrib_line_num to $distrib_line_num 00009
+end-if
+if #db.gross_amt = 0
+   move $filler2 to $distrib_amt
+else
+   move #db.gross_amt to $distrib_amt 000000000009.99
+end-if
+if $In-Option = 'F'
+write 1 from $row_id:3
+	     $ap_business_unit:5
+	     $voucher_id:8
+	     $voucher_line_num:5
+	     $distrib_line_num:5
+	     $account:6
+	     $filler:3
+	     $filler3:15
+	     $filler2:15
+	     $filler:10
+	     'O':1
+	     $filler:30
+	     $distrib_amt:15
+	     $business_unit:5
+	     $filler:15
+	     '0000000000000':13
+	     $filler:65
+	     $filler2:15
+	     $filler2:15
+	     $filler2:15
+	     $filler2:15
+	     $filler2:15
+	     $filler:15
+	     '0000000000000':13
+	     $department:10
+	     $product:6
+	     $filler:342
+
+end-if
+
+  Do Select-Name1
+  Do Print-Trailer2
+
+end-procedure
+
+!*********************************************************************
+begin-procedure Select-Name1
+let $name1 = ' ' 
+begin-select
+N.NAME1
+  move &N.NAME1 to $name1
+
+FROM PS_GEX_VENDOR_ADDR N
+WHERE N.AP_VENDOR_ID_10 = &V.AP_VENDOR_ID_10
+AND   N.ADDRESS_SEQ_NUM = &V.ADDRESS_SEQ_NUM
+end-select
+if rtrim($name1,' ') = ''
+   do select-name1-1
+end-if
+end-procedure
+
+begin-procedure select-name1-1
+begin-select
+n1.name1
+  move &n1.name1 to $name1
+from ps_gex_vendor_tbl n1
+where n1.ap_vendor_id_10 = &V.AP_VENDOR_ID_10
+end-select
+end-procedure
+
+!*********************************************************************
+begin-procedure Print-Trailer2
+
+  move #db.gross_amt to $db.gross_amt 99999999990.99
+  let $ap_vendor_id_p = &V.AP_VENDOR_ID_10||'-'||to_char(&V.ADDRESS_SEQ_NUM)
+
+print &V.COMPANY             (+1,1)
+print &V.BUSINESS_UNIT       (0,12)
+print $ap_vendor_id_p        (0,30)
+print $name1                 (0,48)
+print $origin		     (0,83)	!AXL 4/27/2001 AP Origin
+print &V.INVOICE_ID          (0,95)
+print &V.INVOICE_DT          (0,115)
+print &V.DUE_DT              (0,128)
+print &DB.DEPARTMENT         (0,142)
+print &DB.ACCOUNT            (0,150)
+!print &DB.PRODUCT            (0,169)
+print $db.gross_amt          (0,160) edit 999999999.99
+
+end-procedure
+
+!*********************************************************************
+begin-procedure Select-Pay-End-Dt
+begin-select
+MAX(PC.PAY_END_DT)      &pay_end_dt
+  move &pay_end_dt   to $pay_end_dt
+FROM   PS_PAY_CAL_BAL_ID PC
+WHERE  PC.PAY_END_DT <= $X000_WHERE_SELECT_ASOFDATE 
+end-select
+  display 'Last Confirmed Pay End Date: ' noline
+  display $pay_end_dt
+end-procedure
+
+!*********************************************************************
+begin-procedure Select-Qtr-Pay-End-Dt
+begin-select
+MAX(PC2.PAY_END_DT)         &pc2.pay_end_dt
+  move &pc2.pay_end_dt   to $pay_end_dt
+FROM   PS_PAY_CAL_BAL_ID PC2
+WHERE  PC2.PAY_END_DT <= $X000_WHERE_SELECT_ASOFDATE 
+AND    PC2.BALANCE_QTR = #GEX_RC_PAY.Balance_Qtr
+end-select
+  display 'Last Confirmed Pay End Date: ' noline
+  display $pay_end_dt
+end-procedure
+
+!*********************************************************************
+!Displays the error messages and stops execution
+!*********************************************************************
+ 
+begin-procedure SQL-Error-Found($Proc_Name) 
+!  do error-found
+  display 'SQL Error in ' 
+  display $Proc_Name 
+  display $_sql-error
+  display 'sql-status:' 
+  display #_sql-status 
+
+  STOP
+
+end-procedure
+!****************************************************************************
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'stdapi.sqc'    !Update Process API
+#Include 'datemath.sqc'  !Does the date-math functions
+#Include 'getdatcd.sqc'  !Get-Date-Codes procedure
+#Include 'getbalid.sqc'  !Get-Calendar-Year-Id
+#Include 'askaod.sqc'    !Ask-As-Of-Date Routine
+#Include 'gexxx922.sqc'  !Get gex_rc_pay run controls
+#Include 'gexxx902.sqc'  !Get gex_rc_deptid run controls - multiple row table
+#Include 'gexxx953.sqc'  !Get gex_rc_gexpyvhr run controls - multiple row table

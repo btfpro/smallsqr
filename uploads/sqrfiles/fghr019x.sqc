@@ -1,0 +1,327 @@
+!***********************************************************************
+!  FGHR019X.SQC: Routines for formatting CPDF data                     *
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+!                                                                      *
+! This module contains confidential and proprietary information        *
+! of Oracle; it is not to be copied, reproduced, or transmitted        *
+! in any form, by any means, in whole or in part, nor is it to         *
+! be used for any purpose other than that for which it is              *
+! expressly provided under the applicable license agreement.           *
+!                                                                      *
+! Copyright (C) 2006 Oracle. All Rights Reserved.                      *
+!                                                                      *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!          $Date:  2006/08/29:22:19:26                                 
+!       $Release:  HR9                                                 
+!      $Revision:  103                                                 
+!                                                                      *
+!***********************************************************************
+
+
+
+#define CPDF-ARRAY-SIZE 100      ! proc Add-CPDF-Field will only allow entry of CPDF-ARRAY-SIZE - 1 elements
+
+begin-procedure Setup-CPDF-Field-Formats
+! Array will be loaded with data formats for CPDF fields from the CPDF_FLD_TBL
+
+CREATE-ARRAY NAME=CPDF-FORMAT SIZE={CPDF-ARRAY-SIZE}
+   FIELD=DBFIELD:char              ! Name of associated database field (may not be used)
+   FIELD=LENGTH:number             ! Length of field
+   FIELD=TRUNC:char                ! Allow truncation of field to LENGTH if 'Y'
+   FIELD=PAD:char                  ! L=left, R=Right, and N = No padding
+   FIELD=PADCHAR:char              ! Character that will be used in padding
+   FIELD=TFILLCHAR:char            ! Fill character used in gvt_cpdf_dyn and gvt_cpdf_status tables when field is blank
+   FIELD=FFILLCHAR:char            ! Fill character used in flat file when field is blank
+   FIELD=DATATYPE:char             ! Data Type of the field.  N=number, C=character, D=date
+   FIELD=EDITMASK:char             ! Edit picture for formatted output
+
+begin-select
+GVT_CPDF_FLD_TYPE       &TYPE
+GVT_CPDF_FLD_LGTH       &LENGTH
+GVT_CPDF_FLD_NAME       &NAME
+GVT_CPDF_DEF_VALUE      &FDEF
+GVT_CPDF_TBL_DEFLT      &TDEF
+GVT_CPDF_TRUNC_FLD      &TRUNC
+GVT_CPDF_FLD_PAD        &PAD
+GVT_CPDF_PAD_CHAR       &PADCHAR
+GVT_CPDF_EDIT_MASK      &MASK
+
+   do Add-CPDF-Field(&NAME, &LENGTH, &TRUNC, &PAD, &PADCHAR, &TDEF, &FDEF, &TYPE, &MASK)
+   add 1 to #field-count
+
+FROM PS_GVT_CPDF_FLDTBL
+end-select
+
+Show #field-count ' fields loaded for CPDF Fields Setup Table into CPDF-FORMAT array'
+
+end-procedure
+
+
+!*******************************************************************************************
+! Add-CPDF-Field function inserts CPDF field format information into the CPDF-FORMAT array |
+!*******************************************************************************************
+begin-procedure Add-CPDF-Field($cpdf-fld-name,#cpdf-fld-len,$cpdf-trunc,$cpdf-pad,$cpdf-pad-ch,$cpdf-tfill-ch,$cpdf-ffill-ch,$cpdf-fld-type,$cpdf-edit-msk)
+
+
+   if rtrim($cpdf-fld-name,' ') = ''
+      ! error: Database field name must be specified
+      Show 'ERROR:  Attempted to add element to array CPDF-FORMAT with a NULL field-name element.'
+      stop
+   end-if
+
+   if #cpdf-array-count < ({CPDF-ARRAY-SIZE} - 1)        ! do not allow last blank array element to be filled.  Need for search until end of array.
+
+      PUT $cpdf-fld-name #cpdf-fld-len $cpdf-trunc $cpdf-pad $cpdf-pad-ch $cpdf-tfill-ch $cpdf-ffill-ch $cpdf-fld-type $cpdf-edit-msk INTO CPDF-FORMAT(#cpdf-array-count)
+      let #cpdf-array-count = #cpdf-array-count + 1
+
+   else
+      ! error: Array is full - stop execution
+      Show 'ERROR:  Attempted to add element [' $cpdf-fld-name '] to array CPDF-FORMAT.  The array is full.'
+      Show '        Change the size of the array by changing #define CPDF-ARRAY-SIZE {CPDF-ARRAY-SIZE}.'
+      stop
+   end-if
+
+#debugd Show 'PUT: ' $cpdf-fld-name '/' #cpdf-fld-len '/'  $cpdf-trunc '/'  $cpdf-pad '/'  $cpdf-pad-ch '/'  $cpdf-tfill-ch '/'  $cpdf-ffill-ch  '/' $cpdf-fld-type  '/' $cpdf-edit-msk
+
+end-procedure
+
+
+
+!*******************************************************************************************
+! Format-CPDF-Field formats $input-data according to the formatting rules specified for    |
+! the field specified by $cpdf-field-name.  The formatted output is returned in $out       |
+!*******************************************************************************************
+
+begin-procedure Format-CPDF-Field($input-data, $cpdf-field-name, :$out)
+
+! Dates passed via $input-data are accepted in default database format only!
+! Either use dates directly from the database field or convert dates by using Format-DateTime procedure.
+!
+!         Ex. 1         do Format-CPDF-Field(&A.BIRTH_DT, {GVT_CPDF_BIRTH_DT}, $return-val
+!
+!         Ex. 2         do Format-DateTime(....)
+!                       do Format-CPDF-Field($birth_dt, {GVT_CPDF_BIRTH_DT}, $return-val
+   do Search-CPDF-Format($cpdf-field-name,#fld-len,$trunc-flag,$pad-side,$pad-char,$tfill-char,$ffill-char,$dtype,$editpic)
+
+   let $input-data = rtrim($input-data,' ')
+
+   if $dtype = 'N' and $input-data = '0'       ! forces zero values for numbers to blank
+      let $input-data = ''                     ! pass a '00' if you wish to pass a zero
+   end-if                                      ! instead of a blank to the cpdf file
+
+   let $oracle-date-found = 'N'
+#IFDEF ORACLE
+   ! ORACLE requires a single blank inserted into DATE fields
+   if $dtype = 'D' and $input-data = ''    ! null
+      let $out = ' '    ! single blank
+      let $oracle-date-found = 'Y'
+   end-if
+#END-IF
+
+  if $oracle-date-found = 'N'
+   if $input-data <> ''
+      let $edit-mask = rtrim($editpic,' ')
+
+      if rtrim($edit-mask,' ') <> ''
+         let $out = edit($input-data,$edit-mask)
+      else
+         let $out = $input-data
+      end-if
+
+      if $pad-char = ''
+         let $pad-char = ' '
+      end-if
+
+      evaluate $pad-side
+         when = 'L'
+            let $out = lpad($out,#fld-len,$pad-char)
+            break
+         when = 'R'
+            let $out = rpad($out,#fld-len,$pad-char)
+      end-evaluate
+
+   else
+      ! field was blank.  Apply fill character.
+      let $out = lpad(rtrim($input-data,' '),#fld-len,$tfill-char)
+   end-if
+   if (length($out) > #fld-len)
+     if $trunc-flag = 'Y'
+        Show 'Value [' $out '] exceeded maximum field length for field [' $dbfield '/' #fld-len '].'
+        let $out = substr($out,1,#fld-len)
+        Show 'Truncated to [' $out '].'
+     else
+        ! error: formatted field was greater than specified field length with no option for truncation
+        Show 'ERROR:  Formatted value [' $out '] is too long for field [' $cpdf-field-name '].  Must be ' #fld-len
+        Show '        The following input value was used: ' $input-data
+        stop
+     end-if
+   end-if
+ end-if
+
+#debugd Show 'FORMAT-CPDF: ' $input-data '/' $out ':  ' $dbfield '/' #fld-len '/' $trunc-flag '/' $pad-side '/' $pad-char '/' $tfill-char '/' $ffill-char '/' $dtype '/' $edit-mask
+
+end-procedure
+
+
+!*******************************************************************************************
+! Translate default values from the database table default fill character to the default   |
+! character for use in the flat file                                                       |
+!*******************************************************************************************
+
+begin-procedure Translate-Default-Values($in, $cpdf-field-name,:$out)
+
+   do Search-CPDF-Format($cpdf-field-name,#fld-len,$trunc-flag,$pad-side,$pad-char,$tfill-char,$ffill-char,$dtype,$editpic)
+
+   if rtrim($tfill-char,' ') = ''
+      let $tfill-char = ' '
+   end-if
+
+   if rtrim($ffill-char,' ') = ''
+      let $ffill-char = ' '
+   end-if
+
+   let $out = translate($in,$tfill-char,$ffill-char)
+#debugd Show 'TRANSLATE ' $cpdf-field-name ' - (in/out): ' $in '/' $out
+
+end-procedure
+
+
+
+!***********************************************************************************************
+! Looks up formatting information in CPDF-FORMAT array for field specified by $cpdf-field-name |
+!***********************************************************************************************
+
+begin-procedure Search-CPDF-Format($cpdf-field-name,:#fld-len,:$trunc-flag,:$pad-side,:$pad-char,:$tfill-char,:$ffill-char,:$dtype,:$editpic)
+
+   let $found-cpdf-field = 'N'
+
+   let #search-index = 0
+
+   while 1
+
+       GET $dbfield #fld-len $trunc-flag $pad-side $pad-char $tfill-char $ffill-char $dtype $editpic FROM CPDF-FORMAT(#search-index)
+
+      #debugd Show 'SEARCH/FOUND: ' $cpdf-field-name ' [' #search-index ']/' $dbfield
+
+
+      if rtrim($dbfield,' ') = rtrim($cpdf-field-name,' ')
+         let $found-cpdf-field = 'Y'
+         break
+      else
+        if rtrim($dbfield,' ') = ''
+         let $found-cpdf-field = 'N'
+         break
+        end-if
+      end-if
+
+      add 1 to #search-index
+   end-while
+
+   if $found-cpdf-field = 'N'
+     ! error: field not found in lookup table - stop execution
+     Show 'ERROR:  Field [' $cpdf-field-name '] not found in CPDF-FORMAT array.  Check CPDF Fields Setup Table.'
+     stop
+   end-if
+
+end-procedure
+
+
+begin-procedure Initialize-CPDF-Fields
+
+ ! call for every field, pass blanks or zeros
+
+do Format-CPDF-Field('','AGENCY_SUBELEMENT',     $agency_subelement)
+do Format-CPDF-Field('','SSN',                   $ssn)
+do Format-CPDF-Field('','GVT_NOA_EFFDT',         $gvt_noa_effdt)
+do Format-CPDF-Field('','GVT_DEPTID_CPDF',       $gvt_deptid_cpdf)
+do Format-CPDF-Field('','GVT_POI',               $gvt_poi)
+do Format-CPDF-Field('','GVT_CPDF_BIRTH_DT',     $gvt_cpdf_birth_dt)
+do Format-CPDF-Field('','GVT_VET_PREF_APPT',     $gvt_vet_pref_appt)
+do Format-CPDF-Field('','GVT_TENURE',            $gvt_tenure)
+do Format-CPDF-Field('','GVT_CPDF_SCD_DT',       $gvt_cpdf_scd_dt)
+do Format-CPDF-Field('','GVT_RETIRE_PLAN',       $gvt_retire_plan)
+do Format-CPDF-Field('','GVT_CRED_MIL_SVCE',     $gvt_cred_mil_svce)
+do Format-CPDF-Field('','GVT_CSRS_FROZN_SVC',    $gvt_csrs_frozn_svc)
+do Format-CPDF-Field('','GVT_PREV_RET_COVRG',    $gvt_prev_ret_covrg)
+do Format-CPDF-Field('','MILITARY_STATUS',       $military_status)
+do Format-CPDF-Field('','SEX',                   $sex)
+do Format-CPDF-Field('','ETHNIC_GROUP',          $ethnic_group)
+do Format-CPDF-Field('','GVT_DISABILITY_CD',     $gvt_disability_cd)
+do Format-CPDF-Field('','GVT_NOA_CODE',          $gvt_noa_code)
+do Format-CPDF-Field('','GVT_NOA_CODE_2',        $gvt_noa_code_2)
+do Format-CPDF-Field('','GVT_LEG_AUTH_1',        $gvt_leg_auth_1)
+do Format-CPDF-Field('','GVT_LEG_AUTH_2',        $gvt_leg_auth_2)
+do Format-CPDF-Field('','GVT_CPDF_ERN_PROG',     $gvt_cpdf_ern_prog)
+do Format-CPDF-Field('','GVT_OCC_SERIES',        $gvt_occ_series)
+do Format-CPDF-Field('','GVT_CPDF_GRADE',        $gvt_cpdf_grade)
+do Format-CPDF-Field('','GVT_STEP',              $gvt_step)
+do Format-CPDF-Field('','GVT_CPDF_BASIC_PAY-A',  $gvt_cpdf_basic_pay)
+do Format-CPDF-Field('','GVT_PAY_BASIS',         $gvt_pay_basis)
+do Format-CPDF-Field('','GVT_WORK_SCHED',        $gvt_work_sched)
+do Format-CPDF-Field('','GVT_PAY_RATE_DETER',    $gvt_pay_rate_deter)
+do Format-CPDF-Field('','GVT_POSN_OCCUPIED',     $gvt_posn_occupied)
+do Format-CPDF-Field('','GVT_CPDF_SUPV_STAT',    $gvt_cpdf_supv_stat)
+do Format-CPDF-Field('','GVT_CPDF_LOCATION',     $gvt_cpdf_location)
+do Format-CPDF-Field('','GVT_CURR_APT_AUTH1',    $gvt_curr_apt_auth1)
+do Format-CPDF-Field('','GVT_CURR_APT_AUTH2',    $gvt_curr_apt_auth2)
+do Format-CPDF-Field('','REVIEW_RATING',         $review_rating)
+do Format-CPDF-Field('','GVT_CPDF_REVW_PTRN',    $gvt_cpdf_revw_ptrn)
+do Format-CPDF-Field('','GVT_CPDF_REV_PRD',      $gvt_cpdf_rev_prd)
+do Format-CPDF-Field('','GVT_AWARD_GROUP',       $gvt_award_group)
+do Format-CPDF-Field('','GVT_CPDF_AWARD_AMT',    $gvt_cpdf_award_amt)
+do Format-CPDF-Field('','GVT_CPDF_BEN_AMT',      $gvt_cpdf_ben_amt)
+do Format-CPDF-Field('','GVT_CPDF_NAME',         $gvt_cpdf_name)
+do Format-CPDF-Field('','GVT_CPDF_ERN_PROG1',    $gvt_cpdf_ern_prog1)
+do Format-CPDF-Field('','GVT_CPDF_OCC_SER1',     $gvt_cpdf_occ_ser1)
+do Format-CPDF-Field('','GVT_CPDF_GRADE1',       $gvt_cpdf_grade1)
+do Format-CPDF-Field('','GVT_CPDF_PREV_STEP',    $gvt_cpdf_prev_step)
+do Format-CPDF-Field('','GVT_CPDF_PR_PAY-A',     $gvt_cpdf_pr_pay)
+do Format-CPDF-Field('','GVT_CPDF_PAY_BAS1',     $gvt_cpdf_pay_bas1)
+do Format-CPDF-Field('','GVT_CPDF_WORK_SCH1',    $gvt_cpdf_work_sch1)
+do Format-CPDF-Field('','GVT_CPDF_PAYRTDET1',    $gvt_cpdf_payrtdet1)
+do Format-CPDF-Field('','GVT_CPDF_CORR_NOA',     $gvt_cpdf_corr_noa)
+do Format-CPDF-Field('','GVT_CPDF_COR_NOADT',    $gvt_cpdf_cor_noadt)
+do Format-CPDF-Field('','GVT_CPDF_CORR_SSN',     $gvt_cpdf_corr_ssn)
+do Format-CPDF-Field('','GVT_CPDF_PR_LCLADJ',    $gvt_cpdf_pr_lcladj)
+do Format-CPDF-Field('','GVT_CPDF_PR_DTY_ST',    $gvt_cpdf_pr_dty_st)
+do Format-CPDF-Field('','GVT_CPDF_LCLTY_PAY',    $gvt_cpdf_lclty_pay)
+do Format-CPDF-Field('','GVT_CPDF_STFF_DIFF',    $gvt_cpdf_stff_diff)
+do Format-CPDF-Field('','GVT_CPDF_SUPV_DIFF',    $gvt_cpdf_supv_diff)
+do Format-CPDF-Field('','GVT_CPDF_RET_ALLW',     $gvt_cpdf_ret_allw)
+do Format-CPDF-Field('','GVT_CPDF_HI_ED_LVL',    $gvt_cpdf_hi_ed_lvl)
+do Format-CPDF-Field('','GVT_CPDF_INST_PROG',    $gvt_cpdf_inst_prog)
+do Format-CPDF-Field('','GVT_CPDF_YR_OF_DEG',    $gvt_cpdf_yr_of_deg)
+do Format-CPDF-Field('','GVT_SUB_AGENCY',        $gvt_sub_agency)
+do Format-CPDF-Field('','GVT_FEGLI',             $gvt_fegli)
+do Format-CPDF-Field('','GVT_ANN_IND',           $gvt_ann_ind)
+do Format-CPDF-Field('','FLSA_STATUS',           $flsa_status)
+do Format-CPDF-Field('','BARG_UNIT',             $barg_unit)
+do Format-CPDF-Field('','GVT_FERS_COVERAGE',     $gvt_fers_coverage)
+do Format-CPDF-Field('','GVT_FUNC_CLASS',        $gvt_func_class)
+do Format-CPDF-Field('','HEALTH_PLAN',           $health_plan)
+do Format-CPDF-Field('','SAL_ADMIN_PLAN',        $sal_admin_plan)
+do Format-CPDF-Field('','GVT_CPDF_RTNERNPRG',    $gvt_cpdf_rtnernprg)
+do Format-CPDF-Field('','GVT_CPDF_RTND_GRD',     $gvt_cpdf_rtnd_grd)
+do Format-CPDF-Field('','GVT_CPDF_RTND_STEP',    $gvt_cpdf_rtnd_step)
+do Format-CPDF-Field('','CITIZENSHIP_STATUS',    $citizenship_status)
+do Format-CPDF-Field('','GVT_CPDF_PAY_STAT',     $gvt_cpdf_pay_stat)
+ !*************** Incident 1100365005 ********
+do Format-CPDF-Field('','GVT_CPDF_LAST_NAME',$gvt_cpdf_last_name)
+do Format-CPDF-Field('','GVT_CPDF_FIRST_NAM',$gvt_cpdf_first_name)
+do Format-CPDF-Field('','GVT_CPDF_MID_NAME',$gvt_cpdf_middle_name)
+do Format-CPDF-Field('','GVT_CPDF_SUFFIX',$gvt_cpdf_name_suffix)
+do Format-CPDF-Field('','GVT_CPDF_POS_TITLE',$gvt_cpdf_descr)
+do Format-CPDF-Field('','GVT_CPDF_GOAL_AMT',$gvt_cpdf_goal_amt)
+do Format-CPDF-Field('','GVT_CPDF_OTH_HRS',$gvt_cpdf_oth_hrs)
+do Format-CPDF-Field('','GVT_CPDF_AWD_PRCNT',$gvt_cpdf_percent_of_award)
+do Format-CPDF-Field('','GVT_CPDF_SCD_RETIR',$gvt_cpdf_gvt_scd_retire)
+do Format-CPDF-Field('','GVT_CPDF_SCD_RIF',$gvt_cpdf_cmpny_seniority_dt)
+ !*************** Incident 1100365005 ********
+
+end-procedure
+

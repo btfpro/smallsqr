@@ -1,0 +1,266 @@
+!********************************************************
+!  OSHA.SQC - Common functions for OSHA Reports         !
+!********************************************************
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module contains confidential and proprietary information        *
+! of Oracle; it is not to be copied, reproduced, or transmitted        *
+! in any form, by any means, in whole or in part, nor is it to         *
+! be used for any purpose other than that for which it is              *
+! expressly provided under the applicable license agreement.           *
+!                                                                      *
+! Copyright (C) 2006 Oracle. All Rights Reserved.                      *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+!          $Date:  2006/07/19:14:20:21                                 *
+!       $Release:  HR9                                                 *
+!      $Revision:  101                                                 *
+!                                                                      *
+!***********************************************************************
+
+
+!----------------------------------------------------------------------
+!---------Unterminated-Leave-Check-------------------------------------
+!----------------------------------------------------------------------
+begin-procedure Unterminated-Leave-Check
+#DEBUG DISPLAY 'Flow: Unterminated-Leave-Check'
+BEGIN-SELECT
+E.START_DATE
+E.END_DT
+E.HS_AWAY_TYPE
+
+  ! Add the length of this leave as of the $ThruDate to the 
+  ! appropriate leave type
+  
+  LET #add_days = 0
+  DO Convert-To-DTU-Date(&E.START_DATE,$eStartDate)
+  DO Convert-To-DTU-Date($ThruDate, $ThruDateDTU)
+  DO dtu-diff-days($eStartDate,$ThruDateDTU, #add_days)
+  #DEBUG DISPLAY #add_days NOLINE
+  
+  IF &E.HS_AWAY_TYPE = '1'
+     LET #Away = #Away + #add_days
+     SHOW #Away ' added to Days Away.'
+  ELSE
+     LET #Restricted = #Restricted + #add_days + 1
+     SHOW #Restricted ' added to Days Restricted / Transferred.'
+  END-IF
+
+
+FROM PS_INJURY_ABSENCES E, 
+     PS_INJURY_ILL_VW F
+WHERE F.INCIDENT_NBR = E.INCIDENT_NBR
+  AND F.EMPL_RCD = E.EMPL_RCD
+  AND F.EMPLID = E.EMPLID
+  AND F.CASE_NBR_USA = $A_CASE_NBR_USA
+  AND E.END_DT IS NULL
+END-SELECT
+end-procedure Unterminated-Leave-Check
+!----------------------------------------------------------------------
+!---------RTF-Clear-Tokens---------------------------------------------
+!----------------------------------------------------------------------
+Begin-Procedure RTF-Clear-Tokens
+#DEBUG DISPLAY 'Flow: RTF-Clear-Tokens'
+
+CLEAR-ARRAY NAME=OSHA
+LET #ArraySize = 0
+end-procedure RTF-Clear-Tokens
+
+!----------------------------------------------------------------------
+!---------Add-Job-Transfers--------------------------------------------
+!----------------------------------------------------------------------
+! Monitor Health & Safety has not traditionally tracked the number of
+! days a person was on a job restriction. This functionality was added
+! along with these new OSHA reports, but for backwards compatability,
+! these values are still stored in the RESTRICTD_WORKDAYS field
+! where OSHA expects to find them, so this routine adds them in for
+! the report run
+!----------------------------------------------------------------------
+begin-procedure Add-Job-Transfers
+#DEBUG DISPLAY 'Flow: Add-Job-Transfers'
+
+BEGIN-SELECT
+G.START_DATE
+G.END_DT
+ 
+  #DEBUG SHOW 'START_DATE: ' &G.START_DATE
+  #DEBUG SHOW 'END_DT: ' &G.END_DT 
+
+  LET #add_days = 0
+  DO Convert-To-DTU-Date(&G.START_DATE,$gStartDate)
+  DO Convert-To-DTU-Date(&G.END_DT, $gEndDate)
+  DO dtu-diff-days($gStartDate, $gEndDate, #add_days)
+  LET #Restricted = #Restricted + #add_days + 1
+  #DEBUG SHOW 'Adding Job Transfers: ' #add_days ' added.'
+
+FROM PS_INJURY_ABSENCES G, 
+     PS_INJURY_ILL_VW H
+WHERE G.INCIDENT_NBR = H.INCIDENT_NBR
+  AND G.EMPLID = H.EMPLID 
+  AND G.EMPL_RCD = H.EMPL_RCD
+  AND H.CASE_NBR_USA = $A_CASE_NBR_USA
+  AND G.HS_AWAY_TYPE = '3'
+  AND G.END_DT IS NOT NULL
+END-SELECT
+end-procedure Add-Job-Transfers
+
+!----------------------------------------------------------------------
+!---------RTF-Add-Token------------------------------------------------
+!----------------------------------------------------------------------
+Begin-Procedure RTF-Add-Token($inKey, $inValue)
+
+IF NOT (ISBLANK($inKey))
+   ADD 1 to #_ArraySize
+   LET OSHA.search(#_ArraySize) = $inKey
+   LET OSHA.replace(#_ArraySize) = rtrim($inValue,' ')
+END-IF
+End-Procedure
+
+!----------------------------------------------------------------------
+!---------RTF-Wildcard-Merge-------------------------------------------
+!----------------------------------------------------------------------
+! Description:
+! This local routine takes a string buffer and searches for $Token
+! and replaces it with $Value. 
+! 
+! RTF Tokens begin and end with %s, so if the provided $Token value 
+! does not have this character at each end, it will be added
+!----------------------------------------------------------------------
+Begin-Procedure RTF-Wildcard-Merge($StringBuffer, $Token, $Value, :$BufferOut)
+#DEBUG DISPLAY 'Flow: RTF-Wildcard-Merge'
+
+LET $Token = RTRIM($Token,' ')
+LET $Token = LTRIM($Token,' ')
+
+! Check $Token for % characters
+! -----------------------------
+IF SUBSTR($Token, 1, 1) != '%'
+   LET $Token = '%' || $Token
+END-IF
+
+IF SUBSTR($Token, LENGTH($Token), 1) != '%'
+   LET $Token = $Token || '%'
+END-IF
+
+! Loop until no more $Tokens
+! --------------------------
+LET #Start = 1
+LET $BufferOut = ''
+WHILE 1
+   FIND $Token in $StringBuffer #Start #Found
+   IF #Found = -1
+      BREAK
+   END-IF
+
+   ! Copy everything up to the token into $BufferOut
+   ! -----------------------------------------------
+   LET #CopyLength = #Found - #Start + 1
+   LET $BufferOut = $BufferOut || SUBSTR($StringBuffer, #Start, #CopyLength)
+
+   ! Copy the replacement Value into $BufferOut
+   ! ------------------------------------------
+   LET $BufferOut = $BufferOut || $Value
+
+   ! Set the Start position to one space after the 
+   ! token we just replaced
+   ! ---------------------------------------------
+   LET #Start = #Found + LENGTH($Token) + 1
+
+END-WHILE
+
+! Copy from the end of the last token to the OutBuffer
+! ----------------------------------------------------
+LET #CopyLength = LENGTH($StringBuffer) - #Start + 1
+LET $BufferOut = $BufferOut || SUBSTR($StringBuffer, #Start, #CopyLength)
+
+End-Procedure RTF-Wildcard-Merge
+
+!----------------------------------------------------------------------
+!---------RTF-Fetch-and-Process----------------------------------------
+!----------------------------------------------------------------------
+! Fetches template data from the database, processes it, and writes it
+! to the specified file
+!----------------------------------------------------------------------
+Begin-Procedure RTF-Fetch-and-Process
+BEGIN-SELECT
+FT.FILE_DATA_CHAR
+FT.SEQ_NBR
+
+   LET $RTFTemplate  = &FT.FILE_DATA_CHAR
+   DO Process-Chunk
+
+FROM PS_OSHA_TEMPLATES FT
+WHERE FT.FILENAME = $RTFFile
+ORDER BY SEQ_NBR
+END-SELECT
+End-Procedure RTF-Fetch-and-Process
+
+!----------------------------------------------------------------------
+!---------RTF-Chunk-Write----------------------------------------------
+!----------------------------------------------------------------------
+! Function was originally written to rites data to a specified file
+! a single line at a time. This new version writes the data back into
+! the PS_OSHA_300_RUNS table so that it can be delivered over PIA, 
+! since SQR doesn't give us any easy way to determine the correct
+! output location if we're not letting it create the printed output.
+!----------------------------------------------------------------------
+Begin-Procedure RTF-Chunk-Write
+#DEBUG SHOW 'Flow: RTF-Chunk-Write'
+!SHOW '$prcs_oprid: ' $prcs_oprid
+!SHOW '$prcs_run_cntl_id: ' $prcs_run_cntl_id
+!SHOW '$current-date: ' $current-date
+!SHOW '#RTF_Seq_Nbr: ' #RTF_Seq_Nbr
+!SHOW '$Data: ' $Data
+
+#DEBUG SHOW '$cur-date: ' $cur-date
+#DEBUG SHOW '$FromDate: ' $FromDate
+#DEBUG SHOW '$ThruDate: ' $ThruDate
+
+BEGIN-SQL
+INSERT 
+INTO PS_OSHA_300_RUNS 
+(OPRID, 
+RUNCNTLID, 
+PRCSNAME,
+DTTM_STAMP,
+SEQ_NBR,
+FROM_DATE,
+THRU_DATE,
+FILE_DATA_CHAR)
+VALUES (
+$prcs_oprid,
+$prcs_run_cntl_id,
+$ProcessName,
+$current-date, 
+#RTF_Seq_Nbr,
+$FromDate,
+$ThruDate,
+$Data)
+END-SQL
+
+ADD 1 to #RTF_Seq_Nbr 
+
+End-Procedure RTF-Chunk-Write
+
+!----------------------------------------------------------------------
+!---------Process-Chunk------------------------------------------------
+!----------------------------------------------------------------------
+begin-procedure Process-Chunk
+#DEBUG DISPLAY 'Flow: Process-Chunk'
+   LET #Count = 1
+
+   WHILE #Count <= #ArraySize
+      GET $RowToken FROM OSHA(#Count) search
+      GET $RowValue FROM OSHA(#Count) replace
+      DO RTF-Wildcard-Merge($RTFTemplate, $RowToken, $RowValue, $RTFTemplate)
+      ADD 1 to #Count
+   END-WHILE
+
+   LET $Data = $RTFTemplate
+   DO RTF-Chunk-Write
+   LET #Total_Processed = #Total_Processed + LENGTH($RTFTemplate)
+   LET $RTFTemplate = ''   
+end-procedure Process-Chunk

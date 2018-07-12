@@ -1,0 +1,927 @@
+!#define DISABLE_STATE_FUTA  ! <-- to delay implementing the new TF_ADP_ST_FUTA table & logic
+ 
+!********************************************************************** 
+! SQR Name:           adpstfut.sqc  
+! SQR Descr:          ADP Employment Tax
+! Created by:         drmonroe 
+! Create date:        11/25/2011 
+! Last modified by:   drmonroe
+! Last modified date: 2/17/2015
+ 
+#define        adpstfuta_release     adpstfut.Feb 17, 2015
+ 
+!#define debug_adpstfut
+ 
+!*********************************************************************** 
+!                                                                                  !
+!     Author: Dan Monroe  (dan_monroe@adp.com, (406) 251-0300)                     !
+!     Date:   Nov 2008                                                             !
+!                                                                                  !
+!  This is invoked by the pbzqtr.sqr module if GENERATE_STATE_FUTA is enabled      !
+!  PBZQTR.SQR would need to populate the TF_ADP_ST_FUTA table with the fields:     !
+!  fields: EMPLID (key), COMPANY (key), STATE (key), TXGRS_QTD and TXGRS_YTD       !
+!                                                                                  !
+!  Needs the TF_ADP_ST_FUTA Table / Project                                        !
+!  Modification History
+!  -----------------------
+!  11/30/2011 - optional #define DISABLE_STATE_FUTA 
+!                  allows clients to delay implementing the new table/logic        !
+! ********************************* Q4, 2011 release **************************    !
+!  12/02/2011   if rtrim($sqr-database,' ') = 'ODBC' - no alias on delete          !
+!  12/14/2011   sync up with tax940a.sqr 11-F, and add company State Futa totals   !
+!               STATE_FUTA_OVERRIDE_WITH_BALANCES (no overrise, always use chk dtl !
+!               no TBA's, add state description to report                          !
+!   1/10/2012   CMB2
+!   1/12/2012   PERFORMANCE NOTE - if pbzqtr.sqr is really slow, reindex PS_PAY_TAX
+!           CREATE UNIQUE INDEX SYSADM.PS_PAY_TAX
+!            ON SYSADM.PS_PAY_TAX(COMPANY,PAYGROUP,PAY_END_DT,OFF_CYCLE,PAGE_NUM,LINE_NUM,SEPCHK,STATE,LOCALITY,TAX_CLASS,WORK_PSD_CD)
+!           TABLESPACE PSINDEX
+!           LOGGING
+!           PCTFREE 10
+!           INITRANS 2
+!           MAXTRANS 255
+!           STORAGE(INITIAL 32M
+!           BUFFER_POOL DEFAULT)
+!           NOPARALLEL
+!           NOCOMPRESS
+!
+!  2/7/2012  INCLUDE_FUTA_TBA
+!  6/28/2012 performance enhancements
+!  8/6/2012  diagnose the over reporting with ADP Compid rollup enabled 
+!  8/16/2012 limit the State FUTA by default (#define STATE_FUTA_LIMIT) -- limits the QTD and YTD State FUTA by the actual QTD and YTD FUTA
+! ********************************* Q3, 2011 release **************************    !
+!  10/25/2012 for 2012+, use the new tax_class (6 for PeopleSoft, S for Rimini)
+!  11/07/2012 20121107 - and only skip the derived logic if we have tax_class '6' in 2012+ as our State FUTA tax class (we pull from balances normally now)
+!  11/19/2012 pbzqtr.sqr modified to set the $STATE_FUTA_TAX_CLASS variable based on the year, & tax update.  no Init if it's blank
+!  11/20/2012 moved the 'state_futa_balance' table create to the Init no matter what the method of reporting/generating State FUTA in
+!  12/06/2012 Generate-State-Futa modification to pull in the data just for the current company with ADP Rollup/FEIN enabled, otherwise over State FUTA reporting occurs
+!   1/03/2013 TXGRS_ADJ INCLUDE_FUTA_TBA logic, the TBA inclusion can cause the State FUTA to go negative, clip it to 0
+!   1/05/2013 Issue10 SQC, make INCLUDE_FUTA_TBA standard, clean up report header, and create a array limit on the TBA array
+!   1/08/2013 don't count checks if the SUI is negative see: 20130118
+!   3/06/2013 INCLUDE_FUTA_TBA, start in 2013, allow for it to be disabled by adding #define INCLUDE_FUTA_TBA 0=1
+!   3/19/2013 Change main query to pick up negative wages see 20130319, STATE_FUTA_EXTRACT_NEG_WAGES
+!   3/19/2013 Add option to not compile in the code to generate the State FUTA, STATE_FUTA_SKIP_GENERATION_CODE (shrink code) AHM1
+!             if DISABLE_STATE_FUTA, don't include the TBA's
+!   5/30/2013 05302013, changes criteria string so the State FUTA calc won't get run for tax class '6' scenarios
+!  12/17/2013 option to get trace to have list of the state futa amounts #define FORCE_STATE_FUTA_AMOUNTS_INTO_LOG
+!   2/17/2015 USE_INT_CRITERIA
+!------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+#if {SITE_ID} = 'CMB2'
+  #define DB_Schema    sysadm.
+#else
+  #if {SITE_ID} = 'STKS'
+    #define DB_Schema    sysadm.
+  #else
+    #define DB_Schema
+  #endif
+#endif
+ 
+#if {SITE_ID} = 'WHS1'
+  #define STATE_FUTA_EXTRACT_NEG_WAGES
+#endif
+
+#if {SITE_ID} = 'AHM1'
+  #define STATE_FUTA_SKIP_GENERATION_CODE
+#endif
+
+#ifndef ADP_ST_FUTA_TABLE
+  #define ADP_ST_FUTA_TABLE {DB_Schema}PS_{Client_Table_Prefix}ADP_ST_FUTA{Client_Table_Suffix}
+#endif
+ 
+#ifdef ADP_TAX_DEV
+  #define STATE_FUTA_START_CRITERIA #RptYear >= 2010
+#endif
+ 
+#ifndef STATE_FUTA_START_CRITERIA
+  #define STATE_FUTA_START_CRITERIA (#RptYear > 2011 or (#RptYear = 2011 and #RptQtr = 4))  !05302013
+#endif
+
+#define STATE_FUTA_LIMIT
+
+#ifndef DISABLE_STATE_FUTA
+ #ifndef INCLUDE_FUTA_TBA
+  #define INCLUDE_FUTA_TBA          #RptYear >= 2013 
+ #endif
+#endif
+
+!---------------------------------------------------------------------------------------------------------        !
+ 
+begin-procedure Init-State-Futa !from pbzqtr.sqr
+  show ' '
+  show 'Init-State-Futa: adpstfut.sqc release: {adpstfuta_release}, new Tax_Class = ' $STATE_FUTA_TAX_CLASS ', for ' #RptYear edit 9999
+ 
+#ifndef DISABLE_STATE_FUTA
+ 
+ create-array name=State_Futa_balance size=5000
+      field=company:char
+      field=state:char
+      field=Txgrs_Qtd:number
+      field=Txgrs_Ytd:number
+
+ #ifndef STATE_FUTA_SKIP_GENERATION_CODE      
+  if {STATE_FUTA_START_CRITERIA} and rtrim($STATE_FUTA_TAX_CLASS,' ') = '4'  ! Tax Class '4' is the generated class, others are not generated
+ 
+        
+  #ifdef STATE_FUTA_OVERRIDE_WITH_BALANCES
+  #debugd show 'STATE_FUTA_OVERRIDE_WITH_BALANCES enabled.'
+  #endif
+ 
+  #ifdef STATE_FUTA_LIMIT
+  #debugd show 'QTD & YTD State FUTA Limited by QTD and YTD FUTA'
+  #endif
+  
+   create-array name=State_Futa_detail size=100
+      field=state:char
+      field=Txgrs_Qtd:number
+      field=Txgrs_Ytd:number
+ 
+ 
+     #ifdef INCLUDE_FUTA_TBA
+      #debugd show 'INCLUDE_FUTA_TBA: {INCLUDE_FUTA_TBA}'
+       if rtrim('{INCLUDE_FUTA_TBA}',' ') = ''
+         show 'ERROR:  set INCLUDE_FUTA_TBA criteria, contact cis_peoplesoft@adp.com'
+         stop
+       end-if
+       #ifndef state_futa_tba_balance_limit
+         #define state_futa_tba_balance_limit 10000
+       #endif
+        create-array name=State_Futa_tba_balance size={state_futa_tba_balance_limit}
+          field=company:char
+          field=emplid:char
+          field=period:number
+          field=state:char
+          field=Txgrs_Qtd:number
+          field=Txgrs_Ytd:number
+          field=seq:number
+   
+     #endif
+     #ifdef TEST_EMPLID_IN_RUN_CONTROL
+      if $SelectEmplid <> ''
+        let $SelectEmplidSelection_state_futa   = 'AND STFUTPC.EMPLID {TEST_EMPLID_PHRASE} ''' || $SelectEmplid || ''''
+        let $SelectEmplidSelection_state_delete = 'WHERE EMPLID {TEST_EMPLID_PHRASE} ''' || $SelectEmplid || ''''  !12/2/2011 removed alias for ODBC
+      else
+        let $SelectEmplidSelection_state_futa   = 'AND STFUTPC.EMPLID > '' '''
+        let $SelectEmplidSelection_state_delete = 'WHERE EMPLID > '' '''               !12/2/2011 removed alias for ODBC
+      end-if
+     #else
+       let $SelectEmplidSelection_state_delete = 'WHERE EMPLID > '' '''               !12/2/2011 removed alias for ODBC
+     #endif
+     
+     let #l = length($CompanySelection) - 6
+     let $SelectEmplidSelection_state_delete = $SelectEmplidSelection_state_delete || ' AND ' || substr($CompanySelection,7,#l)
+     let $CompanySelection_state_futa        = 'STFUTPC.' || substr($CompanySelection,7,#l)
+ 
+    #debugd show 'Emplid           ' $SelectEmplid
+    #debugd show 'CompanySelection ' $CompanySelection
+    #debugd show 'SelectCompany    ' $SelectCompany
+    #debugd show 'delete           ' $SelectEmplidSelection_state_delete
+    #debugd show 'emplid           ' $SelectEmplidSelection_state_futa
+    #debugd show 'company          ' $CompanySelection_state_futa
+     
+     do Get-Current-DateTime
+     show 'Init-State-Futa: Begin      {ADP_ST_FUTA_TABLE} cleanup tbl  --> ' $AsOfNow
+ 
+#ifdef ORACLE                                       
+ #debugd show 'Init-State-Futa: Truncating {ADP_ST_FUTA_TABLE}'
+begin-sql
+TRUNCATE TABLE {ADP_ST_FUTA_TABLE}
+end-sql
+#else
+begin-sql
+DELETE FROM {ADP_ST_FUTA_TABLE}                                                  !12/2/2011 removed alias for ODBC
+!      #ifdef MVS                                                                
+!         \$SelectEmplidSelection_state_delete\
+!      #else
+!         [$SelectEmplidSelection_state_delete]
+!      #endif
+end-sql
+#endif
+ 
+!#ifndef MVS
+!  if rtrim($sqr-database,' ') <> 'ODBC'
+!   do Commit-Transaction
+!  end-if
+!#endif
+ 
+ 
+  do Get-Current-DateTime
+  show 'Init-State-Futa: Begin {ADP_ST_FUTA_TABLE} Main Select.. --> ' $AsOfNow
+ 
+begin-select distinct
+STFU.COMPANY
+STFU.PAYGROUP
+ 
+  let $STFU_COMPANY =  &STFU.COMPANY
+  let $STFU_PAYGROUP = &STFU.PAYGROUP
+  do STFU_GEN
+ 
+  FROM PS_PAY_CHECK STFU
+   WHERE   STFU.CHECK_DT >=  $Year_Start_Date_Native      
+     AND   STFU.CHECK_DT <=  $Qtr_End_Native   
+   ORDER by STFU.COMPANY
+
+#ifdef SELECT_WITH_UR
+ {SELECT_WITH_UR} with ur
+#endif
+end-select
+
+    do Get-Current-DateTime
+  
+    #ifdef INCLUDE_FUTA_TBA
+      show '----> Init-State-Futa complete: state_futa_tba_balance count           = ' #state_futa_tba_balance edit 999,999
+    #endif  
+   
+   show '----> Init-State-Futa complete: {ADP_ST_FUTA_TABLE} Record Count       = ' #temp_records_st_fut edit 999,999 '  --> ' $AsOfNow
+   show '----> Init-State-Futa complete: FUTA YTD Taxable Wages from pay checks = ' #FUTA_Taxable_Hash_from_pay_checks edit $$$,$$$,$$$,$$9.99mi
+   show ' '
+  end-if
+ #else
+ #debugd show 'STATE_FUTA_SKIP_GENERATION_CODE enabled'
+ #endif  !STATE_FUTA_SKIP_GENERATION_CODE
+#else
+ #debugd show '----> Init-State-Futa complete: DISABLE_STATE_FUTA is defined.  Remove this definition to enable State FUTA reporting.'
+ #debugd show '   *** Required: Table: TF_ADP_ST_FUTA with fields: EMPLID (key), COMPANY (key), STATE (key), TXGRS_QTD and TXGRS_YTD'
+ #debugd show ' '
+#endif
+ 
+ 
+end-procedure
+
+#ifndef STATE_FUTA_SKIP_GENERATION_CODE 
+begin-procedure STFU_GEN
+#ifndef DISABLE_STATE_FUTA
+ 
+  let $Tax_State     = ''
+ 
+begin-SELECT
+#if {SITE_ID} = 'AAP1'
+/*+ leading (stfutpc pt1 pt2) parallel(stfutpc ) */
+#endif
+STFUTPC.COMPANY
+STFUTPC.EMPLID
+STFUTPC.CHECK_DT
+PT1.TXGRS_CUR
+PT2.STATE
+ 
+ let $Tax_State     = rtrim(&PT2.STATE,' ')
+ if length($Tax_State) = 2
+  if $SelectEmplid <> ''
+    do Get-Current-DateTime
+   #debugd show 'Init-State-Futa:Select ' #temp_records_st_fut edit 999 ' ' &STFUTPC.COMPANY  ' ' &STFUTPC.EMPLID ' ' &STFUTPC.CHECK_DT ' ' &PT2.STATE ' ' &PT1.TXGRS_CUR ' --> ' $AsOfNow
+  end-if
+ 
+  Do Convert-to-DTU-Date(&STFUTPC.CHECK_DT, $PSPC.CHECK_DT_DTU)
+  if $PSPC.CHECK_DT_DTU >= $Qtr_Start_DTU and $PSPC.CHECK_DT_DTU <= $Qtr_End_DTU
+    let #FUTA_Taxable_QTD  = &PT1.TXGRS_CUR  !we need this prior the the state records
+  else
+    let #FUTA_Taxable_QTD  = 0
+  end-if
+ 
+  let #FUTA_Taxable  = &PT1.TXGRS_CUR  !we need this prior the the state records
+  add #FUTA_Taxable to #FUTA_Taxable_Hash_from_pay_checks
+  let $STFUTPC.EMPLID   = &STFUTPC.EMPLID
+  let $STFUTPC.COMPANY  = &STFUTPC.COMPANY
+  let $PT2.STATE        = &PT2.STATE
+ 
+  do update_State_Futa_detail
+ 
+  #ifdef INCLUDE_FUTA_TBA
+    if {INCLUDE_FUTA_TBA}
+      do Include-FUTA-TBA
+    end-if
+  #endif  
+ 
+ end-if
+ 
+ FROM  PS_PAY_CHECK STFUTPC,
+        PS_PAY_TAX   PT1,
+        PS_PAY_TAX   PT2
+ WHERE 
+ 
+   #ifndef SUBTOTAL_ADP_COMPID_EXTRACT
+    #ifdef MVS                                                                
+      \$CompanySelection_state_futa\
+    #else
+      [$CompanySelection_state_futa]
+    #endif
+   #else 
+     STFUTPC.COMPANY > ' '
+   #endif
+ 
+     #ifdef TEST_EMPLID_IN_RUN_CONTROL
+       #ifdef MVS                                                                
+         \$SelectEmplidSelection_state_futa\
+       #else
+         [$SelectEmplidSelection_state_futa]
+       #endif
+     #endif
+ 
+    #ifdef TEST_EMPLID
+      AND STFUTPC.EMPLID = '{TEST_EMPLID}'
+    #endif
+ 
+  AND   STFUTPC.CHECK_DT >=  $Year_Start_Date_Native
+  AND   STFUTPC.CHECK_DT <=  $Qtr_End_Native 
+  AND   STFUTPC.COMPANY = $STFU_COMPANY
+  AND   STFUTPC.PAYGROUP = $STFU_PAYGROUP
+  AND   STFUTPC.COMPANY    = PT1.COMPANY
+  AND   STFUTPC.PAYGROUP   = PT1.PAYGROUP
+  AND   STFUTPC.PAY_END_DT = PT1.PAY_END_DT
+  AND   STFUTPC.OFF_CYCLE  = PT1.OFF_CYCLE
+  AND   STFUTPC.{pg}       = PT1.{pg}
+  AND   STFUTPC.{ln}       = PT1.{ln}
+  AND   STFUTPC.SEPCHK     = PT1.SEPCHK
+  AND   STFUTPC.PAYCHECK_STATUS IN ('A','F','R')
+  AND   PT1.STATE = '$U'
+  AND   PT1.TAX_CLASS = 'U'
+  AND   PT1.TXGRS_CUR <> 0
+  AND   PT2.COMPANY    = STFUTPC.COMPANY
+  AND   PT2.PAYGROUP   = STFUTPC.PAYGROUP
+  AND   PT2.PAY_END_DT = STFUTPC.PAY_END_DT
+  AND   PT2.OFF_CYCLE  = STFUTPC.OFF_CYCLE
+  AND   PT2.{pg}       = STFUTPC.{pg}
+  AND   PT2.{ln}       = STFUTPC.{ln}
+  AND   PT2.SEPCHK     = STFUTPC.SEPCHK
+  AND   PT2.STATE <> '$U'
+  AND   PT2.TAX_CLASS = 'U'  
+  #ifdef STATE_FUTA_EXTRACT_NEG_WAGES
+  AND   PT2.NLGRS_CUR <> 0                !20130319
+  #else
+  AND   PT2.NLGRS_CUR > 0                 !20130118
+  #endif
+  ORDER BY STFUTPC.COMPANY
+ 
+ 
+#ifdef SELECT_WITH_UR
+ {SELECT_WITH_UR} with ur
+#endif
+end-select
+
+#endif 
+end-procedure
+
+begin-procedure update_State_Futa_detail
+#ifndef DISABLE_STATE_FUTA
+ 
+  let $found = 'f'
+ 
+begin-SELECT
+STFUTU.TXGRS_QTD
+STFUTU.TXGRS_YTD
+ 
+       let $found = 't'
+       add &STFUTU.TXGRS_QTD to #FUTA_Taxable_QTD
+       add &STFUTU.TXGRS_YTD to #FUTA_Taxable
+ 
+       FROM  {ADP_ST_FUTA_TABLE} STFUTU
+       WHERE  STFUTU.EMPLID     = $STFUTPC.EMPLID
+          AND STFUTU.COMPANY    = $STFUTPC.COMPANY
+          AND STFUTU.STATE      = $PT2.STATE
+          
+  #ifdef SELECT_WITH_UR
+   {SELECT_WITH_UR} with ur
+  #endif
+end-select
+ 
+  if $found = 'f'
+   do insert-state-futa
+  else
+   do update-state-futa
+  end-if
+ 
+#endif     
+end-procedure
+ 
+ 
+begin-procedure update-state-futa
+#ifndef DISABLE_STATE_FUTA   
+  let $Futa_Error = 'Temp Update Error.'
+ 
+!  if $SelectEmplid <> ''
+!   #debugd show 'update-state-futa: ' $STFUTPC.EMPLID ' ' $STFUTPC.COMPANY ' ' $PT2.STATE ', QTD = ' #FUTA_Taxable_QTD ', YTD = ' #FUTA_Taxable
+!  end-if
+ 
+ begin-sql on-error=futa-st-ins-error
+     
+     
+  UPDATE {ADP_ST_FUTA_TABLE}
+     SET  TXGRS_QTD = #FUTA_Taxable_QTD, 
+          TXGRS_YTD = #FUTA_Taxable
+     WHERE EMPLID  = $STFUTPC.EMPLID
+       AND COMPANY = $STFUTPC.COMPANY          
+       AND STATE   = $PT2.STATE
+ 
+end-sql
+ 
+!#ifndef MVS
+!  if rtrim($sqr-database,' ') <> 'ODBC'
+!   do Commit-Transaction
+!  end-if
+!#endif
+ 
+#endif
+end-procedure
+ 
+#ifdef INCLUDE_FUTA_TBA
+begin-procedure Include-FUTA-TBA
+ 
+!  if $SelectEmplid <> ''
+!   #debugd show 'Include-FUTA-TBA: ' $STFUTPC.EMPLID ' ' $STFUTPC.COMPANY
+!  end-if
+ 
+begin-SELECT
+SADJ.BALANCE_PERIOD
+SADJ.BALANCE_QTR
+SADJ.TXGRS_ADJ
+SADJ.STATE
+SADJ.BAL_ADJ_SEQ 
+
+!    if $SelectEmplid <> ''
+!     #debugd show 'Include-FUTA-TBA retrieved: ' &SADJ.BALANCE_PERIOD edit 99 ' ' &SADJ.BALANCE_QTR edit 9 ' ' &SADJ.BAL_ADJ_SEQ edit 999 ' ' &SADJ.STATE ', ADJ ' &SADJ.TXGRS_ADJ edit 999,999.99 
+!    end-if
+
+    do check-state-futa-tba-balances
+    if $state_futa_tba_processed = 'f'
+     let #FUTA_Taxable  = &SADJ.TXGRS_ADJ  !we need this prior the the state records
+     if &SADJ.BALANCE_QTR = #RptQtr
+      let #FUTA_Taxable_QTD  = &SADJ.TXGRS_ADJ !we need this prior the the state records
+     else
+      let #FUTA_Taxable_QTD  = 0
+     end-if
+
+     if $SelectEmplid <> ''
+      #debugd show 'Include-FUTA-TBA processed: ' $STFUTPC.COMPANY ', Month: ' &SADJ.BALANCE_PERIOD edit 99 ' ' &SADJ.STATE ', Adj = ' #FUTA_Taxable_QTD edit 999,999.99 ', YTD Adj = ' #FUTA_Taxable edit 999,999.99 
+     end-if
+
+     let $PT2.STATE        = &SADJ.STATE
+     do update-state-futa-tba-balances
+     do update_State_Futa_detail
+
+    end-if
+
+ 
+ FROM PS_BAL_ADJ_TAX SADJ
+   WHERE   SADJ.EMPLID       = $STFUTPC.EMPLID
+     AND   SADJ.COMPANY      = $STFUTPC.COMPANY
+     AND   SADJ.BALANCE_ID   = $Calendar_Year_Id
+    #ifdef USE_INT_CRITERIA
+     AND   SADJ.BALANCE_YEAR = int(\$RptYearZ\)
+     AND   SADJ.BALANCE_QTR <= int(\$RptQtrZ\)
+    #else
+     AND   SADJ.BALANCE_YEAR = #RptYear
+     AND   SADJ.BALANCE_QTR <= #RptQtr
+    #endif
+
+     AND   SADJ.STATE       <> '$U'
+     AND   SADJ.TAX_CLASS   =  'U'
+     AND   SADJ.TXGRS_ADJ <> 0     
+     
+     Order by SADJ.BALANCE_PERIOD, SADJ.STATE
+     
+#ifdef SELECT_WITH_UR
+ {SELECT_WITH_UR} with ur
+#endif
+end-select
+ 
+end-procedure
+
+begin-procedure check-state-futa-tba-balances
+ 
+  let $state_futa_tba_processed = 'f'
+  let #sfinx = 0
+  while #sfinx < #state_futa_tba_balance
+   get $SFCOMPANY $SFEMPLID #SFPERIOD $SFSTATE #SFSEQ from state_futa_tba_balance(#sfinx) company emplid period state seq
+
+!   if $SelectEmplid <> ''
+!      #debugd show 'check-state-futa-tba-balances1 ' $SFCOMPANY ' ' $SFEMPLID ' ' #SFPERIOD edit 99 ' ' $SFSTATE ' ' #SFSEQ edit 999
+!      #debugd show 'check-state-futa-tba-balances2 ' $STFUTPC.COMPANY ' ' $STFUTPC.EMPLID ' ' &SADJ.BALANCE_PERIOD edit 99 ' ' &SADJ.STATE ' ' &SADJ.BAL_ADJ_SEQ edit 999
+!   end-if
+   
+   if rtrim($SFCOMPANY,' ') = rtrim($STFUTPC.COMPANY,' ') and rtrim($SFEMPLID,' ') = rtrim($STFUTPC.EMPLID,' ') and
+      #SFPERIOD = &SADJ.BALANCE_PERIOD and $SFSTATE = &SADJ.STATE and #SFSEQ = &SADJ.BAL_ADJ_SEQ 
+        let $state_futa_tba_processed = 't'
+        break
+   end-if
+   add 1 to #sfinx
+  end-while
+  
+end-procedure
+
+begin-procedure update-state-futa-tba-balances
+ 
+  if #state_futa_tba_balance < {state_futa_tba_balance_limit}
+   put $STFUTPC.COMPANY $STFUTPC.EMPLID &SADJ.BALANCE_PERIOD $PT2.STATE #FUTA_Taxable_QTD #FUTA_Taxable &SADJ.BAL_ADJ_SEQ into 
+       state_futa_tba_balance(#state_futa_tba_balance) company emplid period state txgrs_qtd txgrs_ytd seq
+       
+   add 1 to #state_futa_tba_balance
+  else
+    show 'ERROR: TBA, state_futa_tba_balance_limit {state_futa_tba_balance_limit} is too small in adpstfut.sqc.  Create new definition in probiz.sqc'
+    stop
+  end-if
+  
+end-procedure
+ 
+begin-procedure print-state-futa-tba-balances
+ 
+  let #nextinx = 0
+  let $prior_st_futa_cmp = ''
+  while #nextinx < #state_futa_tba_balance
+     get $cmp $emp #per $st #txgrs_qtd #txgrs_ytd #seq from state_futa_tba_balance(#nextinx) company emplid period state txgrs_qtd txgrs_ytd seq
+     if $prior_st_futa_cmp <> '' 
+      if  rtrim($prior_st_futa_cmp,' ') <> rtrim($cmp,' ')
+       print 'Company FUTA TBA Totals: ' (+2,1) 
+       print $prior_st_futa_cmp () 
+       print #State_futa_QTD_TBA_Company (,41) edit $$$,$$$,$$$,$$9.99mi  
+       print #State_futa_YTD_TBA_Company (,61) edit $$$,$$$,$$$,$$9.99mi 
+       move 0 to #State_futa_QTD_TBA_Company
+       move 0 to #State_futa_YTD_TBA_Company
+       print '' (+1,1)
+       let $prior_st_futa_cmp = $cmp    
+      end-if
+     else
+      let $prior_st_futa_cmp = $cmp    
+     end-if
+     do get-st-descr
+     
+     print $cmp       (+1,1)
+     print $st        (,11)
+     print $st_descr  (,15)
+     print #txgrs_qtd (,41) edit $$$,$$$,$$$,$$9.99mi
+     print #txgrs_ytd (,61) edit $$$,$$$,$$$,$$9.99mi
+     print 'Emplid: ' (,90)
+     print $emp       ()
+     print 'Period: ' (,110)
+     print #per       () edit 99
+     print 'Seq#    ' (,122)
+     print #seq       () edit 99
+     
+     add #txgrs_qtd to #State_futa_QTD_TBA_Company
+     add #txgrs_ytd to #State_futa_YTD_TBA_Company
+     add #txgrs_qtd to #State_futa_QTD_TBA_Hash
+     add #txgrs_ytd to #State_futa_YTD_TBA_Hash
+     add 1 to #nextinx
+  end-while
+ 
+  if $prior_st_futa_cmp <> '' 
+       print 'Company FUTA TBA Totals: ' (+2,1) 
+       print $prior_st_futa_cmp ()     
+       print #State_futa_QTD_TBA_Company (,41) edit $$$,$$$,$$$,$$9.99mi  
+       print #State_futa_YTD_TBA_Company (,61) edit $$$,$$$,$$$,$$9.99mi  
+  end-if
+ 
+  print 'State FUTA TBA Total = ' (+2,1) 
+  print #State_futa_QTD_TBA_Hash  (,41)  edit $$$,$$$,$$$,$$9.99mi 
+  print #State_futa_YTD_TBA_Hash  (,61)  edit $$$,$$$,$$$,$$9.99mi 
+ 
+end-procedure
+ 
+#endif
+ 
+begin-procedure insert-state-futa
+#ifndef DISABLE_STATE_FUTA   
+ 
+  let $Futa_Error = 'Temp Insert Error.'
+ 
+!  if $SelectEmplid <> ''
+!   #debugd show 'insert-state-futa: ' $STFUTPC.EMPLID ' ' $STFUTPC.COMPANY ' ' $PT2.STATE ', QTD = ' #FUTA_Taxable_QTD ', YTD = ' #FUTA_Taxable
+!  end-if
+
+begin-sql on-error=futa-st-ins-error
+ 
+  INSERT INTO {ADP_ST_FUTA_TABLE}
+          (EMPLID,             !key
+           COMPANY,            !key
+           STATE,              !key
+           TXGRS_QTD,
+           TXGRS_YTD )
+ 
+       VALUES ($STFUTPC.EMPLID,
+               $STFUTPC.COMPANY,
+               $PT2.STATE,
+               #FUTA_Taxable_QTD,
+               #FUTA_Taxable)
+ 
+end-sql
+ 
+      add 1 to #temp_records_st_fut
+      if mod(#temp_records_st_fut,500) = 0
+         do Get-Current-DateTime
+        #debugd show '----> Init Status: {ADP_ST_FUTA_TABLE} Record Count... ' #temp_records_st_fut '  --> ' $AsOfNow
+      end-if
+#endif
+end-procedure
+ 
+begin-procedure futa-st-ins-error
+#ifndef DISABLE_STATE_FUTA
+   if #temp_records_st_fut = 0
+       show $futa_error
+       show '  *** Required: Table: {ADP_ST_FUTA_TABLE} with fields: EMPLID (key), COMPANY (key), STATE (key), TXGRS_QTD and TXGRS_YTD'
+       stop
+   end-if
+#endif
+end-procedure
+ 
+begin-procedure Generate-State-Futa  !hook - from pbzqtr.sqr, after writing the $UU (FUTA) record to balances
+#ifndef DISABLE_STATE_FUTA
+ if {STATE_FUTA_START_CRITERIA}
+ 
+   clear-array name=State_Futa_detail
+   let #State_Futa_detail = 0
+   
+   if $SelectEmplid <> ''
+    #debugd show 'Generate-State-Futa: ' $Current_Emplid ', QTD FUTA = '  #TXGRS_QTD_T edit 999,999.99 ', YTD FUTA =  ' #TXGRS_YTD_T edit 999,999.99
+   end-if
+   
+   let #TXGRS_QTD_FUTA = #TXGRS_QTD_T
+   let #TXGRS_YTD_FUTA = #TXGRS_YTD_T
+       
+begin-SELECT
+STFUTG.STATE
+STFUTG.COMPANY
+STFUTG.TXGRS_QTD
+STFUTG.TXGRS_YTD
+ 
+   if $SelectEmplid <> ''
+    #debugd show 'Generate-State-Futa: ' &STFUTG.COMPANY ' ' &STFUTG.STATE ', QTD State FUTA = ' &STFUTG.TXGRS_QTD edit 999,999.99 ', YTD State FUTA = ' &STFUTG.TXGRS_YTD edit 999,999.99
+   end-if
+ 
+   put &STFUTG.STATE &STFUTG.TXGRS_QTD &STFUTG.TXGRS_YTD into State_Futa_detail(#State_Futa_detail) state txgrs_qtd txgrs_ytd
+   add 1 to #State_Futa_detail
+
+!20121206 commented out these for rollups     
+!   #ifdef SUBTOTAL_FEIN_EXTRACT
+!     FROM  {ADP_ST_FUTA_TABLE} STFUTG , PS_COMPANY_TBL CO4 
+!     WHERE    STFUTG.EMPLID     = $Current_Emplid
+!          AND STFUTG.COMPANY    = CO4.COMPANY
+!          AND CO4.FEDERAL_EIN  = #Current_FEIN
+!          AND CO4.EFFDT = (SELECT MAX(EFFDT)
+!            FROM   PS_COMPANY_TBL C041
+!            WHERE  C041.COMPANY = CO4.COMPANY
+!              AND  C041.EFFDT  <= $AsOfDate)
+! 
+!   #else  !added 04/14/2011, 8/3/2012, causing doubling up
+!     #ifdef SUBTOTAL_ADP_COMPID_EXTRACT
+!     FROM  {ADP_ST_FUTA_TABLE} STFUTG , PS_TF_COMPANY_XREF CO4 
+!     WHERE    STFUTG.EMPLID     = $Current_Emplid
+!          AND STFUTG.COMPANY    = CO4.COMPANY
+!          AND CO4.TF_COMPANY   = $Current_ADP_Compid
+!          AND CO4.EFFDT = (SELECT MAX(EFFDT)
+!            FROM   PS_TF_COMPANY_XREF C041
+!            WHERE  C041.COMPANY = CO4.COMPANY
+!              AND  C041.EFFDT  <= $AsOfDate)
+!     #else
+       FROM  {ADP_ST_FUTA_TABLE} STFUTG 
+       WHERE     STFUTG.EMPLID     = $Current_Emplid
+             AND STFUTG.COMPANY    = $Current_Company
+!     #endif
+!   #endif
+ 
+  #ifdef SELECT_WITH_UR
+   {SELECT_WITH_UR} with ur
+  #endif
+end-select
+ 
+  if #State_Futa_detail > 0
+ 
+   #ifdef STATE_FUTA_OVERRIDE_WITH_BALANCES
+    let #fi = 0                !if the sum of the che ks don't equal the FUTA taxable, we stick all the FUTA into the first state record
+    let #txgrs_ytd_chk = 0
+    while #fi < #State_Futa_detail
+      get #txgrs_ytd from State_Futa_detail(#fi) txgrs_ytd
+      add #txgrs_ytd to #txgrs_ytd_chk
+      add 1 to #fi
+    end-while
+ 
+    if #txgrs_ytd_chk <> #TXGRS_YTD_T
+     #debugd show 'Generate-State-Futa: Message YTD - ' $Current_Company ' ' $Current_Emplid ', Sum of FUTA checks ' #txgrs_ytd_chk edit 999,999.99 ' <> FUTA YTD Balance ' #TXGRS_YTD_T edit 999,999.99
+      add 1 to #State_Futa_Message_cnt
+      let #State_Futa_detail = 1
+      put #TXGRS_QTD_T #TXGRS_YTD_T into State_Futa_detail(0) txgrs_qtd txgrs_ytd
+    end-if
+   #endif
+ 
+ let #fi = 0
+ while #fi < #State_Futa_detail
+      get $st #txgrs_qtd #txgrs_ytd from State_Futa_detail(#fi) state txgrs_qtd txgrs_ytd
+       
+      let #NLGRS_QTD_T    = 0
+      let #TAX_QTD_T      = 0
+      let #NLGRS_YTD_T    = 0
+      let #TAX_YTD_T      = 0
+      let #Tip_Wages_QTD  = 0
+      let #Tip_Wages_YTD  = 0
+      let #Tip_Tax_QTD    = 0
+      let #Tip_Tax_YTD    = 0
+      let $Cur_Locality = ''
+      let $Cur_Tax_Class = $STATE_FUTA_TAX_CLASS       ! <------------------MT4, CA4,.. new taxcode written to balances
+      let $Cur_State = rtrim($st,' ')
+      let #TXGRS_QTD_T = #TXGRS_QTD
+      let #TXGRS_YTD_T = #TXGRS_YTD 
+ 
+ 
+      #ifdef STATE_FUTA_LIMIT
+       if #TXGRS_QTD_T > #TXGRS_QTD_FUTA
+         #debugd show 'Generate-State-Futa: QTD > FUTA QTD ' $Current_Emplid ' ' $Cur_State $Cur_Tax_Class ' ' #TXGRS_QTD_T edit 999,999.99 ' setting QTD State FUTA to ' #TXGRS_QTD_FUTA edit 999,999.99
+          let #TXGRS_QTD_T = #TXGRS_QTD_FUTA
+       end-if
+       if #TXGRS_YTD_T > #TXGRS_YTD_FUTA
+         #debugd show 'Generate-State-Futa: YTD > FUTA YTD ' $Current_Emplid ' ' $Cur_State $Cur_Tax_Class ' ' #TXGRS_YTD_T edit 999,999.99 ' setting YTD State FUTA to ' #TXGRS_YTD_FUTA edit 999,999.99
+          let #TXGRS_YTD_T = #TXGRS_YTD_FUTA
+       end-if
+       if #TXGRS_QTD_T < 0
+         #debugd show 'Generate-State-Futa: QTD < 0        ' $Current_Emplid ' ' $Cur_State $Cur_Tax_Class ' ' #TXGRS_QTD_T edit 999,999.99 ' setting QTD State FUTA to 0'
+          let #TXGRS_QTD_T = 0
+       end-if
+       if #TXGRS_YTD_T < 0
+         #debugd show 'Generate-State-Futa: YTD < 0        ' $Current_Emplid ' ' $Cur_State $Cur_Tax_Class ' ' #TXGRS_YTD_T edit 999,999.99 ' setting YTD State FUTA to 0'
+          let #TXGRS_YTD_T = 0
+       end-if
+      #endif
+      
+      add #TXGRS_QTD_T to #State_futa_QTD_Hash
+      add #TXGRS_YTD_T to #State_futa_YTD_Hash
+ 
+      do update-tax-balances             !in pbzqtr.sqr
+      do update-state-futa-balances
+    add 1 to #fi
+  end-while
+  clear-array name=State_Futa_detail
+  let #State_Futa_detail = 0
+ 
+ end-if
+ end-if     
+#endif
+end-procedure
+#endif               !STATE_FUTA_SKIP_GENERATION_CODE
+
+
+begin-procedure  report-state-futa
+
+   if $SelectEmplid <> ''
+    #debugd show 'report-state-futa: ' $Cur_State ' ' $Current_Company ', QTD State FUTA = '  #TXGRS_QTD_T edit 999,999.99 ', YTD State FUTA =  ' #TXGRS_YTD_T edit 999,999.99
+   end-if
+   do update-state-futa-balances
+   
+   add #TXGRS_QTD_T to #State_futa_QTD_Hash
+   add #TXGRS_YTD_T to #State_futa_YTD_Hash
+   
+end-procedure
+ 
+ 
+begin-procedure  update-state-futa-balances
+#ifndef DISABLE_STATE_FUTA
+ 
+   #ifdef debug_adpstfut
+    #debugd show 'update-state-futa-balances: ' $Current_Emplid ' ' $Current_Company ' ' $Cur_State ' ' #TXGRS_QTD_T ' ' #TXGRS_YTD_T
+   #endif
+ 
+   let #ifut = 0
+   let $found = 'f'
+   while #ifut < #state_futa_balance
+     get $cmp $st from state_futa_balance(#ifut) company state
+     if rtrim($st,' ') = $Cur_State and rtrim($cmp,' ') = rtrim($Current_Company,' ')
+       array-add #TXGRS_QTD_T #TXGRS_YTD_T to state_futa_balance(#ifut) txgrs_qtd txgrs_ytd
+       let $found = 't'
+       break
+     end-if
+     add 1 to #ifut
+   end-while
+   
+   if $found <> 't'
+       put $Current_Company $Cur_State  #TXGRS_QTD_T #TXGRS_YTD_T into state_futa_balance(#state_futa_balance) company state txgrs_qtd txgrs_ytd
+       add 1 to #state_futa_balance
+   end-if
+   
+#endif
+end-procedure
+ 
+begin-procedure Summarize-State-Futa  !hook - from pbzqtr.sqr
+#ifndef DISABLE_STATE_FUTA
+ if {STATE_FUTA_START_CRITERIA} and rtrim($STATE_FUTA_TAX_CLASS,' ') <> ''
+ 
+  #ifdef FORCE_STATE_FUTA_AMOUNTS_INTO_LOG
+      show '' 
+      show 'ADP Employment Tax, Quarterly State FUTA: adpstfut.sqc release: {adpstfuta_release}, class = ' $STATE_FUTA_TAX_CLASS ', count = ' #state_futa_balance edit 9999999     
+      show ''
+      show '                       QTD Taxable         YTD Taxable'
+  #endif
+  let #header_type = 70
+  let $ReportTitle  = 'ADP Employment Tax, Quarterly State FUTA.'
+ 
+  let $cmp_zz = 'ZZZ'
+  let $state_zz    = 'ZZ'
+  let #ifut = 0
+  let $prior_st_futa_cmp = ''
+  while #ifut < #state_futa_balance
+    
+     let $sorttest = $cmp_zz || $state_zz
+     let #jfut = 0
+     let #nextinx = 0
+     
+     while #jfut < #state_futa_balance
+       get $cmp $st from state_futa_balance(#jfut) company state
+       let $sortfield = $cmp || $st
+       if ($sortfield < $sorttest)
+          let #nextinx = #jfut
+          move $sortfield to $sorttest
+       end-if
+       add 1 to #jfut
+     end-while
+     
+     if #current-line > 56
+       New-Page
+     end-if
+     get $cmp $st #txgrs_qtd #txgrs_ytd from state_futa_balance(#nextinx) company state txgrs_qtd txgrs_ytd
+     if $prior_st_futa_cmp <> '' 
+      if  rtrim($prior_st_futa_cmp,' ') <> rtrim($cmp,' ')
+       print 'Company FUTA Totals: ' (+2,1) 
+       print $prior_st_futa_cmp () 
+       print #State_futa_QTD_Company (,41) edit $$$,$$$,$$$,$$9.99mi  
+       print #State_futa_YTD_Company (,61) edit $$$,$$$,$$$,$$9.99mi 
+       #ifdef FORCE_STATE_FUTA_AMOUNTS_INTO_LOG
+        show ''
+        show ' Totals: ' $prior_st_futa_cmp '    ' #State_futa_QTD_Company edit $$$,$$$,$$$,$$9.99mi ' ' #State_futa_YTD_Company edit $$$,$$$,$$$,$$9.99mi
+        show ''
+       #endif
+       move 0 to #State_futa_QTD_Company
+       move 0 to #State_futa_YTD_Company
+       print '' (+1,1)
+       let $prior_st_futa_cmp = $cmp    
+      end-if
+     else
+      let $prior_st_futa_cmp = $cmp    
+     end-if
+     do get-st-descr
+     print $cmp       (+1,1)
+     print $st        (,11)
+     print $st_descr  (,15)
+     print #txgrs_qtd (,41) edit $$$,$$$,$$$,$$9.99mi
+     print #txgrs_ytd (,61) edit $$$,$$$,$$$,$$9.99mi
+     add #txgrs_qtd to #State_futa_QTD_Company
+     add #txgrs_ytd to #State_futa_YTD_Company
+     #ifdef FORCE_STATE_FUTA_AMOUNTS_INTO_LOG
+      show #ifut edit 999,999 '. ' $cmp ' ' $st ' ' #txgrs_qtd edit $$$,$$$,$$$,$$9.99mi ' ' #txgrs_ytd edit $$$,$$$,$$$,$$9.99mi
+     #endif
+     put $cmp_zz $state_zz into state_futa_balance(#nextinx) company state
+     add 1 to #ifut
+  end-while
+ 
+  if $prior_st_futa_cmp <> '' 
+       print 'Company FUTA Totals: ' (+2,1) 
+       print $prior_st_futa_cmp ()     
+       print #State_futa_QTD_Company (,41) edit $$$,$$$,$$$,$$9.99mi  
+       print #State_futa_YTD_Company (,61) edit $$$,$$$,$$$,$$9.99mi  
+       #ifdef FORCE_STATE_FUTA_AMOUNTS_INTO_LOG
+        show ''
+        show ' Totals: ' $prior_st_futa_cmp '    ' #State_futa_QTD_Company edit $$$,$$$,$$$,$$9.99mi ' ' #State_futa_YTD_Company edit $$$,$$$,$$$,$$9.99mi
+        show ''
+       #endif
+  end-if
+ 
+  print 'State FUTA Totals    = ' (+2,1) 
+  print #State_futa_QTD_Hash  (,41)  edit $$$,$$$,$$$,$$9.99mi 
+  print #State_futa_YTD_Hash  (,61)  edit $$$,$$$,$$$,$$9.99mi 
+  #ifdef FORCE_STATE_FUTA_AMOUNTS_INTO_LOG
+     show ''
+     show ' Totals:        ' #State_futa_QTD_Hash  edit $$$,$$$,$$$,$$9.99mi ' ' #State_futa_YTD_Hash edit $$$,$$$,$$$,$$9.99mi
+     show ''
+  #endif
+  New-Page
+ 
+ end-if
+#endif
+
+#ifndef STATE_FUTA_SKIP_GENERATION_CODE
+ #ifdef INCLUDE_FUTA_TBA
+  if {INCLUDE_FUTA_TBA}
+   let #header_type = 70
+   let $ReportTitle  = 'ADP Employment Tax, State FUTA Tax Balance Adjustments'
+   do print-state-futa-tba-balances
+   New-Page
+  end-if
+ #endif
+#endif
+
+end-procedure
+ 
+  
+begin-procedure get-st-descr
+ 
+  let $st_descr = ''
+  
+Begin-Select
+DSN.DESCR
+ 
+  let $st_descr = rtrim(&DSN.DESCR,' ')
+ 
+   FROM PS_STATE_NAMES_TBL DSN
+     WHERE  DSN.COUNTRY     = 'USA'
+      AND   DSN.STATE       = $st
+ 
+  #ifdef SELECT_WITH_UR
+   {SELECT_WITH_UR} with ur
+  #endif
+end-select
+ 
+end-procedure
+

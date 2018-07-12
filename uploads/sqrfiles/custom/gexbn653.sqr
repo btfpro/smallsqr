@@ -1,0 +1,1369 @@
+!***********************************************************************
+! GEXBN653:  Mercer Voluntary Benefits Deductions-Inbound File         *
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module is the confidential and proprietary information of       *
+! Giant Eagle, Inc.; it is not to be copied, reproduced,or transmitted *
+! in any form, by any means, in whole or in part, nor is it to be used *
+! for any purpose other than that for which it is expressly provided   *
+! without the written permission of Giant Eagle.                       *
+!                                                                      *
+! Copyright (c) 1997-1998 Giant Eagle,Inc. All Rights Reserved         *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+! GEXBN653 :            Mercer Voluntary Benefits Deductions:          *
+!                       Inbound file to setup voluntary deductions.    *
+!                                                                      *
+! Narrative:            Voluntary Benefits will be offered to          *
+!                       Team Members by Mercer, Giant Eagle’s new      *
+!                       Voluntary Benefits Partner. A new interface    *
+!                       needs to be developed to read a file inbound   *
+!                       from Mercer to Giant Eagle and update          *
+!                       PS_GENL_DEDUCTION with new or changed Team     *
+!                       Member contributions for Voluntary Benefit     *
+!                       plans. This new sqr will replace GEXBN613      *
+!                       currently in use to load files from Paylogix.  *
+!                       Only the inbound file record layout is         *
+!                       changing. The new SQR should use the same      *
+!                       logic as GEXBN613 with regard to procedures,   *
+!                       including updating PS_GENL_DEDUCTION, using    *
+!                       the run control page to validate deduction     *
+!                       codes, EMPL_RCD (for Multi-job Team Members)   *
+!                       and Company.                                   *
+!                                                                      *
+! #Debugx Used:         #debug9 paragraph trace                        *
+!                       #debug8 key variable values                    *
+!                       #debug7 data returned from sql calls           *
+!                                                                      *
+! SQL Tables:           JOB                                            *
+!                       PERSONAL_DATA                                  *
+!                       GENL_DEDUCTION                                 *
+!                       GENL_DED_CD                                    *
+!                       PAY_CALENDAR                                   *
+!                                                                      *
+! Written by:           Ramesh Solai (cloned from gexbn613)            *
+!                                                                      *
+! Normally Run:         Monthly                                        *
+!                                                                      *
+! Control Parms:        AsOfDate                                       *
+!                                                                      *
+!***********************************************************************
+!                         MODIFICATION HISTORY                         *
+!***********************************************************************
+! INITIALS  DATE        DESCRIPTION OF THE CHANGE                      *
+!***********************************************************************
+! TCSXRAS   09/16/2014  Initial Creation - Cloned from gexbn613        *
+!                                                                      *
+! TCSXSSS      03/25/2015   Modified to add the Moveit SQC and changes *
+!GEX_SEC_REENG 2015-04-29 Vahini Katta                                 *
+!Changes related to gex_emplid_mapp/7 digit emplid
+!***********************************************************************
+
+#include 'setenv.sqc'    !Set environment
+#Include 'setup32.sqc'   !Printer and Page-Size Initialization (Landscape)
+
+#define #column1     1
+#define #column2    13
+#define #column3    50
+#define #column4    59
+#define #column5    69
+#define #column6    77
+#define #column7    89
+#define #column8    97
+#define #column9   111
+#define debug9     1
+
+Begin-Setup
+Declare-Report Log-Report
+Printer-Type=HPLASERJET
+  Layout=Default
+End-Declare
+
+Declare-Report Load-Report
+Printer-Type=HPLASERJET
+  Layout=Default
+End-Declare
+End-Setup
+
+
+Begin-Report
+#debug9 Show 'Begin-Report'
+
+  Use-Report Log-Report
+  Do P100-Initialization
+  Do P200-Main-Process
+  Do P400-Finalization
+End-Report
+
+!********************************************
+Begin-Heading 7 For-Reports=(Log-Report)
+!********************************************
+#debug9 Show 'Begin-Heading (Log-Report)'
+  Let $ReportID      =   'BN653ERR'
+  Let $ReportTitle   =   'Mercer Voluntary Benefits Deductions'
+  Let $ReportTitle2  =   'Error Report'
+
+  #Include 'stdhdg01.sqc'
+  Print $ReportTitle2      (3,) Center
+
+  Print 'EMPLID'           (+3,{#column1})
+  Print 'ERROR MESSAGE'    (+0,{#column2})
+
+  Print '-'                (+1,{#column1},120)  Fill
+End-Heading
+
+!********************************************
+Begin-Heading 6 For-Reports=(Load-Report)
+!********************************************
+#debug9 Show 'Begin-Heading (Load-Report)'
+  Let $ReportID      =   'GEXBN653'
+  Let $ReportTitle   =   'Mercer Voluntary Benefits Deductions'
+  Let $ReportTitle2  =   'Load Report'
+
+  #Include 'stdhdg01.sqc'
+  Print $ReportTitle2      (3,) Center
+
+  Print 'EMPLID'           (+3,{#column1})
+  Print 'NAME'             (+0,{#column2})
+  Print 'COMPANY'          (+0,{#column3})
+  Print 'PAYGROUP'         (+0,{#column4})
+  Print 'STATUS'           (+0,{#column5})
+  Print 'EFFDT'            (+0,{#column6})
+  Print 'DEDCD'            (+0,{#column7})
+  Print ' DED AMOUNT'      (+0,{#column8})
+  Print ' DED END DT'      (+0,{#column9})
+
+  Print '-'                (+1,{#column1},9)  Fill
+  Print '-'                (+0,{#column2},35) Fill
+  Print '-'                (+0,{#column3},7)  Fill
+  Print '-'                (+0,{#column4},8)  Fill
+  Print '-'                (+0,{#column5},6)  Fill
+  Print '-'                (+0,{#column6},10) Fill
+  Print '-'                (+0,{#column7},6)  Fill
+  Print '-'                (+0,{#column8},11) Fill
+  Print '-'                (+0,{#column9},11) Fill
+End-Heading
+
+
+!********************************************
+Begin-Procedure P100-Initialization
+!********************************************
+#debug9 Show 'P100-Initialization'
+  Do Init-DateTime           !datetime.sqc
+  Do Init-Number             !number.sqc
+  Do Get-Current-DateTime    !curdttim.sqc
+  Do Stdapi-Init             !stdapi.sqc
+
+  Let $ReportID      =   'GEXBN653'
+  Let $ReportTitle   =   'Mercer Voluntary Benefits Deductions'
+
+  Show '$ReportID    = ' $ReportID
+  Show '$ReportTitle = ' $ReportTitle
+
+  Let $GEXXX919_Dedcd_Alias = 'DED.DEDCD'
+
+  If $prcs_process_instance = ''
+    Do Ask-As-Of-Date
+    
+    Let $DedcdString = ''''
+    Display 'Enter Dedcd or leave blank to exit.'
+    While 1=1
+      Input $Dedcd Maxlen=6 'Dedcd'
+      Uppercase $Dedcd
+      If Rtrim($Dedcd, ' ') = ''
+        Concat '''' With $DedcdString
+        Break
+      End-If
+      If $DedcdString <> ''''
+        Concat ''',''' With $DedcdString
+      End-If
+      Concat $Dedcd With $DedcdString
+    End-While
+
+    If $DedcdString = ''''''
+      Let $GEXXX919_INCLUDE_DEDCD_CRITERIA = '1=1'
+      Let $GEXXX919_INCLUDE_DEDCD_DISPLAY_CRITERIA = 'ALL'
+    Else
+      Let $GEXXX919_INCLUDE_DEDCD_CRITERIA = $GEXXX919_Dedcd_Alias || ' In (' || $DedcdString || ')'
+      Let $GEXXX919_INCLUDE_DEDCD_DISPLAY_CRITERIA = $GEXXX919_INCLUDE_DEDCD_CRITERIA
+    End-If
+
+  Else
+    Do GEXRCBN1-SELECT-PARAMETERS
+    Let $AsOfDate = &GEX_RC_BEN.ASOFDATE
+    If Rtrim($AsOfDate, ' ') = ''
+      Let $AsOfDate = $AsOfToday
+    End-If
+
+    Do GEXXX919-Select-DEDCD-Parameters
+
+  End-If
+
+  let $effdt = $AsOfDate
+
+  date-time () HH:MI:SS &timeBegan
+  date-time () MM/DD/YYYY &dateBegan
+  show 'Report Began at ' &timeBegan ' on ' &dateBegan
+  show ' '
+
+  let $Data-Found-Flag = 'N'
+
+  Do P140-Open-File
+End-Procedure
+
+
+!********************************************
+Begin-Procedure P140-Open-File
+!********************************************
+#debug9 Show 'P140-Open-File'
+
+!Move Input file from moveit folder
+!**********************************
+
+    let $Prcs_OPRID       = 'HRBATCH'
+    let $PRCS_RUN_CNTL_ID = 'gexbn653'
+    
+   !Do Call_Unix_Commands('GEXBN653_CP_INFILE') Commented by TCSXSSS Surya Sobha and added the new function from gexmovit.SQC
+    Do Call_MovIt_Commands($Prcs_OPRID,$PRCS_RUN_CNTL_ID,$ReportID,$File1, $comments ) !TCSXSSS Surya added the moveit folder changes - gexmovit.sqc
+
+!Open Input file
+!***************
+  Let $file1 = '{INFILE}' || 'giant_eagle_bill'
+!  Let $file1 = 't:\psoft\hr751\working\isdvgbd\' || Lower($ReportID) || '.dat'
+
+  Show 'Input file = ' $file1
+
+  Open $file1 as 1
+       For-Reading Record=80 Status=#filestat
+
+  If #filestat != 0
+     Show 'Error opening input file. Program terminating.'
+     Stop
+  End-If
+
+End-Procedure
+
+
+!********************************************
+Begin-Procedure P200-Main-Process
+!********************************************
+#debug9 Show 'P200-Main-Process'
+
+  let #recs-read  = 0
+  let #trans-read = 0
+  let #recs-error = 0
+  let #recs-inserted = 0
+  let #recs-termed   = 0
+  let #recs-updated  = 0
+  let #recs-zero  = 0
+
+  While 1=1
+
+    Read 1 Into $in_line:80
+
+          Status=#filestat
+
+    If #filestat != 0
+       Show 'Error reading input file. Program terminating.'
+       Stop
+    End-If
+
+    If #end-file 
+      Break
+    Else
+      Add 1 To #recs-read
+      Add 1 To #trans-read
+    End-If
+
+    Use-Report Log-Report
+
+!    If $message = 'No transactions to process'
+!      show $message
+!      print $message (+1,1)
+!    Else
+
+    show $in_line
+    let $rec_cd = substr($in_line,1,3) 
+    show $rec_cd
+    
+    If $rec_cd = 'DTL'
+    
+      let $lastname       = ltrim(rtrim(substr($in_line,4,20),' '), ' ')
+      let $Mercer_dedcd   = ltrim(rtrim(substr($in_line,24,5),' '), ' ')
+      !let $emplid_7digit  = ltrim(rtrim(substr($in_line,29,15),' '), ' ') !GEX_SEC_REENG 2015-04-29 Vahini Katta 
+      let $emplid         = ltrim(rtrim(substr($in_line,29,15),' '), ' ')
+      let $Mercer_effdtin = ltrim(rtrim(substr($in_line,49,8),' '), ' ')
+      let $amount         = ltrim(rtrim(substr($in_line,60,9),' '), ' ')
+      let $ded_id         = ltrim(rtrim(substr($in_line,71,8),' '), ' ')
+    
+      let $error_row = $rec_cd||$lastname||$Mercer_dedcd||$emplid||$Mercer_effdtin||$amount||$ded_id
+
+      !Do P250-Get-Emplid-from-7digit !GEX_SEC_REENG 2015-04-29 Vahini Katta Begins
+
+      show $error_row
+      show 'Read Record'
+      show 'Emplid:  ' $emplid
+      show 'Name:    ' $lastname
+      show 'Dedcd:   ' $Mercer_dedcd
+      show 'Amount:  ' $amount
+      show 'Ded ID:  ' $ded_id
+      show 'Effdt:   ' $Mercer_effdtin
+
+      Let #Amount = $amount
+      Let #Amount = #Amount/100
+
+      show 'Mercer Effdt: ' $Mercer_effdtin
+      let $Mercer_effdtin1 = strtodate($Mercer_effdtin,'MMDDYYYY')
+      show '$Mercer_effdtin1 ' $Mercer_effdtin1
+      let $Mercer_mm = substr($Mercer_effdtin,1,2)
+      let $Mercer_dd = substr($Mercer_effdtin,3,2)
+      let $Mercer_yy = substr($Mercer_effdtin,5,4)	  
+      let $Mercer_effdt = $Mercer_mm||'/'||$Mercer_dd||'/'||$Mercer_yy
+      show 'Mercer Effdt: ' $Mercer_effdt
+
+      let $Year4=1
+      show 'Effdt: ' $effdt
+      Do Format-DateTime($effdt,$comp_effdt,{DEFDMY},'','')
+      show '$comp_effdt: ' $comp_effdt
+      let $comp_dd = substr($comp_effdt,1,2)
+      let $comp_mm = substr($comp_effdt,4,2)
+      let $comp_yy = substr($comp_effdt,7,2)
+      Do MakeYear4Digits($comp_yy)
+      let $comp_effdt = $comp_mm||$comp_dd||$comp_yy
+      show 'Comp effdt: ' $comp_effdt
+      
+      let #Mercer_mm = $Mercer_mm
+      let #comp_mm = $comp_mm
+      let #Mercer_yy = $Mercer_yy
+      let #comp_yy = $comp_yy
+      let $continue = 'Y'
+
+      if (#Mercer_mm = #comp_mm) or (#Mercer_mm = #comp_mm + 1) or (#Mercer_mm = #comp_mm + 2)
+         let $continue = 'Y'
+      else
+         if #Mercer_mm + (#Mercer_yy - #comp_yy)*12 > #comp_mm + 2
+            let $continue = 'N'
+            Add 1 to #recs-error         
+            show $emplid ' has a future dated effective date. No rows inserted.'
+            Print $emplid                                                 (+1,{#column1})
+            Print 'has a future dated effective date. No rows inserted.'  (+0,{#column2})
+            Print $error_row                                              (+1,{#column2})
+         end-if
+      end-if
+
+      let $dedcd_valid = 'N'
+      Do Validate-Dedcd
+      If $dedcd_valid = 'N'
+         let $continue = 'N'
+            Add 1 to #recs-error         
+            show $emplid ' has a DEDCD of ' $Mercer_dedcd '. Code is not on Run Control panel. No rows inserted.'
+            Print $emplid                                                 (+1,{#column1})
+            Print 'has a bad dedcd. No rows inserted.'  (+0,{#column2})
+            Print $error_row                                              (+1,{#column2})
+            Print 'Deduction Code not found.  Did not process.'           (+1,{#column2})
+      end-if
+
+      If $continue = 'Y'
+
+         let $job_exist = 'N'
+         Do Check-Job
+   
+         Show '$job_exist:     ' $job_exist
+         Show '$no_job_active: ' $no_job_active
+         Show '$multi_job:     ' $multi_job
+
+         if $job_exist = 'Y'
+            if $no_job_active = 'N'
+!              if $status = 'N' and #Amount = 0
+               if #Amount = 0
+		    Do Update-Deduction-End-Dt
+                  Use-Report Log-Report   
+                  show $emplid ' is new and has no amounts for dedcd: ' $Mercer_dedcd '. Deduction End Date will be ' $Mercer_effdtin1 '.'
+                  Print $emplid                                                 (+1,{#column1})
+                  let $out = 'Emplid is new and has no amounts for dedcd: ' || $Mercer_dedcd || '. Deduction End Date will be ' || $Mercer_effdtin1 || '.'
+                  print $out                                                    (+0,{#column2})
+                  Print $error_row    (+1,{#column2})
+                  Add 1 to #recs-zero
+                  Add 1 to #recs-error   !1 rows rejected 
+               Else
+!                 Let $Mercer_dedcd = $Mercer1_dedcd
+                  Let #Ded_Amt     = #Amount
+                  Add #Ded_Amt    to #Mercer_TOT
+                  
+                  Do Process-Load
+                  
+!                  Let $Mercer_dedcd = $Mercer2_dedcd
+!                  Let #Ded_Amt     = #Amount2
+!                  Add #Ded_Amt    to #Mercer2_TOT
+                  
+!                  Do Process-Load
+               End-if
+            else
+               Use-Report Log-Report   
+               show $emplid ' does not have an active Corporate, Non Union Job row. Did not process.'
+               Print $emplid                                                                          (+1,{#column1})
+               Print 'Emplid does not have an active Corporate, Non Union Job row. Did not process.'  (+0,{#column2})
+               Print $error_row                                                                       (+1,{#column2})
+               Add 2 to #recs-error   !2 rows rejected - Mercer1&2
+            end-if
+         else
+            Use-Report Log-Report
+            if $multi_job = 'N'
+               show $emplid ' does not exist on Job. No row inserted'
+               Print $emplid                                                 (+1,{#column1})
+               Print 'does not exist on Job table. No row inserted.'         (+0,{#column2})
+            Else
+               show $skip_message
+               Print $skip_message                                           (+1,{#column1})
+            End-if
+            Print $error_row                                                 (+1,{#column2})
+            Add 2 to #recs-error
+         End-If
+      End-If
+
+    Else  !Trailer row
+    
+      show 'Not a DTL row.'
+    
+      If $rec_cd = 'TRL'
+    
+        let $prcs_dt 	= ltrim(rtrim(substr($in_line,4,8),' '), ' ')
+        let $rcd_count 	= ltrim(rtrim(substr($in_line,29,11),' '), ' ')
+   	 let $total_amt 	= ltrim(rtrim(substr($in_line,50,13),' '), ' ')
+        let #tot_amt 	= $total_amt
+        let #tot_amt 	= #tot_amt / 100  
+	  
+        show 'Process Date: ' $prcs_dt
+        let $prcs_dtin1 = strtodate($prcs_dt,'MMDDYYYY')
+        show '$prcs_dtin1 ' $prcs_dtin1
+        let $prcs_mm = substr($prcs_dt,1,2)
+        let $prcs_dd = substr($prcs_dt,3,2)
+        let $prcs_yy = substr($prcs_dt,5,4)		
+        let $prcs_effdt = $prcs_mm||'/'||$prcs_dd||'/'||$prcs_yy
+        
+        let $trail_row = $rec_cd||$prcs_dt||$rcd_count||$total_amt
+        show $trail_row
+        show 'Trailer Record'
+        show 'Process Date: ' $prcs_dt
+        show 'Process Date: ' $prcs_effdt
+        show 'Record Count: ' $rcd_count      
+        show 'Total Amount: ' $total_amt
+        show 'Total Amount: ' #tot_amt
+      
+      Else
+        show 'Error: Neither a DTL nor a TRL row.'
+		show $in_line
+      End-If
+
+    End-if   
+
+  End-While
+
+  Use-Report Load-Report
+  Do Print-Load-Totals
+
+End-Procedure
+
+!GEX_SEC_REENG 2015-04-29 Vahini Katta Begins
+!********************************************
+!Begin-Procedure P250-Get-Emplid-from-7digit
+!********************************************
+!Retrieve the 9-digit SSN from 7-digit emplid in file
+!The SSN will be used as $emplid in the program
+
+!#debug9 Show 'P250-Get-Emplid-from-7digit'
+
+!begin-select
+!M.SSN
+
+!   move &M.SSN to $emplid
+
+! FROM PS_GEX_EMPLID_MAPP M
+!WHERE M.EMPLID = $emplid_7digit
+
+!End-select
+
+!********************************************
+!End-Procedure P250-Get-Emplid-from-7digit
+!********************************************
+!GEX_SEC_REENG 2015-04-29 Vahini Katta Ends
+
+!********************************************
+Begin-Procedure Check-Job
+!********************************************
+#debug9 Show 'Check-Job'
+#debug9 show 'Emplid: ' $emplid
+
+  Let $no_job_active = 'N'
+  Let $multi_job = 'N'
+  Let #active_count = 0
+  Let $first_check = 'Y'
+  Let $skip_message = ' '
+
+begin-select
+CJ.EMPLID
+CJ.EMPL_RCD    &cj.empl_rcd
+CJ.COMPANY     &cj.company
+CJ.PAYGROUP    &cj.paygroup
+CJ.EMPL_STATUS &cj.empl_status
+
+   let $job_exist = 'Y'
+
+   let #check_empl_rcd    = &cj.empl_rcd
+   let $check_empl_status = &cj.empl_status
+
+   if $check_empl_status = 'A' or $check_empl_status = 'L' or
+      $check_empl_status = 'P' or $check_empl_status = 'S'
+
+      Add 1 to #active_count
+      
+      if $first_check = 'Y'
+         let $hold_company = &cj.company
+         let $hold_paygroup = &cj.paygroup
+         let $first_check = 'N'
+      end-if
+
+
+      if #check_empl_rcd > 0
+         if #active_count > 1
+            let $job_exist = 'N'
+            let $multi_job = 'Y'
+            let $skip_message = $emplid||'    is an active multi job employee. No row inserted.'
+            show $skip_message
+         else
+            let $no_job_active = 'N'
+            let #cj_empl_rcd = &cj.empl_rcd
+            let $cj_company  = &CJ.COMPANY
+            let $cj_paygroup = &CJ.PAYGROUP
+            let $cj_empl_status = &CJ.EMPL_STATUS
+         end-if
+      else
+            let $no_job_active = 'N'
+            let #cj_empl_rcd = &cj.empl_rcd
+            let $cj_company  = &CJ.COMPANY
+            let $cj_paygroup = &CJ.PAYGROUP
+            let $cj_empl_status = &CJ.EMPL_STATUS
+            
+            if $hold_company <> $cj_company
+               let $job_exist = 'N'
+               let $multi_job = 'Y'
+               let $skip_message = $emplid||'    has two active Job rows: '||$hold_company||' and '||$cj_company||'.'
+            else
+               if $hold_paygroup <> $cj_paygroup
+                  let $job_exist = 'N'
+                  let $multi_job = 'Y'
+                  let $skip_message = $emplid||'    has two active Job rows: '||$hold_company||'/'||$hold_paygroup||' and '||$cj_company||'/'||$cj_paygroup||'.'
+               end-if
+            end-if
+      end-if
+   else
+      if #active_count = 0
+         let $no_job_active = 'Y'
+      end-if
+   end-if
+
+FROM PS_JOB CJ
+WHERE CJ.EMPLID    = $emplid
+AND   CJ.EFFDT = (SELECT MAX(EFFDT)
+      FROM PS_JOB
+      WHERE EMPLID    = CJ.EMPLID
+      AND   EMPL_RCD = CJ.EMPL_RCD
+      AND   EFFDT <= TO_DATE($Mercer_effdtin1,'DD-MON-YYYY'))
+AND   CJ.EFFSEQ = (SELECT MAX(EFFSEQ)
+      FROM PS_JOB
+      WHERE EMPLID    = CJ.EMPLID
+      AND   EMPL_RCD = CJ.EMPL_RCD
+      AND   EFFDT     = CJ.EFFDT)
+ORDER BY CJ.EMPLID, CJ.EMPL_RCD
+end-select
+
+End-Procedure
+
+
+!********************************************
+Begin-Procedure  Validate-Dedcd
+!********************************************
+#debug9 Show ' Validate-Dedcd'
+
+begin-select
+'X'
+
+   Let $dedcd_valid  = 'Y'
+
+FROM PS_DEDUCTION_TBL DED
+  WHERE DED.EFFDT =
+        (SELECT MAX(EFFDT) FROM PS_DEDUCTION_TBL
+        WHERE DED.PLAN_TYPE = PLAN_TYPE
+          AND DED.DEDCD     = DEDCD
+          AND EFFDT <= SYSDATE)
+  AND [$GEXXX919_INCLUDE_DEDCD_CRITERIA]
+  AND DED.DEDCD = $Mercer_dedcd
+
+end-select
+End-Procedure
+
+
+!*****************************************
+Begin-Procedure Process-Load
+!*****************************************
+#debug9 Show 'Process-Load'
+
+   Do Get-Pay-Begin-Dt-A
+
+   if $pc_pay_end_dt = ' '
+
+      Show $Emplid ' could not find the Pay End Dt for Company/Paygroup ' $cj_company ' ' $cj_paygroup '. No data inserted.'
+      Print $emplid                                                                (+1,{#column1})
+      Print 'could not find the Pay End Dt for company/paygroup '                  (+0,{#column2})
+      Print $cj_company                   (+0,0)
+      Print ' '                           (+0,0)
+      Print $cj_paygroup                  (+0,0)
+      Print '. No data inserted.'         (+0,0)
+      Print $error_row                                                             (+1,{#column2})
+      Add 1 to #recs-error
+
+   else
+   
+      let $genl_ded_exist = 'N'
+      Do Check-Genl-Deduction
+      If $genl_ded_exist = 'N'
+   
+         If #Ded_Amt > 0
+            Do Insert-Genl-Deduction
+         Else
+            Use-Report Log-Report
+         End-if
+
+      Else
+
+         If $status = 'C'
+            If #Ded_Amt = 0
+!               Show 'Term'
+               Do Term-Genl-Deduction
+            else
+!               Show 'Update'
+               Do Check-Genl-Deduction2
+            end-if
+         else
+!            Show 'Update2'
+            Do Check-Genl-Deduction2
+         end-if
+
+      End-if   
+
+   End-if
+
+End-Procedure
+
+
+!********************************************
+Begin-Procedure Get-Pay-Begin-Dt-A
+!********************************************
+#debug9 Show 'Get-Pay-Begin-Dt'
+
+  Let $pc_pay_end_dt = ' '
+
+Begin-Select Loops=1
+pc.pay_end_dt     &pc.pay_end_dt
+pc.check_dt
+pc.pay_begin_dt   &pc.pay_begin_dt
+pc.pay_begin_dt-1 &pc.prior_pay_end_dt
+pc.pay_period
+
+To_Char(pc.pay_begin_dt,'YYYYMMDD') &pc.pay_begin_date
+  Let $pay_begin_dt     = &pc.pay_begin_dt
+  show '$pay_begin_dt from Get-Pay-Begin-Dt-A '$pay_begin_dt
+  Let $pay_begin_date   = &pc.pay_begin_date
+  Let $prior_pay_end_dt = &pc.prior_pay_end_dt
+
+  Let $pc_pay_end_dt   = &pc.pay_end_dt
+  Let $pc_pay_begin_dt = &pc.pay_begin_dt
+
+From ps_pay_calendar pc
+Where pc.company    = $cj_company
+And   pc.paygroup   = $cj_paygroup
+And   pc.pay_end_dt = (select min(pay_end_dt)
+                         from PS_PAY_CALENDAR pc1
+                        where pc1.company = pc.company
+                          and pc1.paygroup = pc.paygroup
+                          and pc1.pay_end_dt > $Mercer_effdtin1)
+And   pc.run_id not like '%YE'
+
+End-Select
+
+ if $pc_pay_end_dt = ' '
+
+   Do Get-Pay-Begin-Dt-B
+
+ end-if
+
+End-Procedure
+
+
+!********************************************
+Begin-Procedure Get-Pay-Begin-Dt-B
+!********************************************
+#debug9 Show 'Get-Pay-Begin-Dt-B'
+
+  Let $Mercerb_mm = substr($Mercer_effdt,1,2)
+  Let $Mercerb_dd = substr($Mercer_effdt,4,2)
+  Let $Mercerb_yy = substr($Mercer_effdt,7,4)
+  Let $Mercerb_dt = $Mercer_yy||'-'||$Mercer_mm||'-'||$Mercer_dd
+  show '$Mercerb_dt: ' $Mercerb_dt
+
+  do dtu-add-days($Mercerb_dt, +7, $Mercerb_effdt)
+  show '$Mercerb_dt+7: ' $Mercerb_dt
+
+  Let $Mercerb_yy = substr($Mercerb_effdt,1,4)
+  Let $Mercerb_mm = substr($Mercerb_effdt,6,2)
+  Let $Mercerb_dd = substr($Mercerb_effdt,9,2)
+  Let $Mercer_effdt_b = $Mercerb_yy||$Mercerb_mm||$Mercerb_dd
+  show 'Mercer_Effdt_b: ' $Mercer_effdt_b
+  let $Mercer_effdt_b2 = strtodate($Mercer_effdt_b,'YYYYMMDD')
+ show '$Mercer_effdt_b2t ' $Mercer_effdt_b2
+
+Begin-Select Loops=1
+pc2.pay_end_dt    &pc2.pay_end_dt
+pc2.check_dt
+pc2.pay_begin_dt  &pc2.pay_begin_dt
+pc2.pay_period
+pc2.pay_begin_dt-1 &pc2.prior_pay_end_dt
+
+To_Char(pc2.pay_begin_dt,'YYYYMMDD') &pc2.pay_begin_date
+
+  Let $pc_pay_end_dt    = &pc2.pay_end_dt
+
+  Let $pay_begin_dt     = &pc2.pay_begin_dt
+  Let $pay_begin_date   = &pc2.pay_begin_date
+  Let $prior_pay_end_dt = &pc2.prior_pay_end_dt
+  show 'Pay Calendar pay_begin_dt = ' $pay_begin_dt
+
+From ps_pay_calendar pc2
+Where pc2.company    = $cj_company
+And   pc2.paygroup   = $cj_paygroup
+And   pc2.pay_end_dt = (select min(pay_end_dt)
+                         from PS_PAY_CALENDAR pc1
+                        where pc1.company = pc2.company
+                          and pc1.paygroup = pc2.paygroup
+                          and pc1.pay_end_dt > $Mercer_effdtin1)
+And   pc2.run_id not like '%YE'
+
+End-Select
+
+End-Procedure
+
+
+!********************************************
+Begin-Procedure Check-Genl-Deduction
+!********************************************
+#debug9 Show 'Check-Genl-Deduction'
+  let #ded_change_amt = 0
+Begin-Select
+CGD.EMPLID
+CGD.COMPANY
+CGD.EFFDT
+CGD.DED_ADDL_AMT
+
+  let $genl_ded_exist = 'Y'
+  let $genl_ded_effdt = &CGD.EFFDT
+  let #ded_change_amt = &CGD.DED_ADDL_AMT
+
+FROM PS_GENL_DEDUCTION CGD
+Where CGD.EMPLID    = $emplid
+And   CGD.COMPANY    = $cj_company
+And   CGD.DEDCD      = $Mercer_dedcd
+And   CGD.EFFDT = (Select MAX(EFFDT)
+      From PS_GENL_DEDUCTION
+      Where EMPLID     = CGD.EMPLID
+      And   COMPANY    = CGD.COMPANY
+      And   DEDCD      = CGD.DEDCD
+      And   EFFDT     <= $AsOfDate)
+End-Select
+End-Procedure
+
+
+!********************************************
+Begin-Procedure Insert-Genl-Deduction
+!********************************************
+#debug9 Show 'Insert-Genl-Deduction'
+
+Begin-Sql ON-ERROR=SQL-Error-Found('Insert-Genl-Deduction')
+Insert Into PS_GENL_DEDUCTION
+!Jyotsna - 10-17-2016 - PTools Upgrade - Begin
+(EMPLID, 
+DEDCD, 
+EFFDT, 
+DED_CALC, 
+DEDUCTION_END_DT, 
+DED_ADDL_AMT, 
+DED_RATE_PCT, 
+GOAL_AMT, 
+GOAL_BAL, 
+LOAN_INT_PCT, 
+BAS_TAXABLE_BEN, 
+DED_STOPPED, 
+LAST_ACTION, 
+LAST_UPDATE_DATE, 
+COMPANY, 
+PROCESS_DEDN, 
+GVT_DED_DIST_CD, 
+GVT_PYMNT_METHOD, 
+GVT_CHK_NAME, 
+GVT_ADDRESS1, 
+GVT_ADDRESS2, 
+GVT_ADDRESS_CITY, 
+GVT_ADDRESS_STATE, 
+GVT_ADDRESS_ZIP, 
+GVT_ADDRESS_CNTRY, 
+BANK_CD, 
+ACCOUNT_NUM, 
+ACCOUNT_TYPE, 
+GVT_PAYEE_ID_NO, 
+GVT_PAYEE_NAME, 
+GVT_ALLOT_PB)
+!Jyotsna - 10-17-2016 - PTools Upgrade - End
+	     Values ( $emplid,
+		        $Mercer_dedcd,           !Dedcd
+		        $pay_begin_dt,           !Effdt
+		        'A',                     !Ded_Calc
+		        '',                      !Deduction End Dt
+		        #Ded_Amt,                !Ded Addl Amt
+		        0,                       !Ded Rate Pct
+		        0,                       !Goal Amt
+		        0,                       !Goal Bal
+		        0,                       !Loan Int Pct
+		        'N',                     !Bas Taxable Ben
+			'N',                     !Ded Stopped
+			'C',                     !Last Action
+			$AsOfDate,               !Last Update Action
+			$cj_company,
+			'Y',                     !Process_Dedn
+			' ',                     !Gvt Ded Dist Cd
+			'E',                     !Gvt Pymnt Method
+			' ',                     !Gvt Chk Name
+			' ',                     !Gvt Address1
+			' ',                     !Gvt Address2
+			' ',                     !Gvt Address City
+			' ',                     !Gvt Address State
+			' ',                     !Gvt Address Zip
+			' ',                     !Gvt Address Cntry
+			' ',                     !Bank Cd
+			' ',                     !Account Num
+			' ',                     !Account Type
+			' ',                     !Gvt Payee ID No
+			' ',                     !Gvt Payee Name
+			' ')                     !Gvt Allot PB
+End-Sql
+
+  Add 1 to #recs-inserted
+  
+  Use-Report Load-Report
+  Do Print-Load-Details
+  
+  let $genl-ded-cd-exist = 'N'
+  Do Check-Genl-Ded-Cd
+  if $genl-ded-cd-exist = 'N'
+     Do Insert-Genl-Ded-Cd
+  end-if
+
+End-Procedure
+
+
+!********************************************
+Begin-Procedure Check-Genl-Ded-Cd
+!********************************************
+#debug9 Show 'Check-Genl-Ded-Cd'
+
+Begin-Select
+GDC.EMPLID
+GDC.COMPANY
+GDC.DEDCD
+
+  Let $genl-ded-cd-exist = 'Y'
+
+FROM PS_GENL_DED_CD GDC
+Where GDC.EMPLID    = $emplid
+And   GDC.COMPANY   = $cj_company
+And   GDC.DEDCD     = $Mercer_dedcd
+End-Select
+
+End-Procedure
+
+
+!********************************************
+Begin-Procedure Insert-Genl-Ded-Cd
+!********************************************
+#debug9 Show 'Insert-Genl-Ded-Cd'
+
+Begin-Sql ON-ERROR=SQL-Error-Found('Insert-Genl-Ded-Cd')
+Insert Into PS_GENL_DED_CD
+!Jyotsna - 10-17-2016 - PTools Upgrade - Begin
+(EMPLID, DEDCD, COMPANY)
+!Jyotsna - 10-17-2016 - PTools Upgrade - End
+	Values ($emplid,
+                $Mercer_dedcd,
+                $cj_company)
+End-Sql
+
+End-Procedure
+
+
+!********************************************
+Begin-Procedure Term-Genl-Deduction
+!********************************************
+#debug9 Show 'Term-Genl-Deduction'
+
+Begin-Sql 
+!ON-ERROR=SQL-Error-Found('Term-Genl-Deduction')
+Insert Into PS_GENL_DEDUCTION
+!Jyotsna - 10-17-2016 - PTools Upgrade - Begin
+(EMPLID, 
+DEDCD, 
+EFFDT, 
+DED_CALC, 
+DEDUCTION_END_DT, 
+DED_ADDL_AMT, 
+DED_RATE_PCT, 
+GOAL_AMT, 
+GOAL_BAL, 
+LOAN_INT_PCT, 
+BAS_TAXABLE_BEN, 
+DED_STOPPED, 
+LAST_ACTION, 
+LAST_UPDATE_DATE, 
+COMPANY, 
+PROCESS_DEDN, 
+GVT_DED_DIST_CD, 
+GVT_PYMNT_METHOD, 
+GVT_CHK_NAME, 
+GVT_ADDRESS1, 
+GVT_ADDRESS2, 
+GVT_ADDRESS_CITY, 
+GVT_ADDRESS_STATE, 
+GVT_ADDRESS_ZIP, 
+GVT_ADDRESS_CNTRY, 
+BANK_CD, 
+ACCOUNT_NUM, 
+ACCOUNT_TYPE, 
+GVT_PAYEE_ID_NO, 
+GVT_PAYEE_NAME, 
+GVT_ALLOT_PB)
+!Jyotsna - 10-17-2016 - PTools Upgrade - End
+        Values ($emplid,
+		$Mercer_dedcd,           !Dedcd
+		$pay_begin_dt,           !Effdt
+		'A',                     !Ded_Calc
+		$pay_begin_dt,           !Deduction End Dt
+		#ded_change_amt,         !Ded Addl Amt from prior row
+		0,                       !Ded Rate Pct
+		0,                       !Goal Amt
+		0,                       !Goal Bal
+		0,                       !Loan Int Pct
+		'N',                     !Bas Taxable Ben
+                'N',                     !Ded Stopped
+                'C',                     !Last Action
+                $AsOfDate,               !Last Update Action
+                $cj_company,
+                'Y',                     !Process_Dedn
+                ' ',                     !Gvt Ded Dist Cd
+                'E',                     !Gvt Pymnt Method
+                ' ',                     !Gvt Chk Name
+                ' ',                     !Gvt Address1
+                ' ',                     !Gvt Address2
+                ' ',                     !Gvt Address City
+                ' ',                     !Gvt Address State
+                ' ',                     !Gvt Address Zip
+                ' ',                     !Gvt Address Cntry
+                ' ',                     !Bank Cd
+                ' ',                     !Account Num
+                ' ',                     !Account Type
+                ' ',                     !Gvt Payee ID No
+                ' ',                     !Gvt Payee Name
+                ' ')                     !Gvt Allot PB
+End-Sql
+
+!Begin-Sql ON-ERROR=SQL-Error-Found('Term-Genl-Deduction')
+!Update PS_GENL_DEDUCTION
+!Set EFFDT = $pay_begin_dt,
+!    DEDUCTION_END_DT = $pay_begin_dt,
+!    LAST_UPDATE_DATE = $pay_begin_dt
+!Where EMPLID    = $emplid
+!And   COMPANY   = $cj_company
+!And   DEDCD     = $Mercer_dedcd
+!And   EFFDT     = $genl_ded_effdt
+!End-Sql
+
+  Add 1 to #recs-termed
+
+  Use-Report Load-Report
+  Do Print-Load-Details
+
+End-Procedure
+
+
+!********************************************
+Begin-Procedure Check-Genl-Deduction2
+!********************************************
+#debug9 Show 'Check-Genl-Deduction2'
+
+  let $upd_genl_ded = 'N'
+
+Begin-Select
+CGD2.EMPLID
+CGD2.COMPANY
+CGD2.EFFDT
+CGD2.DED_ADDL_AMT
+
+  let $upd_genl_ded = 'Y'
+
+FROM PS_GENL_DEDUCTION CGD2
+Where CGD2.EMPLID     = $emplid
+And   CGD2.COMPANY    = $cj_company
+And   CGD2.DEDCD      = $Mercer_dedcd
+And   CGD2.EFFDT      = $pay_begin_dt
+End-Select
+
+  if $upd_genl_ded = 'Y'
+     Do Update-Genl-Deduction
+  else
+     Do Update-Genl-Deduction2
+  end-if     
+
+End-Procedure
+
+
+!********************************************
+Begin-Procedure Update-Genl-Deduction
+!********************************************
+#debug9 Show 'Update-Genl-Deduction'
+
+Begin-Sql ON-ERROR=SQL-Error-Found('Update-Genl-Deduction')
+Update PS_GENL_DEDUCTION
+Set DED_ADDL_AMT = #Ded_Amt,
+    LAST_UPDATE_DATE = $pay_begin_dt
+Where EMPLID    = $emplid
+And   COMPANY   = $cj_company
+And   DEDCD     = $Mercer_dedcd
+And   EFFDT     = $pay_begin_dt
+End-Sql
+
+  Add 1 to #recs-updated
+
+  Use-Report Load-Report
+  Do Print-Load-Details
+
+End-Procedure
+
+
+!********************************************
+Begin-Procedure Update-Deduction-End-Dt
+!********************************************
+#debug9 Show 'Update-Deduction-End-Dt'
+
+   let $genl_ded_exist = 'N'
+   Do Check-Genl-Deduction
+
+   If $genl_ded_exist = 'N'
+      Use-Report Log-Report
+      Show $Emplid ' could not find the corresponding row in GENL_DEDUCTION for Company/DEDCD ' $cj_company ' ' $Mercer_dedcd '. No data updated.'
+      Print $emplid                                                                (+1,{#column1})
+      Print 'could not find row in GENL_DEDUCTION for Company/DEDCD '              (+0,{#column2})
+      Print $cj_company                   (+0,0)
+      Print ' '                           (+0,0)
+      Print $Mercer_dedcd                 (+0,0)
+      Print '. No data updated.'          (+0,0)
+      Print $error_row                                                             (+1,{#column2})
+      Add 1 to #recs-error
+
+   Else
+      Show 'Emplid: ' $emplid ', Company: ' $cj_company ', DEDCD: ' $Mercer_dedcd ', EFFDT: ' $genl_ded_effdt ', Deduction_End_Dt: ' $Mercer_effdtin1 ', LAST_UPDATE_DATE: ' $AsOfDate
+
+      Do Update-Genl-Deduction1
+      Add 1 to #recs-updated
+
+      Use-Report Load-Report
+      Do Print-Load-Details
+   End-if
+
+End-Procedure Update-Deduction-End-Dt
+
+
+!********************************************
+Begin-Procedure Update-Genl-Deduction1
+!********************************************
+#debug9 Show 'Update-Genl-Deduction1'
+
+Begin-Sql ON-ERROR=SQL-Error-Found('Update-Deduction-End-Dt')
+Update PS_GENL_DEDUCTION
+Set Deduction_End_Dt = $Mercer_effdtin1,
+	  LAST_UPDATE_DATE = $AsOfDate
+Where EMPLID    = $emplid
+And   COMPANY   = $cj_company
+And   DEDCD     = $Mercer_dedcd
+And   EFFDT     = $genl_ded_effdt
+End-Sql
+
+End-Procedure Update-Genl-Deduction1
+!********************************************
+
+
+!********************************************
+Begin-Procedure Update-Genl-Deduction2
+!********************************************
+#debug9 Show 'Update-Genl-Deduction2'
+
+Begin-Sql ON-ERROR=SQL-Error-Found('Update-Genl-Deduction')
+Insert Into PS_GENL_DEDUCTION
+!Jyotsna - 10-17-2016 - PTools Upgrade - Begin
+(EMPLID, 
+DEDCD, 
+EFFDT, 
+DED_CALC, 
+DEDUCTION_END_DT, 
+DED_ADDL_AMT, 
+DED_RATE_PCT, 
+GOAL_AMT, 
+GOAL_BAL, 
+LOAN_INT_PCT, 
+BAS_TAXABLE_BEN, 
+DED_STOPPED, 
+LAST_ACTION, 
+LAST_UPDATE_DATE, 
+COMPANY, 
+PROCESS_DEDN, 
+GVT_DED_DIST_CD, 
+GVT_PYMNT_METHOD, 
+GVT_CHK_NAME, 
+GVT_ADDRESS1, 
+GVT_ADDRESS2, 
+GVT_ADDRESS_CITY, 
+GVT_ADDRESS_STATE, 
+GVT_ADDRESS_ZIP, 
+GVT_ADDRESS_CNTRY, 
+BANK_CD, 
+ACCOUNT_NUM, 
+ACCOUNT_TYPE, 
+GVT_PAYEE_ID_NO, 
+GVT_PAYEE_NAME, 
+GVT_ALLOT_PB)
+!Jyotsna - 10-17-2016 - PTools Upgrade - End
+      Values ($emplid,
+	        $Mercer_dedcd,           !Dedcd
+	        $pay_begin_dt,           !Effdt
+	        'A',                     !Ded_Calc
+	        '',                      !Deduction End Dt
+	        #Ded_Amt,                !Ded Addl Amt
+	        0,                       !Ded Rate Pct
+	        0,                       !Goal Amt
+	        0,                       !Goal Bal
+	        0,                       !Loan Int Pct
+	        'N',                     !Bas Taxable Ben
+                'N',                     !Ded Stopped
+                'C',                     !Last Action
+                $pay_begin_dt,           !Last Update Action
+                $cj_company,
+                'Y',                     !Process_Dedn
+                ' ',                     !Gvt Ded Dist Cd
+                'E',                     !Gvt Pymnt Method
+                ' ',                     !Gvt Chk Name
+                ' ',                     !Gvt Address1
+                ' ',                     !Gvt Address2
+                ' ',                     !Gvt Address City
+                ' ',                     !Gvt Address State
+                ' ',                     !Gvt Address Zip
+                ' ',                     !Gvt Address Cntry
+                ' ',                     !Bank Cd
+                ' ',                     !Account Num
+                ' ',                     !Account Type
+                ' ',                     !Gvt Payee ID No
+                ' ',                     !Gvt Payee Name
+                ' ')                     !Gvt Allot PB
+End-Sql
+
+  Add 1 to #recs-inserted
+
+  Use-Report Load-Report
+  Do Print-Load-Details
+
+End-Procedure
+
+
+!********************************************
+Begin-Procedure Print-Load-Details
+!********************************************
+#debug9 Show 'Print-Load-Details'
+
+  If #line-count >= 55
+     new-page
+  End-If
+
+  if isblank($pay_begin_dt)
+     let $pay_begin_dt = $Mercer_effdtin1
+  end-if
+  
+  Let $pbd_dd  = substr($pay_begin_dt,1,2)
+  Let $pbd_mon = substr($pay_begin_dt,4,3)
+  Let $pbd_yy  = substr($pay_begin_dt,8,4)
+  Let $pbd_switch = $pbd_dd||'-'||$pbd_mon||'-'||$pbd_yy
+  show '$pbd_switch: ' $pbd_switch
+
+  Let $Year4 = 1
+  Do Format-DateTime($pbd_switch,$pbd_out,{DEFDMY},'','')
+  show '$pbd_out: ' $pbd_out
+  Let $pbd_out_dd = substr($pbd_out,1,2)
+  Let $pbd_out_mm = substr($pbd_out,4,2)
+  Let $pbd_out_yy = substr($pbd_out,7,2)
+  Do MakeYear4Digits($pbd_out_yy)
+  Let $pbd_print = $pbd_out_mm||'/'||$pbd_out_dd||'/'||$pbd_out_yy
+  show '$pbd_print: ' $pbd_print
+
+     If #Amount = 0
+        Let $load_status = 'Term'
+        Do Format-DateTime($pay_begin_dt, $ded_end_dt, {DEFDMY},'','')
+        show '$ded_end_dt: ' $ded_end_dt
+        Let $ded_end_dd = substr($ded_end_dt,1,2)
+        Let $ded_end_mm = substr($ded_end_dt,4,2)
+        Let $ded_end_yy = substr($ded_end_dt,7,2)
+        Do MakeYear4Digits($ded_end_yy)
+        Let $ded_end_dt = $ded_end_mm||'/'||$ded_end_dd||'/'||$ded_end_yy
+        show '$ded_end_dt: ' $ded_end_dt
+     Else
+        Let $load_status = 'Change'
+        Let $ded_end_dt = ' '
+     End-if
+
+  Do Format-Number(#Ded_Amt,$ded_amt,'BBBBBB99.99')
+  
+  !Let $ded_amt = #Ded_Amt 'BBBBBB99.99'
+
+  Print $emplid            (+2,{#column1})
+  Print $name              (+0,{#column2})
+  Print $cj_company        (+0,{#column3})
+  Print $cj_paygroup       (+0,{#column4})
+  Print $load_status       (+0,{#column5})
+  Print $pbd_print         (+0,{#column6})
+  Print $Mercer_dedcd       (+0,{#column7})
+  Print $ded_amt           (+0,{#column8})
+  Print $ded_end_dt        (+0,{#column9})
+
+End-Procedure
+
+
+!********************************************
+Begin-Procedure Print-Load-Totals
+!********************************************
+#debug9 Show 'Print-Load-Totals'
+
+  If #line-count >= 55
+     new-page
+  End-If
+
+  let #deds-read = #recs-read *2
+ 
+  Do Format-Number(#recs-error,$recs-error,'99999')
+  Do Format-Number(#recs-inserted,$recs-inserted,'99999')
+  Do Format-Number(#recs-updated,$recs-updated,'99999')
+  Do Format-Number(#recs-termed,$recs-termed,'99999')
+  Do Format-Number(#recs-read,$recs-read,'99999')
+  Do Format-Number(#recs-zero,$recs-zero,'99999')
+  Do Format-Number(#deds-read,$deds-read,'99999')
+
+  Do Format-Number(#Mercer1_TOT,$Mercer1_tot,'99999999.99')
+  Do Format-Number(#Mercer2_TOT,$Mercer2_tot,'99999999.99')
+
+  
+  Show 'Total Records:    ' $recs-read
+  Show 'Total Deductions: ' $deds-read
+  Show '------------------------------'
+  Show 'Total Inserts:    ' $recs-inserted
+  Show 'Total Updates:    ' $recs-updated
+  Show 'Total Terms:      ' $recs-termed
+  Show 'Total No Amount:  ' $recs-zero
+  Show 'Total Errors:     ' $recs-error
+  Show '------------------------------'
+
+
+  Print 'Total Rows Read from file: ' (+2,{#column1})
+  Print $recs-read               (+0,0)
+  Print 'Total Deductions Read:     ' (+2,{#column1})
+  Print $deds-read               (+0,0)
+  Print '-'               (+1,1,30) FILL
+  Print 'Total Inserts: ' (+3,{#column1})
+  Print $recs-inserted    (+0,0)
+  Print 'Total Updates: ' (+1,{#column1})
+  Print $recs-updated     (+0,0)
+  Print 'Total Terms:   ' (+1,{#column1})
+  Print $recs-termed      (+0,0)
+  Print 'Total No Amt:  ' (+1,{#column1})
+  Print $recs-zero        (+0,0)
+  Print 'Total Errors:  ' (+1,{#column1})
+  Print $recs-error       (+0,0)
+  Print '-'               (+1,1,30) FILL
+
+End-Procedure
+
+
+!********************************************
+Begin-Procedure P400-Finalization
+!********************************************
+#debug9 Show 'P400-Finalization'
+
+  Do P410-Close-File
+!  Do Rollback-Transaction
+
+  Do Reset                   !reset.sqc
+  Do Stdapi-Term             !stdapi.sqc
+
+  date-time () HH:MI:SS &timeEnded
+  date-time () MM/DD/YYYY &dateEnded
+  show ' '
+  show 'Report Ended at ' &timeEnded ' on ' &dateEnded
+
+  Show 'Successful end of report'
+End-Procedure
+
+
+!********************************************
+Begin-Procedure P410-Close-File
+!********************************************
+#debug9 Show 'P410-Close-File'
+  Close 1
+
+  If #filestat != 0
+     Show 'Error closing input file. Program terminating.'
+     Stop
+  End-If
+End-Procedure
+
+
+!********************************************
+begin-procedure SQL-Error-Found($Proc_Name) 
+!********************************************
+  print 'SQL Error in ' (,21)
+  print $Proc_Name (,35)  
+  print $_sql-error (+1,1) 
+  print 'sql-status:' (+1,1)
+  print #_sql-status () edit 99999 
+  show $SSN_In $company noline
+  display ' : SQL error ' noline
+  display #_sql-status
+  stop
+
+end-procedure
+
+!**********************************************************************
+#Include 'gexxx919.sqc'  !Get Dedcd multiple row table  
+#Include 'gexxx920.sqc'  !Run Control parameters from GEX_RC_BEN record
+#Include 'gexxx951.sqc'  !Oracle Database Name
+#include 'askaod.sqc'    !Ask-As-Of-Date procedure
+#Include 'stdapi.sqc'    !Process Scheduler Interface
+#Include 'reset.sqc'     !Reset Printer Procedure
+#Include 'curdttim.sqc'  !Get-Current-DateTime Procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'datemath.sqc'  !Routines for date math
+#Include 'tranctrl.sqc'  !Commit/Rollback Procedures
+#Include 'gexmovit.sqc'  !Move the files to MoveIt Folder 

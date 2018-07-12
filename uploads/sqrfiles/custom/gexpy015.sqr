@@ -1,0 +1,820 @@
+!***********************************************************************
+!  GEXPY015:  Accumulated Hours for Independent Stores                 *
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module is the confidential and proprietary information of       *
+! Giant Eagle, Inc.; it is not to be copied, reproduced,or transmitted *
+! in any form, by any means, in whole or in part, nor is it to be used *
+! for any purpose other than that for which it is expressly provided   *
+! without the written permission of Giant Eagle.                       *
+!                                                                      *
+! Copyright (c) 1997-1998 Giant Eagle,Inc. All Rights Reserved         *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+! GEXPY015:             Accumulated Hours for Independent Stores       *
+!                                                                      *
+! Narrative:		Produce a listing of employees ytd hours for   *
+!                        independent stores.  Includes special balance *
+!                        for EMP_PERMANENT_ADVANCE_AMT.                *
+!                                                                      *
+! #Debugx Used:		#debug9 paragraph trace                        *
+!			      #debug8 key variable values              *
+!			      #debug7 data returned from sql calls     *
+!                                                                      *
+! SQL Tables:		pay_calendar                                   *
+!                       gex_dept_tbl                                   *
+!                       personal_data                                  *
+!                       job                                            *
+!                       gex_indlife_bal                                *
+!                       earnings_bal                                   *
+!                                                                      *
+! Written by:		Jim Hutchison                                  *
+!                                                                      *
+! Normally Run:		Monthly                                        *
+!                                                                      *
+! Control Parms:	FOR WHERE CLAUSE:                              *
+!                         Company Division Code                        *
+!                         Company                                      *
+!                         Paygroup                                     *
+!                         Deptid                                       *
+!                         Employee Status                              *
+!                         Account Code                                 *
+!                         Employee Type                                *
+!                         As Of Date                                   *
+!                                                                      *
+!***********************************************************************
+!                         MODIFICATION HISTORY                         *
+!***********************************************************************
+! INITIALS     DATE         DESCRIPTION OF THE CHANGE                  *
+!***********************************************************************
+! DAH          02/19/97     Initial Creation per specification         *
+! DAH          04/13/98     Added run control parms and page 0.        *
+! JDH          10/14/98     Changed logic to use special accum WK3 to  *
+!                            calc YTD hours.  Added logic to calc      *
+!                            total accum hours.                        *
+! JDH          01/23/99     Added logic to get the maximum balance     *
+!                            period per earnings code from the         *
+!                            earnings balance table.                   *
+!                           Added SQRW run control logic.              *
+!                           Added logic to pull balances for the month *
+!                            of the last confirmed pay end.            *
+! JDH          04/12/99     Modified logic to pull balances starting   *
+!                            from year 1999.                           *
+! JDH          04/14/99     Modified logic to sort by company,         *
+!                            paygroup, deptid, total accum hrs.        *
+! JDH          04/20/99     Modified logic to populate total accum hrs *
+!                            by totalling earnings balance rows        *
+!                            starting from year 1999 and any           *
+!                            gex_indlife_bal rows.                     *
+! JDH          06/09/99     Added employee type run control parameter. *
+!                           Removed department description.            *
+!                           Added jobcode description.                 *
+! JNB          08/10/99     Changed logic to decide balance year and   *
+!                           month based on check_dt instead of pay end *
+!                           date.                                      *
+! JNB          01/13/2000   Corrected logic to pull previous hrs worked*
+!                           and created work table                     *
+!                                                                      *
+! AXL          06/26/2000   Substituted HIRE_DT from PS_EMPLOYMENT for *
+!                           ORIG_HIRE_DT from PS_PERSONAL_DATA.        *
+!                                                                      *
+! AXC	       08/10/2002  Added empl_rcd to join on earnings balance *
+!			    8.3 Upgrade                                *
+! MXR          03/19/2007  Added to select only independent stores     *
+!                          ITG # 40795                                 *
+! GEX-MXT      03/24/2008  Fixed for REHIRE DT issue in 9.0            *
+! VENDTKK       02/11/2009         Added INCLUDE GETPOSNM.SQC to pull  *
+!                  	           JOBTITLE from POSITION_DATA.DESCR   *
+!				   field instead of JOBCODE_TBL.DESCR  *
+!			           	                               *
+!***********************************************************************
+
+
+#include 'setenv.sqc'  !Set environment
+#include 'setup32.sqc' !Init printer and page size
+
+
+ #define #x000_col_selection_criteria_a   2
+ #define #x000_col_selection_criteria_b   5
+
+ #define #x000_col_name			  1
+ #define #x000_col_emplid		 34
+ #define #x000_col_empl_rcd		 46
+ #define #x000_col_hourly_rt		 53
+!AXL - 6/26/2000 - Begin
+!#define #x000_col_orig_hire_dt          67
+ #define #x000_col_hire_dt	         67
+!AXL - 6/26/2000 - End
+ #define #x000_col_deptid		 81
+ #define #x000_col_acct_cd		 94
+ #define #x000_col_jobcode		104
+ #define #x000_col_jobdesc		113
+ #define #x000_col_ytd_hours		126
+ #define #x000_col_prior_years_hrs	139
+ #define #x000_col_historical_ytd_hrs	154
+
+
+begin-heading 8
+#include 'stdhdg02.sqc'
+
+  let $x000_temp_out = 'Balance Year=' || $balance_year || 
+		' Quarter=' || $balance_qtr || 
+		' Period=' || $balance_period
+  print $x000_temp_out 	                (3,) CENTER
+
+  if $PayGroup <> $priorPayGroup
+    do Get-PayGroup-Data
+    move $PayGroup to $priorPayGroup
+  end-if
+  print 'Pay Group'        (4,1)
+  print $PayGroup          (0,13)
+  print $PayGroupName      (0,17)
+
+  let $x000_temp_out =  'Report as of ' || $payenddt
+  print $x000_temp_out 	                (0,) center 
+
+  print 'Employee'			(+2,{#x000_col_emplid})
+  print '    Hourly'         		(0,{#x000_col_hourly_rt})
+!AXL - 6/26/2000 - Begin
+! print 'Employment'            	(0,{#x000_col_orig_hire_dt})
+  print 'Employment'            	(0,{#x000_col_hire_dt})
+!AXL - 6/26/2000 - End
+  print 'Job'        			(0,{#x000_col_jobcode})
+  print 'Job'                    	(0,{#x000_col_jobdesc})
+  print ' YTD Hours' 			(0,{#x000_col_ytd_hours})
+  print ' Prior Years' 			(0,{#x000_col_prior_years_hrs})
+  print ' Total Accum'			(0,{#x000_col_historical_ytd_hrs})
+
+  print 'Name'                       	(+1,{#x000_col_name})
+  print 'Num '                     	(0,{#x000_col_emplid})
+  print 'Rcd#'				(0,{#x000_col_empl_rcd})
+  print '      Rate'       		(0,{#x000_col_hourly_rt})
+!AXL - 6/26/2000 - Begin
+! print 'Date'            		(0,{#x000_col_orig_hire_dt})
+  print 'Date'            		(0,{#x000_col_hire_dt})
+!AXL - 6/26/2000 - End
+  print 'Department'            	(0,{#x000_col_deptid})
+  print 'Acct Cd'                	(0,{#x000_col_acct_cd})
+  print 'Code'        			(0,{#x000_col_jobcode})
+  print 'Title'        			(0,{#x000_col_jobdesc})
+  print '    Worked' 			(0,{#x000_col_ytd_hours})
+  print '       Hours' 			(0,{#x000_col_prior_years_hrs})
+  print '       Hours'			(0,{#x000_col_historical_ytd_hrs})
+ 
+  print '-'                         (+1,{#x000_col_name},30)              Fill
+  print '-'                         (0,{#x000_col_emplid},9)              Fill
+  print '-'                 		(0,{#x000_col_empl_rcd},4)           Fill
+  print '-'		                (0,{#x000_col_hourly_rt},10)          Fill
+!AXL - 6/26/2000 - Begin
+! print '-'		               	(0,{#x000_col_orig_hire_dt},11)       Fill
+  print '-'		               	(0,{#x000_col_hire_dt},11)            Fill
+!AXL - 6/26/2000 - End
+  print '-'	                 	(0,{#x000_col_deptid},10)             Fill
+  print '-'	                 	(0,{#x000_col_acct_cd},7)             Fill
+  print '-'	        		(0,{#x000_col_jobcode},6)             Fill
+  print '-'	                 	(0,{#x000_col_jobdesc},10)            Fill
+  print '-'		         	(0,{#x000_col_ytd_hours},10)          Fill
+  print '-'				(0,{#x000_col_prior_years_hrs},12)    Fill
+  print '-'				(0,{#x000_col_historical_ytd_hrs},12) Fill
+end-heading
+
+ 
+begin-report
+  !do Alter-Session   ! Set Session to RULE Optimizer   JNB 01/13/2000 !vahini
+  do X010-Init-Report
+  do X100-Create-Table
+  do X500-Report
+  do X900-Finalization
+  do X990-Drop-Table 
+  do Reset
+  do Stdapi-Term  
+  date-time () HH:MI:SS &timeEnded
+  date-time () MM/DD/YYYY &dateEnded
+  show 'Report Ended at ' &timeEnded ' on ' &dateEnded
+  show ' '
+  show 'Successful end of report'
+end-report
+
+
+begin-procedure X010-Init-Report
+#debug9 show 'X010-Init-Report'
+  move 'GEXPY015' to $ReportID
+  show $ReportID
+  move 'Accumulated Hours for Independent Stores' to $ReportTitle
+  show $ReportTitle
+ 
+  do Init-DateTime
+  do Init-Number
+ 
+  do Get-Current-DateTime
+  show '$SysDateTime=' $SysDateTime 
+  show '$AsOfToday=' $AsOfToday  
+
+  show '$ReportID=' $ReportID 
+  show '$ReportTitle=' $ReportTitle
+
+  do Stdapi-Init
+
+  Let $GEXXX900_Company_Alias  = 'J.COMPANY'                           
+  Let $GEXXX901_Company_Alias  = 'J.COMPANY' 
+  Let $GEXXX901_Paygroup_Alias = 'J.PAYGROUP'    
+  Let $GEXXX902_Deptid_Alias   = 'J.DEPTID'  
+  Let $GEXXX903_Emp_Stat_Alias = 'J.EMPL_STATUS'  
+  Let $GEXXX907_Div_CD_Alias   = 'GDT.GEX_COMPANY_DIV_CD'
+  Let $GEXXX909_Acct_CD_Alias  = 'J.ACCT_CD'
+  Let $GEXXX930_Emp_Type_Alias = 'J.EMPL_TYPE'
+
+  if $Prcs_Process_Instance = ''
+    Do GEXXX950-Input-Parameters
+
+    Let $EmplTypeString = ''''
+    Display 'Enter Employee Type or leave blank to exit.'
+    While 1=1
+      Input $In-EmplType Maxlen=1 'Employee Type'
+      Uppercase $In-EmplType
+      If Rtrim($In-EmplType, ' ') = ''
+        Concat '''' With $EmplTypeString
+        Break
+      End-If
+      If $EmplTypeString <> ''''
+        Concat ''',''' With $EmplTypeString
+      End-If
+      Concat $In-EmplType With $EmplTypeString
+    End-While
+
+    If $EmplTypeString = ''''''
+      Let $GEXXX930_INCLUDE_EMP_TYPE_CRITERIA = '1=1'
+      Let $GEXXX930_INCLUDE_EMP_TYPE_DISPLAY_CRITERIA = 'ALL'
+    Else
+      Let $GEXXX930_INCLUDE_EMP_TYPE_CRITERIA = $GEXXX930_Emp_Type_Alias || ' In (' || $EmplTypeString || ')'
+      Let $GEXXX930_INCLUDE_EMP_TYPE_DISPLAY_CRITERIA = $GEXXX930_INCLUDE_EMP_TYPE_CRITERIA
+    End-If
+  else
+    Do GEXXX922-Select-Parameters
+    let $X000_WHERE_SELECT_ASOFDATE = $GEX_RC_PAY.ASOFDATE
+    if rtrim($GEX_RC_PAY.ASOFDATE,' ') = ''
+      let $X000_WHERE_SELECT_ASOFDATE = $asoftoday
+    end-if
+
+    Do GEXXX900-Select-Company-Parameters 
+    Do GEXXX901-Select-Company-Paygroup-Parameters    
+    Do GEXXX902-Select-Deptid-Parameters 
+    Do GEXXX903-Select-Emp-Stat-Parameters          
+    Do GEXXX907-Select-Div-CD-Parameters
+    Do GEXXX909-Select-Acct-CD-Parameters
+    Do GEXXX930-Select-Emp-Type-Parameters
+  end-if  
+
+
+  date-time () HH:MI:SS &timeBegan
+  date-time () MM/DD/YYYY &dateBegan
+  show ' '
+  show 'Report Began at ' &timeBegan ' on ' &dateBegan
+  show ' '
+
+  let $X000_ORDER_BY = 'COMPANY, PAYGROUP, DEPTID, TOTAL ACCUM HOURS'
+  do Format-DateTime($X000_WHERE_SELECT_ASOFDATE, $X000_REPORT_HEADING_ASOFDATE ,{DEFDATE}, '', '')
+
+  do P140-Get-Last-Confirmed-Pay
+
+  show '$GEXXX907_INCLUDE_DIV_CD_CRITERIA                =' $GEXXX907_INCLUDE_DIV_CD_CRITERIA
+  show '$GEXXX900_INCLUDE_COMPANY_CRITERIA               =' $GEXXX900_INCLUDE_COMPANY_CRITERIA
+  show '$GEXXX901_INCLUDE_COMPANY_PAYGROUP_CRITERIA      =' $GEXXX901_INCLUDE_COMPANY_PAYGROUP_CRITERIA   
+  show '$GEXXX902_INCLUDE_DEPTID_CRITERIA                =' $GEXXX902_INCLUDE_DEPTID_CRITERIA
+  show '$GEXXX903_INCLUDE_EMP_STAT_CRITERIA              =' $GEXXX903_INCLUDE_EMP_STAT_CRITERIA
+  show '$GEXXX909_INCLUDE_ACCT_CD_CRITERIA               =' $GEXXX909_INCLUDE_ACCT_CD_CRITERIA         
+  Show '$GEXXX930_INCLUDE_EMP_TYPE_CRITERIA              =' $GEXXX930_Include_Emp_Type_Criteria
+  show '$X000_WHERE_SELECT_ASOFDATE                      =' $X000_WHERE_SELECT_ASOFDATE 
+
+  print 'RUN CONTROL INFORMATION FOR THIS REPORT RUN:'            (+5,{#x000_col_selection_criteria_a})
+  print '$Prcs_OPRID          ='                                  (+1,{#x000_col_selection_criteria_b})
+  print $Prcs_OPRID                                               (0,+2)
+  print '$PRCS_RUN_CNTL_ID    ='                                  (+1,{#x000_col_selection_criteria_b})
+  print $PRCS_RUN_CNTL_ID                                         (0,+2)
+
+  print 'SELECTION CRITERIA FOR THIS REPORT RUN:'                 (+5,{#x000_col_selection_criteria_a})
+  print '$GEXXX907_INCLUDE_DIV_CD_DISPLAY_CRITERIA           ='   (+1,{#x000_col_selection_criteria_b})
+  print $GEXXX907_INCLUDE_DIV_CD_DISPLAY_CRITERIA 	          (0,+2)
+  print '$GEXXX900_INCLUDE_COMPANY_DISPLAY_CRITERIA          ='   (+1,{#x000_col_selection_criteria_b})
+  print $GEXXX900_INCLUDE_COMPANY_DISPLAY_CRITERIA                (0,+2)
+  print '$GEXXX901_INCLUDE_COMPANY_PAYGROUP_DISPLAY_CRITERIA ='   (+1,{#x000_col_selection_criteria_b})
+  print $GEXXX901_INCLUDE_COMPANY_PAYGROUP_DISPLAY_CRITERIA       (0,+2)
+  print '$GEXXX902_INCLUDE_DEPTID_DISPLAY_CRITERIA           ='   (+1,{#x000_col_selection_criteria_b})
+  print $GEXXX902_INCLUDE_DEPTID_DISPLAY_CRITERIA	          (0,+2)
+  print '$GEXXX903_INCLUDE_EMP_STAT_DISPLAY_CRITERIA         ='   (+1,{#x000_col_selection_criteria_b})
+  print $GEXXX903_INCLUDE_EMP_STAT_DISPLAY_CRITERIA               (0,+2)
+  print '$GEXXX909_INCLUDE_ACCT_CD_DISPLAY_CRITERIA          ='   (+1,{#x000_col_selection_criteria_b})
+  print $GEXXX909_INCLUDE_ACCT_CD_DISPLAY_CRITERIA                (0,+2)
+  Print '$GEXXX930_INCLUDE_EMP_TYPE_DISPLAY_CRITERIA         ='   (+1,5)
+  Print $GEXXX930_INCLUDE_EMP_TYPE_DISPLAY_CRITERIA               (0,+2)
+
+  print '$X000_WHERE_SELECT_ASOFDATE                         ='   (+1,{#x000_col_selection_criteria_b})
+  print $X000_WHERE_SELECT_ASOFDATE                               (0,+2)
+
+  print 'SORT ORDER FOR THIS REPORT RUN:'                         (+5,{#x000_col_selection_criteria_a})
+  print '$X000_ORDER_BY                                      ='   (+1,{#x000_col_selection_criteria_b})
+  print $X000_ORDER_BY 	(0,+2)
+
+  let #page-count = 0
+  NEW-PAGE
+
+
+end-procedure
+
+!**********************************************************
+!  Create Work Table for future sort 
+!**********************************************************
+Begin-Procedure X100-Create-Table
+#debug9 Show 'X100-Create-Table'
+
+ let $tablename = 'PS_GEX_R_GEXPY015'
+
+begin-sql 
+CREATE TABLE [$tablename] 
+      (COMPANY             VARCHAR2(3)     NOT NULL,
+       PAYGROUP            VARCHAR2(3)     NOT NULL,
+       DEPTID              VARCHAR2(10)    NOT NULL,
+       EMPLID              VARCHAR(11)     NOT NULL,
+       EMPL_RCD           NUMBER(1)       NOT NULL,
+       JOBCODE             VARCHAR2(6)     NOT NULL,
+       HOURLY_RT           NUMBER(18,6)    NOT NULL,
+       ACCT_CD             VARCHAR2(25)    NOT NULL,
+       NAME                VARCHAR2(50)    NOT NULL,
+!AXL - 6/26/2000 - Begin
+!      ORIG_HIRE_DT        DATE, 
+       HIRE_DT             DATE,
+!AXL - 6/26/2000 - End
+       CURR_YR_HRS_YTD     NUMBER(10,2)   NOT NULL,
+       TOTAL_HIST_HRS      NUMBER(10,2)   NOT NULL,
+       TOTAL_ACCUM_HRS     NUMBER(10,2)   NOT NULL,
+       POSITION_NBR	   VARCHAR(11)     NOT NULL)               !VENTKK  added new field
+       TABLESPACE TE7TOOLS001
+
+end-sql
+end-procedure
+
+Begin-Procedure P140-Get-Last-Confirmed-Pay
+#debug9 Show 'P140-Get-Last-Confirmed-Pay'
+Begin-Select Loops=1
+pay_end_dt
+To_Char(check_dt,'MON')                    &balance_month      !JNB 08/10/99
+To_Number(To_Char(check_dt,'MM'))          &balance_period     !JNB 08/10/99 
+To_Number(To_Char(check_dt,'YYYY'))        &balance_year       !JNB 08/10/99
+To_Char(check_dt,'fmMonth YYYY')           &period             !JNB 08/10/99   
+
+  Let $AsOfDate         = &pay_end_dt
+  Let $pay_end_dt       = &pay_end_dt
+  Let #balance_year     = &balance_year
+  Let #balance_period   = &balance_period
+  Let $balance_month    = &balance_month
+  Let $Reporting_Period = &period
+  show '#balance_year ' #balance_year
+  show '#balance_period ' #balance_period   
+  show '$balance_month ' $balance_month    
+  let #balance_qtr = #balance_period
+  let #balance_qtr = ((#balance_qtr - 1)/ 3) + 1
+  do Format-Number(#balance_qtr, $balance_qtr, '9.99') !avoid rounding the integer portion
+  move $balance_qtr to $balance_qtr x     !save the integer portion
+  let #balance_qtr = $balance_qtr
+
+  Move #balance_year   To $balance_year   8888
+  Move #balance_period To $balance_period 88
+
+  do Format-DateTime($pay_end_dt, $payenddt ,{DEFDATE}, '', '')
+
+  If Rtrim($pay_end_dt,' ') = ''
+    Show 'No confirmed pay period found in calendar'
+    Stop
+  Else
+    Show 'Last confirmed pay end date:  ' $pay_end_dt
+  End-If
+
+  Let $Current_Month_Begin = '01-'||$balance_month||'-'||$balance_year
+
+From   ps_pay_calendar
+
+Where  pay_end_dt         =
+      (Select Max(pay_end_dt)
+       From   ps_pay_calendar
+       Where  pay_end_dt <= $X000_WHERE_SELECT_ASOFDATE
+       And    pay_confirm_run = 'Y')
+
+And    pay_confirm_run = 'Y'
+End-Select
+End-Procedure
+
+
+Begin-Procedure X500-Report
+#debug9 show 'X500-Report'
+  let $x500_Get_Employees_Data_Flag = 'N'
+
+begin-SELECT
+J.COMPANY   
+J.PAYGROUP
+J.DEPTID
+J.EMPLID
+J.EMPL_RCD
+J.JOBCODE
+J.HOURLY_RT
+J.ACCT_CD
+
+P.NAME
+!AXL - 6/26/2000 - Begin
+!P.ORIG_HIRE_DT
+EM.HIRE_DT
+!EM.REHIRE_DT			!GEX-MXT commented for rehire date logic
+!AXL - 6/26/2000 - End
+J.Position_nbr  !VENDTKK    ITG#56786   11-Feb-2009
+SUM(EB.HRS_YTD) &EB.HRS_YTD  
+ 
+    ! GEX-MXT 03/24/2008 Fixed for REHIRE DT - BEGIN
+   let $GEXJOB_REH_EMPLID = &J.EMPLID
+   let #GEXJOB_REH_EMPLRCD = &J.EMPL_RCD
+   let $GEXJOB_REH_ASOFDATE = $pay_end_dt
+   do Get-Job-Rehire-Dt
+   ! GEX-MXT 03/24/2008 Fixed for REHIRE DT - END
+  
+  !if isblank(&em.rehire_dt) = 0	!gex-mxt commented for erhire date logic
+  if isblank($GEXJOB_REH_REHIRE_DT) = 0	!gex-mxt added for rehire date logic
+     !let $hire_dt_tmp = &em.rehire_dt	!gex-mxt commented for erhire date logic
+      let $hire_dt_tmp = $GEXJOB_REH_REHIRE_DT	!gex-mxt added for rehire date logic
+  else 
+     let $hire_dt_tmp = &em.hire_dt
+  end-if
+  !show 'Emplid :' &J.emplid ',$hire_dt_tmp' $hire_dt_tmp ',&em.hire_dt' &em.hire_dt ',$GEXJOB_REH_REHIRE_DT:' $GEXJOB_REH_REHIRE_DT
+
+  let #PS_TOTAL_HRS = &EB.HRS_YTD
+
+  do Get-YTD-Hours
+
+  let #PS_PREV_YR_HRS = #PS_TOTAL_HRS - #CURR_YR_HRS_YTD
+
+  do Get-Life-Todate-Hrs
+
+  let #TOTAL_HIST_HRS = #PS_PREV_YR_HRS +  #gex_life_hrs
+  LET #TOTAL_ACCUM_HRS = #TOTAL_HIST_HRS + #CURR_YR_HRS_YTD
+  let $x500_Get_Employees_Data_Flag = 'Y'
+
+    DO X700-Insert-Record
+
+
+FROM   PS_GEX_DEPT_TBL     GDT,
+       PS_PERSONAL_DATA    P,
+       PS_JOB              J,
+       PS_EARNINGS_BAL     EB,
+       PS_EMPLOYMENT       EM		!AXL - 6/26/2000
+
+WHERE  J.EFFDT                =
+      (SELECT MAX(EFFDT)
+       FROM   PS_JOB
+       WHERE  EMPLID          = J.EMPLID
+       AND    EMPL_RCD       = J.EMPL_RCD
+       AND    EFFDT          <= $pay_end_dt)
+
+AND    J.EFFSEQ               =
+      (SELECT MAX(EFFSEQ)
+       FROM   PS_JOB
+       WHERE  EMPLID          = J.EMPLID
+       AND    EMPL_RCD       = J.EMPL_RCD
+       AND    EFFDT           = J.EFFDT)
+
+AND    P.EMPLID               = J.EMPLID  
+
+AND    EB.EMPLID              = J.EMPLID   
+AND    EB.EMPL_RCD	      = J.EMPL_RCD 	!  Added empl_rcd to join. 8.3 Upgrade
+
+!AXL - 6/26/2000 - Begin
+AND    J.EMPLID               = EM.EMPLID
+AND    J.EMPL_RCD            = EM.EMPL_RCD
+!AXL - 6/26/2000 - End
+	
+AND    EB.COMPANY             = J.COMPANY
+AND    EB.BALANCE_ID          = 'CY'
+
+AND    EB.BALANCE_YEAR       >= 1999
+AND    EB.BALANCE_YEAR       <= #balance_year
+
+AND    EB.BALANCE_PERIOD      =
+      (SELECT MAX(BALANCE_PERIOD)
+       FROM   PS_EARNINGS_BAL
+       WHERE  EMPLID          = EB.EMPLID
+       AND    EMPL_RCD	      = EB.EMPL_RCD ! AXC  Added empl_rcd to join. UPgrade 8.3
+       AND    COMPANY         = EB.COMPANY
+       AND    BALANCE_ID      = EB.BALANCE_ID
+       AND    BALANCE_YEAR    = EB.BALANCE_YEAR
+       AND    TO_DATE(BALANCE_YEAR||BALANCE_PERIOD,'YYYYMM')
+                             <= $Current_Month_Begin
+       AND    SPCL_BALANCE    = EB.SPCL_BALANCE
+       AND    ERNCD           = EB.ERNCD)
+
+AND    EB.SPCL_BALANCE        = 'Y' 
+AND    EB.ERNCD               = 'WK3'
+
+AND    J.DEPTID               = GDT.DEPTID 
+
+AND    GDT.EFFDT              =
+      (SELECT MAX(EFFDT)
+       FROM   PS_GEX_DEPT_TBL
+       WHERE  DEPTID          = GDT.DEPTID
+       AND    EFFDT          <= $pay_end_dt)
+
+AND    GDT.SEQUENCE_NUMBER    =
+      (SELECT MAX(SEQUENCE_NUMBER)
+       FROM   PS_GEX_DEPT_TBL
+       WHERE  DEPTID = GDT.DEPTID
+       AND    EFFDT  = GDT.EFFDT)
+ AND J.COMPANY < '999'             !ITG # 40795  ISDVMXR 03/19/2007     
+!AND   [$GEXXX900_INCLUDE_COMPANY_CRITERIA]
+AND   [$GEXXX901_INCLUDE_COMPANY_PAYGROUP_CRITERIA] 
+!AND   [$GEXXX902_INCLUDE_DEPTID_CRITERIA]
+AND   [$GEXXX903_INCLUDE_EMP_STAT_CRITERIA]
+AND   [$GEXXX909_INCLUDE_ACCT_CD_CRITERIA]
+AND   [$GEXXX907_INCLUDE_DIV_CD_CRITERIA]
+AND   [$GEXXX930_INCLUDE_EMP_TYPE_CRITERIA]
+
+GROUP BY J.COMPANY,
+         J.PAYGROUP,
+         J.DEPTID,
+         J.EMPLID,
+         J.EMPL_RCD,
+         J.JOBCODE,
+         J.HOURLY_RT,
+         J.ACCT_CD,
+         P.NAME,
+!AXL - 6/26/2000 - Begin
+         !P.ORIG_HIRE_DT	 
+         EM.HIRE_DT,
+        !  EM.REHIRE_DT	 GEX ISDVNPK Commented for rehiredt
+!AXL - 6/26/2000 - End
+	J.Position_nbr				!VENDTKK added
+
+ORDER BY J.COMPANY,
+         J.PAYGROUP, 
+         J.DEPTID,
+         SUM(EB.HRS_YTD) 
+
+End-Select
+
+End-Procedure
+
+Begin-Procedure Get-Life-Todate-Hrs
+#debug9 Show 'Get-Life-Todate-Hrs'
+let #gex_life_hrs = 0
+
+Begin-Select
+GIB.GEX_LIFE_HRS
+
+ let #gex_life_hrs = &GIB.GEX_LIFE_HRS
+
+FROM PS_GEX_INDLIFE_BAL GIB
+
+WHERE GIB.EMPLID      = &J.EMPLID
+
+End-Select
+End-Procedure
+
+Begin-Procedure Get-YTD-Hours
+#debug9 Show 'Get-YTD-Hours'
+  let #CURR_YR_HRS_YTD = 0
+
+Begin-Select
+EB1.HRS_YTD
+
+  Let #CURR_YR_HRS_YTD = &EB1.HRS_YTD
+
+FROM   PS_EARNINGS_BAL EB1
+
+WHERE  EB1.EMPLID             = &J.EMPLID    	
+AND    EB1.COMPANY            = &J.COMPANY
+AND    EB1.EMPL_RCD	      = &J.EMPL_RCD   ! axc  added empl_rcd to join. Upgrade 8.3
+AND    EB1.BALANCE_ID         = 'CY'
+
+AND    EB1.BALANCE_YEAR      >= 1999
+AND    EB1.BALANCE_YEAR       = #balance_year
+
+AND    EB1.BALANCE_PERIOD     =
+      (SELECT MAX(BALANCE_PERIOD)
+       FROM   PS_EARNINGS_BAL
+       WHERE  EMPLID          = EB1.EMPLID
+       AND    EMPL_RCD	      = EB1.EMPL_RCD ! AXC Added empl_rcd to join. 8.3 Upgrade
+       AND    COMPANY         = EB1.COMPANY
+       AND    BALANCE_ID      = EB1.BALANCE_ID
+       AND    BALANCE_YEAR    = EB1.BALANCE_YEAR
+       AND    BALANCE_PERIOD <= #balance_period
+       AND    SPCL_BALANCE    = EB1.SPCL_BALANCE
+       AND    ERNCD           = EB1.ERNCD)
+
+AND    EB1.SPCL_BALANCE       = 'Y' 
+AND    EB1.ERNCD              = 'WK3'
+End-Select
+End-Procedure
+
+begin-procedure X700-Insert-Record
+#debug9 show 'X700-Insert-Record'
+Begin-SQL
+
+  Insert Into [$tablename]
+   Values (&j.company,
+           &j.paygroup,
+           &j.deptid,
+           &j.emplid,
+           &j.empl_rcd,
+           &j.jobcode,
+           &j.hourly_rt,
+           &j.acct_cd,            
+           &p.name,
+!AXL - 6/26/2000 - Begin
+!          &p.orig_hire_dt,
+           $hire_dt_tmp,
+!AXL - 6/26/2000 - End
+           #CURR_YR_HRS_YTD,
+           #TOTAL_HIST_HRS,
+           #TOTAL_ACCUM_HRS,
+           &J.Position_nbr )    !VENDTKK added new field
+End-SQL
+End-Procedure
+
+begin-procedure X900-Finalization
+#debug9 show 'X900-Finalization'
+
+ Do P910-Select-Record
+
+  If $Data-Found-Flag <> 'Y'
+      Print 'NO DATA SELECTED FOR THIS REPORT RUN'	(25,) Center
+  End-If
+end-procedure
+
+
+begin-procedure P910-Select-Record
+#debug9 show 'P910-Select-Record'
+  let $Data-Found-Flag = 'N'
+begin-SELECT
+T.COMPANY   () on-break level=1
+                        print=never
+                        after=x801-Company-After-Change
+			before=x800-Company-Before-Change
+
+T.PAYGROUP  () on-break level=2
+                        print=never
+                        after=x806-Paygroup-After-Change
+                        before=x805-Paygroup-Before-Change
+
+T.DEPTID
+T.EMPLID
+T.EMPL_RCD
+T.JOBCODE
+T.HOURLY_RT
+T.ACCT_CD
+T.NAME
+!AXL - 6/26/2000 - Begin
+!T.ORIG_HIRE_DT
+T.HIRE_DT
+!AXL - 6/26/2000 - End
+T.CURR_YR_HRS_YTD
+T.TOTAL_HIST_HRS
+T.TOTAL_ACCUM_HRS
+T.Position_nbr  !VENDTKK    ITG#56786   11-Feb-2009
+
+  let $Data-Found-Flag = 'Y'
+ 
+  let $DeptID   = rtrim(&t.DeptID,' ')
+  let $JobCode  = rtrim(&t.JobCode,' ')
+  do Get-Job-Title
+  
+  !VENDTKK Begin   ITG#56786   11-Feb-2009
+  
+   Let $Position_Nbr = &T.Position_nbr
+ 	 Do Get-Position-Title			 !getposnm.sqc
+  	 IF $PosNameAbbrv = '' 
+  		Let $JobTitleabbrv = $JobTitleabbrv
+	 Else
+ 		Let $JobTitleabbrv = $PosNameAbbrv
+	 End-if
+ !VENDTKK End   ITG#56786   11-Feb-2009	
+ 
+  let $Name = &t.Name
+
+  let $emplid       = &t.Emplid
+  let #empl_rcd     = &t.Empl_RCD
+  let #hourly_rt    = &t.HOURLY_RT
+  let $acct_cd      = &t.ACCT_CD
+!AXL - 6/26/2000 - Begin
+! let $orig_hire_dt = &t.Orig_Hire_DT
+  let $hire_dt      = &t.hire_dt
+!AXL - 6/26/2000 - End
+  let #CURR_YR_HRS_YTD = &t.CURR_YR_HRS_YTD
+  let #TOTAL_HIST_HRS  = &t.TOTAL_HIST_HRS
+  let #TOTAL_ACCUM_HRS = &t.TOTAL_ACCUM_HRS
+
+
+
+  show 'emplid             ' $emplid 
+  show 'T.CURR_YR_HRS_YTD  ' &t.CURR_YR_HRS_YTD
+  show '#TOTAL_HIST_HRS    ' &t.TOTAL_HIST_HRS
+  show '#Total_accum_hrs   ' &t.total_accum_hrs
+  show ' '
+
+  do X900-Print-Detail-Line
+
+FROM   [$TABLENAME] T
+
+ORDER BY T.COMPANY,
+         T.PAYGROUP, 
+         T.DEPTID,
+         T.TOTAL_ACCUM_HRS
+
+End-Select
+End-Procedure
+
+begin-procedure x800-Company-Before-Change
+#debug9 show 'x800-Company-Before-Change'
+  if $000-new-page-flag = 'Y'
+    let $000-new-page-flag = 'N'
+    new-page
+  end-if
+  move &T.Company  to $Company			
+end-procedure
+
+begin-procedure x801-Company-After-Change    
+#debug9 show 'x801-Company-After-Change  '
+  let $000-new-page-flag = 'Y' 	
+end-procedure
+
+
+begin-procedure x805-Paygroup-Before-Change
+#debug9 show 'x805-Paygroup-Before-Change'
+  if $000-new-page-flag = 'Y'
+    let $000-new-page-flag = 'N'
+    new-page
+  end-if
+  move &T.PayGroup to $paygroup
+end-procedure
+
+
+begin-procedure x806-Paygroup-After-Change
+#debug9 show 'x806-Paygroup-After-Change'
+  let $000-new-page-flag = 'Y' 	
+end-procedure
+
+
+begin-procedure X900-Print-Detail-Line
+#debug9 show 'X900-Print-Detail-Line'
+  let $Year4 = '1'
+!AXL - 6/26/2000 - Begin
+! do Format-DateTime($Orig_Hire_DT, $orighiredt, {DEFDATE}, '', '')
+  do Format-DateTime($Hire_DT, $hiredt, {DEFDATE}, '', '')
+!AXL - 6/26/2000 - End
+  print $Name			(+1,{#x000_col_name},30)
+  print $Emplid			(0,{#x000_col_emplid})
+  print #Empl_Rcd		(0,{#x000_col_empl_rcd})       edit 9990
+  print #HOURLY_RT		(0,{#x000_col_hourly_rt})	edit 999,999.99
+!AXL - 6/26/2000 - Begin
+! print $orighiredt		(0,{#x000_col_orig_hire_dt})
+  print $hiredt			(0,{#x000_col_hire_dt})
+!AXL - 6/26/2000 - End
+  print $Deptid			(0,{#x000_col_deptid})
+  print $Acct_Cd		(0,{#x000_col_acct_cd},10)
+  print $Jobcode		(0,{#x000_col_jobcode})
+  print $JobTitleAbbrv 		(0,{#x000_col_jobdesc},10)
+  print #CURR_YR_HRS_YTD	(0,{#x000_col_ytd_hours})          edit 999,999.99
+  print #TOTAL_HIST_HRS	      	(0,{#x000_col_prior_years_hrs})    edit 9,999,999.99
+  print #TOTAL_ACCUM_HRS	(0,{#x000_col_historical_ytd_hrs}) edit 9,999,999.99
+end-procedure
+
+!**********************************************************
+!  Drop Work Table 
+!**********************************************************
+begin-procedure X990-Drop-Table 
+#debug9 show 'X990-Drop-Table' 
+
+begin-sql 
+DROP TABLE [$tablename]
+end-sql
+end-procedure
+
+#Include 'getcodta.sqc'  !Get-Company-Data procedure
+#Include 'getpgdta.sqc'  !Get-Paygroup-Data procedure
+#include 'curdttim.sqc'  !Current Date and Time
+#Include 'readxlat.sqc'  !Read-Translate-Table procedure
+#include 'reset.sqc'     !Reset Printer
+#Include 'datetime.sqc'  !Routines for date/time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'stdapi.sqc'    !Update Process API
+#include 'getjobtl.sqc'  !Get-Job-Title procedure
+#include 'askaod.sqc'    !Ask-As-Of-Date procedure
+
+#include 'gexxx900.sqc'  !Get company multiple row table
+#include 'gexxx901.sqc'  !Get company/paygroup multiple row table
+#include 'gexxx902.sqc'  !Get deptid multiple row table
+#include 'gexxx903.sqc'  !Get employee status multiple row table
+#include 'gexxx907.sqc'  !Get company/division code multiple row table
+#include 'gexxx909.sqc'  !Get acct_cd code multiple row table
+#include 'gexxx922.sqc'  !Get pay single row run control
+#include 'gexxx930.sqc'  !Get empl_type multiple row table
+#include 'gexxx950.sqc'  !Get SQRW run controls
+#include 'gexaltse.sqc'  ! Alter session SQC   ! jnb 01/13/00
+#include 'gexrehdt.sqc'	 !GEX-MXT 03/24/2008 Fixed for REHIRE DT
+#Include 'getposnm.sqc'  !Get-Position-Title    VENDTKK ITG#56786   11-Feb-2009  

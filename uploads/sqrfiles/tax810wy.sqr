@@ -1,0 +1,660 @@
+!***********************************************************************
+!  TAX810WY:  Qtrly Wage List - Wyoming                                *
+!                                                                      *
+!             NOTE: "#IFDEF TAXTEST" in main SELECT is used for        *
+!                   testing this report against DEMO database          *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module contains confidential and proprietary information        *
+! of Oracle; it is not to be copied, reproduced, or transmitted        *
+! in any form, by any means, in whole or in part, nor is it to         *
+! be used for any purpose other than that for which it is              *
+! expressly provided under the applicable license agreement.           *
+!                                                                      *
+! Copyright (C) 2008 Oracle. All Rights Reserved.                      *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+!          $Date:  2008/03/03:09:35:34                                 !
+!       $Release:  HR9                                                 !
+!    $Resolution:  739116                                              !
+!                                                                      *
+!***********************************************************************
+!
+!***********************************************************************
+! Modified for Education & Government                                  *
+! HP99999       Release 8 Technical Merge                              *
+!***********************************************************************
+
+#include 'setenv.sqc' !Set environment
+#include 'setup31.sqc' !Printer and page-size initialization
+#include 'usarpt.sqc'  ! NID_COUNTRY defined
+
+begin-report
+  do Init-Report
+
+! These variables are used by rptsmmry.sqc
+  Let $Prnt_CoTxGrs = 'Y'
+  Let $Prnt_CoExGrs = 'N'
+  Let $Prnt_CoTips  = 'Y'
+
+  do Process-Main
+
+  close 10
+
+  if $RecordWritten = 'Y'
+    do Sort-Array
+    do Print-Totals
+    display ''
+    display 'Upon successful conclusion of this program, one or more'
+    display 'file(s) will have been created:'
+    display ''
+    display '  T81WYxxx   where "xxx" represents a volume identifier'
+    display '             for each company code.'
+    display ''
+    display 'The file(s) contain(s) records in the CSV format required'
+    display 'for reporting of quarterly wages to Wyoming Department of'
+    display 'Employment.'
+    display ''
+    display 'Follow the instructions from the department for preparing'
+    display 'and submitting the file(s).'
+    display ''
+  else
+    do Print-Summary-Data('NoData')
+  end-if
+
+  do Stdapi-Term
+
+end-report
+
+begin-procedure Init-Report
+  move 'TAX810WY' to $ReportID
+  move 'Wyoming Quarterly UI Wage Report' to $ReportTitle
+  display ''
+  display 'Creating file for Wyoming UI Wage Reporting'
+
+  do Init-DateTime
+  do Init-Number
+  do Stdapi-Init
+  do Get-Current-DateTime
+  do Create-Array
+  do Initialization
+  do Get-Calendar-Year-Id
+
+end-procedure
+
+begin-procedure Initialization
+#ifdef TAXTEST
+  move 'CA'              to $State
+#else
+  move 'WY'              to $State
+#endif
+
+  do Delete-Temp-Name-Table
+  do Get-Tax-Reporting-Run-Controls
+  move &TX.Balance_Year to $RptYear 9999
+  move $RptYear          to $RptYear ~~xx
+  move $PeriodEndDate    to $AsOfDate
+
+  do Format-DateTime($AsOfDate, $AsOfDate1, {DEFYMD}, '', '')
+  do Format-DateTime($PeriodEndDate, $PeriodEndDate, {DEFYMD}, '', '')
+  move $PeriodEndDate    to $BegAsOfDateYY xxxx
+  let  $BegAsOfDateMM    = Substr($PeriodEndDate, 6, 2)
+  evaluate $BegAsofDateMM
+    when = '03'
+      let $BegAsOfDateMM = '01'
+    when = '06'
+      let $BegAsOfDateMM = '04'
+    when = '09'
+      let $BegAsOfDateMM = '07'
+    when = '12'
+      let $BegAsOfDateMM = '10'
+   end-evaluate
+
+  let  $BegAsOfDate      = $BegAsOfDateYY || '/' || $BegAsOfDateMM || '/' || '01'
+  display ' '
+  display 'Processing balances for '   noline
+  display $RptQtrYr
+
+  do Select-Parameters
+
+  move ',' to $Comma
+  move 1  to #FileCount
+  move 'CSV' to $FileExtension
+
+end-procedure
+
+
+begin-procedure Delete-Temp-Name-Table
+begin-SQL on-error=Ignore
+  DELETE FROM PS_R_TAX810ST
+end-SQL
+end-procedure
+
+begin-procedure Ignore
+! dummy procedure to avoid SQL error message on delete of empty table
+end-procedure
+
+
+begin-procedure Process-Main
+begin-SELECT
+TEMP_SSN_MASK
+FROM PS_INSTALLATION
+end-SELECT
+
+begin-SELECT
+Z.COMPANY
+Z.DESCR
+
+  move &Z.Company to $Company
+  move &Z.Descr   to $CompanyName
+
+  move '' to $priorEmplID
+  do Read-Employee-Data
+
+FROM  PS_COMPANY_TBL Z
+WHERE Z.EFF_STATUS      = 'A'
+  AND Z.TAX_REPORT_TYPE = '2'
+  AND Z.EFFDT =
+  (SELECT MAX(EFFDT)
+     FROM PS_COMPANY_TBL
+     WHERE  COMPANY = Z.COMPANY
+       AND  EFFDT  <= $AsOfDate)
+ORDER BY COMPANY
+end-SELECT
+
+  if #Count_F > 0
+     do Print-Summary-Data('FileNames')
+  end-if
+
+end-procedure
+
+
+begin-procedure Read-Employee-Data
+begin-SELECT
+C.COMPANY    () on-break print=never before=Before-Company
+                                     AFTER=AFTER-COMPANY
+C.EMPLID
+C.NLGRS_QTD
+C.NLGRS_YTD
+C.TXGRS_QTD
+D1.NATIONAL_ID
+D.LAST_NAME
+D.FIRST_NAME
+
+  move &C.Emplid to $TempEmplid
+
+  if $Company_Selected = 'Y'
+    if &C.NlGrs_QTD > 0
+      do Process-Employee
+    else
+      do Print-Summary-Data('NegWage')
+    end-if
+  end-if
+
+FROM  PS_TAX_BALANCE C, PS_PERSON_NAME D, PS_PERS_NID D1
+WHERE C.COMPANY       = &Z.Company
+  AND D.EMPLID        = C.EMPLID
+  AND C.TAX_CLASS     = 'U'
+  AND C.BALANCE_ID    = $Calendar_Year_Id
+  AND C.BALANCE_YEAR  = &TX.Balance_Year
+  AND C.BALANCE_QTR   = &TX.Balance_Qtr
+#ifdef TAXTEST
+  AND C.STATE         = 'CA'
+#else
+  AND C.STATE         = 'WY'
+#endif
+  AND C.LOCALITY      = ' '
+  AND C.BALANCE_PERIOD  =
+      (SELECT MAX(BALANCE_PERIOD)
+       FROM   PS_TAX_BALANCE
+       WHERE  EMPLID        = C.EMPLID
+         AND  COMPANY       = C.COMPANY
+         AND  BALANCE_ID    = C.BALANCE_ID
+         AND  BALANCE_YEAR  = C.BALANCE_YEAR
+         AND  BALANCE_QTR   = C.BALANCE_QTR
+         AND  STATE         = C.STATE
+         AND  LOCALITY      = C.LOCALITY
+         AND  TAX_CLASS     = C.TAX_CLASS)
+  AND C.NLGRS_QTD <> 0
+  AND D1.EMPLID           = D.EMPLID
+  AND D1.COUNTRY          = {NID_Country}
+  AND D1.NATIONAL_ID_TYPE = $Payroll_NID_Type
+ORDER BY D1.NATIONAL_ID
+end-SELECT
+end-procedure
+
+
+begin-procedure Process-Employee
+
+  move &D1.NATIONAL_ID to $S123 xxx       !isolate first 3 digits
+  if $S123 = &Temp_SSN_Mask or RTRIM(&D1.NATIONAL_ID, ' ') = ''
+    move '000000000'   to $NATIONAL_ID
+  else
+    move &D1.NATIONAL_ID        to $NATIONAL_ID
+  end-if
+
+  let $LastName   = rtrim(&D.LAST_NAME, ' ')
+  let $FirstName  = rtrim(&D.FIRST_NAME, ' ')
+
+  move &C.TxGrs_QTD to #TxGrs_QTD
+  add #TxGrs_QTD to #Co_TxGrs_QTD
+
+  move &C.NlGrs_QTD to #NlGrs_QTD
+  add #NlGrs_QTD to #Co_NlGrs_QTD
+
+  move &C.NlGrs_YTD to #NlGrs_YTD
+  add #NlGrs_YTD to #Co_NlGrs_YTD
+
+  move &C.EmplID to $EmplID
+
+! Process Tips - use GETEARNS.SQC
+  move 'PS_RC_ENCD_TX810WY D'  to $TAX810X1
+  move 'PS_RC_ENCD_TX810WY D1' to $TAX810X2
+  move 'PS_RC_ENCD_TX810WY D2' to $TAX810X3
+  move 'PS_RC_ENCD_TX810WY D3' to $TAX810X4
+
+  do Get-Earns
+  move #Earns     to #Tips_QTD
+  add  #Tips_QTD  to #Co_Tips_QTD
+  let  #Tot_Wages =  #NlGrs_QTD - #Tips_QTD
+
+  do Get-Workers-Comp-CD
+
+begin-SELECT DISTINCT
+B4.HIRE_DT
+C4.OFFICER_CD
+C4.PAYGROUP
+C4.BUSINESS_UNIT
+
+    let $bu = &C4.BUSINESS_UNIT
+    do Format-Datetime(&B4.Hire_Dt, $HireDt, {DEFYMD}, '', '')    ! YMD format for date comparison
+    do Format-Datetime(&B4.Hire_Dt, $HireDte, {DEFMDY}, '', '')   ! MDY format for output file
+
+    let $Officer_Cd  = &C4.OFFICER_CD
+
+    let #max_amt_TOT = 999999999.99
+    let #max_amt_YTD = 999999999.99
+    let #Wages_orig  = #Tot_Wages
+    let #NLYTD_orig  = #NlGrs_YTD
+    let $done1 = 'N'
+    let $done2 = 'N'
+
+
+    while $done1 <> 'Y' or $done2 <> 'Y'
+       do split-s-record (#Wages_orig,#Tot_Wages,#max_amt_TOT,$done1)
+       do split-s-record (#NLYTD_orig,#NlGrs_YTD,#max_amt_YTD,$done2)
+       do Format-Number(#Tot_Wages, $Tot_Wages, '099999999.99')
+       do Format-Number(#NlGrs_YTD, $NlGrs_YTD, '099999999.99')
+       do Write-Detail-Record
+       add 1 to #Count_R
+    end-while
+
+    add 1 to #Count_S
+
+FROM  PS_EMPLOYMENT    B4,
+      PS_JOB           C4
+WHERE B4.EMPLID = &C.EMPLID
+  AND B4.EMPL_RCD =
+      (SELECT MIN(K.EMPL_RCD)
+       FROM   PS_EMPLOYMENT K
+       WHERE  K.EMPLID    = B4.EMPLID)
+  AND C4.EMPLID = B4.EMPLID
+  AND C4.EMPL_RCD = B4.EMPL_RCD
+  AND C4.EFFDT =
+      (SELECT MAX(H.EFFDT)
+       FROM   PS_JOB H
+       WHERE  H.EMPLID    = C4.EMPLID
+         AND  H.EMPL_RCD = C4.EMPL_RCD
+         AND  H.EFFDT    <= $AsOfDate)
+  AND C4.EFFSEQ =
+      (SELECT MAX(I.EFFSEQ)
+       FROM   PS_JOB I
+       WHERE  I.EMPLID    = C4.EMPLID
+         AND  I.EMPL_RCD = C4.EMPL_RCD
+         AND  I.EFFDT     = C4.EFFDT)
+end-SELECT
+
+end-procedure
+
+
+begin-procedure Get-Workers-Comp-CD
+  let $L1.US_SOC_CD = ' '
+begin-SELECT
+L1.US_SOC_CD
+  move &L1.US_SOC_CD  to $L1.US_SOC_CD
+FROM        PS_JOBCODE_TBL L1,
+            PS_JOB         N3
+WHERE N3.EMPLID  = $TempEmplid
+  AND N3.COMPANY = $Company
+  AND N3.JOB_INDICATOR = 'P'
+  AND N3.EFFDT  = (SELECT MAX(EFFDT)
+            FROM PS_JOB J2
+            WHERE  J2.EMPLID = N3.EMPLID
+              AND  J2.COMPANY   = N3.COMPANY
+              AND  J2.JOB_INDICATOR = N3.JOB_INDICATOR
+              AND  J2.EFFDT  <= $AsOfDate)
+  AND  N3.EFFSEQ  = (SELECT MAX(EFFSEQ)
+            FROM PS_JOB J3
+            WHERE J3.EMPLID    = N3.EMPLID
+              AND J3.COMPANY   = N3.COMPANY
+              AND  J3.JOB_INDICATOR = N3.JOB_INDICATOR
+              AND J3.EFFDT     = N3.EFFDT)
+  AND N3.JOBCODE = L1.JOBCODE
+  AND N3.SETID_JOBCODE = L1.SETID
+  AND L1.EFFDT =
+      (SELECT MAX(J.EFFDT)
+       FROM   PS_JOBCODE_TBL J
+       WHERE  J.JOBCODE = L1.JOBCODE
+         AND  J.SETID = L1.SETID
+         AND  J.EFFDT  <= $AsOfDate)
+
+end-SELECT
+end-procedure
+
+
+begin-procedure Before-Company
+  do Get-Company-Data
+#ifdef TAXTEST
+  move 'CA'              to $State
+#else
+  move 'WY'              to $State
+#endif
+  do Get-State-Tax-Data             !Employer ID
+  if RTRIM(&Employer_ID_SUT,' ') = ''
+    display '*** State Unemployment ID missing in Company State Tax Table ***'
+    display '*********************** Processing stopped *********************'
+    display 'Company: ' noline
+    display $Company
+    stop
+  end-if
+  move &Employer_ID_SUT to $StateEIN
+
+  if $Prcs_Process_Instance  =  ''
+     do Employer-Prompts
+  else
+     let $Company_Selected = 'N'
+     do Company-Run-Control
+     if $Company_Selected = 'N'
+       display '*** Company and/or UI/WC Indicator not on Run Control Panel ***'
+       display '*** Employees for this Company not processed.               ***'
+       display 'Company: ' noline
+       display $Company
+     end-if
+  end-if
+
+  do Open-File
+  do Build-Temp-Name-Table
+
+end-procedure
+
+begin-procedure After-Company
+  do Print-Summary-Data('CoTotal')
+
+  add #Co_NlGrs_QTD to #Tot_NlGrs_QTD
+  add #Co_NlGrs_YTD to #Tot_NlGrs_YTD
+  add #Co_TxGrs_QTD to #Tot_TxGrs_QTD
+  add #Co_Tips_QTD  to #Tot_Tips_QTD
+
+  add #Count_S to #Count_F
+  add #Count_R to #Count_R_Total
+
+  move 0 to #Co_NlGrs_QTD
+  move 0 to #Co_NlGrs_YTD
+  move 0 to #Co_TxGrs_QTD
+  move 0 to #Co_Tips_QTD
+
+  move 0 to #Count_S
+  move 0 to #Count_R
+
+  add  1 to #FileCount
+  new-page
+end-procedure
+
+begin-procedure Write-Detail-Record
+
+  if  $HireDt <= $AsOfDate1
+  and $HireDt >= $BegAsOfDate
+    let $HireDate = $HireDte
+  else
+    let $HireDate = ''
+  end-if
+
+  if $Officer_Cd = 'P'
+  or $Officer_Cd = 'V'
+  or $Officer_Cd = 'S'
+  or $Officer_Cd = 'T'
+  or $Officer_Cd = 'O'
+     let $Corp_Off     = 'C'
+     let $Corp_Off_Ind = 'Y'
+  else
+     let $Corp_Off     = ' '
+     let $Corp_Off_Ind = 'N'
+  end-if
+
+!  let $Off_NlGrs_QTD  = '000000000.00'
+
+!  if  $UIWC_Ind = 'B'
+!  and $Corp_Off = 'C'
+!      let $Off_NlGrs_QTD = $Wrk_avg_Comp_wage
+!  end-if
+
+  if $UIWC_Ind = 'B'
+     let $US_SOC_CD   = $L1.US_SOC_CD
+     let $SOC_dash = substr($US_SOC_CD,3,1)
+     if $SOC_dash = '-'
+        let $SOC_part1 = substr($US_SOC_CD, 1, 2)
+        let $SOC_part2 = substr($US_SOC_CD, 4, 4)
+        let $US_SOC_CD = $SOC_part1 || $SOC_part2
+     end-if
+  else
+     let $US_SOC_CD   = '    '
+  end-if
+
+  let $Hours = '000'
+  do Format-Number(#Tips_QTD, $Tips_QTD, '099999999.99')
+
+
+  write 10 from  $NATIONAL_ID:9       !    1 -  9
+                       $Comma:1       !   10
+                    $LastName:16      !   11 - 26
+                       $Comma:1       !   27
+                   $FirstName:15      !   28 - 42
+                       $Comma:1       !   43
+                    $Tips_QTD:12      !   44 - 55
+                       $Comma:1       !   56
+                   $Tot_Wages:12      !   57 - 68
+                       $Comma:1       !   69
+                    $UIWC_Ind:1       !   70
+                       $Comma:1       !   71
+                   $US_SOC_CD:6       !   72 - 77
+                    $Corp_Off:1       !   78
+                       $Comma:1       !   79
+                    $HireDate:10      !   80 - 89
+                       $Comma:1       !   90
+                       $Hours:3       !   91 - 93
+                       $Comma:1       !   94
+                $Corp_Off_Ind:1       !   95
+                       $Comma:1       !   96
+                   $NlGrs_YTD:12      !   97 - 108
+
+  do Add-To-Array
+
+  move '' to $Tips_QTD
+  move 0  to #Tips_QTD
+  move '' to $Tot_Wages
+  move 0  to #Tot_Wages
+  move 'Y' to $RecordWritten
+end-procedure
+
+begin-procedure Employer-Prompts
+  display ' '
+  display 'Enter Workers Comp Run Information for'
+  display $Company noline
+  display ':'
+  input $UIWC_Ind 'UI, WC, or Both indicator? (U, W, or B)'
+  uppercase $UIWC_Ind
+end-procedure
+
+begin-procedure Company-Run-Control
+begin-SELECT
+RC_TAX810WY.UI_WC_IND
+!RC_TAX810WY.WRK_AVG_COMP_WAGE
+
+  let $Company_Selected  = 'Y'
+  let $UIWC_Ind          = &RC_TAX810WY.UI_WC_IND
+
+!  let #Wrk_avg_Comp_wage = &RC_TAX810WY.WRK_AVG_COMP_WAGE
+!  do Format-Number(#Wrk_avg_Comp_wage, $Wrk_avg_Comp_wage, '099999999.99')
+
+FROM  PS_RC_TAX810WY RC_TAX810WY
+WHERE RC_TAX810WY.OPRID              = $Prcs_OprID
+AND   RC_TAX810WY.RUN_CNTL_ID        = $Prcs_Run_Cntl_ID
+AND   RC_TAX810WY.COMPANY            = $Company
+end-select
+end-procedure
+
+
+begin-procedure Create-Array
+create-array name = totals
+             size = 1000
+             field = location:char
+             field = wccode:char
+             field = nlgrs_qtd:number
+             field = txgrs_qtd:number
+             field = count:number
+let #array_cnt = 0
+end-procedure
+
+
+begin-procedure Add-To-Array
+let #cntr = 0
+let $found = 'N'
+while #cntr < #array_cnt and $found = 'N'
+  add 1 to #cntr
+  get $location $wccode from totals(#cntr)
+  if $location = $bu and $wccode = $US_SOC_CD
+    let $found = 'Y'
+  end-if
+end-while
+  if $found = 'N'    ! New location/WC Code combination
+    add 1 to #array_cnt
+    put $bu $US_SOC_CD 0 0 0 into totals(#array_cnt)
+    let #cntr = #array_cnt
+  end-if
+
+  ! Now #cntr has the index in the array of the location/WC Code combination
+
+  let #cur_nlgrs_qtd = #nlgrs_qtd
+  let #cur_txgrs_qtd = #txgrs_qtd
+
+  array-add #cur_nlgrs_qtd to totals(#cntr) nlgrs_qtd
+  array-add #cur_txgrs_qtd to totals(#cntr) txgrs_qtd
+  array-add 1 to totals(#cntr) count
+end-procedure
+
+
+begin-procedure Sort-Array
+let #outer_cnt = 0
+while #outer_cnt < #array_cnt
+  add 1 to #outer_cnt
+  let #inner_cnt = #outer_cnt + 1
+  while #inner_cnt <= #array_cnt
+    get $location $wccode #nlgrs_qtd #txgrs_qtd #count from totals(#inner_cnt)
+    get $locationo $wccodeo #nlgrs_qtdo #txgrs_qtdo #counto from totals(#outer_cnt)
+    let $value_inner = $location || $wccode
+    let $value_outer = $locationo || $wccodeo
+    if $value_inner < $value_outer   ! Switch places
+       put $location $wccode #nlgrs_qtd #txgrs_qtd #count into totals(#outer_cnt)
+       put $locationo $wccodeo #nlgrs_qtdo #txgrs_qtdo #counto into totals(#inner_cnt)
+    end-if
+    add 1 to #inner_cnt
+  end-while
+end-while
+end-procedure
+
+
+begin-procedure Print-Totals
+let #cntr = 0
+let #tot_nlgrs_qtd = 0
+let #tot_txgrs_qtd = 0
+let #tot_count = 0
+
+print 'Location'                        (+3,1)
+print 'W/C Code'                        (,10)
+print 'NL Grs'                          (,31)
+print 'TX Grs'                          (,51)
+print 'Count'                           (,65)
+print '-'                               (+1,1,122) fill
+print ''                                (+1)
+while #cntr < #array_cnt
+  add 1 to #cntr
+  get $location $wccode #nlgrs_qtd #txgrs_qtd #count from totals(#cntr)
+  print $location                       (+1,1)
+  print $wccode                         (,10)
+  print #nlgrs_qtd                      (,25)  edit 99,999,999.99
+  print #txgrs_qtd                      (,45)  edit 99,999,999.99
+  print #count                          (,65)  edit 9,999
+  let #tot_nlgrs_qtd = #tot_nlgrs_qtd + #nlgrs_qtd
+  let #tot_txgrs_qtd = #tot_txgrs_qtd + #txgrs_qtd
+  let #tot_count = #tot_count + #count
+end-while
+
+print '-'                               (+1,1,122) fill
+print 'TOTALS'                          (+2,1)
+print #tot_nlgrs_qtd                    (,25)  edit 99,999,999.99
+print #tot_txgrs_qtd                    (,45)  edit 99,999,999.99
+print #tot_count                        (,65)  edit 9,999
+print '-'                               (+1,1,122) fill
+end-procedure
+
+
+begin-procedure Open-File
+
+  if #FileCount > 1
+     close 10
+  end-if
+
+! This code is necessary for the AS/400 platform
+
+#ifdef OS400
+   let $FileExt = '(D' || $FileExtension || ')'
+   let $FileID  = '{IMPORTPREFIX}' || 'T81WY' || &Z.Company || $FileExt
+#else
+   let $FileID = 
+    '{IMPORTPREFIX}' || 'T81WY' || &Z.Company || '.' || $FileExtension
+#endif
+
+  open $FileID as 10 for-writing record=108:fixed
+
+end-procedure
+
+
+begin-Procedure Build-Temp-Name-Table
+begin-SQL on-error=Insert-Name-Error
+  INSERT INTO PS_R_TAX810ST (STATE, COMPANY)
+         VALUES ($State, &Z.Company)
+end-SQL
+end-Procedure
+
+begin-procedure Insert-Name-Error
+  display 'Error on insert to temporary Name table '
+end-procedure
+
+
+#Include 'taxrnctl.sqc'  !Get-Tax-Reporting-Run-Controls procedure
+#Include 'txrnctl1.sqc'  !Get-Tax-Reporting-Panel-Data procedure
+#Include 'getcodta.sqc'  !Get-Company-Data procedure
+#Include 'getstdta.sqc'  !Get-State-Tax-Data procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'getfrmat.sqc'  !Get-Diskette-Format procedure
+#Include 'rptsmmry.sqc'  !Print-Summary-Data procedure
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'getbalid.sqc'  !Get-Calendar-Year-Id
+#Include 'stdapi.sqc'    !Update Process API
+#Include 'txovrflw.sqc'  !Split-S-Record Procedure
+#Include 'getearns.sqc'  !Get-Earns procedure

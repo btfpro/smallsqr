@@ -1,0 +1,495 @@
+!***********************************************************************
+!  GEXPL008:  Monthly Benefits Summary by Division and Store           *
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module is the confidential and proprietary information of       *
+! Giant Eagle, Inc.; it is not to be copied, reproduced,or transmitted *
+! in any form, by any means, in whole or in part, nor is it to be used *
+! for any purpose other than that for which it is expressly provided   *
+! without the written permission of Giant Eagle.                       *
+!                                                                      *
+! Copyright (c) 1997-1998 Giant Eagle,Inc. All Rights Reserved         *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+! GEXPL008:             Monthly Benefits Summary by Division and Store *
+!                                                                      *
+! Narrative:		This program creates a monthly report for      *
+!                       employer contribution for different stores     *
+!                       in the divisions. The categories used in this  *
+!                       report are Health & Welfare, Legal and Pension *
+!                                                                      *
+! #Debugx Used:		#debug9 paragraph trace                        *
+!                       #debug8 key variable values                    *
+!                       #debug7 data returned from sql calls           *
+!                                                                      *
+! SQL Tables:		pay_calendar                                   *
+!                       gex_dept_tbl                                   *
+!                       pay_check                                      *
+!                       pay_deduction                                  *
+!                                                                      *
+! Written by:		Sreeni Kutam   06/25/98                        *
+!                                                                      *
+! Normally Run:         Monthly                                        *
+!                                                                      *
+! Control Parms:        FOR WHERE CLAUSE:                              *
+!                         Health & Welfare Plan Types                  *
+!                         Legal Plan Types                             *
+!                         Pension Plan Types                           *
+!                                                                      *
+!***********************************************************************
+!                         MODIFICATION HISTORY                         *
+!***********************************************************************
+!     INITIALS    DATE        DESCRIPTION OF THE CHANGE                *
+!***********************************************************************
+!     SXK         06/25/98    Initial Creation                         *
+!                                                                      *
+!     JDH         11/16/98    Changed logic to look at pay_check and   *
+!                               pay_deduction instead of job and       *
+!                               deduction_bal in order to ensure that  *
+!                               deptid changes will be selected.       *
+!                             Removed company division code parameter. *
+!                                                                      *
+!     JDH         12/04/98    Removed AsOfDate parameter.              *
+!                             Changed logic to pull balances for the   *
+!                               month of the last confirmed pay end    *
+!                               date.                                  *
+!                                                                      *
+!     JDH         02/22/99    Performance Tuning.                      *
+!                                                                      *
+!     JDH         02/26/99    Pull pay_check rows by the               *
+!                               check date of the pay end              *
+!                               rather than the check date of          *
+!                               the pay_check row.                     *
+!     CWB         02/22/2001  Add division codes 'COL' (Columbus)      *
+!                             and 'CLE' (Cleveland).                   *
+!			AMS					09/05/2007	8.3 TO 9.0 UPGRADE RETROFIT CHANGES
+!***********************************************************************
+
+
+#Include 'setenv.sqc'    !Set environment
+#Include 'setup02.sqc'   !Printer and page-size initialization
+
+
+Begin-Heading 6
+#debug9 Show 'Begin-Heading'
+
+#Include 'stdhdg01.sqc'
+
+  print $Reporting_Period (3,) center 
+
+  let $division  = 'Division: '||$prev_div_cd
+  print $division              (4,) center
+
+  Print 'STORE'                (+2,001)
+  Print 'HEALTH AND WELFARE'   (+0,035)
+  Print '     LEGAL AID'       (+0,060)
+  Print '       PENSION'       (+0,081)
+  Print '         TOTAL'       (+0,102)
+
+End-Heading
+
+
+Begin-Report
+#debug9 Show 'Begin-Report'
+
+  Do Init-DateTime           !datetime.sqc
+  Do Init-Number             !number.sqc
+  Do Get-Current-DateTime    !curdttim.sqc
+  Do Stdapi-Init             !stdapi.sqc
+
+  Do P100-Start
+  Do P200-Main-Process
+  Do P300-Finish
+
+  Do Reset                   !reset.sqc
+  Do Stdapi-Term             !stdapi.sqc
+
+  date-time () HH:MI:SS &timeEnded
+  date-time () MM/DD/YYYY &dateEnded
+  show 'Report Ended at ' &timeEnded ' on ' &dateEnded
+
+  Show 'Successful end of report'
+End-Report
+
+
+Begin-Procedure P100-Start
+#debug9 Show 'P100-Start'
+
+  Do Set-Optimizer-Goal
+
+  Move 'GEXPL008'                              To $ReportID
+  Move 'BENEFIT SUMMARY BY DIVISION AND STORE' To $ReportTitle
+
+  Show '$ReportID=' $ReportID
+  Show '$ReportTitle=' $ReportTitle
+
+  Let $GEXXX917_Plan_Type_Alias = 'pd.plan_type'
+
+  create-array name=plan_types size=50
+    field=pgroup:char:10
+    field=ptype:char:2
+
+  clear-array name=plan_types
+
+  Let #k = 0
+
+  If $prcs_process_instance = ''
+    Move '''' To $PlanTypeString
+    Display 'Enter Health & Welfare Plan Type or leave blank to exit.'
+    While 1=1
+      Input $PlanType Maxlen=2 'Health & Welfare Plan Type'
+      Uppercase $PlanType
+      If RTRIM($PlanType, ' ') = ''
+        Concat '''' With $PlanTypeString
+        Break
+      End-If
+      If $PlanTypeString <> ''''
+        Concat ''',''' With $PlanTypeString
+      End-If
+      Concat $PlanType With $PlanTypeString
+      Add 1 To #k
+      Put 'H&W' $PlanType Into plan_types(#k)
+    End-While
+
+    If $PlanTypeString = ''''''
+      Let $GEXXX917_INCLUDE_HW_PLAN_TYPE_CRITERIA = '1=1'
+      Let $GEXXX917_INCLUDE_HW_PLAN_TYPE_DISPLAY_CRITERIA = 'ALL'
+    Else
+      Let $GEXXX917_INCLUDE_HW_PLAN_TYPE_CRITERIA = $GEXXX917_Plan_Type_Alias || ' In (' || $PlanTypeString || ')'
+      Let $GEXXX917_INCLUDE_HW_PLAN_TYPE_DISPLAY_CRITERIA = $GEXXX917_INCLUDE_HW_PLAN_TYPE_CRITERIA
+    End-If
+
+
+    Move '''' To $PlanTypeString
+    Display 'Enter Legal Plan Type or leave blank to exit.'
+    While 1=1
+      Input $PlanType Maxlen=2 'Legal Plan Type'
+      Uppercase $PlanType
+      If RTRIM($PlanType, ' ') = ''
+        Concat '''' With $PlanTypeString
+        Break
+      End-If
+      If $PlanTypeString <> ''''
+        Concat ''',''' With $PlanTypeString
+      End-If
+      Concat $PlanType With $PlanTypeString
+      Add 1 To #k
+      Put 'LEGAL' $PlanType Into plan_types(#k)
+    End-While
+
+    If $PlanTypeString = ''''''
+      Let $GEXXX917_INCLUDE_LEGAL_PLAN_TYPE_CRITERIA = '1=1'
+      Let $GEXXX917_INCLUDE_LEGAL_PLAN_TYPE_DISPLAY_CRITERIA = 'ALL'
+    Else
+      Let $GEXXX917_INCLUDE_LEGAL_PLAN_TYPE_CRITERIA = $GEXXX917_Plan_Type_Alias || ' In (' || $PlanTypeString || ')'
+      Let $GEXXX917_INCLUDE_LEGAL_PLAN_TYPE_DISPLAY_CRITERIA = $GEXXX917_INCLUDE_LEGAL_PLAN_TYPE_CRITERIA
+    End-If
+
+
+    Move '''' To $PlanTypeString
+    Display 'Enter Pension Plan Type or leave blank to exit.'
+    While 1=1
+      Input $PlanType Maxlen=2 'Pension Plan Type'
+      Uppercase $PlanType
+      If RTRIM($PlanType, ' ') = ''
+        Concat '''' With $PlanTypeString
+        Break
+      End-If
+      If $PlanTypeString <> ''''
+        Concat ''',''' With $PlanTypeString
+      End-If
+      Concat $PlanType With $PlanTypeString
+      Add 1 To #k
+      Put 'PENSION' $PlanType Into plan_types(#k)
+    End-While
+
+    If $PlanTypeString = ''''''
+      Let $GEXXX917_INCLUDE_PENSION_PLAN_TYPE_CRITERIA = '1=1'
+      Let $GEXXX917_INCLUDE_PENSION_PLAN_TYPE_DISPLAY_CRITERIA = 'ALL'
+    Else
+      Let $GEXXX917_INCLUDE_PENSION_PLAN_TYPE_CRITERIA = $GEXXX917_Plan_Type_Alias || ' In (' || $PlanTypeString || ')'
+      Let $GEXXX917_INCLUDE_PENSION_PLAN_TYPE_DISPLAY_CRITERIA = $GEXXX917_INCLUDE_PENSION_PLAN_TYPE_CRITERIA
+    End-If
+
+  Else
+
+    Do GEXXX917-Select-HW-Plan-Type-Parameters
+    Do GEXXX917-Select-Legal-Plan-Type-Parameters
+    Do GEXXX917-Select-Pension-Plan-Type-Parameters
+
+  End-If
+
+  date-time () HH:MI:SS &timeBegan
+  date-time () MM/DD/YYYY &dateBegan
+  show 'Report Began at ' &timeBegan ' on ' &dateBegan
+
+  Let $X000_ORDER_BY = 'Division Code, Store'
+
+  Show '$GEXXX917_INCLUDE_HW_PLAN_TYPE_DISPLAY_CRITERIA      = '   $GEXXX917_INCLUDE_HW_PLAN_TYPE_DISPLAY_CRITERIA
+  Show '$GEXXX917_INCLUDE_LEGAL_PLAN_TYPE_DISPLAY_CRITERIA   = '   $GEXXX917_INCLUDE_LEGAL_PLAN_TYPE_DISPLAY_CRITERIA
+  Show '$GEXXX917_INCLUDE_PENSION_PLAN_TYPE_DISPLAY_CRITERIA = '   $GEXXX917_INCLUDE_PENSION_PLAN_TYPE_DISPLAY_CRITERIA
+  
+  Do P140-Get-Last-Confirmed-Pay
+  Do P150-Print-Cover-Page
+End-Procedure
+
+
+Begin-Procedure P140-Get-Last-Confirmed-Pay
+#debug9 Show 'P140-Get-Last-Confirmed-Pay'
+
+Begin-Select Loops=1
+pay_end_dt
+To_Char(pay_end_dt,'MM')           &balance_period
+To_Char(pay_end_dt,'YYYY')         &balance_year
+To_Char(pay_end_dt,'fmMonth YYYY') &period
+Last_Day(pay_end_dt)               &current_month_end
+
+  Let $pay_end_dt          = &pay_end_dt
+  Let $balance_year        = &balance_year
+  Let $balance_period      = &balance_period
+  Let $balance_year_period = $balance_year || $balance_period
+  Let #balance_year        = &balance_year
+  Let #balance_period      = &balance_period
+  Let $Reporting_Period    = &period
+  Let $current_month_begin = '01-'||Substr($pay_end_dt,4,8)
+  Let $current_month_end   = &current_month_end
+
+  Show 'Report will contain balances for the month of ' $Reporting_Period
+  Show 'Last confirmed pay end date:  ' $pay_end_dt
+
+From   ps_pay_calendar
+
+Where  pay_end_dt         =
+      (Select Max(pay_end_dt)
+       From   ps_pay_calendar
+       Where  pay_end_dt <= $AsOfToday
+       And    pay_confirm_run = 'Y')
+
+And    pay_confirm_run = 'Y'
+End-Select
+End-Procedure
+
+
+begin-procedure P150-Print-Cover-Page
+#debug9 Show 'P150-Print-Cover-Page'
+
+  Print 'RUN CONTROL INFORMATION FOR THIS REPORT RUN:'            (+5,1)
+  Print '$Prcs_OPRID          = '                                 (+2,5)
+  Print $Prcs_OPRID                                               (0,+2)
+  Print '$PRCS_RUN_CNTL_ID    = '                                 (+1,5)
+  Print $PRCS_RUN_CNTL_ID                                         (0,+2)
+
+  Print 'SELECTION CRITERIA FOR THIS REPORT RUN:'                 (+5,2)
+  Print '$GEXXX917_INCLUDE_HW_PLAN_TYPE_DISPLAY_CRITERIA      = ' (+1,5)
+  Print $GEXXX917_INCLUDE_HW_PLAN_TYPE_DISPLAY_CRITERIA           (0,+2)
+  Print '$GEXXX917_INCLUDE_LEGAL_PLAN_TYPE_DISPLAY_CRITERIA   = ' (+1,5)
+  Print $GEXXX917_INCLUDE_LEGAL_PLAN_TYPE_DISPLAY_CRITERIA        (0,+2)
+  Print '$GEXXX917_INCLUDE_PENSION_PLAN_TYPE_DISPLAY_CRITERIA = ' (+1,5)
+  Print $GEXXX917_INCLUDE_PENSION_PLAN_TYPE_DISPLAY_CRITERIA      (0,+2)
+
+  Print 'Report will contain balances for the month of'       (+2,5)
+  Print $Reporting_Period                                     (0,+1)
+  Print 'Last confirmed pay end date:'                        (+2,5)
+  Print $pay_end_dt                                           (0,+2)
+
+  Print 'SORT ORDER FOR THIS REPORT RUN:'                     (+5,2)
+  Print $X000_ORDER_BY                                        (+2,5)
+
+  Let #PAGE-COUNT = 0
+  NEW-PAGE
+End-Procedure
+
+
+Begin-Procedure Set-Optimizer-Goal
+#debug9 Show 'Set-Optimizer-Goal'
+  Begin-SQL
+!   Alter Session Set OPTIMIZER_GOAL=RULE;							!AMS 09/05/2007
+  End-SQL
+End-Procedure
+
+
+Begin-Procedure P200-Main-Process
+#debug9 Show 'P200-Main-Process'
+Begin-Select
+gdt.gex_company_div_cd  ()  On-Break
+                            Level=1
+                            Print=Never
+                            Save=$Prev_Div_Cd
+                            After=P240-After-Div-Break
+
+gdt.deptid              ()  On-Break
+                            Level=2
+                            Print=Never
+                            Save=$Prev_Deptid
+                            After=P250-Print-Record
+
+pd.plan_type
+
+Sum(pd.ded_cur) &pd.ded_cur
+
+#debug7 Show ' '
+#debug7 Show '   Division Code ' &gdt.gex_company_div_cd
+#debug7 Show '         Dept ID ' &gdt.deptid
+#debug7 Show '       Plan Type ' &pd.plan_type
+#debug7 Show '   Deduction Amt ' &pd.ded_cur
+
+  Let #hw_grs_mtd      = 0
+  Let #legal_grs_mtd   = 0
+  Let #pension_grs_mtd = 0
+
+  Let #j = 0
+  While #j < #k
+    add 1 to #j
+    get $pgroup $ptype from plan_types(#j)
+    Evaluate &pd.plan_type
+      When = $ptype
+        let $Data-Found-Flag = 'Y'
+        if $pgroup = 'H&W'
+          let #hw_grs_mtd = &pd.ded_cur
+          if &pd.plan_type = '1S'
+            let #hw_grs_mtd = #hw_grs_mtd * -1
+          end-if
+        end-if
+        if $pgroup = 'LEGAL'
+          let #legal_grs_mtd = &pd.ded_cur
+        end-if
+        if $pgroup = 'PENSION'
+          let #pension_grs_mtd = &pd.ded_cur
+        end-if
+        let #j = #k
+        break
+    End-Evaluate
+  End-While
+
+  add #hw_grs_mtd      to #hw_store_total
+  add #legal_grs_mtd   to #legal_store_total
+  add #pension_grs_mtd to #pension_store_total
+
+From   ps_gex_dept_tbl   gdt,
+       ps_pay_cal_bal_id pcbi,
+       ps_pay_check      pc,
+       ps_pay_deduction  pd
+
+Where  gdt.effdt               =
+      (Select Max(effdt)
+       From   ps_gex_dept_tbl
+       Where  deptid           = gdt.deptid
+       And    effdt           <= $pay_end_dt)
+
+And    gdt.sequence_number     =
+      (Select Max(sequence_number)
+       From   ps_gex_dept_tbl
+       Where  deptid           = gdt.deptid
+       And    effdt            = gdt.effdt)
+
+! CWB 02/22/2001 BEGIN
+!And    gdt.gex_company_div_cd In ('GEM','RMC')
+And    gdt.gex_company_div_cd In ('GEM','RMC','COL','CLE')
+! CWB 02/22/2001 END
+
+And    pc.deptid               = gdt.deptid
+
+And    pcbi.company            = pc.company
+And    pcbi.paygroup           = pc.paygroup
+And    pcbi.balance_id         = 'CY'
+And    pcbi.balance_year       = #balance_year
+And    pcbi.balance_period     = #balance_period
+
+And    pc.pay_end_dt           = pcbi.pay_end_dt
+
+And    pd.company              = pc.company
+And    pd.paygroup             = pc.paygroup
+And    pd.pay_end_dt           = pc.pay_end_dt
+And    pd.off_cycle            = pc.off_cycle
+And    pd.page_num                = pc.page_num
+And    pd.line_num                = pc.line_num
+And    pd.sepchk               = pc.sepchk
+
+And    pd.ded_class            = 'N'
+
+Group By gdt.gex_company_div_cd, gdt.deptid, pd.plan_type
+Order By gdt.gex_company_div_cd, gdt.deptid
+End-Select
+End-Procedure
+
+
+Begin-Procedure P240-After-Div-Break
+#debug9 Show 'P240-After-Div-Break'
+
+  add #hw_total      to #hw_grand_total
+  add #legal_total   to #legal_grand_total
+  add #pension_total to #pension_grand_total
+
+  Let #div_total = #hw_total + #legal_total + #pension_total
+
+  Let $Div_SubTotal_Text = 'Division ' || $Prev_Div_Cd || ' Totals'
+  Print '-'                        (+1,39,014)   Fill
+  Print '-'                        (+0,60,014)   Fill
+  print '-'                        (+0,81,014)   Fill
+  print '-'                        (+0,102,014)  Fill
+  Print $Div_SubTotal_Text         (+1,1)
+  Print #hw_total                  (+0,39)       Edit 999,999,999.99
+  Print #Legal_total               (+0,60)       Edit 999,999,999.99
+  Print #pension_total             (+0,81)       Edit 999,999,999.99
+  Print #div_total                 (+0,102)      Edit 999,999,999.99
+  Print ' '                        (+1,01)
+
+  Let #hw_total      = 0
+  Let #legal_total   = 0
+  Let #pension_total = 0
+  Let #div_total     = 0
+  
+  new-page
+End-Procedure
+
+
+Begin-Procedure P250-Print-Record
+#debug9 Show 'P250-Print-Record'
+
+  let $deptid = $Prev_Deptid
+  do get-department-name
+
+  Let #mtd_total = #hw_store_total + #legal_store_total + #pension_store_total
+
+  Print $deptname                  (+1,01)
+  Print #hw_store_total            (+0,39)   Edit 999,999,999.99
+  Print #legal_store_total         (+0,60)   Edit 999,999,999.99
+  Print #pension_store_total       (+0,81)   Edit 999,999,999.99
+  Print #mtd_total                 (+0,102)  Edit 999,999,999.99
+
+  add #hw_store_total       to #hw_total
+  add #legal_store_total    to #legal_total
+  add #pension_store_total  to #pension_total
+
+  Let #hw_store_total       = 0
+  Let #legal_store_total    = 0
+  Let #pension_store_total  = 0
+  Let #mtd_total            = 0
+End-Procedure
+
+
+Begin-Procedure P300-Finish
+#debug9 Show 'P300-Finish'
+  If $Data-Found-Flag = 'Y'
+    Let #Sum_of_All = #hw_grand_total + #legal_grand_total + #pension_grand_total
+    Print 'Report Totals'            (+1,1)
+    Print #hw_grand_total            (+0,39)        Edit 999,999,999.99
+    Print #legal_grand_total         (+0,60)        Edit 999,999,999.99
+    Print #pension_grand_total       (+0,81)        Edit 999,999,999.99
+    print #sum_of_all                (+0,102)	    Edit 999,999,999.99	
+  Else
+    Print 'NO DATA SELECTED FOR THIS REPORT RUN'	(25,) Center
+  End-If
+End-Procedure
+
+
+#Include 'stdapi.sqc'    !Routines to Update Run Status
+#Include 'curdttim.sqc'  !Get-Current-DateTime Procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'reset.sqc'     !Reset printer Procedure
+#Include 'getdptnm.sqc'  !Get Department Name
+#include 'gexxx917.sqc'  !Get Plan Types run control

@@ -1,0 +1,1622 @@
+!***********************************************************************
+! HPCA011.SQR:  Gross and Fringe Data Load                             *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+!                                                                      *
+! This module contains confidential and proprietary information        *
+! of Oracle; it is not to be copied, reproduced, or transmitted        *
+! in any form, by any means, in whole or in part, nor is it to         *
+! be used for any purpose other than that for which it is              *
+! expressly provided under the applicable license agreement.           *
+!                                                                      *
+! Copyright (C) 2006 Oracle. All Rights Reserved.                      *
+!                                                                      *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!          $Date:  2006/07/20:04:18:42                                 !
+!       $Release:  HR9                                                 !
+!      $Revision:  101                                                 !
+!    $Last-Modified: Apr 8 2002  Addition of 4 new chartfields         *
+!                                                                      *
+!***********************************************************************
+! This program is specific to HRMS for Public Sector                   *
+!***********************************************************************
+
+#include 'setenv.sqc'    !Set environment
+#Include 'setup31.sqc'   !Printer and page-size initialization
+
+begin-report
+  do Init-Report
+
+  do Set-Proc-Indicator
+  do Commit-Transaction
+
+  do Delete-Data
+  do Create-Array
+  do Select-PayGroups
+  do Process-PayGroups
+  do Finish-Processing
+  do Stdapi-Term
+end-report
+
+begin-procedure Init-Report
+  display ''
+  display 'Loading Gross & Fringe Data Records'
+  do Init-DateTime
+  do Init-Number
+  do Stdapi-Init
+  do Initialization
+  do Print-Report-Parameters
+end-procedure
+
+begin-procedure Initialization
+  do Get-Current-DateTime
+
+  if $prcs_process_instance = ''
+     display ''
+     display 'REPORT CAN NOT BE EXECUTED OUTSIDE OF PEOPLESOFT,PLEASE USE PROCESS SCHEDULER.'
+     display ''
+  else
+     do Select-Parameters
+  end-if
+
+end-procedure
+
+begin-procedure Set-Proc-Indicator
+  let $Cntl_Found = 'N'
+begin-Select
+PROC_CNTL.HP_PROC_STATUS
+  let $Cntl_Found = 'Y'
+FROM PS_HP_GRSFRG_CNTL PROC_CNTL
+end-Select
+
+  if $Cntl_Found = 'N'
+      do Insert-Control-Record
+  else
+      do Update-Proc-Status-to-Load
+  end-if
+end-procedure
+
+begin-procedure Delete-Data
+begin-SQL  on-error=Ignore
+  DELETE FROM PS_HP_GRSFRG_DATA
+end-SQL
+end-procedure
+
+begin-procedure Create-Array
+   Create-array name=Calendar  Size = 3000
+        field=Company:Char
+        field=PayGroup:Char
+        field=Pay_End_Dt:Char
+        field=Pay_Begin_Dt:Char
+        field=Pay_Off_Cycle_Cal:Char
+        field=Posn_Fund_Run:Char
+        field=Total_Record:Number
+        field=Total_Gross:Number
+        field=Total_Fringe_Ben:Number
+        field=Total_Fringe_Tax:Number
+        field=Total_Retro_Record:Number
+        field=Total_Retro_Gross:Number
+        field=Total_Retro_Fringe_Ben:Number
+        field=Total_Retro_Fringe_Tax:Number
+
+   Create-array name=Acct_Period_Dt  Size = 500
+        field=Prd_Fiscal_Year:Number
+        field=Prd_Accounting_Period:Number
+        field=Prd_Begin_Dt:Char
+        field=Prd_End_Dt:Char
+
+   Create-array name=Business_Unit_Array  Size = 100
+        field=DeptID:Char
+        field=Business_Unit:Char
+end-procedure
+
+begin-procedure Select-PayGroups
+
+  if $rc_hp_all_comppyg = 'Y'
+      let $Where_Company = ''
+      let $Where_PayGroup = ''
+  else
+     let $Where_Company = 'AND CAL.COMPANY = ' || '''' || $rc_company || ''''
+     if $rc_paygroup = ''
+         let $Where_PayGroup = ''
+     else
+         let $Where_PayGroup = 'AND CAL.PAYGROUP = ' || '''' || $rc_paygroup || ''''
+     end-if
+  end-if
+
+  let $err-statement1 = 'HPCA011, Select Error - Build Calendar Array '
+  let $err-statement2 = ''
+  let #Cal = 0
+
+begin-Select On-Error=SQL-Statement-Error
+CAL.COMPANY
+CAL.PAYGROUP
+CAL.PAY_END_DT
+CAL.PAY_BEGIN_DT
+CAL.PAY_OFF_CYCLE_CAL
+CAL.POSN_FUND_RUN
+
+       if #Cal >= 3000
+           display 'Maximum Calendar Array reached - Company ' noline
+           display &CAL.COMPANY noline
+           display ' Paygroup ' noline
+           display &CAL.PAYGROUP noline
+           display ' Pay End Date ' noline
+           display &CAL.PAY_END_DT noline
+           display ' bypassed.'
+       else
+           PUT &CAL.COMPANY
+               &CAL.PAYGROUP
+               &CAL.PAY_END_DT
+               &CAL.PAY_BEGIN_DT
+               &CAL.PAY_OFF_CYCLE_CAL
+               &CAL.POSN_FUND_RUN
+               0 0 0 0 0 0 0 0
+           INTO Calendar(#cal)
+                Company
+                PayGroup
+                Pay_End_Dt
+                Pay_Begin_Dt
+                Pay_Off_Cycle_Cal
+                Posn_Fund_Run
+                Total_Record
+                Total_Gross
+                Total_Fringe_Ben
+                Total_Fringe_Tax
+                Total_Retro_Record
+                Total_Retro_Gross
+                Total_Retro_Fringe_Ben
+                Total_Retro_Fringe_Tax
+           add 1 to #Cal
+       end-if
+
+
+FROM  PS_PAY_CALENDAR CAL
+WHERE CAL.PAY_END_DT >= $rc_fromdate
+  AND CAL.PAY_END_DT <= $rc_thrudate
+[$Where_Company]
+[$Where_PayGroup]
+ORDER BY CAL.COMPANY, CAL.PAYGROUP, CAL.PAY_END_DT
+end-Select
+
+  let #Total_Cal = #Cal
+end-procedure
+
+begin-procedure Process-PayGroups
+
+  let #Cal = 0
+
+  while #Cal < #Total_Cal
+
+      Get $Cal_Company
+          $Cal_PayGroup
+          $Cal_Pay_End_Dt
+          $Cal_Pay_Begin_Dt
+          $Cal_Off_Cycle_Cal
+          $Cal_Posn_fund_Run
+      from Calendar(#Cal)
+           Company
+           PayGroup
+           Pay_End_Dt
+           Pay_Begin_Dt
+           Pay_Off_Cycle_Cal
+           Posn_Fund_Run
+
+      let #Total_Record           = 0
+      let #Total_Gross            = 0
+      let #Total_Fringe_Ben       = 0
+      let #Total_Fringe_Tax       = 0
+      let #Total_Retro_Record     = 0
+      let #Total_Retro_Gross      = 0
+      let #Total_Retro_Fringe_Ben = 0
+      let #Total_Retro_Fringe_Tax = 0
+
+      if $Cal_Posn_Fund_Run = 'Y'
+
+          do Build-Acct-Period-Dt-Array
+          do Process-Checks
+
+          if $rc_hp_incl_retro = 'Y'
+              do Process-Retro-Records
+          end-if
+      end-if
+
+      PUT #Total_Record
+          #Total_Gross
+          #Total_Fringe_Ben
+          #Total_Fringe_Tax
+          #Total_Retro_Record
+          #Total_Retro_Gross
+          #Total_Retro_Fringe_Ben
+          #Total_Retro_Fringe_Tax
+      INTO Calendar(#cal)
+           Total_Record
+           Total_Gross
+           Total_Fringe_Ben
+           Total_Fringe_Tax
+           Total_Retro_Record
+           Total_Retro_Gross
+           Total_Retro_Fringe_Ben
+           Total_Retro_Fringe_Tax
+
+      add 1 to #Cal
+
+  end-while
+end-procedure
+
+begin-procedure Finish-Processing
+  do Print-Totals
+  do Update-Proc-Status-to-None
+end-procedure
+
+begin-procedure Process-Checks
+
+  let $Prev_Company    = ''
+  let $Prev_Paygroup   = ''
+  let $Prev_Pay_End_Dt = ''
+  let $Prev_Off_Cycle  = ''
+  let #Prev_Page_Num   = 0
+  let #Prev_Line_Num   = 0
+  let #Prev_SepChk     = 0
+
+begin-Select
+PCK1.COMPANY
+PCK1.PAYGROUP
+PCK1.PAY_END_DT
+PCK1.OFF_CYCLE
+PCK1.PAGE_NUM
+PCK1.LINE_NUM
+PCK1.SEPCHK
+PCK1.EMPLID
+PCK1.NAME
+PCK1.PAYCHECK_NBR
+
+  let $company               = &PCK1.Company
+  let $paygroup              = &PCK1.Paygroup
+  let $pay_end_dt            = &PCK1.Pay_End_Dt
+  let $off_cycle             = &PCK1.Off_Cycle
+  let #page_num              = &PCK1.Page_Num
+  let #line_num              = &PCK1.Line_Num
+  let $name                  = &PCK1.Name
+  let $emplid                = &PCK1.Emplid
+  let #paycheck_nbr          = &PCK1.Paycheck_Nbr
+  let #sepchk                = &PCK1.SEPCHK
+
+  if   $Prev_Company       <> $company
+    or $Prev_Paygroup      <> $paygroup
+    or $Prev_Pay_End_Dt    <> $pay_end_dt
+    or $Prev_Off_Cycle     <> $off_cycle
+    or #Prev_Page_Num      <> #page_num
+    or #Prev_Line_Num      <> #line_num
+    or #Prev_SepChk        <> #sepchk
+
+      let $Prev_Company       = $company
+      let $Prev_Paygroup      = $paygroup
+      let $Prev_Pay_End_Dt    = $pay_end_dt
+      let $Prev_Off_Cycle     = $off_cycle
+      let #Prev_Page_Num      = #page_num
+      let #Prev_Line_Num      = #line_num
+      let #Prev_SepChk        = #sepchk
+      let #seqno              = 0
+
+      do Build-Business-Unit-Array ($company, $paygroup, $pay_end_dt, $off_cycle, #page_num, #line_num, #sepchk)
+  end-if
+
+  do Process-Pay-Earn
+  do Process-Pay-Ded
+  do Process-Pay-Tax
+  do Process-Pay-Ctx
+
+FROM PS_PAY_CHECK PCK1
+WHERE PCK1.COMPANY    = $Cal_Company
+  AND PCK1.PAYGROUP   = $Cal_PayGroup
+  AND PCK1.PAY_END_DT = $Cal_Pay_End_Dt
+  AND PCK1.PAYCHECK_STATUS in ('A','F','R')
+ORDER BY PCK1.OFF_CYCLE, PCK1.PAGE_NUM, PCK1.LINE_NUM, PCK1.SEPCHK
+end-Select
+end-procedure
+
+begin-procedure Process-Pay-Earn
+
+  do Init-Variables
+  let $hp_gross = 'E'
+
+begin-Select
+ERNDIST1.ERNCD
+ERNDIST1.FISCAL_YEAR
+ERNDIST1.ACCOUNTING_PERIOD
+ERNDIST1.ACCT_CD
+ERNDIST1.ACCOUNT
+ERNDIST1.DEPTID
+ERNDIST1.POSITION_NBR
+ERNDIST1.JOBCODE
+ERNDIST1.EMPL_RCD
+ERNDIST1.EARNINGS
+ERNDIST1.POSITION_POOL_ID
+ERNDIST1.CURRENCY_CD
+ERNDIST1.REVERSED
+ERNDIST1.HP_RETDIST_STATUS
+ERNDIST1.HP_RETDIST_PAY_DT
+
+  let $erncd             = &ERNDIST1.Erncd
+  let #fiscal_year       = &ERNDIST1.Fiscal_Year
+  let #accounting_period = &ERNDIST1.Accounting_Period
+  let $acct_cd           = &ERNDIST1.Acct_Cd
+  let $account           = &ERNDIST1.Account
+  let $hp_deptid         = &ERNDIST1.Deptid
+  let $position_nbr      = &ERNDIST1.Position_Nbr
+  let $jobcode           = &ERNDIST1.Jobcode
+  let #empl_rcd          = &ERNDIST1.Empl_Rcd
+  let #amount            = &ERNDIST1.Earnings
+  let $position_pool_id  = &ERNDIST1.Position_Pool_ID
+  let $currency_cd       = &ERNDIST1.Currency_CD
+  let $reversed          = &ERNDIST1.Reversed
+  let $hp_retdist_status = &ERNDIST1.Hp_Retdist_Status
+  let $hp_retdist_pay_dt = &ERNDIST1.Hp_Retdist_Pay_Dt
+  let #seqno             = #seqno + 1
+
+  do Get-Business-Unit ($hp_deptid, $business_unit)
+  do Get-SetID ($business_unit, 'HR_01', $setid_dept)
+  do Get-Acct-Cd-Info
+  do Set-Retro-Change-Indicator
+
+  let #Total_Record = #Total_Record + 1
+  let #Total_Gross = #Total_Gross + #amount
+  do Insert-Gross-Fringe-Data
+
+FROM PS_PAY_ERN_DIST ERNDIST1
+WHERE ERNDIST1.COMPANY     = $company
+  AND ERNDIST1.PAYGROUP    = $paygroup
+  AND ERNDIST1.PAY_END_DT  = $pay_end_dt
+  AND ERNDIST1.OFF_CYCLE   = $off_cycle
+  AND ERNDIST1.PAGE_NUM    = #page_num
+  AND ERNDIST1.LINE_NUM    = #line_num
+  AND ERNDIST1.SEPCHK      = #sepchk
+end-Select
+end-procedure
+
+begin-procedure Process-Pay-Ded
+
+  do Init-Variables
+  let $hp_gross = 'D'
+
+begin-Select
+DEDDIST1.PLAN_TYPE
+DEDDIST1.BENEFIT_PLAN
+DEDDIST1.DEDCD
+DEDDIST1.DED_CLASS
+DEDDIST1.DED_SLSTX_CLASS
+DEDDIST1.FISCAL_YEAR
+DEDDIST1.ACCOUNTING_PERIOD
+DEDDIST1.ACCT_CD
+DEDDIST1.ACCOUNT
+DEDDIST1.DEPTID
+DEDDIST1.POSITION_NBR
+DEDDIST1.JOBCODE
+DEDDIST1.EMPL_RCD
+DEDDIST1.DED_CUR
+DEDDIST1.POSITION_POOL_ID
+DEDDIST1.CURRENCY_CD
+DEDDIST1.REVERSED
+DEDDIST1.HP_RETDIST_STATUS
+DEDDIST1.HP_RETDIST_PAY_DT
+
+  let $plan_type         = &DEDDIST1.Plan_Type
+  let $benefit_plan      = &DEDDIST1.Benefit_Plan
+  let $dedcd             = &DEDDIST1.Dedcd
+  let $ded_class         = &DEDDIST1.Ded_Class
+  let $ded_slstx_class   = &DEDDIST1.Ded_Slstx_Class
+  let #fiscal_year       = &DEDDIST1.Fiscal_Year
+  let #accounting_period = &DEDDIST1.Accounting_Period
+  let $acct_cd           = &DEDDIST1.Acct_Cd
+  let $account           = &DEDDIST1.Account
+  let $hp_deptid         = &DEDDIST1.Deptid
+  let $position_nbr      = &DEDDIST1.Position_Nbr
+  let $jobcode           = &DEDDIST1.Jobcode
+  let #empl_rcd          = &DEDDIST1.Empl_Rcd
+  let #amount            = &DEDDIST1.Ded_Cur
+  let $position_pool_id  = &DEDDIST1.Position_Pool_ID
+  let $currency_cd       = &DEDDIST1.Currency_CD
+  let $reversed          = &DEDDIST1.Reversed
+  let $hp_retdist_status = &DEDDIST1.Hp_Retdist_Status
+  let $hp_retdist_pay_dt = &DEDDIST1.Hp_Retdist_Pay_Dt
+  let #seqno             = #seqno + 1
+
+  do Get-Business-Unit ($hp_deptid, $business_unit)
+  do Get-SetID ($business_unit, 'HR_01', $setid_dept)
+  do Get-Acct-Cd-Info
+  do Set-Retro-Change-Indicator
+
+  let #Total_Record = #Total_Record + 1
+  let #Total_Fringe_Ben = #Total_Fringe_Ben + #amount
+  do Insert-Gross-Fringe-Data
+
+FROM PS_PAY_DED_DIST DEDDIST1
+WHERE DEDDIST1.COMPANY     = $company
+  AND DEDDIST1.PAYGROUP    = $paygroup
+  AND DEDDIST1.PAY_END_DT  = $pay_end_dt
+  AND DEDDIST1.OFF_CYCLE   = $off_cycle
+  AND DEDDIST1.PAGE_NUM    = #page_num
+  AND DEDDIST1.LINE_NUM    = #line_num
+  AND DEDDIST1.SEPCHK      = #sepchk
+end-Select
+end-procedure
+
+begin-procedure Process-Pay-Tax
+
+  do Init-Variables
+  let $hp_gross = 'T'
+
+begin-Select
+TAXDIST1.STATE
+TAXDIST1.LOCALITY
+TAXDIST1.TAX_CLASS
+TAXDIST1.FISCAL_YEAR
+TAXDIST1.ACCOUNTING_PERIOD
+TAXDIST1.ACCT_CD
+TAXDIST1.ACCOUNT
+TAXDIST1.DEPTID
+TAXDIST1.POSITION_NBR
+TAXDIST1.JOBCODE
+TAXDIST1.EMPL_RCD
+TAXDIST1.TAX_CUR
+TAXDIST1.POSITION_POOL_ID
+TAXDIST1.CURRENCY_CD
+TAXDIST1.REVERSED
+TAXDIST1.HP_RETDIST_STATUS
+TAXDIST1.HP_RETDIST_PAY_DT
+
+  let $state             = &TAXDIST1.State
+  let $locality          = &TAXDIST1.Locality
+  let $tax_class         = &TAXDIST1.Tax_Class
+  let #fiscal_year       = &TAXDIST1.Fiscal_Year
+  let #accounting_period = &TAXDIST1.Accounting_Period
+  let $acct_cd           = &TAXDIST1.Acct_Cd
+  let $account           = &TAXDIST1.Account
+  let $hp_deptid         = &TAXDIST1.Deptid
+  let $position_nbr      = &TAXDIST1.Position_Nbr
+  let $jobcode           = &TAXDIST1.Jobcode
+  let #empl_rcd          = &TAXDIST1.Empl_Rcd
+  let #amount            = &TAXDIST1.Tax_Cur
+  let $position_pool_id  = &TAXDIST1.Position_Pool_ID
+  let $currency_cd       = &TAXDIST1.Currency_CD
+  let $reversed          = &TAXDIST1.Reversed
+  let $hp_retdist_status = &TAXDIST1.Hp_Retdist_Status
+  let $hp_retdist_pay_dt = &TAXDIST1.Hp_Retdist_Pay_Dt
+  let #seqno             = #seqno + 1
+
+  do Get-Business-Unit ($hp_deptid, $business_unit)
+  do Get-SetID ($business_unit, 'HR_01', $setid_dept)
+  do Get-Acct-Cd-Info
+  do Set-Retro-Change-Indicator
+
+  let #Total_Record = #Total_Record + 1
+  let #Total_Fringe_Tax = #Total_Fringe_Tax + #amount
+  do Insert-Gross-Fringe-Data
+
+FROM PS_PAY_TAX_DIST TAXDIST1
+WHERE TAXDIST1.COMPANY     = $company
+  AND TAXDIST1.PAYGROUP    = $paygroup
+  AND TAXDIST1.PAY_END_DT  = $pay_end_dt
+  AND TAXDIST1.OFF_CYCLE   = $off_cycle
+  AND TAXDIST1.PAGE_NUM    = #page_num
+  AND TAXDIST1.LINE_NUM    = #line_num
+  AND TAXDIST1.SEPCHK      = #sepchk
+end-Select
+end-procedure
+
+begin-procedure Process-Pay-Ctx
+
+  do Init-Variables
+  let $hp_gross = 'C'
+
+begin-Select
+CTXDIST1.PROVINCE
+CTXDIST1.TAX_CLASS_CAN
+CTXDIST1.FISCAL_YEAR
+CTXDIST1.ACCOUNTING_PERIOD
+CTXDIST1.ACCT_CD
+CTXDIST1.ACCOUNT
+CTXDIST1.DEPTID
+CTXDIST1.POSITION_NBR
+CTXDIST1.JOBCODE
+CTXDIST1.EMPL_RCD
+CTXDIST1.TAX_CUR
+CTXDIST1.POSITION_POOL_ID
+CTXDIST1.CURRENCY_CD
+CTXDIST1.REVERSED
+CTXDIST1.HP_RETDIST_STATUS
+CTXDIST1.HP_RETDIST_PAY_DT
+
+  let $province          = &CTXDIST1.Province
+  let $tax_class_can     = &CTXDIST1.Tax_Class_Can
+  let #fiscal_year       = &CTXDIST1.Fiscal_Year
+  let #accounting_period = &CTXDIST1.Accounting_Period
+  let $acct_cd           = &CTXDIST1.Acct_Cd
+  let $account           = &CTXDIST1.Account
+  let $hp_deptid         = &CTXDIST1.Deptid
+  let $position_nbr      = &CTXDIST1.Position_Nbr
+  let $jobcode           = &CTXDIST1.Jobcode
+  let #empl_rcd          = &CTXDIST1.Empl_Rcd
+  let #amount            = &CTXDIST1.Tax_Cur
+  let $position_pool_id  = &CTXDIST1.Position_Pool_ID
+  let $currency_cd       = &CTXDIST1.Currency_CD
+  let $reversed          = &CTXDIST1.Reversed
+  let $hp_retdist_status = &CTXDIST1.Hp_Retdist_Status
+  let $hp_retdist_pay_dt = &CTXDIST1.Hp_Retdist_Pay_Dt
+  let #seqno             = #seqno + 1
+
+  do Get-Business-Unit ($hp_deptid, $business_unit)
+  do Get-SetID ($business_unit, 'HR_01', $setid_dept)
+  do Get-Acct-Cd-Info
+  do Set-Retro-Change-Indicator
+
+  let #Total_Record = #Total_Record + 1
+  let #Total_Fringe_Tax = #Total_Fringe_Tax + #amount
+  do Insert-Gross-Fringe-Data
+
+FROM PS_PAY_CTX_DIST CTXDIST1
+WHERE CTXDIST1.COMPANY     = $company
+  AND CTXDIST1.PAYGROUP    = $paygroup
+  AND CTXDIST1.PAY_END_DT  = $pay_end_dt
+  AND CTXDIST1.OFF_CYCLE   = $off_cycle
+  AND CTXDIST1.PAGE_NUM    = #page_num
+  AND CTXDIST1.LINE_NUM    = #line_num
+  AND CTXDIST1.SEPCHK      = #sepchk
+end-Select
+end-procedure
+
+begin-procedure Process-Retro-Records
+  do Process-Retro-Pay-Earn
+  do Process-Retro-Pay-Ded
+  do Process-Retro-Pay-Tax
+  do Process-Retro-Pay-Ctx
+end-procedure
+
+begin-procedure Process-Retro-Pay-Earn
+
+  do Init-Variables
+  let $hp_gross = 'E'
+
+begin-Select
+
+PCK2E.PAY_END_DT
+PCK2E.OFF_CYCLE
+PCK2E.PAGE_NUM
+PCK2E.LINE_NUM
+PCK2E.SEPCHK
+PCK2E.EMPLID
+PCK2E.NAME
+PCK2E.PAYCHECK_NBR
+ERNDIST2.ERNCD
+ERNDIST2.FISCAL_YEAR
+ERNDIST2.ACCOUNTING_PERIOD
+ERNDIST2.ACCT_CD
+ERNDIST2.ACCOUNT
+ERNDIST2.DEPTID
+ERNDIST2.POSITION_NBR
+ERNDIST2.JOBCODE
+ERNDIST2.EMPL_RCD
+ERNDIST2.EARNINGS
+ERNDIST2.POSITION_POOL_ID
+ERNDIST2.CURRENCY_CD
+ERNDIST2.REVERSED
+ERNDIST2.HP_RETDIST_STATUS
+ERNDIST2.HP_RETDIST_PAY_DT
+
+  let $pay_end_dt        = &PCK2E.Pay_End_Dt
+  let $off_cycle         = &PCK2E.Off_Cycle
+  let #page_num          = &PCK2E.Page_Num
+  let #line_num          = &PCK2E.Line_Num
+  let $name              = &PCK2E.Name
+  let $emplid            = &PCK2E.Emplid
+  let #paycheck_nbr      = &PCK2E.Paycheck_Nbr
+
+  let $erncd             = &ERNDIST2.Erncd
+  let #fiscal_year       = &ERNDIST2.Fiscal_Year
+  let #accounting_period = &ERNDIST2.Accounting_Period
+  let $acct_cd           = &ERNDIST2.Acct_Cd
+  let $account           = &ERNDIST2.Account
+  let $hp_deptid         = &ERNDIST2.Deptid
+  let $position_nbr      = &ERNDIST2.Position_Nbr
+  let $jobcode           = &ERNDIST2.Jobcode
+  let #empl_rcd          = &ERNDIST2.Empl_Rcd
+  let #amount            = &ERNDIST2.Earnings
+  let $position_pool_id  = &ERNDIST2.Position_Pool_ID
+  let $currency_cd       = &ERNDIST2.Currency_CD
+  let $reversed          = &ERNDIST2.Reversed
+  let $hp_retdist_status = &ERNDIST2.Hp_Retdist_Status
+  let $hp_retdist_pay_dt = &ERNDIST2.Hp_Retdist_Pay_Dt
+
+  do Find-Max-Seqno
+  let #seqno             = #max_seqno + 1
+
+  do Build-Business-Unit-Array ($company, $paygroup, $pay_end_dt, $off_cycle, #page_num, #line_num, #sepchk)
+  do Get-Business-Unit ($hp_deptid, $business_unit)
+  do Get-SetID ($business_unit, 'HR_01', $setid_dept)
+  do Get-Acct-Cd-Info
+  do Set-Retro-Change-Indicator
+
+  let #Total_Retro_Record = #Total_Retro_Record + 1
+  let #Total_Retro_Gross = #Total_Retro_Gross + #amount
+  do Insert-Gross-Fringe-Data
+
+FROM PS_PAY_ERN_DIST ERNDIST2,
+     PS_PAY_CHECK    PCK2E
+WHERE ERNDIST2.COMPANY     = $company
+  AND ERNDIST2.PAYGROUP    = $paygroup
+  AND (ERNDIST2.PAY_END_DT  < $rc_fromdate OR ERNDIST2.PAY_END_DT  > $rc_thrudate)
+  AND ERNDIST2.HP_RETDIST_PAY_DT = $Cal_Pay_End_Dt
+  AND ERNDIST2.COMPANY     = PCK2E.COMPANY
+  AND ERNDIST2.PAYGROUP    = PCK2E.PAYGROUP
+  AND ERNDIST2.PAY_END_DT  = PCK2E.PAY_END_DT
+  AND ERNDIST2.OFF_CYCLE   = PCK2E.OFF_CYCLE
+  AND ERNDIST2.PAGE_NUM    = PCK2E.PAGE_NUM
+  AND ERNDIST2.LINE_NUM    = PCK2E.LINE_NUM
+  AND ERNDIST2.SEPCHK      = PCK2E.SEPCHK
+end-Select
+end-procedure
+
+begin-procedure Process-Retro-Pay-Ded
+
+  do Init-Variables
+  let $hp_gross = 'D'
+
+begin-Select
+PCK2D.PAY_END_DT
+PCK2D.OFF_CYCLE
+PCK2D.PAGE_NUM
+PCK2D.LINE_NUM
+PCK2D.SEPCHK
+PCK2D.EMPLID
+PCK2D.NAME
+PCK2D.PAYCHECK_NBR
+DEDDIST2.PLAN_TYPE
+DEDDIST2.BENEFIT_PLAN
+DEDDIST2.DEDCD
+DEDDIST2.DED_CLASS
+DEDDIST2.DED_SLSTX_CLASS
+DEDDIST2.FISCAL_YEAR
+DEDDIST2.ACCOUNTING_PERIOD
+DEDDIST2.ACCT_CD
+DEDDIST2.ACCOUNT
+DEDDIST2.DEPTID
+DEDDIST2.POSITION_NBR
+DEDDIST2.JOBCODE
+DEDDIST2.EMPL_RCD
+DEDDIST2.DED_CUR
+DEDDIST2.POSITION_POOL_ID
+DEDDIST2.CURRENCY_CD
+DEDDIST2.REVERSED
+DEDDIST2.HP_RETDIST_STATUS
+DEDDIST2.HP_RETDIST_PAY_DT
+
+  let $pay_end_dt        = &PCK2D.Pay_End_Dt
+  let $off_cycle         = &PCK2D.Off_Cycle
+  let #page_num          = &PCK2D.Page_Num
+  let #line_num          = &PCK2D.Line_Num
+  let $name              = &PCK2D.Name
+  let $emplid            = &PCK2D.Emplid
+  let #paycheck_nbr      = &PCK2D.Paycheck_Nbr
+
+  let $plan_type         = &DEDDIST2.Plan_Type
+  let $benefit_plan      = &DEDDIST2.Benefit_Plan
+  let $dedcd             = &DEDDIST2.Dedcd
+  let $ded_class         = &DEDDIST2.Ded_Class
+  let $ded_slstx_class   = &DEDDIST2.Ded_Slstx_Class
+  let #fiscal_year       = &DEDDIST2.Fiscal_Year
+  let #accounting_period = &DEDDIST2.Accounting_Period
+  let $acct_cd           = &DEDDIST2.Acct_Cd
+  let $account           = &DEDDIST2.Account
+  let $hp_deptid         = &DEDDIST2.Deptid
+  let $position_nbr      = &DEDDIST2.Position_Nbr
+  let $jobcode           = &DEDDIST2.Jobcode
+  let #empl_rcd          = &DEDDIST2.Empl_Rcd
+  let #amount            = &DEDDIST2.Ded_Cur
+  let $position_pool_id  = &DEDDIST2.Position_Pool_ID
+  let $currency_cd       = &DEDDIST2.Currency_CD
+  let $reversed          = &DEDDIST2.Reversed
+  let $hp_retdist_status = &DEDDIST2.Hp_Retdist_Status
+  let $hp_retdist_pay_dt = &DEDDIST2.Hp_Retdist_Pay_Dt
+
+  do Find-Max-Seqno
+  let #seqno             = #max_seqno + 1
+
+  do Build-Business-Unit-Array ($company, $paygroup, $pay_end_dt, $off_cycle, #page_num, #line_num, #sepchk)
+  do Get-Business-Unit ($hp_deptid, $business_unit)
+  do Get-SetID ($business_unit, 'HR_01', $setid_dept)
+  do Get-Acct-Cd-Info
+  do Set-Retro-Change-Indicator
+
+  let #Total_Retro_Record = #Total_Retro_Record + 1
+  let #Total_Retro_Fringe_Ben = #Total_Retro_Fringe_Ben + #amount
+  do Insert-Gross-Fringe-Data
+
+FROM PS_PAY_DED_DIST DEDDIST2,
+     PS_PAY_CHECK    PCK2D
+WHERE DEDDIST2.COMPANY     = $company
+  AND DEDDIST2.PAYGROUP    = $paygroup
+  AND (DEDDIST2.PAY_END_DT  < $rc_fromdate OR DEDDIST2.PAY_END_DT  > $rc_thrudate)
+  AND DEDDIST2.HP_RETDIST_PAY_DT = $Cal_Pay_End_Dt
+  AND DEDDIST2.COMPANY     = PCK2D.COMPANY
+  AND DEDDIST2.PAYGROUP    = PCK2D.PAYGROUP
+  AND DEDDIST2.PAY_END_DT  = PCK2D.PAY_END_DT
+  AND DEDDIST2.OFF_CYCLE   = PCK2D.OFF_CYCLE
+  AND DEDDIST2.PAGE_NUM    = PCK2D.PAGE_NUM
+  AND DEDDIST2.LINE_NUM    = PCK2D.LINE_NUM
+  AND DEDDIST2.SEPCHK      = PCK2D.SEPCHK
+end-Select
+end-procedure
+
+begin-procedure Process-Retro-Pay-Tax
+
+  do Init-Variables
+  let $hp_gross = 'T'
+
+begin-Select
+PCK2T.PAY_END_DT
+PCK2T.OFF_CYCLE
+PCK2T.PAGE_NUM
+PCK2T.LINE_NUM
+PCK2T.SEPCHK
+PCK2T.EMPLID
+PCK2T.NAME
+PCK2T.PAYCHECK_NBR
+TAXDIST2.STATE
+TAXDIST2.LOCALITY
+TAXDIST2.TAX_CLASS
+TAXDIST2.FISCAL_YEAR
+TAXDIST2.ACCOUNTING_PERIOD
+TAXDIST2.ACCT_CD
+TAXDIST2.ACCOUNT
+TAXDIST2.DEPTID
+TAXDIST2.POSITION_NBR
+TAXDIST2.JOBCODE
+TAXDIST2.EMPL_RCD
+TAXDIST2.TAX_CUR
+TAXDIST2.POSITION_POOL_ID
+TAXDIST2.CURRENCY_CD
+TAXDIST2.REVERSED
+TAXDIST2.HP_RETDIST_STATUS
+TAXDIST2.HP_RETDIST_PAY_DT
+
+  let $pay_end_dt        = &PCK2T.Pay_End_Dt
+  let $off_cycle         = &PCK2T.Off_Cycle
+  let #page_num          = &PCK2T.Page_Num
+  let #line_num          = &PCK2T.Line_Num
+  let $name              = &PCK2T.Name
+  let $emplid            = &PCK2T.Emplid
+  let #paycheck_nbr      = &PCK2T.Paycheck_Nbr
+
+  let $state             = &TAXDIST2.State
+  let $locality          = &TAXDIST2.Locality
+  let $tax_class         = &TAXDIST2.Tax_Class
+  let #fiscal_year       = &TAXDIST2.Fiscal_Year
+  let #accounting_period = &TAXDIST2.Accounting_Period
+  let $acct_cd           = &TAXDIST2.Acct_Cd
+  let $account           = &TAXDIST2.Account
+  let $hp_deptid         = &TAXDIST2.Deptid
+  let $position_nbr      = &TAXDIST2.Position_Nbr
+  let $jobcode           = &TAXDIST2.Jobcode
+  let #empl_rcd          = &TAXDIST2.Empl_Rcd
+  let #amount            = &TAXDIST2.Tax_Cur
+  let $position_pool_id  = &TAXDIST2.Position_Pool_ID
+  let $currency_cd       = &TAXDIST2.Currency_CD
+  let $reversed          = &TAXDIST2.Reversed
+  let $hp_retdist_status = &TAXDIST2.Hp_Retdist_Status
+  let $hp_retdist_pay_dt = &TAXDIST2.Hp_Retdist_Pay_Dt
+
+  do Find-Max-Seqno
+  let #seqno             = #max_seqno + 1
+
+  do Build-Business-Unit-Array ($company, $paygroup, $pay_end_dt, $off_cycle, #page_num, #line_num, #sepchk)
+  do Get-Business-Unit ($hp_deptid, $business_unit)
+  do Get-SetID ($business_unit, 'HR_01', $setid_dept)
+  do Get-Acct-Cd-Info
+  do Set-Retro-Change-Indicator
+
+  let #Total_Retro_Record = #Total_Retro_Record + 1
+  let #Total_Retro_Fringe_Ben = #Total_Retro_Fringe_Ben + #amount
+  do Insert-Gross-Fringe-Data
+
+FROM PS_PAY_TAX_DIST TAXDIST2,
+     PS_PAY_CHECK    PCK2T
+WHERE TAXDIST2.COMPANY     = $company
+  AND TAXDIST2.PAYGROUP    = $paygroup
+  AND (TAXDIST2.PAY_END_DT  < $rc_fromdate OR TAXDIST2.PAY_END_DT  > $rc_thrudate)
+  AND TAXDIST2.HP_RETDIST_PAY_DT = $Cal_Pay_End_Dt
+  AND TAXDIST2.COMPANY     = PCK2T.COMPANY
+  AND TAXDIST2.PAYGROUP    = PCK2T.PAYGROUP
+  AND TAXDIST2.PAY_END_DT  = PCK2T.PAY_END_DT
+  AND TAXDIST2.OFF_CYCLE   = PCK2T.OFF_CYCLE
+  AND TAXDIST2.PAGE_NUM    = PCK2T.PAGE_NUM
+  AND TAXDIST2.LINE_NUM    = PCK2T.LINE_NUM
+  AND TAXDIST2.SEPCHK      = PCK2T.SEPCHK
+end-Select
+end-procedure
+
+begin-procedure Process-Retro-Pay-Ctx
+
+  do Init-Variables
+  let $hp_gross = 'C'
+
+begin-Select
+PCK2C.PAY_END_DT
+PCK2C.OFF_CYCLE
+PCK2C.PAGE_NUM
+PCK2C.LINE_NUM
+PCK2C.SEPCHK
+PCK2C.EMPLID
+PCK2C.NAME
+PCK2C.PAYCHECK_NBR
+CTXDIST2.PROVINCE
+CTXDIST2.TAX_CLASS_CAN
+CTXDIST2.FISCAL_YEAR
+CTXDIST2.ACCOUNTING_PERIOD
+CTXDIST2.ACCT_CD
+CTXDIST2.ACCOUNT
+CTXDIST2.DEPTID
+CTXDIST2.POSITION_NBR
+CTXDIST2.JOBCODE
+CTXDIST2.EMPL_RCD
+CTXDIST2.TAX_CUR
+CTXDIST2.POSITION_POOL_ID
+CTXDIST2.CURRENCY_CD
+CTXDIST2.REVERSED
+CTXDIST2.HP_RETDIST_STATUS
+CTXDIST2.HP_RETDIST_PAY_DT
+
+  let $pay_end_dt        = &PCK2C.Pay_End_Dt
+  let $off_cycle         = &PCK2C.Off_Cycle
+  let #page_num          = &PCK2C.Page_Num
+  let #line_num          = &PCK2C.Line_Num
+  let $name              = &PCK2C.Name
+  let $emplid            = &PCK2C.Emplid
+  let #paycheck_nbr      = &PCK2C.Paycheck_Nbr
+
+  let $province          = &CTXDIST2.Province
+  let $tax_class_can     = &CTXDIST2.Tax_Class_Can
+  let #fiscal_year       = &CTXDIST2.Fiscal_Year
+  let #accounting_period = &CTXDIST2.Accounting_Period
+  let $acct_cd           = &CTXDIST2.Acct_Cd
+  let $account           = &CTXDIST2.Account
+  let $hp_deptid         = &CTXDIST2.Deptid
+  let $position_nbr      = &CTXDIST2.Position_Nbr
+  let $jobcode           = &CTXDIST2.Jobcode
+  let #empl_rcd          = &CTXDIST2.Empl_Rcd
+  let #amount            = &CTXDIST2.Tax_Cur
+  let $position_pool_id  = &CTXDIST2.Position_Pool_ID
+  let $currency_cd       = &CTXDIST2.Currency_CD
+  let $reversed          = &CTXDIST2.Reversed
+  let $hp_retdist_status = &CTXDIST2.Hp_Retdist_Status
+  let $hp_retdist_pay_dt = &CTXDIST2.Hp_Retdist_Pay_Dt
+
+  do Find-Max-Seqno
+  let #seqno             = #max_seqno + 1
+
+  do Build-Business-Unit-Array ($company, $paygroup, $pay_end_dt, $off_cycle, #page_num, #line_num, #sepchk)
+  do Get-Business-Unit ($hp_deptid, $business_unit)
+  do Get-SetID ($business_unit, 'HR_01', $setid_dept)
+  do Get-Acct-Cd-Info
+  do Set-Retro-Change-Indicator
+
+  let #Total_Retro_Record = #Total_Retro_Record + 1
+  let #Total_Retro_Fringe_Ben = #Total_Retro_Fringe_Ben + #amount
+  do Insert-Gross-Fringe-Data
+
+FROM PS_PAY_CTX_DIST CTXDIST2,
+     PS_PAY_CHECK    PCK2C
+WHERE CTXDIST2.COMPANY     = $company
+  AND CTXDIST2.PAYGROUP    = $paygroup
+  AND (CTXDIST2.PAY_END_DT  < $rc_fromdate OR CTXDIST2.PAY_END_DT  > $rc_thrudate)
+  AND CTXDIST2.HP_RETDIST_PAY_DT = $Cal_Pay_End_Dt
+  AND CTXDIST2.COMPANY     = PCK2C.COMPANY
+  AND CTXDIST2.PAYGROUP    = PCK2C.PAYGROUP
+  AND CTXDIST2.PAY_END_DT  = PCK2C.PAY_END_DT
+  AND CTXDIST2.OFF_CYCLE   = PCK2C.OFF_CYCLE
+  AND CTXDIST2.PAGE_NUM    = PCK2C.PAGE_NUM
+  AND CTXDIST2.LINE_NUM    = PCK2C.LINE_NUM
+  AND CTXDIST2.SEPCHK      = PCK2C.SEPCHK
+end-Select
+end-procedure
+
+begin-procedure Build-Acct-Period-Dt-Array
+
+  let $err-statement1 = 'HPCA011, Select Error - BUILD-ACCT-PERIOD-DT-ARRAY'
+  let $err-statement2 = 'Bind Variables: Pay Begin Date '||$Cal_Pay_Begin_Dt||
+                        ', and Pay End Date '||$Cal_Pay_End_Dt
+
+  let #Prd_Total = 0
+
+begin-SELECT DISTINCT On-Error=SQL-Statement-Error
+CA.FISCAL_YEAR
+CA.ACCOUNTING_PERIOD
+CA.BEGIN_DT
+CA.END_DT
+
+  PUT &CA.Fiscal_Year
+      &CA.Accounting_Period
+      &CA.Begin_Dt
+      &CA.End_Dt
+  INTO Acct_Period_Dt(#Prd_Total)
+       Prd_Fiscal_Year
+       Prd_Accounting_Period
+       Prd_Begin_Dt
+       Prd_End_Dt
+
+  if &CA.End_Dt > $Cal_Pay_End_Dt
+      PUT $Cal_Pay_End_Dt
+      INTO Acct_Period_Dt(#Prd_Total)
+           Prd_End_Dt
+  end-if
+
+  add 1 to #Prd_Total
+
+FROM  PS_PAY_EARNINGS     PE,
+      PS_BUS_UNIT_TBL_HR  BU,
+      PS_GL_JRNL_TMPLT    GL,
+      PS_CAL_DETP_TBL     CA,
+      PS_SET_CNTRL_REC    SC
+WHERE PE.COMPANY          = $Cal_Company
+  AND PE.PAYGROUP         = $Cal_PayGroup
+  AND PE.PAY_END_DT       = $Cal_Pay_End_Dt
+  AND PE.BUSINESS_UNIT    = BU.BUSINESS_UNIT
+  AND GL.BUSINESS_UNIT_GL = BU.BUSINESS_UNIT_GL
+  AND SC.SETCNTRLVALUE    = GL.BUSINESS_UNIT_GL
+  AND SC.REC_GROUP_ID     = 'FS_02'
+  AND SC.RECNAME          = 'CAL_DETP_TBL'
+  AND CA.SETID            = SC.SETID
+  AND CA.CALENDAR_ID      = GL.CALENDAR_ID
+  AND    (CA.BEGIN_DT BETWEEN $Cal_Pay_Begin_Dt AND $Cal_Pay_End_Dt
+      OR  CA.END_DT   BETWEEN $Cal_Pay_Begin_Dt AND $Cal_Pay_End_Dt
+      OR      (CA.BEGIN_DT >= $Cal_Pay_Begin_Dt
+          AND  CA.END_DT   <= $Cal_Pay_End_Dt)
+      OR      (CA.BEGIN_DT <= $Cal_Pay_Begin_Dt
+          AND  CA.END_DT   >= $Cal_Pay_End_Dt))
+end-SELECT
+end-procedure
+
+begin-procedure Init-Variables
+  let $erncd                = ' '
+  let $plan_type            = ' '
+  let $benefit_plan         = ' '
+  let $dedcd                = ' '
+  let $ded_class            = ' '
+  let $ded_slstx_class      = ' '
+  let $state                = ' '
+  let $locality             = ' '
+  let $tax_class            = ' '
+  let $province             = ' '
+  let $tax_class_can        = ' '
+end-procedure
+
+begin-procedure Build-Business-Unit-Array ($in_company,$in_paygroup, $in_payenddt, $in_off_cycle, #in_page_num, #in_line_num, #in_sepchk)
+  let #_total_bu = 0
+  let #bu_cnt   = 0
+begin-Select
+PCHKERN.DEPTID
+PCHKERN.BUSINESS_UNIT
+
+       if #bu_cnt > 100
+           display 'Maximum Business Unit Array reached for - Company ' noline
+           display $in_company noline
+           display ' Paygroup ' noline
+           display $in_paygroup noline
+           display ' Pay End Date ' noline
+           display $in_payenddt noline
+           display ' Off Cycle ' noline
+           display $in_off_cycle noline
+           display ' Page# ' noline
+           display #in_page_num noline
+           display ' Line# ' noline
+           display #in_line_num noline
+           display ' Sepchk ' noline
+           display #in_sepchk noline
+           display '.'
+       else
+           PUT &PCHKERN.DEPTID
+               &PCHKERN.BUSINESS_UNIT
+           INTO Business_Unit_Array(#bu_cnt)
+                DeptID
+                Business_Unit
+       end-if
+
+       add 1 to #bu_cnt
+
+FROM PS_PAY_CHECK_EARNS PCHKERN
+WHERE PCHKERN.COMPANY     = $in_company
+  AND PCHKERN.PAYGROUP    = $in_paygroup
+  AND PCHKERN.PAY_END_DT  = $in_payenddt
+  AND PCHKERN.OFF_CYCLE   = $in_off_cycle
+  AND PCHKERN.PAGE_NUM    = #in_page_num
+  AND PCHKERN.LINE_NUM    = #in_line_num
+  AND PCHKERN.SEPCHK      = #in_sepchk
+end-Select
+  let #_total_bu = #bu_cnt
+
+begin-Select
+PCHK.BUSINESS_UNIT
+       let $_Default_BU = &PCHK.BUSINESS_UNIT
+FROM PS_PAY_CHECK PCHK
+WHERE PCHK.COMPANY     = $in_company
+  AND PCHK.PAYGROUP    = $in_paygroup
+  AND PCHK.PAY_END_DT  = $in_payenddt
+  AND PCHK.OFF_CYCLE   = $in_off_cycle
+  AND PCHK.PAGE_NUM    = #in_page_num
+  AND PCHK.LINE_NUM    = #in_line_num
+  AND PCHK.SEPCHK      = #in_sepchk
+end-Select
+end-procedure
+
+
+begin-procedure Get-Business-Unit ($in_deptid, :$out_Business_Unit)
+  let #bu_cnt   = 0
+  let $bu_found = 'N'
+  let $out_Business_Unit = ' '
+
+  while (#bu_cnt < #_total_bu and $bu_found = 'N')
+
+      Get $bu_deptid
+          $bu_business_unit
+      from Business_Unit_Array(#bu_cnt)
+                DeptID
+                Business_Unit
+
+      if $bu_deptid = $in_deptid
+          let $bu_found = 'Y'
+          let $out_business_unit = $bu_business_unit
+      else
+          add 1 to #bu_cnt
+      end-if
+  end-while
+  if $bu_found = 'N'
+      let $out_business_unit = $_Default_BU
+  end-if
+end-procedure
+
+begin-procedure Get-Setid ($in_business_unit,$in_record_group,:$out_Setid)
+  let $out_Setid = ' '
+begin-Select
+SETID
+  let $out_Setid = &SETID
+FROM PS_SET_CNTRL_GROUP WHERE SETCNTRLVALUE = $in_business_unit
+     AND REC_GROUP_ID = $in_record_group
+end-Select
+end-procedure
+
+begin-procedure Get-Acct-Cd-Info
+
+  do Get-Acct-Period-End-Dt
+
+  move 'N' to $acct_cd_found
+
+  let $err-statement1 = 'HPCA011, Select Error - Get-Acct-Cd-Info'
+  let $err-statement2 = 'Bind Variables: Account Code '||$Acct_Cd||
+                        ', Effective Status A, and Effective date <= '||
+                        $Prd_End_Dt
+
+begin-SELECT On-Error=SQL-Statement-Error
+ACCT_CD2.DEPTID_CF
+ACCT_CD2.PROJECT_ID
+ACCT_CD2.PRODUCT
+ACCT_CD2.FUND_CODE
+ACCT_CD2.PROGRAM_CODE
+ACCT_CD2.CLASS_FLD
+ACCT_CD2.AFFILIATE
+ACCT_CD2.OPERATING_UNIT
+ACCT_CD2.ALTACCT
+ACCT_CD2.BUDGET_REF
+ACCT_CD2.CHARTFIELD1
+ACCT_CD2.CHARTFIELD2
+ACCT_CD2.CHARTFIELD3
+ACCT_CD2.AFFILIATE_INTRA1
+ACCT_CD2.AFFILIATE_INTRA2
+
+   move 'Y' to $acct_cd_found
+
+   let $deptid            = &ACCT_CD2.Deptid_CF
+   let $project_id        = &ACCT_CD2.Project_Id
+   let $product           = &ACCT_CD2.Product
+   let $fund_code         = &ACCT_CD2.Fund_Code
+   let $program_code      = &ACCT_CD2.Program_Code
+   let $class_fld         = &ACCT_CD2.Class_Fld
+   let $affiliate         = &ACCT_CD2.Affiliate
+   let $operating_unit    = &ACCT_CD2.Operating_Unit
+   let $altAcct           = &ACCT_CD2.AltAcct
+   let $budget_ref        = &ACCT_CD2.Budget_ref
+   let $chartfield1       = &ACCT_CD2.Chartfield1
+   let $chartfield2       = &ACCT_CD2.Chartfield2
+   let $chartfield3       = &ACCT_CD2.Chartfield3
+   let $affiliate_intra1  = &ACCT_CD2.AFFILIATE_INTRA1
+   let $affiliate_intra2  = &ACCT_CD2.AFFILIATE_INTRA2
+
+FROM PS_ACCT_CD_TBL ACCT_CD2
+WHERE $acct_cd            = ACCT_CD2.ACCT_CD
+end-SELECT
+
+  if $acct_cd_found = 'N'
+      let $Msg = '   ERROR-Account Code: '||$Acct_Cd||' Is Invalid or Inactive.'
+      display $Msg
+
+      let $deptid            = ' '
+      let $project_id        = ' '
+      let $product           = ' '
+      let $fund_code         = ' '
+      let $program_code      = ' '
+      let $class_fld         = ' '
+      let $affiliate         = ' '
+      let $operating_unit    = ' '
+      let $altAcct           = ' '
+      let $budget_ref        = ' '
+      let $chartfield1       = ' '
+      let $chartfield2       = ' '
+      let $chartfield3       = ' '
+      let $affiliate_intra1  = ' '
+      let $affiliate_intra2  = ' '
+  end-if
+end-procedure
+
+begin-procedure Set-Retro-Change-Indicator
+  if $hp_retdist_status = '0' and rtrim($hp_retdist_pay_dt,' ') = ''
+      let $hp_retrodist_chg = 'N'          !Regular original distribution record
+  else
+      if $hp_retdist_status = '0' and rtrim($hp_retdist_pay_dt,' ') <> ''
+          let $hp_retrodist_chg = 'F'      !Distribution record after retro
+      else
+          let $hp_retrodist_chg = 'R'      !Distribution reversed records
+      end-if
+  end-if
+end-procedure
+
+begin-procedure Find-Max-Seqno
+  let #max_seqno = 0
+begin-Select
+GFDATA.SEQNO
+  let #max_seqno = &GFDATA.Seqno
+FROM PS_HP_GRSFRG_DATA GFDATA
+WHERE GFDATA.COMPANY     = $company
+  AND GFDATA.PAYGROUP    = $paygroup
+  AND GFDATA.PAY_END_DT  = $pay_end_dt
+  AND GFDATA.OFF_CYCLE   = $off_cycle
+  AND GFDATA.PAGE_NUM    = #page_num
+  AND GFDATA.LINE_NUM    = #line_num
+  AND GFDATA.SEPCHK      = #sepchk
+  AND GFDATA.SEQNO = (Select Max(GFDATA1.SEQNO)
+                      FROM PS_HP_GRSFRG_DATA GFDATA1
+                      WHERE GFDATA1.COMPANY     = GFDATA.COMPANY
+                        AND GFDATA1.PAYGROUP    = GFDATA.PAYGROUP
+                        AND GFDATA1.PAY_END_DT  = GFDATA.PAY_END_DT
+                        AND GFDATA1.OFF_CYCLE   = GFDATA.OFF_CYCLE
+                        AND GFDATA1.PAGE_NUM    = GFDATA.PAGE_NUM
+                        AND GFDATA1.LINE_NUM    = GFDATA.LINE_NUM
+                        AND GFDATA1.SEPCHK      = GFDATA.SEPCHK)
+end-Select
+end-procedure
+
+begin-procedure Get-Acct-Period-End-Dt
+
+  let $Prd_Found = 'N'
+  let #Prd_Cnt   = 0
+
+  while (#Prd_Cnt < #Prd_Total and $Prd_Found = 'N')
+
+      GET #Prd_Fiscal_Year
+          #Prd_Accounting_Period
+          $Prd_Begin_Dt
+          $Prd_End_Dt
+      FROM Acct_Period_Dt(#Prd_Cnt)
+           Prd_Fiscal_Year
+           Prd_Accounting_Period
+           Prd_Begin_Dt
+           Prd_End_Dt
+
+      if #Prd_Fiscal_Year       = #fiscal_year        and
+         #Prd_Accounting_Period = #accounting_period
+          let $Prd_Found = 'Y'
+      end-if
+      add 1 to #Prd_Cnt
+  end-while
+
+  if $Prd_Found = 'N'
+      let $Prd_End_Dt = ' '
+      do Find-Accounting-Date
+
+      if $No_Cal = 'N'
+          if $accounting_Dt < $Cal_Pay_End_Dt
+              move $accounting_Dt  to $Prd_End_Dt
+          else
+              move $Cal_Pay_End_Dt to $Prd_End_Dt
+          end-if
+      end-if
+  end-if
+end-procedure
+
+begin-procedure Find-Accounting-Date
+
+  let $accounting_period = TO_CHAR(#accounting_period)
+  let $fiscal_year       = TO_CHAR(#fiscal_year)
+
+  let $err-statement1 = 'HPCA011, Select Error - Find-Accounting-Date'
+  let $err-statement2 = 'Bind Variables: Accounting Period '||$accounting_period||
+                        ', and Fiscal Year '||$fiscal_year
+
+  let $No_Cal = 'Y'
+
+begin-SELECT On-Error=SQL-Statement-Error
+CAL_DETP.END_DT
+
+  let $No_Cal = 'N'
+  move &CAL_DETP.END_DT to $accounting_dt
+
+FROM PS_CAL_DETP_TBL CAL_DETP,
+     PS_GL_JRNL_TMPLT GL_TMPLT,
+     PS_BUS_UNIT_TBL_HR  HR_BU,
+     PS_SET_CNTRL_REC    SC_CNTRL
+WHERE HR_BU.BUSINESS_UNIT        = $business_unit
+  AND GL_TMPLT.BUSINESS_UNIT_GL  = HR_BU.BUSINESS_UNIT_GL
+  AND SC_CNTRL.SETCNTRLVALUE     = HR_BU.BUSINESS_UNIT_GL
+  AND SC_CNTRL.REC_GROUP_ID      = 'FS_02'
+  AND SC_CNTRL.RECNAME           = 'CAL_DETP_TBL'
+  AND CAL_DETP.SETID             = SC_CNTRL.SETID
+  AND CAL_DETP.CALENDAR_ID       = GL_TMPLT.CALENDAR_ID
+  AND CAL_DETP.FISCAL_YEAR       = #fiscal_year
+  AND CAL_DETP.ACCOUNTING_PERIOD = #accounting_period
+end-SELECT
+
+  if $No_Cal = 'Y'
+      let $Msg = '   ERROR- Accounting Calendar not Found. ' ||
+                        'Accounting Period '||$Accounting_Period||
+                        ', and Fiscal Year '||$Fiscal_Year
+       display $Msg
+  end-if
+end-Procedure
+
+begin-procedure Insert-Control-Record
+  let $err-statement1 = 'HPCA011, Insert Error - Control Record'
+  let $err-statement2 = ' '
+
+   let $Ins_Company    = nvl($rc_company,' ')
+   let $Ins_Paygroup   = nvl($rc_paygroup,' ')
+
+begin-SQL on-error=SQL-Statement-Error
+INSERT INTO PS_HP_GRSFRG_CNTL (
+  HP_ALL_COMPPYG,
+  COMPANY,
+  PAYGROUP,
+  FROMDATE,
+  THRUDATE,
+  OPRID_LAST_UPDT,
+  LAST_UPDT_DT,
+  HP_PROC_STATUS)
+VALUES (
+  $rc_hp_all_comppyg,
+  $Ins_Company,
+  $Ins_Paygroup,
+  $rc_fromdate,
+  $rc_thrudate,
+  $prcs_oprid,
+  $asoftoday,
+  'L')
+end-SQL
+end-procedure
+
+begin-procedure Update-Proc-Status-to-Load
+  let $err-statement1 = 'HPCA011, Update Error - Control Record - Load Status'
+  let $err-statement2 = ' '
+
+begin-SQL on-error=SQL-Statement-Error
+  UPDATE PS_HP_GRSFRG_CNTL
+     SET HP_PROC_STATUS = 'L'
+end-SQL
+end-procedure
+
+begin-procedure Update-Proc-Status-to-None
+  let $err-statement1 = 'HPCA011, Update Error - Control Record - Status None'
+  let $err-statement2 = ' '
+  let $Ins_Company    = nvl($rc_company,' ')
+  let $Ins_Paygroup   = nvl($rc_paygroup,' ')
+
+begin-SQL on-error=SQL-Statement-Error
+  UPDATE PS_HP_GRSFRG_CNTL
+     SET HP_PROC_STATUS  = 'N',
+         HP_ALL_COMPPYG  = $rc_hp_all_comppyg,
+         COMPANY         = $Ins_Company,
+         PAYGROUP        = $Ins_Paygroup,
+         FROMDATE        = $rc_fromdate,
+         THRUDATE        = $rc_thrudate,
+         OPRID_LAST_UPDT = $prcs_oprid,
+         LAST_UPDT_DT    = $asoftoday
+end-SQL
+end-procedure
+
+begin-procedure Reset-Proc-Status
+  let $err-statement1 = 'HPCA011, Update Error - Control Record - Reset Status'
+  let $err-statement2 = ' '
+  let $reset_status = 'Y'
+
+begin-SQL on-error=SQL-Statement-Error
+  UPDATE PS_HP_GRSFRG_CNTL
+     SET HP_PROC_STATUS  = 'N'
+end-SQL
+end-procedure
+
+begin-procedure Insert-Gross-Fringe-Data
+
+  let $page_num     = #page_num
+  let $line_num     = #line_num
+  let $sepchk       = #sepchk
+  let $seqno        = #seqno
+
+  let $err-statement1 = 'HPCA011, Insert-Error - Insert Gross Fringe Data'
+  let $err-statement2 = 'Key Values: TABLE '||'PS_HP_GRSFRG_DATA'||
+                        ', Company '||$company||
+                        ', Paygroup '||$paygroup||
+                        ', Pay_End_Dt '||$pay_end_dt||
+                        ', Off_Cycle '||$off_cycle||
+                        ', Page_Num '||$page_num||
+                        ', Line_Num '||$line_num||
+                        ', Sepchk '||$sepchk||
+                        ', Seqno '||$seqno||
+                        ', Hp_Gross '||$hp_gross
+
+begin-SQL on-error=SQL-Statement-Error
+INSERT INTO PS_HP_GRSFRG_DATA (
+  COMPANY,
+  PAYGROUP,
+  PAY_END_DT,
+  OFF_CYCLE,
+  PAGE_NUM,
+  LINE_NUM,
+  SEPCHK,
+  SEQNO,
+  HP_GROSS,
+  EMPLID,
+  EMPL_RCD,
+  NAME,
+  PAYCHECK_NBR,
+  FISCAL_YEAR,
+  ACCOUNTING_PERIOD,
+  BUSINESS_UNIT,
+  SETID_DEPT,
+  HP_DEPTID,
+  JOBCODE,
+  POSITION_NBR,
+  POSITION_POOL_ID,
+  ERNCD,
+  PLAN_TYPE,
+  BENEFIT_PLAN,
+  DEDCD,
+  DED_CLASS,
+  DED_SLSTX_CLASS,
+  STATE,
+  LOCALITY,
+  TAX_CLASS,
+  PROVINCE,
+  TAX_CLASS_CAN,
+  ACCT_CD,
+  ACCOUNT,
+  DEPTID_CF,
+  PROJECT_ID,
+  PRODUCT,
+  FUND_CODE,
+  PROGRAM_CODE,
+  CLASS_FLD,
+  AFFILIATE,
+  OPERATING_UNIT,
+  ALTACCT,
+  BUDGET_REF,
+  CHARTFIELD1,
+  CHARTFIELD2,
+  CHARTFIELD3,
+  AFFILIATE_INTRA1,
+  AFFILIATE_INTRA2,
+  AMOUNT,
+  CURRENCY_CD,
+  REVERSED,
+  HP_RETDIST_STATUS,
+  HP_RETDIST_PAY_DT,
+  HP_RETRODIST_CHG)
+VALUES (
+  $company,
+  $paygroup,
+  $pay_end_dt,
+  $off_cycle,
+  #page_num,
+  #line_num,
+  #sepchk,
+  #seqno,
+  $hp_gross,
+  $emplid,
+  #empl_rcd,
+  $name,
+  #paycheck_nbr,
+  #fiscal_year,
+  #accounting_period,
+  $business_unit,
+  $setid_dept,
+  $hp_deptid,
+  $jobcode,
+  $position_nbr,
+  $position_pool_id,
+  $erncd,
+  $plan_type,
+  $benefit_plan,
+  $dedcd,
+  $ded_class,
+  $ded_slstx_class,
+  $state,
+  $locality,
+  $tax_class,
+  $province,
+  $tax_class_can,
+  $acct_cd,
+  $account,
+  $deptid,
+  $project_id,
+  $product,
+  $fund_code,
+  $program_code,
+  $class_fld,
+  $affiliate,
+  $operating_unit,
+  $altacct,
+  $budget_ref,
+  $chartfield1,
+  $chartfield2,
+  $chartfield3,
+  $affiliate_intra1,
+  $affiliate_intra2,
+  #amount,
+  $currency_cd,
+  $reversed,
+  $hp_retdist_status,
+  $hp_retdist_pay_dt,
+  $hp_retrodist_chg)
+end-SQL
+end-procedure
+
+begin-procedure Ignore
+  !Dummy procedure to avoid error if no records to delete
+end-procedure
+
+begin-procedure Print-Report-Parameters
+  display ' '
+  display 'Run Control Parameters - '
+  display ' '
+  if $rc_hp_all_comppyg = 'Y'
+      display '     Company  = All'
+      display '     Paygroup = All'
+  else
+      display '     Company  = ' noline
+      display $rc_company
+      if $rc_paygroup = ''
+          display '     Paygroup = All'
+      else
+          display '     Paygroup = ' noline
+          display $rc_paygroup
+      end-if
+  end-if
+  display ' '
+  do Format-DateTime($rc_fromdate, $rc_fromdate_DMY, {DEFDATE}, '', '')
+  do Format-DateTime($rc_thrudate, $rc_thrudate_DMY, {DEFDATE}, '', '')
+  display '     Process Date Range from = ' noline
+  display $rc_fromdate_DMY noline
+  display ' to ' noline
+  display $rc_thrudate_DMY noline
+  display ' '
+  display '     Include Retro Records = ' noline
+  display $rc_hp_incl_retro
+  display ' '
+end-procedure
+
+begin-procedure Print-Totals
+  display ' '
+  display 'Run Control Totals - '
+  let #Cal = 0
+  while #Cal < #Total_Cal
+
+      Get $Cal_Company
+          $Cal_PayGroup
+          $Cal_Pay_End_Dt
+          $Cal_Pay_Begin_Dt
+          $Cal_Off_Cycle_Cal
+          $Cal_Posn_fund_Run
+          #Total_Record
+          #Total_Gross
+          #Total_Fringe_Ben
+          #Total_Fringe_Tax
+          #Total_Retro_Record
+          #Total_Retro_Gross
+          #Total_Retro_Fringe_Ben
+          #Total_Retro_Fringe_Tax
+      from Calendar(#Cal)
+           Company
+           PayGroup
+           Pay_End_Dt
+           Pay_Begin_Dt
+           Pay_Off_Cycle_Cal
+           Posn_Fund_Run
+           Total_Record
+           Total_Gross
+           Total_Fringe_Ben
+           Total_Fringe_Tax
+           Total_Retro_Record
+           Total_Retro_Gross
+           Total_Retro_Fringe_Ben
+           Total_Retro_Fringe_Tax
+
+      do Format-DateTime($Cal_Pay_End_Dt, $Cal_Pay_End_Dt_DMY, {DEFDATE}, '', '')
+      let $Msg = '     Company : ' || $Cal_Company ||
+                 ' Paygroup : ' || $Cal_Paygroup ||
+                 ' Pay End Date : ' || $Cal_Pay_End_Dt_DMY ||
+                 ' Off Cycle Calendar : ' || $Cal_Off_Cycle_Cal ||
+                 ' Actuals Distribution Run : ' || $Cal_Posn_fund_Run
+      display ' '
+      display $Msg
+
+      if $Cal_Posn_Fund_Run = 'N'
+          display '          - Pay Period bypassed'
+      else
+          do Format-Number(#Total_Record,           $Total_Record,          '9999999999')
+          do Format-Number(#Total_Retro_Record,     $Total_Retro_Record,    '9999999999')
+          do Format-Number(#Total_Gross,            $Total_Gross,           '999999999999999.99')
+          do Format-Number(#Total_Retro_Gross,      $Total_Retro_Gross,     '999999999999999.99')
+          do Format-Number(#Total_Fringe_Ben,       $Total_Fringe_Ben,      '999999999999999.99')
+          do Format-Number(#Total_Fringe_Tax,       $Total_Fringe_Tax,      '999999999999999.99')
+          do Format-Number(#Total_Retro_Fringe_Ben, $Total_Retro_Fringe_Ben,'999999999999999.99')
+          do Format-Number(#Total_Retro_Fringe_Tax, $Total_Retro_Fringe_Tax,'999999999999999.99')
+
+          display '          - Total Number of Records Created      = ' noline
+          display '        ' noline
+          display $Total_Record noline
+          display '  *Retro Distribution* = ' noline
+          display '        ' noline
+          display $Total_Retro_Record
+          display '          - Total Gross Amount                   = ' noline
+          display $Total_Gross noline
+          display '  *Retro Distribution* = ' noline
+          display $Total_Retro_Gross
+          display '          - Total Fringe Benefits Amount         = ' noline
+          display $Total_Fringe_Ben noline
+          display '  *Retro Distribution* = ' noline
+          display $Total_Retro_Fringe_Ben
+          display '          - Total Fringe Taxes Amount            = ' noline
+          display $Total_Fringe_Tax noline
+          display '  *Retro Distribution* = ' noline
+          display $Total_Retro_Fringe_Tax
+      end-if
+
+      add 1 to #Cal
+  end-while
+end-procedure
+
+begin-procedure SQL-Statement-Error
+
+  DISPLAY 'SQL-STATEMENT-ERROR '
+
+  display $err-statement1
+  display $err-statement2
+  display ' Error : ' noline
+  display $SQL-error
+  display ' SQL Status : ' noline
+  display #SQL-Status
+
+  do Rollback-Transaction
+  if $reset_status <> 'Y'
+      do Reset-Proc-Status
+      do Commit-Transaction
+  end-if
+  stop
+
+end-procedure
+
+#include 'hpcarct1.sqc'  !Get Run Control Parameters
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'stdapi.sqc'    !Update Process API

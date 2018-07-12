@@ -1,0 +1,814 @@
+!***********************************************************************
+! GEXPY624:  DATA WAREHOUSE                                            *
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module is the confidential and proprietary information of       *
+! Giant Eagle, Inc.; it is not to be copied, reproduced,or transmitted *
+! in any form, by any means, in whole or in part, nor is it to be used *
+! for any purpose other than that for which it is expressly provided   *
+! without the written permission of Giant Eagle.                       *
+!                                                                      *
+! Copyright (c) 1997-1998 Giant Eagle,Inc. All Rights Reserved         *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+! GEXPY624 :            Data Warehouse File(s)/Report(s)               *
+!                                                                      *
+! Narrative:            Create an Interface between PeopleSoft and the *
+!                       Data Warehouse.  There will be two files       *
+!                       created from this program on a daily basis.    *
+!                       1. Population & New Hire Detail - provides     *
+!                          prior month population and current month new* 
+!                          hire info for the current month.            *
+!                       2. Turnovers - provides turnover info for the  *
+!                          current month.                              *
+!                                                                      *
+! #Debugx Used:         #debug9 paragraph trace                        *
+!                               #debug8 key variable values            *
+!                               #debug7 data returned from sql calls   *
+!                                                                      *
+! SQL Tables:           personal_data                                  *
+!                       employment                                     *
+!                       job                                            *
+!                                                                      *
+! Written by:           Gene Davis                                     *
+!                                                                      *
+! Normally Run:         Daily                                          *
+!                                                                      *
+! Control Parms:        None                                           *
+!                                                                      *
+!***********************************************************************
+!                         MODIFICATION HISTORY                         *
+!***********************************************************************
+! INITIALS      DATE            DESCRIPTION OF THE CHANGE              *
+!***********************************************************************
+! GXD           04/29/1999      Initial Creation                       *
+!                                                                      *
+! CWB           06/09/1999      Add code to select empl_status         *
+!                               of A, L, P, S for population.          *    
+! CWB           07/27/1999      Added paygroups PHM, PH2 (pharmacies)  *
+! CWB           09/09/1999      Added logic to subtract 1 day from     *
+!                                AsOfToday in order to capture hire    *
+!                                and terminate transactions from the   *
+!                                previous day.                         *
+! CWB           02/02/2000      Changed break logic to correct a       *
+!                                 problem in reporting the number of   *
+!                                 termination records.                 *
+! CWB           02/23/2000      Added PS_PERSONNEL_HIST to select in   *
+!                                  order to get ETHNIC_GROUP which was *
+!                                  moved from PS_PERSONAL_DATA in 7.51.*  
+! CWB           04/24/2000      Changed PS_PERSONNEL_HIST to           * 
+!                                  PS_DIVERSITY to get ETHNIC_GROUP in *
+!                                  order to improve performance.       *
+! CWB           11/30/2000      Added Columbus paygroups RE4 and PH4.  *    
+! CJH           01/09/2001      Add COD Paygroups and Company          *
+! CWB           06/12/2001      Added Columbus paygroups RE4 and PH4   *
+!                                to turnover logic.                    *
+!                                                                      *
+! AXL           09/18/2001      Added new Ret Promo paygroup of C01.   *
+! NPK           09/18/2006      Added new Company MCC and new Paygroup RE5
+! ISDVNPK       08/28/2007      Modified for upgrade 9.0 -Changed PS_DIVERSITY 
+!                               to PS_DIVERS_ETHNIC to get ETHNIC_GROUP*
+! GEX-AXG       02/07/2008      Added PRIMARY_INDICATOR in the SQl.    *
+!GEX-TLL	03/27/2008	HCM 9.0 Upgrade			       *
+! GEX001        03/02/2011    ITG 94306  Add the hardcodings of company  *
+!                             paygroup and empl status to the run control*
+!                             and remove unnecessary coding            *
+!***********************************************************************
+
+#include 'setenv.sqc' !Set environment
+#include 'setup02.sqc'
+ 
+!*********************************************************************
+!Initial processing, retrieving current dates and calls the main 
+!procedure to do the processing.                                     
+!*********************************************************************
+begin-report
+
+  do Init-DateTime
+  do Init-Number
+  do stdapi-init
+  do Get-Calendar-Year-Id
+  move 'GEXPY624' to $ReportID
+  move 'Data Warehouse' to $ReportTitle
+  display $ReportTitle noline
+  display ' ' noline
+
+  do Get-Current-DateTime
+
+  let #empl_cnt    = 0
+  let #grand_total = 0
+  let #pop_total   = 0
+  let #hire_total  = 0
+  let #term_total  = 0
+
+  do Report
+  do Commit-Transaction
+  date-time () hh:mi:ss &timeEnded
+  display 'Report Ended: ' noline
+  display &timeEnded
+  do stdapi-term
+
+end-report
+
+!*********************************************************************
+!If this Program is being executed through process scheduler, 
+!the run control parameters and calls the main processing procedure.
+!Otherwise, interrogates the user for the run control parameters and 
+!validates them. If the run control parameters are invalid, stops the
+!execution.
+!*********************************************************************
+begin-procedure Report
+
+date-time () hh:mi:ss &timeBegan
+display 'Report Began: ' noline
+display &timeBegan
+
+  move 'N' to $Errorfound
+
+  Do Convert-to-dtu-date($Asoftoday,$today_dtu)
+  let #dtu_days = 1  
+  do dtu-subtract-days($today_dtu, #dtu_days, $yesterday_dtu) 
+  Show 'today_dtu :   '$today_dtu
+  Show 'yesterday_dtu : '$yesterday_dtu
+  do Convert-from-dtu-date($yesterday_dtu, $AsOfToday)
+  let $date_yy = substr($yesterday_dtu,1,4)
+  let $date_mm = substr($yesterday_dtu,6,2)
+
+  let $date_all = $date_mm||'/01'||'/'||$date_yy
+
+  let $write_date = 'D'||$date_yy||$date_mm||'01'
+
+  let $date_dtu = $date_yy||'-'||$date_mm||'-01'
+  Do Convert-from-dtu-date($date_dtu,$begin_date)
+  Show ' Begin Date : '$begin_date
+
+  Do dtu-add-months($date_dtu,-1,$prev_date_dtu)
+  Do Convert-from-dtu-date($prev_date_dtu,$prev_date)
+  Show 'Previous Date : '$prev_date
+
+  Do dtu-subtract-days($date_dtu,1,$end_date_dtu)
+  Do Convert-from-dtu-date($end_date_dtu,$end_date)
+  Show 'End Date :  '$end_date
+
+  Let $X000_Where_Select_AsOfDate = $AsOfToday
+  show '$X000_Where_Select_AsOfDate:' $X000_Where_Select_AsOfDate
+  
+  Do Determine-Selection
+
+  Do Process-Population
+  
+  Do Process-Termination
+  
+  
+  Let #grand_total =  #pop_total + #hire_total + #term_total 
+  move #grand_total to $grand_total 99,990
+  
+  display 'Grand Total:         ' noline
+  display $grand_total
+
+Report-Exit:
+
+  date-time () hh:mi:ss &timeProcess
+
+end-procedure
+
+!**********************************
+begin-procedure Get-Values
+
+end-procedure
+
+!**********************************
+! Determine Selection
+!**********************************
+begin-procedure Determine-Selection
+
+  Let $Selection_Criteria_pop  = 'J.EFFDT = (MAX (EFFDT) <= '||''''||$end_date||''''||')'
+  
+  Let $Selection_Criteria_hire = 'J2.EFFDT BETWEEN '||''''||$begin_date||''''||' AND '||''''||$AsofToday||''''||' AND J2.ACTION IN ('||''''||'HIR'||''''||','||''''||'REH'||''''||')'
+  
+  Let $Selection_Criteria_Term = 'J3.EFFDT BETWEEN '||''''||$begin_date||''''||' AND '||''''||$AsofToday||''''||' AND J3.ACTION IN ('||''''||'TER'||''''||','||''''||'TWB'||''''||','||''''||'TWP'||''''||')'
+
+  display 'Population:    ' noline
+  display $Selection_Criteria_pop
+
+  display 'New Hires:    ' noline
+  display $Selection_Criteria_hire
+
+  display 'Terminations: ' noline
+  display $Selection_Criteria_term
+
+  Let $X000_Order_By_Pop  = 'J.DEPTID, J.ACCT_CD, J.JOBCODE, ETHN.ETHNIC_GROUP'
+  Let $X000_Order_By_Hire = 'J2.DEPTID, J2.ACCT_CD, J2.JOBCODE, ETHN2.ETHNIC_GROUP'
+  Let $X000_Order_By_Term = 'J3.DEPTID, J3.ACCT_CD, J3.JOBCODE, ETHN3.ETHNIC_GROUP, J3.ACTION_REASON'               
+  
+end-procedure
+
+!*********************************************************************
+! Main Process
+!*********************************************************************
+
+begin-procedure Process-Population
+
+move 'N' to $rowfound
+move 'Y' to $first_pass
+
+let #inputtran = 0
+
+  move 'B' to $rowtype
+  let $filename = '{OUTFILE}'||'population.dat'  
+  open $filename as 1
+     for-writing record=30
+
+  if #writestat != 0
+     display 'Error Opening output file.  Program terminating.'
+     stop
+  end-if
+  
+  !GEX001-Begins
+  Let $GEXXX901_Company_Alias  = 'J.COMPANY'                           
+	Let $GEXXX901_Paygroup_Alias = 'J.PAYGROUP'  
+  do GEXXX901-Select-Company-Paygroup-Parameters
+  show '$GEXXX901_INCLUDE_COMPANY_PAYGROUP_CRITERIA :' $GEXXX901_INCLUDE_COMPANY_PAYGROUP_CRITERIA
+  show '$GEXXX901_INCLUDE_COMPANY_PAYGROUP_DISPLAY_CRITERIA:' $GEXXX901_INCLUDE_COMPANY_PAYGROUP_DISPLAY_CRITERIA
+    
+  Let $GEXXX903_Emp_Stat_Alias = 'J.EMPL_STATUS'                      
+  do GEXXX903-Select-Emp-Stat-Parameters
+  show '$GEXXX903_Include_Emp_Stat_Criteria         :' $GEXXX903_Include_Emp_Stat_Criteria
+  !GEX001-Ends
+
+begin-select distinct ON-ERROR=SQL-Error-Found('Process-Population')
+J.DEPTID              &j.deptid
+J.ACCT_CD             &j.acct_cd
+J.JOBCODE             &j.jobcode
+J.FULL_PART_TIME      &j.fp_time
+J.EMPLID              &j.emplid
+P.DISABLED            &j.disabled
+ETHN.ETHNIC_GROUP     &j.race 
+J.ACTION      
+J.ACTION_REASON       &j.action_reason
+
+  move &j.disabled      to $disabled
+  move &j.race          to $race 	
+  move &j.deptid        to $deptid
+  move &j.acct_cd       to $acct_cd
+  move &j.jobcode       to $jobcode
+  move &j.fp_time       to $fp_time
+  move &j.action_reason to $action_reason
+  
+  if $disabled = 'N'
+     move '0' to $disabled
+  else
+     move '1' to $disabled
+  end-if
+  
+  let $wrkfrc_cd = $disabled||$race
+  add 1 to #pop_total
+  
+  if $first_pass = 'Y'
+     move $deptid        to $hold_deptid
+     move $acct_cd       to $hold_acct_cd
+     move $jobcode       to $hold_jobcode
+     move $fp_time       to $hold_fp_time
+     move $wrkfrc_cd     to $hold_wrkfrc_cd
+     move $action_reason to $hold_action_reason
+     move 'N' to $first_pass
+  end-if
+
+  if $deptid <> $hold_deptid
+     Do Write-Record1
+     move $deptid        to $hold_deptid
+     move $acct_cd       to $hold_acct_cd
+     move $jobcode       to $hold_jobcode
+     move $fp_time       to $hold_fp_time
+     move $wrkfrc_cd     to $hold_wrkfrc_cd
+     move $action_reason to $hold_action_reason
+     add 1 to #empl_cnt
+  else
+     if $acct_cd <> $hold_acct_cd
+	       Do Write-Record1
+	       move $acct_cd       to $hold_acct_cd
+	       move $jobcode       to $hold_jobcode
+	       move $fp_time       to $hold_fp_time
+	       move $wrkfrc_cd     to $hold_wrkfrc_cd
+	       move $action_reason to $hold_action_reason
+	       add 1 to #empl_cnt
+     else   
+	       if $jobcode <> $hold_jobcode
+    	      Do Write-Record1
+	          move $jobcode       to $hold_jobcode
+	          move $fp_time       to $hold_fp_time
+	          move $wrkfrc_cd     to $hold_wrkfrc_cd
+	          move $action_reason to $hold_action_reason
+	          add 1 to #empl_cnt
+	       else   
+	          if $fp_time <> $hold_fp_time
+!              display 'Fp_time'
+	             Do Write-Record1
+	             move $fp_time       to $hold_fp_time
+	             move $wrkfrc_cd     to $hold_wrkfrc_cd
+	             move $action_reason to $hold_action_reason
+	             add 1 to #empl_cnt
+	         else
+	             if $wrkfrc_cd <> $hold_wrkfrc_cd
+              		 Do Write-Record1
+		               move $wrkfrc_cd     to $hold_wrkfrc_cd
+		               move $action_reason to $hold_action_reason
+		               add 1 to #empl_cnt
+	             else
+		              add 1 to #empl_cnt
+	             end-if   
+	         end-if
+	       end-if
+     end-if
+  end-if   
+
+FROM PS_PERSONAL_DATA P, 
+     PS_DIVERS_ETHNIC D,	
+     PS_ETHNIC_GRP_TBL ETHN,
+     PS_JOB J
+WHERE P.EMPLID = J.EMPLID
+AND   P.EMPLID = D.EMPLID	
+AND   D.REG_REGION = 'USA'  	
+AND   D.PRIMARY_INDICATOR = 'Y' 
+and D.REG_REGION = ETHN.SETID
+and D.ETHNIC_GRP_CD = ETHN.ETHNIC_GRP_CD
+and ETHN.EFFDT = (SELECT MAX(ETHNA.EFFDT)
+		 FROM PS_ETHNIC_GRP_TBL ETHNA
+		 WHERE ETHN.SETID    = ETHNA.SETID
+		 AND   ETHN.ETHNIC_GRP_CD = ETHNA.ETHNIC_GRP_CD
+		 AND   ETHNA.EFFDT    <= $end_date)
+AND   J.EFFDT = (SELECT MAX(EFFDT)
+		 FROM PS_JOB
+		 WHERE EMPLID    = J.EMPLID
+		 AND   EMPL_RCD = J.EMPL_RCD
+		 AND   EFFDT    <= $end_date)
+AND   J.EFFSEQ = (SELECT MAX(EFFSEQ)
+		  FROM PS_JOB 
+		  WHERE EMPLID    = J.EMPLID
+		  AND   EMPL_RCD = J.EMPL_RCD
+		  AND   EFFDT     = J.EFFDT)
+!GEX001-Begins		  
+!AND   J.COMPANY IN ('GEI','RTP','TMK','RFI','MCC')   !NPK 09/18/2006 added MCC
+!AND   J.PAYGROUP IN ('OF3','R01','RET','RE2','PHM','PH2','OF4','PH3','RE3','RE4','PH4','C01','RE5') !AXL 09/18/2001 add C01  !NPK 09/18/2006 added RE5
+!AND   J.EMPL_STATUS IN ('A', 'L', 'P', 'S')
+AND [$GEXXX901_INCLUDE_COMPANY_PAYGROUP_CRITERIA]
+AND [$GEXXX903_Include_Emp_Stat_Criteria]
+!GEX001-Ends
+ORDER BY [$X000_Order_By_Pop]
+
+end-select
+
+if $rowfound = 'N'
+   display 'No Employees found for the Data Warehouse Report.' 
+   move 0 to #pop_total
+else
+   move $deptid        to $hold_deptid
+   move $acct_cd       to $hold_acct_cd
+   move $jobcode       to $hold_jobcode
+   move $fp_time       to $hold_fp_time
+   move $wrkfrc_cd     to $hold_wrkfrc_cd
+   move $action_reason to $hold_action_reason
+
+   Do Write-Record1
+
+end-if
+
+   move #pop_total to $pop_total 99,990
+
+   display ' '
+   display 'Population Records:  ' noline
+   display $pop_total
+
+Do Process-Hires
+		
+end-procedure
+
+!******************************
+begin-procedure Process-Hires
+
+move 'N' to $rowfound
+move 'Y' to $first_pass
+
+move ' '     to $hold_deptid
+move ' '     to $hold_acct_cd
+move ' '     to $hold_jobcode
+move ' '     to $hold_fp_time
+move ' '     to $hold_wrkfrc_cd
+move ' '     to $hold_action_reason
+
+  !GEX001-Begins
+  Let $GEXXX901_Company_Alias  = 'J2.COMPANY'                           
+	Let $GEXXX901_Paygroup_Alias = 'J2.PAYGROUP'  
+  do GEXXX901-Select-Company-Paygroup-Parameters
+  show '$GEXXX901_INCLUDE_COMPANY_PAYGROUP_CRITERIA :' $GEXXX901_INCLUDE_COMPANY_PAYGROUP_CRITERIA
+  show '$GEXXX901_INCLUDE_COMPANY_PAYGROUP_DISPLAY_CRITERIA:' $GEXXX901_INCLUDE_COMPANY_PAYGROUP_DISPLAY_CRITERIA
+  !GEX001-Ends
+
+let #inputtran = 0
+
+move 'H' to $rowtype
+
+begin-select distinct ON-ERROR=SQL-Error-Found('Process-Hires')
+J2.DEPTID              &j2.deptid
+J2.ACCT_CD             &j2.acct_cd
+J2.JOBCODE             &j2.jobcode
+J2.FULL_PART_TIME      &j2.fp_time
+J2.EMPLID              &j2.emplid
+P2.DISABLED            &j2.disabled
+ETHN2.ETHNIC_GROUP     &j2.race 
+J2.ACTION 
+J2.ACTION_REASON       &j2.action_reason
+
+  move &j2.disabled to $disabled
+  move &j2.race     to $race	
+  if $disabled = 'N'
+     move '0' to $disabled
+  else
+     move '1' to $disabled
+  end-if
+
+  let $wrkfrc_cd = $disabled||$race
+
+  add 1 to #hire_total
+
+     move &j2.deptid        to $deptid
+     move &j2.acct_cd       to $acct_cd
+     move &j2.jobcode       to $jobcode
+     move &j2.fp_time       to $fp_time
+     move &j2.action_reason to $action_reason
+
+  if $first_pass = 'Y'
+     move $deptid        to $hold_deptid
+     move $acct_cd       to $hold_acct_cd
+     move $jobcode       to $hold_jobcode
+     move $fp_time       to $hold_fp_time
+     move $wrkfrc_cd     to $hold_wrkfrc_cd
+     move $action_reason to $hold_action_reason
+     move 'N' to $first_pass
+  end-if
+
+  if $deptid <> $hold_deptid
+     Do Write-Record1
+     move $deptid        to $hold_deptid
+     move $acct_cd       to $hold_acct_cd
+     move $jobcode       to $hold_jobcode
+     move $fp_time       to $hold_fp_time
+     move $wrkfrc_cd     to $hold_wrkfrc_cd
+     move $action_reason to $hold_action_reason
+     add 1 to #empl_cnt
+  else
+     if $acct_cd <> $hold_acct_cd
+	       Do Write-Record1
+	       move $acct_cd       to $hold_acct_cd
+	       move $jobcode       to $hold_jobcode
+	       move $fp_time       to $hold_fp_time
+	       move $wrkfrc_cd     to $hold_wrkfrc_cd
+	       move $action_reason to $hold_action_reason
+	       add 1 to #empl_cnt
+     else   
+	        if $jobcode <> $hold_jobcode
+  	          Do Write-Record1
+	            move $jobcode       to $hold_jobcode
+	            move $fp_time       to $hold_fp_time
+	            move $wrkfrc_cd     to $hold_wrkfrc_cd
+	            move $action_reason to $hold_action_reason
+	            add 1 to #empl_cnt
+	        else   
+	             if $fp_time <> $hold_fp_time
+!                  display 'Fp_time'
+	                Do Write-Record1
+	                move $fp_time       to $hold_fp_time
+	                move $wrkfrc_cd     to $hold_wrkfrc_cd
+	                move $action_reason to $hold_action_reason
+	                add 1 to #empl_cnt
+	             else
+	                 if $wrkfrc_cd <> $hold_wrkfrc_cd
+                   		 Do Write-Record1
+		                   move $wrkfrc_cd     to $hold_wrkfrc_cd
+		                   move $action_reason to $hold_action_reason
+		                   add 1 to #empl_cnt
+	                 else
+		                  add 1 to #empl_cnt
+                   end-if   
+	             end-if
+	        end-if
+     end-if
+  end-if   
+
+FROM PS_PERSONAL_DATA P2, 
+     PS_JOB J2, 
+     PS_DIVERS_ETHNIC D2,			
+     PS_ETHNIC_GRP_TBL ETHN2  
+WHERE P2.EMPLID = J2.EMPLID
+AND   P2.EMPLID = D2.EMPLID	
+AND   D2.REG_REGION = 'USA' 	 
+AND   D2.PRIMARY_INDICATOR = 'Y'
+and D2.REG_REGION = ETHN2.SETID
+and D2.ETHNIC_GRP_CD = ETHN2.ETHNIC_GRP_CD
+and ETHN2.EFFDT = (SELECT MAX(ETHNB.EFFDT)
+		               FROM PS_ETHNIC_GRP_TBL ETHNB
+		               WHERE ETHN2.SETID    = ETHNB.SETID
+		               AND   ETHN2.ETHNIC_GRP_CD = ETHNB.ETHNIC_GRP_CD
+		               AND   ETHNB.EFFDT    <= $X000_Where_Select_AsOfDate)
+AND   J2.EFFDT = (SELECT MAX(EFFDT)
+		  FROM PS_JOB
+		  WHERE EMPLID    = J2.EMPLID
+		  AND   EMPL_RCD = J2.EMPL_RCD
+		  AND   EFFDT    <= $X000_Where_Select_AsOfDate)
+AND   J2.EFFSEQ = (SELECT MAX(EFFSEQ)
+		   FROM PS_JOB 
+		   WHERE EMPLID    = J2.EMPLID
+		   AND   EMPL_RCD = J2.EMPL_RCD
+		   AND   EFFDT     = J2.EFFDT)
+!GEX001-Begins		   
+!AND   J2.COMPANY IN ('GEI','RTP','TMK','RFI','MCC')  
+!AND J2.PAYGROUP IN ('OF3','R01','RET','RE2','PHM','PH2','OF4','PH3','RE3','RE4','PH4','C01','RE5')	
+AND [$GEXXX901_INCLUDE_COMPANY_PAYGROUP_CRITERIA]
+!GEX001-Ends                    
+AND   [$SELECTION_CRITERIA_HIRE] 
+ORDER BY [$X000_Order_By_Hire]
+
+end-select
+
+if $rowfound = 'N'
+   display 'No New Hires found for the Data Warehouse Report.' 
+   move 0 to #hire_total
+else
+   move $deptid        to $hold_deptid
+   move $acct_cd       to $hold_acct_cd
+   move $jobcode       to $hold_jobcode
+   move $fp_time       to $hold_fp_time
+   move $wrkfrc_cd     to $hold_wrkfrc_cd
+   move $action_reason to $hold_action_reason
+   Do Write-Record1
+end-if
+
+   move #hire_total to $hire_total 99,990
+
+   display ' '
+   display 'New Hire Records:    ' noline
+   display $hire_total
+   
+close 1
+
+end-procedure
+
+!****************************
+begin-procedure Process-Termination
+
+move 'N' to $rowfound
+move 'Y' to $first_pass2
+
+move ' '     to $hold_deptid
+move ' '     to $hold_acct_cd
+move ' '     to $hold_jobcode
+move ' '     to $hold_fp_time
+move ' '     to $hold_wrkfrc_cd
+move ' '     to $hold_action_reason
+
+  !GEX001-Begins
+  Let $GEXXX901_Company_Alias  = 'J3.COMPANY'                           
+	Let $GEXXX901_Paygroup_Alias = 'J3.PAYGROUP'  
+  do GEXXX901-Select-Company-Paygroup-Parameters
+  show '$GEXXX901_INCLUDE_COMPANY_PAYGROUP_CRITERIA :' $GEXXX901_INCLUDE_COMPANY_PAYGROUP_CRITERIA
+  show '$GEXXX901_INCLUDE_COMPANY_PAYGROUP_DISPLAY_CRITERIA:' $GEXXX901_INCLUDE_COMPANY_PAYGROUP_DISPLAY_CRITERIA
+  !GEX001-Ends
+
+let #inputtran = 0
+
+  move 'T' to $rowtype
+  let $filename = '{OUTFILE}'||'turnover.dat'  
+  open $filename as 2
+     for-writing record=33
+
+  if #writestat != 0
+     display 'Error Opening output file.  Program terminating.'
+     stop
+  end-if
+
+begin-select distinct ON-ERROR=SQL-Error-Found('Process-Termination')
+J3.DEPTID              &j3.deptid
+J3.ACCT_CD             &j3.acct_cd
+J3.JOBCODE             &j3.jobcode
+J3.FULL_PART_TIME      &j3.fp_time
+J3.EMPLID              &j3.emplid
+P3.DISABLED            &j3.disabled
+ETHN3.ETHNIC_GROUP     &j3.race  
+J3.ACTION 
+J3.ACTION_REASON       &j3.action_reason
+
+  move &j3.disabled to $disabled
+  move &j3.race     to $race
+  if $disabled = 'N'
+     move '0' to $disabled
+  else
+     move '1' to $disabled
+  end-if
+
+  let $wrkfrc_cd = $disabled||$race
+
+  add 1 to #term_total
+
+  move &j3.deptid        to $deptid
+  move &j3.acct_cd       to $acct_cd
+  move &j3.jobcode       to $jobcode
+  move &j3.fp_time       to $fp_time
+  move &j3.action_reason to $action_reason
+
+  if $first_pass2 = 'Y'
+     move $deptid        to $hold_deptid
+     move $acct_cd       to $hold_acct_cd
+     move $jobcode       to $hold_jobcode
+     move $fp_time       to $hold_fp_time
+     move $wrkfrc_cd     to $hold_wrkfrc_cd
+     move $action_reason to $hold_action_reason
+     move 'N' to $first_pass2
+  end-if
+
+  if $deptid <> $hold_deptid
+     Do Write-Record2
+     move 0 to #empl_cnt
+     move $deptid        to $hold_deptid
+     move $acct_cd       to $hold_acct_cd
+     move $jobcode       to $hold_jobcode
+     move $fp_time       to $hold_fp_time
+     move $wrkfrc_cd     to $hold_wrkfrc_cd
+     move $action_reason to $hold_action_reason
+     add 1 to #empl_cnt
+  else
+     if $acct_cd <> $hold_acct_cd
+       	Do Write-Record2
+        move 0 to #empl_cnt
+       	move $acct_cd       to $hold_acct_cd
+	      move $jobcode       to $hold_jobcode
+	      move $fp_time       to $hold_fp_time
+	      move $wrkfrc_cd     to $hold_wrkfrc_cd
+	      move $action_reason to $hold_action_reason
+	      add 1 to #empl_cnt
+     else   
+	       if $jobcode <> $hold_jobcode
+        	   Do Write-Record2
+             move 0 to #empl_cnt
+        	   move $jobcode       to $hold_jobcode
+	           move $fp_time       to $hold_fp_time
+	           move $wrkfrc_cd     to $hold_wrkfrc_cd
+	           move $action_reason to $hold_action_reason
+	           add 1 to #empl_cnt
+         else   
+	            if $fp_time <> $hold_fp_time
+          	      Do Write-Record2
+                  move 0 to #empl_cnt
+          	      move $fp_time       to $hold_fp_time
+	                move $wrkfrc_cd     to $hold_wrkfrc_cd
+	                move $action_reason to $hold_action_reason
+	                add 1 to #empl_cnt
+	            else
+	                if $wrkfrc_cd <> $hold_wrkfrc_cd
+                		 Do Write-Record2
+                     move 0 to #empl_cnt
+                		 move $wrkfrc_cd     to $hold_wrkfrc_cd
+		                 move $action_reason to $hold_action_reason
+		                 add 1 to #empl_cnt
+	                else
+                		 if $action_reason <> $hold_action_reason
+                    		 Do Write-Record2
+                         move 0 to #empl_cnt
+		                     move $action_reason to $hold_action_reason
+        	               add 1 to #empl_cnt
+                     else
+                   	    add 1 to #empl_cnt
+                     end-if   
+	                end-if   
+	            end-if
+	       end-if
+     end-if
+  end-if   
+
+FROM PS_PERSONAL_DATA P3,
+     PS_JOB J3, 
+     PS_DIVERS_ETHNIC D3,			
+     PS_ETHNIC_GRP_TBL ETHN3 
+WHERE P3.EMPLID = J3.EMPLID
+AND   P3.EMPLID = D3.EMPLID		
+AND   D3.REG_REGION = 'USA' 	 
+AND   D3.PRIMARY_INDICATOR = 'Y' 
+and D3.REG_REGION = ETHN3.SETID
+and D3.ETHNIC_GRP_CD = ETHN3.ETHNIC_GRP_CD
+and ETHN3.EFFDT = (SELECT MAX(ETHNC.EFFDT)
+		               FROM PS_ETHNIC_GRP_TBL ETHNC
+		               WHERE ETHN3.SETID    = ETHNC.SETID
+		               AND   ETHN3.ETHNIC_GRP_CD = ETHNC.ETHNIC_GRP_CD
+		               AND   ETHNC.EFFDT    <= $X000_Where_Select_AsOfDate)
+AND   J3.EFFDT = (SELECT MAX(EFFDT)
+		  FROM PS_JOB
+		  WHERE EMPLID    = J3.EMPLID
+		  AND   EMPL_RCD = J3.EMPL_RCD
+		  AND   EFFDT    <= $X000_Where_Select_AsOfDate)
+AND   J3.EFFSEQ = (SELECT MAX(EFFSEQ)
+		   FROM PS_JOB 
+		   WHERE EMPLID    = J3.EMPLID
+		   AND   EMPL_RCD = J3.EMPL_RCD
+		   AND   EFFDT     = J3.EFFDT)
+!GEX001-Begins		   
+!AND   J3.COMPANY IN ('GEI','RTP','TMK','RFI','MCC') 
+!AND   J3.PAYGROUP IN ('OF3','R01','RET','RE2','PHM','PH2','OF4','PH3','RE3','RE4','PH4','C01','RE5') 
+AND [$GEXXX901_INCLUDE_COMPANY_PAYGROUP_CRITERIA]
+!GEX001-Ends   
+AND   [$SELECTION_CRITERIA_TERM] 
+ORDER BY [$X000_Order_By_Term]
+end-select
+
+if $rowfound = 'N'
+   display 'No Terminations found for the Data Warehouse Report.' 
+   move 0 to #term_total
+else
+   move $deptid        to $hold_deptid
+   move $acct_cd       to $hold_acct_cd
+   move $jobcode       to $hold_jobcode
+   move $fp_time       to $hold_fp_time
+   move $wrkfrc_cd     to $hold_wrkfrc_cd
+   move $action_reason to $hold_action_reason
+   Do Write-Record2
+end-if
+
+   move #term_total to $term_total 99,990
+   display ' '
+   display 'Termination Records: ' noline
+   display $term_total
+
+close 2
+
+end-procedure
+
+!******************************
+begin-procedure Write-Record1   !New Hire and Population File  
+
+  move 'Y' to $rowfound 
+  move #empl_cnt to $print_cnt 0009
+
+  write 1 from $hold_deptid:4 
+	       $write_date:9
+	       $hold_acct_cd:3
+	       $hold_jobcode:6
+	       $hold_fp_time:1
+	       $hold_wrkfrc_cd:2
+	       $rowtype:1
+	       $print_cnt:4
+
+   move 0 to #empl_cnt
+
+end-procedure
+
+!******************************
+begin-procedure Write-Record2   !Term File
+
+  move 'Y' to $rowfound 
+  move #empl_cnt to $print_cnt 0000
+
+  write 2 from $hold_deptid:4
+	       $write_date:9
+	       $hold_acct_cd:3
+	       $hold_jobcode:6
+	       $hold_fp_time:1
+	       $hold_wrkfrc_cd:2
+	       $rowtype:1
+	       $hold_action_reason:3
+	       $print_cnt:4
+
+  move 0 to #empl_cnt
+
+end-procedure
+
+!*********************************************************************
+!Displays the error messages and stops execution
+!*********************************************************************
+ 
+begin-procedure SQL-Error-Found($Proc_Name) 
+  display 'SQL Error in ' 
+  display $Proc_Name 
+  display $_sql-error
+  display 'sql-status:' 
+  display #_sql-status 
+
+  STOP
+
+end-procedure
+
+!**************************************************************
+#Include 'tranctrl.sqc'  !Common Transaction Control Procedures
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'stdapi.sqc'    !Update Process API
+#Include 'hrrnctl1.sqc'  !Get_Run_Control Procedure
+#Include 'hrgetval.sqc'  !Get values mask routines
+#Include 'datemath.sqc'  !Does the date-math functions
+#Include 'getdatcd.sqc'  !Get-Date-Codes procedure
+#Include 'getbalid.sqc'  !Get-Calendar-Year-Id
+#Include 'sqrtrans.sqc'
+#Include 'readxlat.sqc'
+#include 'gexxx901.sqc'  !Get company paygroup multiple row table
+#include 'gexxx903.sqc'  !Get employee status multiple row table

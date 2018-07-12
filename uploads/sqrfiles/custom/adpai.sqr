@@ -1,0 +1,1700 @@
+!--------------------------------------------------------------------------------- !
+!adpai.sqr   -  automatically creates an AI file via the W-2C data
+!Property: ADP / CIS
+!Author:   Dan Monroe
+!Date:     12/9/2014
+!--------------------------------------------------------------------------------  !                                                                                  !
+! specs:
+!   implements 5_16_2012_specs_ExcelImport_W-2c (5/15/2012 AI specs)               !
+!                                                                                  !
+!  Modification History                                                            !
+!                                                                                  !
+!   May 31, 2012   change default filename to {FILEPREFIX}adp_ai.csv               !
+!   June 8, 2012   no client defined literal and convert 8 char SSN's start with 0 !
+!   June 12, 2012  add Employer taxes/wages via PS_BAL_ADJ_TAX table, using        !
+!                  the DT_ENTERED and an optional FROM..THRU date on the RC page   !
+!   Feb 22, 2012   Q1_2013_ExcelImport_W-2c.xls Q1, 2013 format in adpaic.sqc      !
+!                  split into adpaic and adpaii.sqc files to make more modular     !
+!                  SKIP_EMPLID_and_BATCH_INTO_LITERAL_FIELD option added           !
+!                  20130222, Payroll tax holiday calc for Soc Sec ER taxes         !
+!   Mar 1, 2013    Option to print the header or not WRITE_AI_HEADER               !
+!   Apr 23, 2013   04232013 per direction from Yum Brands (LM)                     !
+!   May 29, 2013   TRANSLATE_COMPANY_CODES                                         !
+!                  TRANSLATE_LOCAL_CODES                                           !
+!                  filter commas                                                   !
+!   Jun 18, 2013   eliminate writing the ER SDI QTD and YTD for 14A items for CA   !
+!                  see: 06182013
+!   Aug 16, 2013   If an adjustment to New Hire Credits 12CC -->                   !
+!                   then an equal offsetting (negative) 
+!                   value should be entered in the corresponding 
+!                   Differences Social Sec Employer Wages.                         
+!                   (030/AE) = - (034/AI)
+!                   (031/AF) = - (035/AJ)
+!   Oct 14, 2013
+!           New Specs: Q4_2013_Template_ExcelImport_W-2c (4 more fields for Addl Medicare)
+!           Change company and local translations to use YEAR not EFFDT
+!   Dec 09, 2013    Make the Local and Company standard lookups effective year oriented to pull in most current year translations
+!   Nov 04, 2014    handle Med EE for 2013+ off of the Box 05 amounts, calculating the surcharge, ignore Box 06 20141104
+!   Nov 10, 2014    CUSTOM_W2C_Box_14, and track the TBA's so we process them for once for the associate
+!   Nov 18, 2014    check these out -->
+!                      put 'GG' 'Lived In PSD Code (PA Only)' 'T'                                               into w2c_column(188) Column Descr_ADP col_type
+!                      put 'GH' 'Lived In ADP Local Code (PA Only)' 'T'                                         into w2c_column(189) Column Descr_ADP col_type
+!                   RES_PSD_CD was working for TBA's but not for W-2Cs
+!   Dec 5,  2014    Put RES_PSD_CD into GG.  If no RES_PSD_CD put resident ADP Local code into GH
+!   Dec 9,  2014    Local ER TBA's include see proc: Local-ER-TBA
+!   May 13, 2015    WRITE_AI_HEADER_SECOND_ROW  (Boxes)
+!   Aug  3, 2016    August 1 specs (5 resident fields inserted)
+!   Aug 16, 2016    fixed MED issue due to shifting 5 cols
+!   Sept 9, 2016    employee location for IN in GJ
+! -----------------------------------------------------------------------------------------------------------------------------------------------------
+
+#define adpai_version       ADPAI.SQR: Sept 9, 2016
+
+#ifndef INPUT_PARAMETERS_CRITERIA
+   #define INPUT_PARAMETERS_CRITERIA        #prcs_process_instance = 0
+#endif
+
+#ifndef RESIDENT_ADDRESS_TYPE
+  #define RESIDENT_ADDRESS_TYPE HOME
+#endif
+
+#include 'adpaic.sqc'
+#include 'adpaii.sqc'
+
+#if {SITE_ID} <> 'TCN1'
+  #DEFINE SKIP_EMPLID_and_BATCH_INTO_LITERAL_FIELD
+#endif
+
+#if {SITE_ID} = 'TGP1'
+  #define TRANSLATE_COMPANY_CODES
+#endif
+
+#DEFINE WRITE_AI_HEADER
+#DEFINE WRITE_AI_HEADER_SECOND_ROW
+
+Begin-Report
+  
+  do Init-DateTime
+  do Init-Number
+  do Define-Standard-Vars      !added 4/13/06
+  do assign-year-end-variables
+  
+  do Get-Current-DateTime
+  do stdAPI-Init
+  if #prcs_process_instance <> 0
+    do Format-Number(#prcs_process_instance, $prcs_process_instance, '0999999')
+  end-if
+  
+  Show 'Begin-Report:  Current Date      : ' $Asoftoday
+  Show '               Report Started at : ' $Asofnow
+  show '               Version           : {adpai_version}'
+  show '               Instance          : ' $prcs_process_instance 
+  show '               SITE_ID           : {SITE_ID}'
+
+  show '               Version           : {adpai_version}'
+  show '               Program           : ' $sqr-program
+  show '               Database:           ' $sqr-database
+  show '               Platform:           ' $sqr-platform
+  show '               Username:           ' $username
+  show '               Oprid:              ' $Prcs_OprID
+  show '               RunCtlID:           ' $Prcs_Run_Cntl_ID
+
+  
+#ifdef TRANSLATE_COMPANY_CODES
+  show '               TRANSLATE_COMPANY_CODES enabled. Table: {TRANSLATE_COMPANY_AI_TBL} '
+  create-array name=w2c_company size=1000
+       field=Company:char   
+       field=ADP_Compid:char
+       field=Year:char
+#endif
+#ifdef TRANSLATE_LOCAL_CODES
+  show '               TRANSLATE_LOCAL_CODES enabled. Table: {TRANSLATE_LOCAL_AI_TBL} '
+  create-array name=w2c_local size=10000
+       field=State:char   
+       field=Locality:char
+       field=ADP_Local:char
+       field=Year:char
+#endif
+
+  show '               W2C_Batch_log enabled.'
+  #ifndef W2C_Batch_log_limit
+    #define W2C_Batch_log_limit 10000
+  #endif
+  create-array name=W2C_Batch_log size={W2C_Batch_log_limit}
+       field=W2C_BATCH_NBR:number   
+       field=COMPANY:char
+       field=W2C_ADD_EMPLID:char
+
+  do Get-Current-DateTime
+  move $AsofNow to $ReportStartTime
+ 
+  do input-prompts
+
+  let $Max_Effdt_DTU = $RptYear || '-12-31'
+  Do Convert-From-DTU-Date($Max_Effdt_DTU,$Max_Effdt)
+ 
+  let $Fmt = '-999,999,999.99'
+  
+  show '               Max_Effdt         : ' $Max_Effdt
+  show '               Number Format     : ' $Fmt
+  show '               Report Year       : ' $RptYear
+
+  do Get-Calendar-Year-Id
+  show '$Calendar_Year_Id: ' $Calendar_Year_Id
+
+  do Init-W2c
+  do Get-W2c
+  do Close-W2c  
+  do AI-custom-close 
+
+#ifdef TRANSLATE_COMPANY_CODES
+    do display-company-translations
+#endif
+
+#ifdef TRANSLATE_LOCAL_CODES
+    do display-local-translations
+#endif
+
+  do Get-Current-DateTime
+  show ''
+  show  'Report Started:         ' $ReportStartTime
+  show  'Report Ended:           ' $AsOfNow
+
+  do stdAPI-Term
+
+end-report
+
+begin-procedure input-prompts
+
+ let $SelectEmplid = ''
+  show 'Input-Prompts: criteria: {INPUT_PARAMETERS_CRITERIA}.  #prcs_process_instance = ' #prcs_process_instance edit 999999999 ' $PRCS_PROCESS_INSTANCE = ' $PRCS_PROCESS_INSTANCE
+  if {INPUT_PARAMETERS_CRITERIA}
+
+  show 'Input-Prompts via input statements'
+
+  input $RptYear maxlen=4          'Enter Year  (2011,2012,...) '
+  show 'Input-Prompts: year ' $RptYear
+  input $Batch_From maxlen=4       'Starting Batch              '
+  input $Batch_Thru maxlen=4       'Ending Batch                '
+  input $AllCompanies maxlen=1     'Select ALL Companies? (Y/N) '
+  uppercase $AllCompanies
+  if $AllCompanies = 'N'
+    input $SelectCompany maxlen=4  'Company '
+    uppercase $SelectCompany
+    let $SelectCompany = rtrim($SelectCompany,' ')
+  end-if
+
+  input $SelectEmplid     maxlen=15  'Test Emplid '
+  input $AI_Filename_in   maxlen=254 'AI Output (override) Folder and Name '
+  let $SelectEmplid = rtrim($SelectEmplid,' ')
+  if rtrim($AI_Filename_in,' ') <> ''
+    let $AI_Filename = rtrim($AI_Filename_in,' ')
+  end-if
+  
+  input $TBA_Select  maxlen=1  'None(N), Employee(E), Employer(R), Both(B)'
+  if $TBA_Select <> 'N'
+   input $TBA_FromDate_DTU maxlen=10 'From Date Entered (YYYY-MM-DD) ' type=char
+   if RTRIM($TBA_FromDate_DTU, ' ') <> ''
+     Do Convert-From-DTU-Date($TBA_FromDate_DTU,$TBA_FromDate)
+   end-if
+   input $TBA_ThruDate_DTU maxlen=10 'Thru Date Entered (YYYY-MM-DD) ' type=char
+   if RTRIM($TBA_ThruDate_DTU, ' ') <> ''
+     Do Convert-From-DTU-Date($TBA_ThruDate_DTU,$TBA_ThruDate)
+   end-if
+  end-if
+  
+ else
+    DO Select-Parameters-For-Scheduler
+ end-if
+ 
+ move $Batch_From to #Batch_From
+ move $Batch_Thru to #Batch_Thru
+ move $RptYear to #RptYear
+ move '4'  to $RptQtr 
+ move $RptQtr to #RptQtr
+ 
+ let #RptMonth = #RptQtr * 3
+
+ if $AllCompanies = 'Y'
+    let $CompanySelection = 'AND C.COMPANY > '' '''
+ else
+    if ($SelectCompany = 'ALL') or ($SelectCompany = '')
+       let $CompanySelection = 'AND C.COMPANY > '' '''
+    else
+       let $CompanySelection = 'AND C.COMPANY = ''' || $SelectCompany || ''''
+    end-if
+ end-if
+
+ if $SelectEmplid <> ''
+     let $SelectEmplidSelection     = 'AND C.W2C_ADD_EMPLID = ''' || $SelectEmplid || ''''
+ else
+     let $SelectEmplidSelection     = 'AND C.W2C_ADD_EMPLID <> '' '''
+ end-if
+
+ show 'ADPAI Run Parameters: Batches ' $Batch_From '...' $Batch_Thru ' for year '  $RptYear ' AllCompanies ' $AllCompanies ' ' $SelectCompany ' ' $SelectEmplid
+ show '      TBA Selections:         ' $TBA_Select ' ' $TBA_FromDate '...' $TBA_ThruDate 
+ show '   EMPLID Selections:         ' $SelectEmplidSelection
+ show '  COMPANY Selections:         ' $CompanySelection
+ show ' '
+end-procedure
+
+!----------------------------------------
+Begin-Procedure Select-Parameters-For-Scheduler
+
+#ifdef Process_Scheduler_Enabled
+  show 'Retrieving run control from Table: PS_{Client_Table_Prefix}ADP_AI_RC{Client_Table_Suffix} for  ' $PRCS_OPRID ' ' $PRCS_RUN_CNTL_ID
+   
+Begin-Select
+STD_SP.CALENDAR_YEAR
+STD_SP.{Client_Field_Prefix}ALL_COMPANIES{Client_Field_Suffix}
+STD_SP.{Client_Field_Prefix}SELECT_COMPANY{Client_Field_Suffix}
+STD_SP.{Client_Field_Prefix}BATCH_FROM{Client_Field_Suffix}
+STD_SP.{Client_Field_Prefix}BATCH_THRU{Client_Field_Suffix}
+STD_SP.EMPLID
+STD_SP.FILEREFPATHANDFILE
+STD_SP.{Client_Field_Prefix}TAX_TYPE_SEL{Client_Field_Suffix}
+STD_SP.FROMDATE
+STD_SP.THRUDATE
+
+ Let $RptYear        = to_char(&STD_SP.CALENDAR_YEAR)
+ Let $AllCompanies   = &STD_SP.{Client_Field_Prefix}ALL_COMPANIES{Client_Field_Suffix}
+ Let $SelectCompany  = rtrim(&STD_SP.{Client_Field_Prefix}SELECT_COMPANY{Client_Field_Suffix},' ')
+ Let $SelectEmplid   = rtrim(&STD_SP.EMPLID,' ')
+ Let $Batch_From     = to_char(&STD_SP.{Client_Field_Prefix}BATCH_FROM{Client_Field_Suffix})
+ Let $Batch_Thru     = to_char(&STD_SP.{Client_Field_Prefix}BATCH_THRU{Client_Field_Suffix})
+ Let $TBA_Select     = rtrim(&STD_SP.{Client_Field_Prefix}TAX_TYPE_SEL{Client_Field_Suffix},' ')
+ Let $TBA_FromDate   = &STD_SP.FROMDATE
+ Let $TBA_ThruDate   = &STD_SP.THRUDATE
+
+ if rtrim(&STD_SP.FILEREFPATHANDFILE,' ') <> ''
+   let $AI_Filename = rtrim(&STD_SP.FILEREFPATHANDFILE,' ')
+ end-if
+
+ From PS_{Client_Table_Prefix}ADP_AI_RC{Client_Table_Suffix} STD_SP
+ Where STD_SP.OPRID       = $PRCS_OPRID
+   and STD_SP.RUN_CNTL_ID = $PRCS_RUN_CNTL_ID
+
+End-Select
+
+#else
+   show 'Process_Scheduler_Enabled not enabled, add this definition to adpaic.sqc and build run control'
+   stop
+#endif
+
+End-Procedure
+
+!----------------------------------------------------------------------!
+! Called SQC Procedures                                                !
+!----------------------------------------------------------------------!
+
+
+begin-procedure Init-W2C     
+
+
+    do Define-AI-Columns     ! in adpaii.sqc
+
+    let $Batch_From = rtrim($Batch_From,' ')
+    let $Batch_Thru = rtrim($Batch_Thru,' ')
+
+    do AI-open
+    do AI-custom-open
+    open $AI_Filename as 1 for-writing record=10000:vary status=#filestat
+    if #filestat <> 0
+      show '*** Error on Output File Open *** ' $AI_Filename
+      stop
+    else
+      show 'AI file opened: ' $AI_Filename ', note AI file has {MAX_W2C_COLUMNS} columns.'
+    end-if
+
+    !write first row
+    let $msg = ''
+    let #i = 0
+    while #i < {MAX_W2C_COLUMNS}
+      get $col from w2c_column(#i) Descr_ADP
+      let $msg = $msg || $col
+      add 1 to #i
+ 
+      if #i < {MAX_W2C_COLUMNS}
+        let $msg = $msg || ','
+      end-if
+      
+    end-while
+
+    #ifdef WRITE_AI_HEADER
+      let $msg = rtrim($msg,' ')
+      write 1 from $msg:9000
+    #endif       
+
+    encode <39> into $tick
+
+    !write second row (Boxes)
+    let $msg = ''
+    let #i = 0
+    while #i < {MAX_W2C_COLUMNS}
+      get $box from w2c_column(#i) Box
+      if rtrim($box,' ') <> ''
+        let $msg = $msg || $tick || rtrim($box,' ') || $tick
+      else
+        let $msg = $msg || '  ' 
+      end-if
+      add 1 to #i
+ 
+      if #i < {MAX_W2C_COLUMNS}
+        let $msg = $msg || ','
+      end-if
+      
+    end-while
+
+    #ifdef WRITE_AI_HEADER_SECOND_ROW
+      let $msg = rtrim($msg,' ')
+      write 1 from $msg:9000
+    #endif       
+
+
+    let #lit_col = {MAX_W2C_COLUMNS} - 1
+ 
+end-procedure
+
+begin-procedure init-w2c-data
+
+    let #i = 0
+    while #i < {MAX_W2C_COLUMNS}
+      put '' into w2c_column(#i) value
+      add 1 to #i
+    end-while
+    
+    let $Middle_init =   substr(&C.W2C_MIDDLE_NAME,1,1)
+    let $Current_name  = rtrim(&C.W2C_FNAME,' ') || ' ' || substr(&C.W2C_MIDDLE_NAME,1,1) || ' ' || rtrim(&C.W2C_LNAME,' ')
+    let $Previous_name = rtrim(&C.PRV_YE_FNAME,' ') || ' ' || substr(&C.PRV_YE_MIDDLE_NAME,1,1) || ' ' || rtrim(&C.PRV_YE_LNAME,' ')
+
+    put '{BRANCH_CODE}'        into w2c_column(000) value
+    put &C.COMPANY             into w2c_column(001) value
+    put $Rptyear               into w2c_column(002) value
+    put '4'                    into w2c_column(003) value
+    put &C.W2C_FNAME           into w2c_column(004) value
+    put $Middle_init           into w2c_column(005) value
+    put &C.W2C_LNAME           into w2c_column(006) value
+
+    if $Previous_name <> $Current_name
+      put $Previous_name         into w2c_column(007) value
+    end-if
+    
+    put &C.ADDRESS1            into w2c_column(008) value
+    put &C.CITY                into w2c_column(009) value
+    put &C.STATE               into w2c_column(010) value
+    put &C.POSTAL              into w2c_column(011) value
+
+
+!8/3/2016 insert 012-016 resident fields here
+!----------------------------------------------
+    do Extract-Resident-Address
+    
+    put $Employee_Residential_Address1       into w2c_column(012) value
+    put $Employee_Residential_Address2       into w2c_column(013) value
+    put $Employee_Residential_City           into w2c_column(014) value
+    put $Employee_Residential_State          into w2c_column(015) value
+    put $Employee_Residential_Zip            into w2c_column(016) value
+
+    LET $W2C_SSN  = rtrim(&C.W2C_SSN,' ')
+    put $W2C_SSN   into w2c_column(017) value
+
+    LET $PRV_SSN  = rtrim(&C.PRV_SSN,' ')
+    if $W2C_SSN <> $PRV_SSN
+     put $PRV_SSN  into w2c_column(018) value
+    end-if
+    
+    if &C.STATUTORY_EE <> &C.PRV_STATUTORY_EE
+     put &C.STATUTORY_EE        into w2c_column(019) value
+    end-if
+    if &C.PENSION_PLAN <> &C.PRV_PENSION_PLAN   
+     put &C.PENSION_PLAN        into w2c_column(020) value
+    end-if
+    if &C.THIRDPARTY_SICKPAY <> &C.PRV_THIRDPARTYSICK
+     put &C.THIRDPARTY_SICKPAY  into w2c_column(022) value
+    end-if
+   
+    #ifdef SKIP_EMPLID_and_BATCH_INTO_LITERAL_FIELD
+      put ' ' into w2c_column(#lit_col)  value                        !client defined Batch Emplid (this will cause W-2C amendment)
+    #else
+      let $literal = rtrim(&C.W2C_ADD_EMPLID,' ') || ' ' || $Batch         !no client defined codes allowed.. this is for W-2 free form...
+      let $literal = substr($literal,1,20)
+      put $literal into w2c_column(#lit_col)  value                        !client defined Batch Emplid (this will cause W-2C amendment)
+      show 'writing ' $Literal  ' into w2c_column ' #lit_col edit 9999 ', MAX_W2C_COLUMNS = {MAX_W2C_COLUMNS}'
+    #endif
+    
+    let $amounts = 'f'
+
+  
+end-procedure
+
+begin-procedure init-w2c-amounts
+
+  let #i = 20
+  while #i < {MAX_W2C_COLUMNS} - 1  !don't clear out the client literal (last column)
+    put '' into w2c_column(#i) value
+    add 1 to #i
+  end-while
+  
+end-procedure
+
+begin-procedure Get-w2c
+
+  let $TAXFORM_ID = 'W'
+
+  show 'Get-w2c: Year: ' #RptYear edit '9999' ', Batches: ' #Batch_From edit '9999' '...' #Batch_thru edit '9999'
+   
+begin-SELECT
+C.COMPANY
+C.W2C_ADD_EMPLID
+C.W2C_BATCH_NBR
+C.W2C_SSN
+C.W2C_STATUS
+C.ADDRESS1
+C.ADDRESS2
+C.CITY
+C.STATE
+C.POSTAL
+C.COUNTRY
+C.STATUTORY_EE
+C.PENSION_PLAN
+C.PRV_SSN
+C.PRV_STATUTORY_EE
+C.PRV_PENSION_PLAN
+C.CALENDAR_YEAR
+C.DESCRLONG
+C.PRV_YE_FNAME
+C.PRV_YE_MIDDLE_NAME
+C.PRV_YE_LNAME
+C.W2C_FNAME
+C.W2C_MIDDLE_NAME
+C.W2C_LNAME
+C.THIRDPARTY_SICKPAY
+C.PRV_THIRDPARTYSICK
+
+   #ifdef debug_adpai
+      show ' '
+      show '-------------------------------------------------------------------'
+      show 'W-2C: Batch: ' &C.W2C_BATCH_NBR edit 9999 ' Company ' &C.COMPANY ' Emplid ' &C.W2C_ADD_EMPLID ' LastName ' &C.W2C_LNAME
+   #endif
+   
+   let $Batch = to_char(&C.W2C_BATCH_NBR)
+   do Init-w2c-data
+   do Load-Amounts-W2C                  !Get Batches 1..W2C_BATCH_NBR mods, overlay W-2 data
+   if $amounts = 'f'
+     do Write-w2c
+   end-if
+   
+   !20141110 - see if we've already pulled in the TBA's for this company/emplid
+   !---------------------------------------------------------------------------
+   let $Include-ER-TBA = 't'
+   let #w2c_er_inx = 0
+   while #w2c_er_inx < #W2C_Batch_log
+     get #w2c_batch $w2c_comp $w2c_empl from W2C_Batch_log(#w2c_er_inx) W2C_BATCH_NBR COMPANY W2C_ADD_EMPLID
+     if rtrim($w2c_comp,' ') = rtrim(&C.COMPANY,' ') and rtrim($w2c_empl,' ') = rtrim(&C.W2C_ADD_EMPLID,' ')
+      let $Include-ER-TBA = 'f'
+      show 'Skipping TBAs for batch ' &C.W2C_BATCH_NBR edit 9999 ', Company ' $w2c_comp ', Emplid ' $w2c_empl ' as this associates TBAs have already been handled in batch ' #w2c_batch edit 9999
+      break
+     end-if
+     add 1 to #w2c_er_inx
+   end-while
+   
+   if $Include-ER-TBA = 't'
+     do Include-ER-TBA
+   end-if
+   
+   if #W2C_Batch_log < {W2C_Batch_log_limit}
+    put &C.W2C_BATCH_NBR &C.COMPANY &C.W2C_ADD_EMPLID into W2C_Batch_log(#W2C_Batch_log) W2C_BATCH_NBR COMPANY W2C_ADD_EMPLID
+    add 1 to #W2C_Batch_log
+   else
+     show 'Error: increase W2C_Batch_log_limit from {W2C_Batch_log_limit} in adpaic.sqc'
+     stop
+   end-if
+   !--------------------------------------------------------------------------
+   
+ FROM  PS_YE_W2C_DATA C
+
+  WHERE C.CALENDAR_YEAR    = #RptYear
+    AND C.W2C_STATUS       = 'C'   !Closed only data is pulled
+    AND C.W2C_TAXFORM_ID   = 'W'
+    AND C.W2C_BATCH_NBR >= #Batch_From 
+    AND C.W2C_BATCH_NBR <= #Batch_Thru
+
+     #ifdef MVS                   !OS400 - /.../, NT - [...], MVS - \...\
+       \$SelectEmplidSelection\
+     #else
+       [$SelectEmplidSelection]
+     #endif
+     
+     #ifdef MVS                   !OS400 - /.../, NT - [...], MVS - \...\
+       \$CompanySelection\
+     #else
+       [$CompanySelection]
+     #endif
+     
+  ORDER by C.W2C_BATCH_NBR, C.COMPANY, C.W2C_ADD_EMPLID
+
+end-SELECT
+
+end-procedure
+
+
+begin-procedure Load-Amounts-W2C
+
+
+begin-SELECT
+DW2C.STATE
+DW2C.LOCALITY
+DW2C.BOX
+DW2C.CURRENT_AMOUNT
+DW2C.PRV_AMOUNT
+DW2C.W2C_BATCH_NBR
+DW2C.W2C_ADD_EMPLID
+#ifdef PAACT_32_11F_Logic
+DW2C.RES_PSD_CD
+#endif
+
+    
+  do init-w2c-amounts
+  let $Box = RTRIM(&DW2C.BOX,' ')
+  move $Box to $Bx xx
+
+  let $State = rtrim(&DW2C.STATE,' ')         !11/12/01
+  let $Local = rtrim(&DW2C.LOCALITY,' ')   !11/12/01
+  if $State = ''
+     let $State = '$U'
+  end-if
+
+  let $amounts = 'f'
+
+  let #Cur_Amount = &DW2C.CURRENT_AMOUNT
+  let #Prv_Amount = &DW2C.PRV_AMOUNT
+  let #Amount = #Cur_Amount - #Prv_Amount
+
+  let $Fmt = '99999999999.99'
+  do Format-Number(#Cur_Amount,    $Cur_Amount, $Fmt)
+  do Format-Number(#Prv_Amount,    $Prv_Amount, $Fmt)
+  do Format-Number(#Amount,        $Amount,     $Fmt)
+
+
+  #ifdef debug_adpai
+   show 'W-2C: Box:   ' $Box ', State ' $State ', Local ' $Local ', Prev: ' $Prv_Amount ', Cur: ' $Cur_Amount ', Diff: ' $amount 
+  #endif
+
+  let #index = 0
+  if ($Box = $YE_Med_Tax or $Box = $YE_Med_Wages) and #RptYear >= 2013    !20141104 - from 2013 we need to calculate these based on the YE_MED_Wages due to the additional Med
+    goto skip_index
+  end-if
+  
+  do get-index-using-box
+  
+ skip_index:
+ 
+  #ifdef debug_adpai
+     show 'Load-Amounts-W2C:   Box ' $Box ', get-index-using-box = ' #index edit 999
+  #endif
+  
+  if #index = 0
+   evaluate $Box
+    when =  $YE_State_Wages
+          put $State  into w2c_column(118) value
+          put $Amount into w2c_column(119) value
+          put $Amount into w2c_column(120) value
+          let $amounts = 't'
+          break
+    when =  $YE_State_Tax               
+          put $State  into w2c_column(118) value
+          put $Amount into w2c_column(121) value
+          put $Amount into w2c_column(122) value
+          let $amounts = 't'
+          break
+    when =  $YE_Local_Wages            
+          put $State  into w2c_column(192) value
+          put $Local  into w2c_column(193) value
+          put $Amount into w2c_column(196) value
+          put $Amount into w2c_column(197) value
+          put $Amount into w2c_column(198) value
+          put $Amount into w2c_column(199) value
+          #ifdef PAACT_32_11F_Logic
+           if rtrim(&DW2C.RES_PSD_CD,' ') <> ''
+             put &DW2C.RES_PSD_CD into w2c_column(193) value  !GG
+           end-if
+          #else
+           if rtrim(&DW2C.LOCALITY,' ') <> ''
+             put &DW2C.LOCALITY into w2c_column(194) value    !GH
+           end-if
+          #endif
+          let $amounts = 't'
+          break
+          
+    when =  $YE_Local_Tax
+          put $State  into w2c_column(192) value  !04232013
+          put $Local  into w2c_column(193) value
+          put $Amount into w2c_column(200) value
+          put $Amount into w2c_column(201) value
+          #ifdef PAACT_32_11F_Logic
+           if rtrim(&DW2C.RES_PSD_CD,' ') <> ''
+             put &DW2C.RES_PSD_CD into w2c_column(194) value     
+           end-if
+          #else
+           if rtrim(&DW2C.LOCALITY,' ') <> ''
+             put &DW2C.LOCALITY into w2c_column(195) value    
+           end-if
+          #endif
+          let $amounts = 't'
+          break
+
+    when-other
+     if $Bx = '14'
+        do w2c-get-box-type
+        evaluate $Box
+          when = $YE_OtherA  !CA SDI - 14A is a tax that needs to be converted to a wage amount
+          
+            let #calc_wages = 0
+            do get-oth-state-tax-rate
+            if #rate > 0
+              let #calc_wages = #amount / #rate
+            end-if
+            do Format-Number(#calc_wages,        $calc_wages,     $Fmt)
+
+            put $State      into w2c_column(131) value
+            put $Calc_wages into w2c_column(141) value    !Subject Wages EE QTD
+            put $Calc_wages into w2c_column(142) value    !Subject Wages EE YTD
+            if $State <> 'CA'
+              put $Calc_wages into w2c_column(143) value   !06182013 (no ER QTD)
+              put $Calc_wages into w2c_column(144) value   !06182013 (no ER YTD)
+            end-if
+            put $Calc_wages into w2c_column(145) value    !Taxable Wages EE QTD
+            put $Calc_wages into w2c_column(146) value    !Taxable Wages EE QTD
+            let $amounts = 't'
+            break
+          when = $YE_OtherB  !20130222: CA VDI - 14B is a tax that needs to be converted to a wage amount
+          
+            let #calc_wages = 0
+            do get-state-tax-rate
+            if #rate > 0
+              let #calc_wages = (#amount / #rate) * 100  !04232013
+            end-if
+            do Format-Number(#calc_wages,        $calc_wages,     $Fmt)
+
+            put $State      into w2c_column(131) value
+            put $Calc_wages into w2c_column(153) value    !14B
+            put $Calc_wages into w2c_column(154) value    !14B
+            let $amounts = 't'
+            break
+          
+          ! NOTE,  other Box 14x items (other than the standard 14A and 14B) logic should be placed here
+          !
+          ! ---------------------------------------------------------------------------------------------
+            when-other
+              #ifdef CUSTOM_W2C_Box_14
+                do Custom-W2C-Box-14   !in adpaic.sqc
+              #endif
+            break
+          end-evaluate
+      end-if
+    end-evaluate
+  
+!20141104
+!--------
+  
+    #ifdef debug_adpai
+         show 'W-2C, *** Special logic for Box ' $Bx 
+    #endif
+    
+    !Med Taxes and wages, both normal and surcharge handled here for 2013+
+    !-------------------------------------------------------------------------
+    if $Bx = $YE_Med_Wages and #RptYear >= 2013
+       let #WageEE_Diff = #Amount
+       let #TaxEE_Diff  = #Amount * 0.0145
+       let $Fmt = '99999999999.99'
+       do Format-Number(#WageEE_Diff,    $WageEE_Diff, $Fmt)
+       do Format-Number(#TaxEE_Diff,     $TaxEE_Diff, $Fmt)
+       put $WageEE_Diff into w2c_column(041) value      
+       put $WageEE_Diff into w2c_column(043) value      
+       put $WageEE_Diff into w2c_column(049) value      
+       put $WageEE_Diff into w2c_column(050) value      
+       put $TaxEE_Diff  into w2c_column(045) value      
+       put $TaxEE_Diff  into w2c_column(047) value      
+       
+       let $medee_surcharge = 'f'
+       if #Cur_Amount > 200000 !now for addl medicare
+          let $medee_surcharge = 't'
+          let #addl_cur_wages = #Cur_Amount - 200000       
+       else
+         let #addl_cur_wages = 0
+       end-if
+       
+       if #Prv_Amount > 200000
+          let $medee_surcharge = 't'
+          let #addl_prv_wages = #Prv_Amount - 200000       
+          if #addl_prv_wages < 0
+            let #addl_prv_wages = 0
+          end-if
+       else
+         let #addl_prv_wages = 0
+       end-if
+
+       if $medee_surcharge = 't'
+        let #WageEE_Diff = #addl_cur_wages - #addl_prv_wages
+        let #TaxEE_Diff  = #WageEE_Diff * 0.009
+        do Format-Number(#WageEE_Diff,    $WageEE_Diff, $Fmt)
+        do Format-Number(#TaxEE_Diff,     $TaxEE_Diff, $Fmt)
+        put $WageEE_Diff into w2c_column(042) value          !Addl Med EE wages QTD
+        put $WageEE_Diff into w2c_column(044) value          !Addl Med EE wages YTD
+        put $TaxEE_Diff  into w2c_column(046) value          !Addl Med EE taxes QTD
+        put $TaxEE_Diff  into w2c_column(048) value          !Addl Med EE taxes YTD
+       end-if
+
+    let $amounts = 't'
+
+    #ifdef debug_adpai
+       show 'W-2C, Med Surcharge.  Box ' $Bx ', medee_surcharge: ' $medee_surcharge ', Surcharge Wage Diff = ' $WageEE_Diff ', Surcharge Tax Diff = ' $TaxEE_Diff
+    #endif
+    
+   end-if
+   
+
+      
+!-----------------------------
+
+
+    !payroll tax break for 2011 and 2012 - 20130222
+    if $Bx = $YE_SS_Tax and (#RptYear = 2011 or #RptYear = 2012) !payroll tax break for 2011 and 2012
+
+       let #TaxER_Diff = ((#Cur_Amount - #Prv_Amount) / .042) * .062  !04232013
+       let $Fmt = '99999999999.99'
+       do Format-Number(#TaxER_Diff,    $TaxER_Diff, $Fmt)
+
+       put $TaxER_Diff into w2c_column(037) value      !'Differences Social Sec Employer Tax QTD' $YE_SS_Tax into w2c_column(032)
+       put $TaxER_Diff into w2c_column(038) value      !'Differences Social Sec Employer Tax YQTD' $YE_SS_Tax into w2c_column(033)
+       let $amounts = 't'
+       
+       #ifdef debug_adpai
+         show 'Calc ER FICA Payroll tax holiday, Bx ' $Bx ', calculated Social Sec employer tax ' $TaxER_Diff
+       #endif
+       
+    end-if
+  
+  !   Aug 16, 2013   If an adjustment to New Hire Credits 12CC -->                   !
+  !                   then an equal offsetting (negative) 
+  !                   value should be entered in the corresponding 
+  !                   Differences Social Sec Employer Wages.                         
+  !                   (030/AE) = - (034/AI)
+  !                   (031/AF) = - (035/AJ)
+
+    if ($Bx = $HIRE_exempt_wages) 
+
+       let #WageER_Diff = 0 - #Amount 
+       let $Fmt = '99999999999.99'
+       do Format-Number(#WageER_Diff, $WageER_Diff, $Fmt)
+
+       put $WageER_Diff into w2c_column(035) value      !'Differences Social Sec Employer Wages QTD'
+       put $WageER_Diff into w2c_column(036) value      !'Differences Social Sec Employer Wages YTD'
+       let $amounts = 't'
+       
+       #ifdef debug_adpai
+         show 'New Hire Act, Bx ' $Bx ', Social Sec employer wages adjusted to: ' $WageER_Diff
+       #endif
+       
+    end-if
+
+   end-if
+   
+   if $amounts = 't'
+      do Write-w2c
+   end-if
+   
+   FROM  PS_YE_W2C_AMOUNTS DW2C
+    WHERE  DW2C.W2C_BATCH_NBR   = &C.W2C_BATCH_NBR        !6/2... <= changed to = as this query gets called for each batch
+     AND   DW2C.COMPANY         = &C.COMPANY
+     AND   DW2C.W2C_ADD_EMPLID  = &C.W2C_ADD_EMPLID
+     AND   DW2C.CALENDAR_YEAR   = &C.CALENDAR_YEAR
+  
+    ORDER by DW2C.BOX
+
+end-SELECT
+
+end-procedure
+
+begin-procedure get-index-using-box
+
+  let #i = 1
+  while #i < {MAX_W2C_COLUMNS}
+      get $boxtst from w2c_column(#i) box
+      if rtrim($boxtst,' ') = $box
+        let #index = #i
+        put $Amount into w2c_column(#index) value
+	let $amounts = 't'
+      end-if
+      add 1 to #i
+  end-while
+ 
+end-procedure
+
+
+
+
+begin-procedure Write-w2c
+
+  let $s = ''
+  let #i = 0
+  while #i < {MAX_W2C_COLUMNS}
+      get $value $typ $dscr from w2c_column(#i) value col_type Descr_ADP
+
+      if $typ = 'T'
+        do filter-field  !filters commas out of text fields to keep shifting from occuring
+      end-if
+
+      #ifdef TRANSLATE_COMPANY_CODES
+         if rtrim($dscr,' ') = 'Company Code' 
+             do Translate-Company-Codes
+             move $ADP_Compid to $value
+         end-if
+      #endif
+
+      #ifdef TRANSLATE_LOCAL_CODES
+         if rtrim($dscr,' ') = 'State for Local'
+           let $local_st_code = $value
+         end-if
+         if (rtrim($dscr,' ') = 'Local Code' or  rtrim($dscr,' ') = 'Lived In ADP Local Code (PA Only)' )
+           and rtrim($value,' ') <> ''
+             do Translate-Local-Codes
+             move $ADP_Local to $value
+         end-if
+      #endif
+
+      evaluate $typ
+        when = 'G'
+          !if rtrim($value,' ') = ''
+          !  let $value = ' '
+          !end-if
+          let $s = $s || $value
+          break
+        when = 'T'
+          !if rtrim($value,' ') = ''
+          !  let $value = ' '
+          !end-if
+          let $s = $s || $value
+          break
+        when = 'N'
+!          if rtrim($value,' ') = ''
+!            let $value = '0'
+!          end-if
+          let $s = $s || $value
+          break
+        when-other
+          show 'invalid column type (w2c_column) ' $typ ' index ' #i edit 9999
+          stop
+      end-evaluate
+          
+      add 1 to #i
+      if #i < {MAX_W2C_COLUMNS}
+        let $s = $s || ','
+      end-if
+  end-while
+   
+  write 1 from $s:6500
+  
+  add 1 to #ai_record_count
+     
+end-procedure
+
+
+begin-procedure w2c-get-box-type
+
+  let $w2c_amount_type = ''
+  let $w2c_tax_class   = ''
+  let $w2c_box_descr   = ''
+
+  #ifdef debug_adpai_details
+    show 'w2c-get-box-type: query against: PS_TAXFORM_TAX, PS_TAXFORM_BOX ' $Box ' ' $TAXFORM_ID ' ' $Max_Effdt
+  #endif
+  
+begin-SELECT
+TW2C.AMOUNT_TYPE
+TW2C.TAX_CLASS
+
+  let $w2c_tax_class   = rtrim(&TW2C.TAX_CLASS,' ')
+  let $w2c_amount_type = rtrim(&TW2C.AMOUNT_TYPE,' ')  !'G' for wages, 'T' for Taxes
+  
+ FROM  PS_TAXFORM_TAX TW2C
+ WHERE TW2C.TAXFORM_ID = $TAXFORM_ID
+   AND TW2C.BOX        = $Box
+   AND TW2C.EFFDT = (SELECT MAX(EFFDT)
+       FROM   PS_TAXFORM_TAX  
+       WHERE  TAXFORM_ID  = TW2C.TAXFORM_ID
+         AND  BOX         = TW2C.BOX
+         AND  EFFDT      <= $Max_Effdt)
+   
+end-select
+
+begin-SELECT
+SW2C.DESCRSHORT
+
+  let $w2c_box_descr = rtrim(&SW2C.DESCRSHORT,' ')
+  
+ FROM  PS_TAXFORM_BOX SW2C
+ WHERE SW2C.TAXFORM_ID = $TAXFORM_ID
+   AND SW2C.BOX        = $Box
+   AND SW2C.EFFDT = (SELECT MAX(EFFDT)
+       FROM   PS_TAXFORM_BOX  
+       WHERE  TAXFORM_ID  = SW2C.TAXFORM_ID
+         AND  BOX         = SW2C.BOX
+         AND  EFFDT      <= $Max_Effdt)
+
+end-select
+
+  #ifdef debug_adpai_details
+    show 'w2c-get-box-type: results: ' $Box ' ' $w2c_box_descr ' ' $w2c_tax_class ' ' $w2c_amount_type
+  #endif
+
+end-procedure
+
+begin-procedure get-oth-state-tax-rate
+
+begin-SELECT
+FICALM.TAX_RT
+
+   let #rate = &FICALM.TAX_RT
+
+ FROM  PS_ST_OTH_TAX_TBL FICALM 
+ WHERE FICALM.STATE      = &DW2C.STATE
+   AND FICALM.TAX_CLASS  = 'D'
+   AND FICALM.TAX_TYPE   = 'G'
+   AND FICALM.TAXGR_BASE = 'D'
+   AND FICALM.EFFDT = (SELECT MAX(EFFDT)
+       FROM   PS_ST_OTH_TAX_TBL  
+       WHERE  STATE       = FICALM.STATE
+         AND  TAX_CLASS   = FICALM.TAX_CLASS
+         AND  EFFDT      <= $Max_Effdt)
+         
+end-select
+
+   #ifdef debug_adpai_details
+     show 'get-oth-state-tax-rate: '  &DW2C.STATE ' ' &DW2C.STATE ' ' $Max_Effdt ' --> ' #rate
+   #endif
+   
+end-procedure
+
+begin-procedure get-state-tax-rate
+
+  let #rate = 0
+
+begin-select
+SDI.VDI_EE_RT
+SDI.VDI_ER_RT
+
+   let #rate = &SDI.VDI_EE_RT
+
+  FROM  PS_CO_STATETAX_TBL SDI
+  WHERE SDI.COMPANY = &C.COMPANY
+    AND SDI.STATE   = &DW2C.STATE
+    AND EFFDT = (SELECT MAX(EFFDT)
+       FROM   PS_CO_STATETAX_TBL
+       WHERE  COMPANY           = SDI.COMPANY
+         AND  STATE             = SDI.STATE
+         AND  EFFDT            <= $Max_Effdt)
+  
+
+end-select
+
+   #ifdef debug_adpai_details
+     show 'get-state-tax-rate: ' &C.COMPANY ' ' &DW2C.STATE ' ' $Max_Effdt ' --> ' #rate
+   #endif
+   
+end-procedure
+
+
+begin-procedure Include-ER-TBA
+
+ if #debug_adpai_details < 1
+   show 'Include-ER-TBA: ' &C.COMPANY ' ' &C.W2C_ADD_EMPLID ' ' $Calendar_Year_Id ' ' #RptYear edit '9999' ' ' #RptQtr edit '9'
+   show '                ' $TBA_Select ' ' $TBA_FromDate '...' $TBA_ThruDate
+   add 1 to #debug_adpai_details
+ end-if
+   
+ if $TBA_Select = 'N' or rtrim($TBA_Select,' ') = '' or rtrim($TBA_FromDate,' ') = '' or rtrim($TBA_ThruDate,' ') = ''
+   goto no_tba
+ end-if
+
+begin-SELECT
+SADJ.EMPLID
+SADJ.COMPANY
+SADJ.STATE
+SADJ.LOCALITY
+SADJ.TAX_CLASS
+SADJ.BALANCE_QTR
+SADJ.BALANCE_PERIOD
+SADJ.NLGRS_ADJ
+SADJ.TXGRS_ADJ
+SADJ.TAX_ADJ
+SADJ.DT_ENTERED
+SADJ.BALANCE_ID
+SADJ.BALANCE_YEAR
+SADJ.BAL_ADJ_SEQ
+SADJ.ADJ_REASON
+#ifdef PAACT_32_11F_Logic     
+SADJ.WORK_PSD_CD
+SADJ.RES_PSD_CD 
+#endif
+
+  let $ADJ.EMPLID       =  	 rtrim(&SADJ.EMPLID,' ')
+  let $ADJ.COMPANY	=	 rtrim(&SADJ.COMPANY,' ')
+  let $ADJ.STATE	=	 rtrim(&SADJ.STATE,' ')
+  let $ADJ.LOCALITY	=	 &SADJ.LOCALITY
+  let $ADJ.TAX_CLASS	=	 rtrim(&SADJ.TAX_CLASS,' ')
+  let #ADJ.BALANCE_QTR	=	 &SADJ.BALANCE_QTR
+  let #ADJ.BALANCE_PERIOD =      &SADJ.BALANCE_PERIOD
+  let #ADJ.NLGRS_ADJ	=	 &SADJ.NLGRS_ADJ
+  let #ADJ.TXGRS_ADJ	=	 &SADJ.TXGRS_ADJ
+  let #ADJ.TAX_ADJ	=	 &SADJ.TAX_ADJ
+  let $ADJ.DT_ENTERED	=	 rtrim(&SADJ.DT_ENTERED,' ')
+  let $ADJ.BALANCE_ID	=	 rtrim(&SADJ.BALANCE_ID,' ')
+  let #ADJ.BALANCE_YEAR	= 	 &SADJ.BALANCE_YEAR
+  let #ADJ.BAL_ADJ_SEQ	=	 &SADJ.BAL_ADJ_SEQ
+  #ifdef PAACT_32_11F_Logic
+    let $ADJ.WORK_PSD_CD    =  	 rtrim(&SADJ.WORK_PSD_CD,' ')
+    let $ADJ.RES_PSD_CD     =  	 rtrim(&SADJ.RES_PSD_CD,' ')
+  #endif
+
+  let $tba_amounts = 'f'
+  do Init-tba-data
+  do Format-Number(#ADJ.TAX_ADJ,      $ADJ.TAX_ADJ,   $Fmt)
+  do Format-Number(#ADJ.TXGRS_ADJ,    $ADJ.TXGRS_ADJ, $Fmt)
+  do Format-Number(#ADJ.NLGRS_ADJ,    $ADJ.NLGRS_ADJ, $Fmt)
+
+  #ifdef debug_adpai
+    show 'TBA: ' &C.W2C_FNAME ' ' $Middle_init ' ' &C.W2C_LNAME ', Emplid: ' $ADJ.EMPLID ', COMP: ' $ADJ.COMPANY ', Q' #ADJ.BALANCE_QTR edit '9' ', P' #ADJ.BALANCE_PERIOD edit '99' ', DATE ' $ADJ.DT_ENTERED ' ' &SADJ.ADJ_REASON
+    show '             STATE    ' $ADJ.STATE $ADJ.TAX_CLASS $ADJ.LOCALITY
+    show '           TAX_QTD    ' $ADJ.TAX_ADJ    edit $$$,$$$,$$$.$$
+    show '         TXGRS_QTD    ' $ADJ.TXGRS_ADJ  edit $$$,$$$,$$$.$$
+    show '         NLGRS_QTD    ' $ADJ.NLGRS_ADJ  edit $$$,$$$,$$$.$$
+    #ifdef PAACT_32_11F_Logic
+     show '        RES_PSD_CD    ' $ADJ.RES_PSD_CD ', WORK_PSD_CD    ' $ADJ.WORK_PSD_CD
+    #endif
+  #endif
+
+  evaluate $TBA_Select 
+   when = 'B'   !EE/ER
+     !SUI
+     if $ADJ.STATE <> '$U' and $ADJ.TAX_CLASS = 'U'
+       put $ADJ.STATE     into w2c_column(131) value
+       put $ADJ.NLGRS_ADJ into w2c_column(132) value     !QTD NLGRS
+       put $ADJ.NLGRS_ADJ into w2c_column(133) value     !YTD NLGRS
+       put $ADJ.TXGRS_ADJ into w2c_column(134) value     !QTD TXGRS
+       put $ADJ.TXGRS_ADJ into w2c_column(135) value     !YTD TXGRS
+       let $tba_amounts = 't'
+     end-if
+     if $ADJ.STATE <> '$U' and $ADJ.TAX_CLASS = '6'
+       put $ADJ.STATE     into w2c_column(131) value
+       put $ADJ.TXGRS_ADJ into w2c_column(155) value     !QTD TXGRS State FUTA
+       put $ADJ.TXGRS_ADJ into w2c_column(156) value     !YTD TXGRS State FUTA
+       let $tba_amounts = 't'
+     end-if
+     
+     !FUTA
+     if $ADJ.STATE = '$U' and $ADJ.TAX_CLASS = 'U'
+       put $ADJ.NLGRS_ADJ into w2c_column(060) value     !YTD NLGRS
+       put $ADJ.TXGRS_ADJ into w2c_column(061) value     !QTD TXGRS
+       put $ADJ.TXGRS_ADJ into w2c_column(062) value     !YTD TXGRS
+       let $tba_amounts = 't'
+     end-if
+
+     if rtrim($ADJ.LOCALITY,' ') <> '' and $ADJ.TAX_CLASS = 'R'
+       do Local-ER-TBA
+       let $tba_amounts = 't'
+     end-if
+
+     break
+   when = 'E'   !EE                         
+     break
+   when = 'R'   !ER
+     !SUI
+     if $ADJ.STATE <> '$U' and $ADJ.TAX_CLASS = 'U'
+       put $ADJ.STATE     into w2c_column(131) value
+       put $ADJ.NLGRS_ADJ into w2c_column(132) value     !QTD NLGRS
+       put $ADJ.NLGRS_ADJ into w2c_column(133) value     !YTD NLGRS
+       put $ADJ.TXGRS_ADJ into w2c_column(134) value     !QTD TXGRS
+       put $ADJ.TXGRS_ADJ into w2c_column(135) value     !YTD TXGRS
+       let $tba_amounts = 't'
+     end-if
+     if $ADJ.STATE <> '$U' and $ADJ.TAX_CLASS = '6'
+       put $ADJ.STATE     into w2c_column(131) value
+       put $ADJ.TXGRS_ADJ into w2c_column(155) value     !QTD TXGRS State FUTA
+       put $ADJ.TXGRS_ADJ into w2c_column(156) value     !YTD TXGRS State FUTA
+       let $tba_amounts = 't'
+     end-if
+    
+     !FUTA
+     if $ADJ.STATE = '$U' and $ADJ.TAX_CLASS = 'U'
+       put $ADJ.NLGRS_ADJ into w2c_column(060) value     !YTD NLGRS
+       put $ADJ.TXGRS_ADJ into w2c_column(061) value     !QTD TXGRS
+       put $ADJ.TXGRS_ADJ into w2c_column(062) value     !YTD TXGRS
+       let $tba_amounts = 't'
+     end-if
+
+     if rtrim($ADJ.LOCALITY,' ') <> '' and $ADJ.TAX_CLASS = 'R'
+       do Local-ER-TBA
+       let $tba_amounts = 't'
+     end-if
+
+     break
+   when-other
+     break
+  end-evaluate
+
+   if $tba_amounts = 't'
+     do Write-w2c
+   end-if
+    
+  FROM PS_BAL_ADJ_TAX SADJ
+   WHERE   SADJ.COMPANY      = &C.COMPANY
+     AND   SADJ.EMPLID       = &C.W2C_ADD_EMPLID
+     AND   SADJ.BALANCE_ID   = $Calendar_Year_Id
+     AND   SADJ.BALANCE_YEAR = #RptYear
+     AND   SADJ.BALANCE_QTR  = #RptQtr
+     AND  ( (SADJ.DT_ENTERED >= $TBA_FromDate) AND (SADJ.DT_ENTERED <= $TBA_ThruDate) )
+    
+     Order by SADJ.COMPANY, SADJ.EMPLID, SADJ.STATE, SADJ.TAX_CLASS, SADJ.BALANCE_PERIOD
+     
+#ifdef SELECT_WITH_UR
+ {SELECT_WITH_UR} with ur
+#endif
+end-select
+
+no_tba:
+
+end-procedure
+
+begin-procedure Local-ER-TBA
+
+   put $ADJ.State     into w2c_column(192) value
+   put $ADJ.LOCALITY  into w2c_column(193) value
+
+   put $ADJ.TAX_ADJ into w2c_column(200) value    !QTD Tax Adj
+   put $ADJ.TAX_ADJ into w2c_column(201) value    !YTD Tax Adj
+
+   put $ADJ.NLGRS_ADJ into w2c_column(196) value  !QTD Nlgrs Adj
+   put $ADJ.NLGRS_ADJ into w2c_column(197) value  !YTD Nlgrs Adj
+   put $ADJ.TXGRS_ADJ into w2c_column(198) value  !QTD Txgrs Adj
+   put $ADJ.TXGRS_ADJ into w2c_column(199) value  !YTD Txgrs Adj
+   
+   #ifdef PAACT_32_11F_Logic
+    if rtrim($ADJ.RES_PSD_CD,' ') <> ''
+      put $ADJ.RES_PSD_CD into w2c_column(194) value      !GG  Lived in PSD
+    end-if
+   #else
+    if rtrim($ADJ.LOCALITY,' ') <> ''
+      put $ADJ.LOCALITY into w2c_column(195) value        !GH  Lived in ADP Local
+    end-if
+   #endif
+          
+
+end-procedure
+
+begin-procedure init-tba-data
+
+    let #i = 0
+    while #i < {MAX_W2C_COLUMNS}
+      put '' into w2c_column(#i) value
+      add 1 to #i
+    end-while
+    
+    let $Middle_init   = substr(&C.W2C_MIDDLE_NAME,1,1)
+    let $Current_name  = rtrim(&C.W2C_FNAME,' ') || ' ' || substr(&C.W2C_MIDDLE_NAME,1,1) || ' ' || rtrim(&C.W2C_LNAME,' ')
+
+    put '{BRANCH_CODE}'        into w2c_column(000) value
+    put $ADJ.COMPANY           into w2c_column(001) value
+    put $Rptyear               into w2c_column(002) value
+    put '4'                    into w2c_column(003) value
+
+    put &C.W2C_FNAME           into w2c_column(004) value
+    put $Middle_init           into w2c_column(005) value
+    put &C.W2C_LNAME           into w2c_column(006) value
+
+    if $Previous_name <> $Current_name
+      put $Previous_name         into w2c_column(007) value
+    end-if
+    
+    put &C.ADDRESS1            into w2c_column(008) value
+    put &C.CITY                into w2c_column(009) value
+    put &C.STATE               into w2c_column(010) value
+    put &C.POSTAL              into w2c_column(011) value
+
+    LET $W2C_SSN  = rtrim(&C.W2C_SSN,' ')
+    put $W2C_SSN   into w2c_column(017) value
+
+end-procedure
+
+begin-procedure assign-year-end-variables  !mirror w2.sqc, but don't use it due to &tx.balance_year requirement
+
+         let $YE_Fed_Wages               = '01'
+         let $YE_Fed_Tax                 = '02'
+         let $YE_SS_Wages                = '03'
+         let $YE_SS_Tax                  = '04'
+         let $YE_Med_Wages               = '05'
+         let $YE_Med_Tax                 = '06'
+         let $YE_SS_Tips                 = '07'
+         let $YE_Alloc_Tips              = '08'
+         let $YE_Adv_EIC                 = '09'
+         let $YE_Dep_Care                = '10'
+         let $YE_Non_Qual_457            = '11'
+         let $YE_Non_Qual_457_Y          = '11A'
+         let $YE_Non_Qual_457_N          = '11B'
+         let $YE_Box12_StartPos          = '12'
+         let $YE_Uncoll_SS_Tax_On_Tips   = '12A'
+         let $YE_Uncoll_Med_Tax_On_Tips  = '12B'
+         let $YE_Group_Term_Life         = '12C'
+         let $YE_401K                    = '12D'
+         let $YE_403B                    = '12E'
+         let $YE_408K                    = '12F'
+         let $YE_457B                    = '12G'
+         let $YE_501C18D                 = '12H'
+         let $YE_Sick_Pay                = '12J'
+         let $YE_Excise_Tax              = '12K'
+         let $YE_Business_Exp            = '12L'
+         let $YE_Uncoll_SS_Tax_GTL       = '12M'
+         let $YE_Uncoll_Med_Tax_GTL      = '12N'
+         let $YE_Excl_Moving_Exp         = '12P'
+         let $YE_Basic_Qtrs_and_Subsist  = '12Q'
+         let $YE_Med_Svgs_Acct           = '12R'
+         let $YE_408P_Simple_Retirement  = '12S'
+         let $YE_Adoption_Exp            = '12T'
+         let $YE_NonStatutory_Stock_Opt  = '12V'
+         let $YE_Health_Savings_Acct     = '12W'
+         let $YE_deferral_409a           = '12Y'
+         let $YE_income_409a             = '12Z'
+         let $YE_Statut_EE               = '13A'
+         let $YE_Retire_Plan             = '13B'
+         let $YE_Third_Party_Sick_Pay    = '13C'
+         let $YE_Other                   = '14'
+         let $YE_OtherA                  = '14A'
+         let $YE_OtherB                  = '14B'
+         let $YE_OtherC                  = '14C'
+         let $YE_OtherD                  = '14D'
+         let $YE_OtherE                  = '14E'
+         let $YE_OtherF                  = '14F'
+         let $YE_OtherG                  = '14G'
+         let $YE_OtherH                  = '14H'
+         let $YE_OtherI                  = '14I'
+         let $YE_OtherJ                  = '14J'
+         let $YE_OtherK                  = '14K'
+         let $YE_OtherL                  = '14L'
+         let $YE_OtherM                  = '14M'
+         let $YE_OtherN                  = '14N'
+         let $YE_OtherO                  = '14O'
+         let $YE_OtherP                  = '14P'
+         let $YE_OtherQ                  = '14Q'
+         let $YE_OtherR                  = '14R'
+         let $YE_OtherS                  = '14S'
+         let $YE_OtherT                  = '14T'
+         let $YE_OtherU                  = '14U'
+         let $YE_OtherV                  = '14V'
+         let $YE_OtherW                  = '14W'
+         let $YE_OtherX                  = '14X'
+         let $YE_OtherY                  = '14Y'
+         let $YE_OtherZ                  = '14Z'
+         let $YE_State                   = '15'
+         let $YE_State_ID                = '15A'
+         let $YE_State_Wages             = '16'
+         let $YE_State_Tax               = '17'
+         let $YE_Local_Wages             = '18'
+         let $YE_Local_Tax               = '19'
+         let $YE_Locality                = '20'
+         let $YE_Control_Nbr             = 'A'
+         let $YE_ER_ID                   = 'B'
+         let $YE_ER_Name                 = 'C1'
+         let $YE_ER_Address1             = 'C2'
+         let $YE_ER_Address2             = 'C3'
+         let $YE_State_City_Zip          = 'C4'
+         let $YE_EE_SSN                  = 'D'
+         let $YE_EE_FullName             = 'E'
+         let $YE_EE_FName                = 'E1'
+         let $YE_EE_Init                 = 'E2'
+         let $YE_EE_LName                = 'E3'
+         let $YE_EE_Suffix               = 'E4'
+         let $YE_EE_Address1             = 'F1'
+         let $YE_EE_Address2             = 'F2'
+         let $YE_EE_Country              = 'F3'
+         let $YE_EE_City                 = 'F4'
+         let $YE_EE_State                = 'F5'
+         let $YE_EE_Zip                  = 'F6'
+         let $YE_Roth_401K             = '12AA'
+         let $YE_Roth_403B             = '12BB'
+         let $HIRE_exempt_wages        = '12CC'
+         let $YE_ER_HEALTH             = '12DD'
+         let $YE_457B_ROTH             = '12EE'
+
+end-procedure
+
+
+begin-procedure Close-W2c  
+
+  close 1
+  show 'Close-W2c: record count ' #ai_record_count edit '999,999'
+  
+end-procedure
+
+!File handling
+!------------------------------
+
+begin-procedure AI-open 
+
+  if rtrim($AI_Filename,' ') = ''    !we don't need to do any of this if the user selects/overrides the filename from the run control
+    LET $Folder = '{OUTPUT_FOLDER}' 
+    do AI-database-name
+    do AI-custom-folder 
+ 
+    LET $AI_Filename = $Folder || '{AI_FILENAME}'  
+    do AI-custom-open
+   end-if
+   
+end-procedure
+
+begin-procedure AI-database-name !archive/transmit $AI_Filename as required
+
+    let $DataBase_Name = ''
+    show ' '
+    
+#ifdef USE_PSOPTIONS
+Begin-select
+PSO.SYSTEMTYPE
+    let $SystemType = &PSO.SYSTEMTYPE
+FROM PSOPTIONS PSO
+end-select
+
+   if $SystemType = 'PRD'
+     let $Database_name = rtrim('{PROD_DBNAME}',' ')
+   else
+     let $Database_name = 'SystemType_' || $SystemType
+   end-if
+
+   show 'AI-database-name: USE_PSOPTIONS SystemType ' $SystemType ' Database ' $Database_name
+   goto database_name_exit
+   
+#endif
+
+#ifdef DATABASE_NAME_PSDBOWNER_DBNAME
+begin-select 
+dbtts.dbname
+  
+    let $DataBase_Name = &dbtts.dbname  
+    from psdbowner dbtts 
+    
+end-select
+
+   show 'AI-database-name: DATABASE_NAME_PSDBOWNER_DBNAME Database ' $Database_name
+   goto database_name_exit
+#endif
+
+#ifdef MICROSOFT
+begin-SELECT
+DB_NAME() &DBNAME
+
+    let $Database_Name = rtrim(&DBNAME,' ')
+
+  from PS_INSTALLATION DB
+end-SELECT
+
+   show 'AI-database-name: MICROSOFT Database ' $Database_name
+   goto database_name_exit
+#endif
+
+#ifdef ORACLE
+Begin-select
+dbttso.name
+
+    let $DataBase_Name = &dbttso.name  
+    from v$database dbttso
+
+end-select
+
+   show 'AI-database-name: ORACLE Database ' $Database_name
+   goto database_name_exit
+#endif
+
+database_name_exit:
+
+  let $Database_name      = upper($Database_name)
+  show 'AI-database-name: Database ' $Database_name 
+  do AI-custom-database-name
+
+end-procedure
+
+begin-procedure filter-field
+
+      move $value to $sf
+      do filter-comma
+      move $sf to $value
+      
+end-procedure
+
+begin-procedure filter-comma
+
+ while 1 = 1
+   let #comma_inx = instr($sf,',', 1)
+   if #comma_inx <> 0
+     let #slen = length($sf)
+     let #t0 = #comma_inx - 1
+     let #t1 = #comma_inx + 1
+     let #tn = #slen - #comma_inx
+     let $sf = substr($sf, 1, #t0) || ' ' || substr($sf, #t1, #tn)
+   else
+    break
+   end-if
+ end-while
+
+
+end-procedure
+
+#ifdef TRANSLATE_COMPANY_CODES
+begin-procedure Translate-Company-Codes
+
+  let #j = 0
+  let $found = 'f'
+  while #j < #w2c_companies
+    get $c $a $y from w2c_company(#j) COMPANY ADP_COMPID YEAR
+    if rtrim($c,' ') = rtrim($value,' ')
+      let $found = 't'
+      move $a to $ADP_Compid
+      break
+    end-if
+    add 1 to #j
+  end-while
+
+ if $found = 'f'
+
+  let $ADP_Compid = $value
+
+#ifdef TRANSLATE_COMPANY_CODES_AI_CUSTOM
+   do AI-custom-company-translate
+#else
+
+begin-select
+CT.{TRANSLATE_COMPANY_AI_FLD}
+CT.YEAR
+
+   let $ADP_Compid = rtrim(&CT.{TRANSLATE_COMPANY_AI_FLD},' ')
+   let $Year       = &CT.YEAR
+
+   FROM {TRANSLATE_COMPANY_AI_TBL} CT
+         WHERE CT.COMPANY = $value
+            AND CT.YEAR   = (SELECT MAX(YEAR) 
+              FROM {TRANSLATE_COMPANY_AI_TBL} CT1
+               WHERE CT1.COMPANY = CT.COMPANY
+                 AND CT1.YEAR    <= $RptYear)
+           
+end-select
+
+#endif
+   
+  put $value $ADP_Compid $Year into w2c_company(#w2c_companies) COMPANY ADP_COMPID YEAR
+  add 1 to #w2c_companies
+
+ end-if
+
+
+end-procedure
+
+begin-procedure display-company-translations
+ 
+  show ''
+  show 'Count     Company   ADP_Compid  Year               (COMPANY TRANSLATIONS), count = ' #w2c_companies edit 999,999
+  show ''
+  let #i = 0
+  while #i < #w2c_companies
+    get $c $a $y from w2c_company(#i) COMPANY ADP_COMPID YEAR 
+    add 1 to #i
+    let $m = 'OK'
+    if rtrim($y,' ') = ''
+      let $m = '          ***** Missing Company Translation *****'
+    end-if
+    show #i edit 999 '.      ' $c '       ' $y '        ' $e ' ' $m
+  end-while
+
+end-procedure
+
+#endif
+
+
+#ifdef TRANSLATE_LOCAL_CODES
+begin-procedure Translate-Local-Codes
+
+  let #j = 0
+  let $found = 'f'
+  while #j < #w2c_locals
+    get $st $l $a $y from w2c_local(#j) STATE LOCALITY ADP_Local YEAR 
+    if rtrim($st,' ') = rtrim($local_st_code,' ') and rtrim($l,' ') = rtrim($value,' ')
+      let $found = 't'
+      move $a to $ADP_Local
+      break
+    end-if
+    add 1 to #j
+  end-while
+
+ if $found = 'f'
+
+  let $ADP_Local  = $value
+  let $year  = ''
+
+#ifdef TRANSLATE_LOCAL_CODES_AI_CUSTOM
+   do AI-custom-local-translate
+#else
+
+begin-select
+LT.{TRANSLATE_LOCAL_AI_FLD}
+LT.YEAR
+
+   let $ADP_Local = rtrim(&LT.{TRANSLATE_LOCAL_AI_FLD},' ')
+   let $Year      = &LT.YEAR
+
+   FROM {TRANSLATE_LOCAL_AI_TBL} LT
+         WHERE LT.STATE    = $local_st_code
+           AND LT.LOCALITY = $value
+           AND LT.YEAR     = (SELECT MAX(YEAR) 
+              FROM {TRANSLATE_LOCAL_AI_TBL} LT1
+               WHERE LT1.STATE    = LT.STATE  
+                 AND LT1.LOCALITY = LT.LOCALITY  
+                 AND LT1.YEAR    <= $RptYear)
+           
+end-select
+
+#endif
+
+  put $local_st_code $value $ADP_Local $Year into w2c_local(#w2c_locals) STATE LOCALITY ADP_LOCAL YEAR
+  add 1 to #w2c_locals
+
+ end-if
+
+
+end-procedure
+
+begin-procedure display-local-translations
+ 
+  show ''
+  show 'Count     State     Locality   ADP_Local  Year    (LOCAL TRANSLATIONS), count = ' #w2c_locals edit 999,999
+  show ''
+  let #i = 0
+  while #i < #w2c_locals
+    get $s $l $a $y from w2c_local(#i) STATE LOCALITY ADP_LOCAL YEAR 
+    add 1 to #i
+    let $l = rpad($l,10,' ')
+    let $a = rpad($a,10,' ')
+    let $m = 'OK'
+    if rtrim($y,' ') = ''
+      let $m = '          ***** Missing Local Translation *****'
+    end-if
+    show #i edit 999 '.      ' $s '        ' $l ' ' $a ' ' $y ' ' $m
+
+  end-while
+
+end-procedure
+
+#endif
+
+begin-procedure Extract-Resident-Address
+
+#if {PeopleSoft_Version} < '8.8'
+
+  let $Employee_Residential_Address1 = &C.ADDRESS1
+  let $Employee_Residential_Address2 = &C.ADDRESS2
+  let $Employee_Residential_City     = &C.CITY     
+  let $Employee_Residential_State    = &C.STATE   
+  let $Employee_Residential_Zip      = &C.POSTAL  
+  uppercase $Employee_Residential_Address1
+  uppercase $Employee_Residential_Address2
+  uppercase $Employee_Residential_City
+
+#else
+  let $Employee_Residential_Address1 = ''
+  let $Employee_Residential_Address2 = ''
+  let $Employee_Residential_City = ''
+  let $Employee_Residential_State = ''
+  let $Employee_Residential_Zip = ''
+  
+Begin-Select           loops=1
+#ifdef cast_ps_addresses       
+cast(RESADD.ADDRESS1 as char(55)) &RESADD.ADDRESS1
+cast(RESADD.ADDRESS2 as char(55)) &RESADD.ADDRESS2
+cast(RESADD.CITY as char(30))     &RESADD.CITY
+cast(RESADD.STATE as char(6))     &RESADD.STATE
+cast(RESADD.POSTAL as char(12))   &RESADD.POSTAL
+cast(RESADD.COUNTRY as char(3))   &RESADD.COUNTRY
+#else
+RESADD.ADDRESS1
+RESADD.ADDRESS2
+RESADD.CITY
+RESADD.STATE
+RESADD.POSTAL
+RESADD.COUNTRY
+#endif
+
+  LET $Employee_Residential_Address1    =  &RESADD.ADDRESS1
+  LET $Employee_Residential_Address2    =  &RESADD.ADDRESS2
+  LET $Employee_Residential_City        =  &RESADD.CITY
+  LET $Employee_Residential_State       =  &RESADD.STATE
+  LET $Employee_Residential_Zip         =  &RESADD.POSTAL
+
+  uppercase $Employee_Residential_Address1
+  uppercase $Employee_Residential_Address2
+  uppercase $Employee_Residential_City
+
+  if rtrim(&RESADD.COUNTRY,' ') <> 'USA'
+    let $Employee_Residential_City = rtrim($Employee_Residential_City,' ') || ' ' || rtrim($Employee_Residential_State,' ') || ' ' || rtrim($Employee_Residential_Zip,' ') || ' ' || rtrim(&RESADD.COUNTRY,' ')
+    move '  '        to $Employee_Residential_State
+    move '         ' to $Employee_Residential_Zip
+  end-if
+
+  if substr($Employee_Residential_Zip,6,1) = '-' or
+    substr($Employee_Residential_Zip,6,1) = ' '
+    let $Employee_Residential_Zip     = substr($Employee_Residential_Zip,1,5) ||
+                       substr($Employee_Residential_Zip,7,4)
+  else
+     let $Employee_Residential_Zip     = substr($Employee_Residential_Zip,1,9)
+  end-if
+ 
+  if $SelectEmplid <> ''
+    show 'Extract-Resident-Address: ' $Employee_Residential_Address1 ' ' $Employee_Residential_Address2 ' ' $Employee_Residential_City ' ' $Employee_Residential_State ' ' $Employee_Residential_Zip
+  end-if
+
+  FROM PS_ADDRESSES RESADD
+   WHERE RESADD.EMPLID       = &C.W2C_ADD_EMPLID
+     AND RESADD.ADDRESS_TYPE = '{RESIDENT_ADDRESS_TYPE}'
+     AND RESADD.EFFDT       <= $Qtr_End_Native
+     ORDER by RESADD.EFFDT DESC
+
+ 
+#ifdef SELECT_WITH_UR
+ {SELECT_WITH_UR} with ur
+#endif
+end-select
+
+ 
+  if ($Employee_Residential_Address1 = '' and $Employee_Residential_Address2 = '') 
+  
+    LET $Employee_Residential_Address1    =  &C.ADDRESS1
+    LET $Employee_Residential_Address2    =  &C.ADDRESS2
+    LET $Employee_Residential_City        =  &C.CITY
+    LET $Employee_Residential_State       =  &C.STATE
+    LET $Employee_Residential_Zip         =  &C.POSTAL
+    uppercase $Employee_Residential_Address1
+    uppercase $Employee_Residential_Address2
+    uppercase $Employee_Residential_City
+
+    if $SelectEmplid <> ''
+      show 'Extract-Resident-Address: missing home address,  Setting Home to Mail address. '
+    end-if
+
+  end-if
+  
+#endif
+
+end-procedure
+
+#include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#include 'datetime.sqc'  !general date and time formatting procedures
+#include 'datemath.sqc'  !Date Functions
+#include 'number.sqc'    !general number formatting procedures
+#include 'stdapi.sqc'    !StdAPI-Init procedure
+#Include 'getbalid.sqc'  !Get-Calendar-Year-Id
+

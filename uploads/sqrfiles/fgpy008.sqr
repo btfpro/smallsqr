@@ -1,0 +1,835 @@
+!***********************************************************************
+!  FGPY008:  Print SF-2807 or SF-3103                                  *
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+!   This module contains confidential and proprietary information      *
+!   of Oracle; it is not to be copied, reproduced, or transmitted      *
+!   in any form, by any means, in whole or in part, nor is it to       *
+!   be used for any purpose other than that for which it is            *
+!   expressly provided under the applicable license agreement.         *
+!                                                                      *
+!   Copyright (C) 2006 Oracle. All Rights Reserved.                    *
+!----------------------------------------------------------------------
+!                                                                      *
+!                                                                      *
+!***********************************************************************
+!
+!          $Date:  2006/07/20:03:42:33                                 
+!       $Release:  HR9                                                 
+!      $Revision:  101                                                 
+!                                                                      *
+!***********************************************************************
+
+#include 'setenv.sqc'      !Set environment
+
+#define Year4      '1'   !Changing year to YYYY
+#define DDelimiter '-'   !Changing date separator to dashes
+
+Begin-Setup
+
+#include 'setupdb.sqc'
+Declare Printer
+  type = HPLASERJET
+  orientation = Portrait
+  top-margin = 0.25
+  left-margin = 0.25
+  font = 5
+  point-size = 12
+  char-size = 7.2
+  line-size = 12
+
+page-size 60 200
+
+End-Setup
+
+Begin-Report
+
+display 'begin report'
+do Init-DateTime
+do Init-Number
+do Get-Current-DateTime
+do Init-Report
+
+do Process-Main
+
+do Commit-Transaction
+do Stdapi-Term
+
+End-Report
+
+
+!***********************************************************************
+!                                                                      *
+!  Function:     Init-Report                                           *
+!                                                                      *
+!  Description:  Initializes data for the beginning of the report      *
+!                processing.                                           *
+!                                                                      *
+!***********************************************************************
+Begin-Procedure Init-Report
+
+move 'FGROST'                to $ReportID
+move 'SF2807/SF3103 Print Program' to $ReportTitle
+display $ReportTitle
+do Format-DateTime($AsOfToday,$Calendar_YMD, {DEFYMD}, '', '')
+let #cur_yr = substr($Calendar_YMD,1,4)
+
+do Stdapi-Init
+let $first_page = 'Y'
+
+! The report body starts on line 14 and ends on line 46
+let #max_rpt_lines = 46
+let #sv_prt_line = 14
+
+
+End-Procedure
+
+
+!***********************************************************************
+!                                                                      *
+!  Function:     Process-Main                                          *
+!                                                                      *
+!  Description:  Performs the main processing of the program.          *
+!                                                                      *
+!***********************************************************************
+Begin-Procedure Process-Main
+
+create-array name=par_rmks size=50
+  field=field11a:char=''
+
+create-array name=irr_rmks size=50
+  field=field11b:char=''
+
+create-array name=prt_buff size=100
+  field=fld8:char=''
+  field=fld9:char=''
+  field=fld10:char=''
+  field=fld11:char=''
+
+Create-array name=wrap_array size=25
+  field=ColText:char=''
+
+if $prcs_process_instance = ''
+  display '********************************'
+  display 'Please enter the following data*'
+  display '********************************'
+  Input $run_company 'Company'
+  Input $run_form 'Form Type'
+  Input $reg_series 'Register Series'
+
+else
+  do Select-ROST-Run-Control-Data
+end-if
+
+do Get-TSP-Voucher-Date
+
+if $Voucher_Dt = 'Y'
+
+  do Select-Latest-ROST
+
+  do Process-Final-IRR
+
+  evaluate &irr.gvt_irr_ret_form
+     when = 'F'
+       do Print-SF3103-Print-Totals
+       break
+     when = 'C'
+       do Print-SF2807-Print-Totals
+       break
+     when-other
+       break
+  end-evaluate
+
+else
+
+  display 'Voucher Sequence Year must be entered on the Payroll Interface Information tab of Agency Table'
+
+end-if
+
+
+End-Procedure
+
+!***********************************************************************
+!                                                                      *
+!  Function:     Select-ROST-Run-Control-Data                          *
+!                                                                      *
+!  Description:  Select ROST run control variables:                    *
+!                Company, Form                                         *
+!                                                                      *
+!***********************************************************************
+
+Begin-Procedure Select-ROST-Run-Control-Data
+
+Begin-Select
+
+RUN1.OPRID
+RUN1.RUN_CNTL_ID
+RUN1.COMPANY
+RUN1.GVT_IRR_RET_FORM
+RUN1.GVT_ROST_TYPE
+
+  let $run_company = &run1.company
+  let $run_form = &run1.gvt_irr_ret_form
+  let $reg_series = &run1.gvt_rost_type
+
+
+from PS_GVT_ROST_RUNCTL RUN1
+where RUN1.OPRID       = $prcs_oprid
+and   RUN1.RUN_CNTL_ID = $prcs_run_cntl_id
+
+End-Select
+
+End-Procedure
+
+!***********************************************************************
+!                                                                      *
+!  Function:     Get-TSP-Voucher-Date                                  *
+!                                                                      *
+!  Description:                                                        *
+!                                                                      *
+!***********************************************************************
+Begin-Procedure Get-TSP-Voucher-Date
+
+let $Voucher_Dt = 'N'
+
+Begin-Select
+
+AGY.GVT_TSP_SEQ_YR
+
+   let #cur_yr = &AGY.GVT_TSP_SEQ_YR
+   let $Voucher_Dt = 'Y'
+
+FROM PS_GVT_INTRFC_INFO AGY
+WHERE AGY.COMPANY = $run_company
+AND   AGY.EFFDT   = (SELECT MAX(AGY1.EFFDT)
+                    FROM PS_GVT_INTRFC_INFO AGY1
+                    WHERE AGY1.COMPANY = AGY.COMPANY
+                    AND AGY1.EFFDT <= $AsOfToday)
+
+End-Select
+
+End-Procedure
+
+
+!***********************************************************************
+!                                                                      *
+!  Function:     Select-Latest-ROST                                    *
+!                                                                      *
+!  Description:                                                        *
+!                                                                      *
+!***********************************************************************
+Begin-Procedure Select-Latest-ROST
+
+let #page_no = 0
+let #seq_yr = #cur_yr
+let #pg_tot_curyr = 0
+let #pg_tot_cum = 0
+let #td_tot_curyr = 0
+let #td_tot_cum = 0
+let #prior_pg = 0
+
+Begin-Select
+
+ROST.COMPANY
+ROST.GVT_ROST_TYPE
+ROST.GVT_ROST_SEQ_YR
+ROST.GVT_ROST_PAGE_NO
+ROST.EFFDT
+ROST.GVT_ROST_PG_CURYR
+ROST.GVT_ROST_PG_TOT
+ROST.GVT_ROST_YTD_CURYR
+ROST.GVT_ROST_YTD_TOT
+
+  let #page_no = &rost.gvt_rost_page_no
+  let #prior_pg = &rost.gvt_rost_page_no
+  let #seq_yr = &rost.gvt_rost_seq_yr
+  let #td_tot_curyr = &rost.gvt_rost_ytd_curyr
+  let #td_tot_cum = &rost.gvt_rost_ytd_tot
+
+from PS_GVT_ROST_CNTRL ROST
+where ROST.COMPANY = $run_company
+and   ROST.GVT_ROST_SEQ_YR = #cur_yr
+and   ROST.EFFDT = (SELECT MAX(R.EFFDT)
+                    FROM PS_GVT_ROST_CNTRL R
+                    WHERE R.COMPANY = ROST.COMPANY)
+
+
+End-Select
+
+
+End-Procedure
+
+!***********************************************************************
+!                                                                      *
+!  Function:     Process-Final-IRR                                    *
+!                                                                      *
+!  Description:                                                        *
+!                                                                      *
+!***********************************************************************
+Begin-Procedure Process-Final-IRR
+
+Begin-Select
+
+IRR.EMPLID
+IRR.EMPL_RCD
+IRR.EFFDT
+IRR.EFFSEQ
+IRR.GVT_IRR_TYPE
+IRR.GVT_IRR_RET_FORM
+IRR.GVT_IRR_STATUS
+IRR.GVT_IRR_DED_TOT
+IRR.GVT_IRR_DED_CURYR
+JOB.COMPANY
+NN.NAME
+NN.BIRTHDATE
+NID.COUNTRY
+NID.NATIONAL_ID_TYPE
+NID.NATIONAL_ID
+C.GVT_ADDRESS1
+C.GVT_ADDRESS_CITY
+C.GVT_ADDRESS_STATE
+C.GVT_AGY_LOC_CODE
+D.DESCR
+
+    !display 'Processing IRR for: ' noline
+    !display &irr.emplid
+
+    let $field1 = &d.descr
+    ! let $field2 = phone?
+    let $field5 = &c.gvt_address1
+    let $field6 = rtrim(&c.gvt_address_city, ' ') || ', ' || &c.gvt_address_state
+    let $field7 = &c.gvt_agy_loc_code
+
+    do Init-Variables
+
+    do Select-ROST-Reportable-PARs
+
+    do Select-IRR-Remarks
+
+    do Build-Print-Buffer
+
+    do Print-Form
+
+    do Update-IRR-Control
+
+from PS_GVT_IRR_CONTROL IRR,
+     PS_GVT_JOB          JOB,
+     PS_GVT_PERS_DATA    NN,
+     PS_GVT_PERS_NID     NID,
+     PS_GVT_INTRFC_INFO  C,
+     PS_COMPANY_TBL      D
+
+where IRR.GVT_IRR_STATUS     = 'F'
+and   IRR.GVT_IRR_RET_FORM   = $run_form
+and   IRR.GVT_ROST_PAGE_NO   = 0
+and   JOB.EMPLID             = IRR.EMPLID
+and   JOB.EMPL_RCD          = IRR.EMPL_RCD
+and   JOB.COMPANY            = $run_company
+and   JOB.EFFDT              = (SELECT MAX(J1.EFFDT)
+                               FROM PS_GVT_JOB J1
+                               WHERE J1.EMPLID = JOB.EMPLID
+                               AND   J1.EMPL_RCD = JOB.EMPL_RCD
+                               AND   J1.EFFDT <= IRR.EFFDT)
+and   JOB.EFFSEQ             = (SELECT MAX(J2.EFFSEQ)
+                              FROM PS_GVT_JOB J2
+                              WHERE J2.EMPLID = JOB.EMPLID
+                              AND   J2.EMPL_RCD = JOB.EMPL_RCD
+                              AND   J2.EFFDT = JOB.EFFDT)
+and   JOB.EMPLID             = NN.EMPLID
+and   JOB.EMPL_RCD          = NN.EMPL_RCD
+and   JOB.EFFDT              = NN.EFFDT
+and   JOB.EFFSEQ             = NN.EFFSEQ
+and   JOB.EMPLID             = NID.EMPLID
+and   JOB.EMPL_RCD          = NID.EMPL_RCD
+and   JOB.EFFDT              = NID.EFFDT
+and   JOB.EFFSEQ             = NID.EFFSEQ
+and   NID.COUNTRY            = 'USA'
+and   NID.NATIONAL_ID_TYPE   = 'PR'
+AND   JOB.COMPANY            = D.COMPANY
+and   D.EFFDT                = (SELECT MAX(D1.EFFDT)
+                               FROM  PS_COMPANY_TBL D1
+                               WHERE D1.COMPANY = JOB.COMPANY
+                               AND   D1.EFFDT   <= JOB.EFFDT)
+AND   D.COMPANY              = C.COMPANY
+and   C.EFFDT                = (SELECT MAX(C1.EFFDT)
+                               FROM  PS_GVT_INTRFC_INFO C1
+                               WHERE C1.COMPANY = JOB.COMPANY
+                               AND   C1.EFFDT   <= JOB.EFFDT)
+
+End-Select
+
+End-Procedure
+
+!***********************************************************************
+!                                                                      *
+!  Function:     Select-ROST-Reportable-PARs                           *
+!                                                                      *
+!  Description:                                                        *
+!                                                                      *
+!***********************************************************************
+Begin-Procedure Select-ROST-Reportable-PARs
+
+Begin-Select
+
+JOB.EMPLID
+JOB.EMPL_RCD
+JOB.EFFDT
+JOB.EFFSEQ
+P1.GVT_REMARK_LINE1
+P1.GVT_REMARK_LINE2
+P1.GVT_REMARK_LINE3
+P1.GVT_REMARK_LINE4
+P1.GVT_REMARK_LINE5
+P1.GVT_REMARK_LINE6
+P1.GVT_REMARK_LINE7
+P1.GVT_REMARK_LINE8
+P1.GVT_REMARK_LINE9
+
+    if rtrim(&p1.gvt_remark_line1, ' ') <> ''
+      let $PrnText = &p1.gvt_remark_line1
+      do Store-PAR-Remarks
+   end-if
+   if rtrim(&p1.gvt_remark_line2, ' ') <> ''
+      let $PrnText = &p1.gvt_remark_line2
+      do Store-PAR-Remarks
+   end-if
+   if rtrim(&p1.gvt_remark_line3, ' ') <> ''
+      let $PrnText = &p1.gvt_remark_line3
+      do Store-PAR-Remarks
+   end-if
+   if rtrim(&p1.gvt_remark_line4, ' ') <> ''
+      let $PrnText = &p1.gvt_remark_line4
+      do Store-PAR-Remarks
+   end-if
+   if rtrim(&p1.gvt_remark_line5, ' ') <> ''
+      let $PrnText = &p1.gvt_remark_line5
+      do Store-PAR-Remarks
+   end-if
+   if rtrim(&p1.gvt_remark_line6, ' ') <> ''
+      let $PrnText = &p1.gvt_remark_line6
+      do Store-PAR-Remarks
+   end-if
+   if rtrim(&p1.gvt_remark_line7, ' ') <> ''
+      let $PrnText = &p1.gvt_remark_line7
+      do Store-PAR-Remarks
+   end-if
+   if rtrim(&p1.gvt_remark_line8, ' ') <> ''
+      let $PrnText = &p1.gvt_remark_line8
+      do Store-PAR-Remarks
+   end-if
+   if rtrim(&p1.gvt_remark_line9, ' ') <> ''
+      let $PrnText = &p1.gvt_remark_line9
+      do Store-PAR-Remarks
+   end-if
+
+from
+     PS_GVT_JOB          JOB,
+     PS_RTRMNT_PLAN_TBL  R,
+     PS_GVT_NOAC_TBL     NOA,
+     PS_GVT_PAR_REMARKS  P1,
+     PS_GVT_SF50_RK_TBL  P2
+where
+      JOB.EMPLID             = &irr.emplid
+and   JOB.EMPL_RCD          = &irr.EMPL_RCD
+and   JOB.EFFDT              <= &irr.effdt
+and   JOB.GVT_RETIRE_PLAN    = R.BENEFIT_PLAN
+and   JOB.COMPANY            = $run_company
+and   R.PLAN_TYPE            = '70'
+and   R.EFFDT                = (SELECT MAX(R2.EFFDT)
+                                FROM PS_RTRMNT_PLAN_TBL R2
+                                WHERE R2.PLAN_TYPE = R.PLAN_TYPE
+                                AND   R2.BENEFIT_PLAN = R.BENEFIT_PLAN
+                                AND R2.EFFDT <= JOB.EFFDT)
+and   R.GVT_IRR_RET_FORM     = $run_form
+AND   JOB.GVT_NOA_CODE       = NOA.GVT_NOA_CODE
+AND   JOB.ACTION             = NOA.ACTION
+AND   NOA.EFFDT              = (SELECT MAX(N1.EFFDT)
+                               FROM PS_GVT_NOAC_TBL N1
+                               WHERE N1.GVT_NOA_CODE=JOB.GVT_NOA_CODE
+                               AND   N1.ACTION=JOB.ACTION
+                               AND   N1.EFFDT <= JOB.EFFDT)
+AND   NOA.GVT_IRR_REPORTABLE = 'Y'
+AND   P1.EMPLID              = JOB.EMPLID
+AND   P1.EMPL_RCD           = JOB.EMPL_RCD
+AND   P1.EFFDT               = JOB.EFFDT
+AND   P1.EFFSEQ              = JOB.EFFSEQ
+AND   P1.GVT_SF50_REMARK     = P2.GVT_SF50_REMARK
+AND   P2.GVT_ROST_REMARK     = 'Y'
+AND   P2.EFFDT               =  (SELECT MAX(P2A.EFFDT)
+                                FROM PS_GVT_SF50_RK_TBL  P2A
+                                WHERE P2A.GVT_SF50_REMARK = P1.GVT_SF50_REMARK
+                                AND   P2A.EFFDT <= P1.EFFDT)
+
+
+End-Select
+
+End-Procedure
+
+
+!***********************************************************************
+!                                                                      *
+!  Function:     Store-PAR-Remarks                                     *
+!                                                                      *
+!  Description:                                                        *
+!                                                                      *
+!***********************************************************************
+Begin-Procedure Store-PAR-Remarks
+
+      let #MaxLineChars = 22
+      do Column-Wrap
+      let #j = 0
+
+      While #j < #MaxRows
+        get $ColText from wrap_array(#j)
+        if rtrim($ColText, ' ') <> ''
+          let #par_rmk_cnt = #par_rmk_cnt + 1
+          put $ColText into par_rmks(#par_rmk_cnt) field11a
+        end-if
+        let #j = #j + 1
+      end-While
+
+End-Procedure
+
+
+!***********************************************************************
+!                                                                      *
+!  Function:     Column-Wrap                                           *
+!                                                                      *
+!  Description:                                                        *
+!                                                                      *
+!***********************************************************************
+Begin-Procedure Column-Wrap
+
+clear-array name=wrap_array
+let #TextLen = length($PrnText)
+let $cr = chr(13)
+let $lf = chr(10)
+move 0 to #CurrLine
+move 1 to #ActChar
+let #MaxRows = 25
+
+while #CurrLine < #MaxRows
+  move 0 to #CurrChar
+  move 0 to #SkipAhead
+  while #CurrChar < #MaxLineChars
+    let $AscChr = substr($PrnText,#ActChar + #CurrChar,1)
+    if (#ActChar + #CurrChar + 1) <= #TextLen
+       let $AscChrLA = substr($PrnText,#ActChar + #CurrChar + 1,1)
+    else
+       break
+    end-if
+
+    if $AscChr = $cr or $AscChr = $lf
+       subtract 1 from #CurrChar
+       add 1 to #SkipAhead
+       if $AscChrLA = $cr or $AscChrLA = $lf
+          add 1 to #SkipAhead
+       end-if
+       break
+    end-if
+
+    if #CurrChar + 1 = #MaxLineChars and $AscChrLA <> ' ' and (#ActChar + #CurrChar ) <> #TextLen
+       move 0 to #MoveBack
+       while #MoveBack < #MaxLineChars and $AscChr <> ' '
+          add 1 to #MoveBack
+          let $AscChr = substr($PrnText,#ActChar + #CurrChar - #MoveBack,1)
+       end-while
+       if #MoveBack + 1 <> #MaxLineChars
+          subtract #MoveBack from #CurrChar
+       end-if
+       break
+    end-if
+    add 1 to #CurrChar
+  end-while
+
+  add 1 to #CurrChar
+  let $ColText = substr($PrnText, #ActChar, #CurrChar)
+
+  put $ColText into wrap_array(#CurrLine)
+
+
+  add 1 to #CurrLine
+  add #CurrChar to #ActChar
+  add #SkipAhead to #ActChar
+
+end-while
+
+End-Procedure
+
+
+!***********************************************************************
+!                                                                      *
+!  Function:     Select-IRR_Remarks                                    *
+!                                                                      *
+!  Description:  Select IRR specific remarks                           *
+!                                                                      *
+!***********************************************************************
+Begin-Procedure Select-IRR-Remarks
+
+let $tmp_irr_rmk = ''
+
+Begin-Select
+
+R1.EMPLID
+R1.EMPL_RCD
+R1.GVT_IRR_TYPE
+R1.EFFDT
+R1.GVT_IRR_REMARK
+R1.SEQ_NO
+R1.GVT_RMK_VAL_TEXT
+R1.GVT_RMK_VAL_DATE
+R1.GVT_RMK_VAL_NBR
+R2.GVT_IRR_RK_TYPE
+R2.GVT_RMK_FIELD_TYPE
+R2.GVT_RMK_VAL_TEXT
+
+  if &r2.gvt_irr_rk_type = 'E'
+    if &r2.gvt_rmk_field_type = 'T'
+      let $tmp_irr_rmk = rtrim($tmp_irr_rmk, ' ') || ' ' || &r1.gvt_rmk_val_text
+    end-if
+    if &r2.gvt_rmk_field_type = 'D'
+      Do format-datetime(&r1.gvt_rmk_val_date,$out,{defdate},'','')
+      let $tmp_irr_rmk = rtrim($tmp_irr_rmk, ' ') || ' ' || $out
+    end-if
+    if &r2.gvt_rmk_field_type = 'N'
+      let $tmp_irr_rmk = rtrim($tmp_irr_rmk, ' ') || ' ' || to_char(&r1.gvt_rmk_val_nbr)
+    end-if
+  end-if
+
+  if &r2.gvt_irr_rk_type = 'T'
+    let $tmp_irr_rmk = rtrim($tmp_irr_rmk, ' ') || ' ' || &r2.gvt_rmk_val_text
+  end-if
+
+FROM PS_GVT_IRR_RMK_VAL R1,
+     PS_GVT_IRR_RK_FMT  R2,
+     PS_GVT_IRR_RK_TBL  R3
+
+WHERE R1.EMPLID         = &irr.emplid
+AND   R1.EMPL_RCD      = &irr.EMPL_RCD
+AND   R1.GVT_IRR_TYPE   = &irr.gvt_irr_type
+AND   R1.EFFDT          = &irr.effdt
+AND   R2.GVT_IRR_REMARK = R1.GVT_IRR_REMARK
+AND   R2.SEQ_NO         = R1.SEQ_NO
+AND   R2.EFFDT          = (SELECT MAX(R2A.EFFDT)
+                          FROM PS_GVT_IRR_RK_FMT  R2A
+                          WHERE R2A.GVT_IRR_REMARK = R1.GVT_IRR_REMARK
+                          AND   R2A.SEQ_NO = R1.SEQ_NO
+                          AND   R2A.EFFDT <= R1.EFFDT)
+AND   R2.GVT_IRR_REMARK = R3.GVT_IRR_REMARK
+AND   R2.EFFDT          = R3.EFFDT
+AND   R3.GVT_ROST_REMARK = 'Y'
+
+End-Select
+
+!Format remarks to fit column width and store in array
+let #MaxLineChars = 22
+let $PrnText = $tmp_irr_rmk
+do Column-Wrap
+let #j = 0
+
+While #j < #MaxRows
+   get $ColText from wrap_array(#j)
+   if rtrim($ColText, ' ') <> ''
+     let #irr_rmk_cnt = #irr_rmk_cnt + 1
+     put $ColText into irr_rmks(#irr_rmk_cnt) field11b
+   end-if
+   let #j = #j + 1
+end-While
+
+
+End-Procedure
+
+!***********************************************************************
+!                                                                      *
+!  Function:     Init-Variables                                        *
+!                                                                      *
+!  Description:                                                        *
+!                                                                      *
+!***********************************************************************
+Begin-Procedure Init-Variables
+
+
+let #par_rmk_cnt = -1
+let #irr_rmk_cnt = -1
+
+let #prt_cnt1 = 0
+let #prt_cnt2 = 0
+let #prt_cnt3 = 0
+let #prt_cnt4 = 0
+
+clear-array name=par_rmks
+clear-array name=irr_rmks
+clear-array name=prt_buff
+
+
+End-Procedure
+
+
+!***********************************************************************
+!                                                                      *
+!  Function:     Build-Print-Buffer                                    *
+!                                                                      *
+!  Description:                                                        *
+!                                                                      *
+!***********************************************************************
+Begin-Procedure Build-Print-Buffer
+
+let #buff_cnt = -1
+
+! Store Name, DOB, SSN
+
+   let $fld8c = 'SS#: ' || edit(&nid.national_id, 'xxx-xx-xxxx')
+   Do format-datetime(&nn.birthdate,$out,{defdate},'','')
+   let $fld8 = rtrim(&nn.name, ' ') || ' ' || $out
+   let $fld9 = edit(&irr.gvt_irr_ded_curyr,'99,999,999.99')
+   let $fld10 = edit(&irr.gvt_irr_ded_tot,'99,999,999.99')
+   let #buff_cnt = #buff_cnt + 1
+   put $fld8 $fld9 $fld10 into prt_buff(#buff_cnt) fld8 fld9 fld10
+
+   if &irr.gvt_irr_ret_form = 'F'
+     let #buff_cnt = #buff_cnt + 1
+     put $fld8c into prt_buff(#buff_cnt) fld8
+   end-if
+
+   let #max_buff_line = #buff_cnt
+
+!Store Par Remarks
+   let #prt_cnt2 = 0
+   let #buff_cnt = -1
+   While #prt_cnt2 <= #par_rmk_cnt
+
+     get $field11a from par_rmks(#prt_cnt2) field11a
+     let $fld11 = translate($field11a,chr(13),' ')
+     let #buff_cnt = #buff_cnt + 1
+     put $fld11 into prt_buff(#buff_cnt) fld11
+     ! limit IRR lines so that there is no page overflow
+     if #buff_cnt >= #max_rpt_lines
+        break
+     end-if
+     let #prt_cnt2 = #prt_cnt2 + 1
+
+   end-While
+
+
+!Store IRR Remarks
+While #prt_cnt4 <= #irr_rmk_cnt
+
+  ! limit IRR lines so that there is no page overflow
+  if #buff_cnt >= #max_rpt_lines
+     break
+  end-if
+  get $field11b from irr_rmks(#prt_cnt4)
+  let $fld11 = $field11b
+  let #buff_cnt = #buff_cnt + 1
+  put $fld11 into prt_buff(#buff_cnt) fld11
+
+  let #prt_cnt4 = #prt_cnt4 + 1
+
+end-While
+
+if #buff_cnt > #max_buff_line
+  let #max_buff_line = #buff_cnt
+end-if
+
+
+
+End-Procedure
+
+!***********************************************************************
+!                                                                      *
+!  Function:     Print-Form                                            *
+!                                                                      *
+!  Description:                                                        *
+!                                                                      *
+!***********************************************************************
+Begin-Procedure Print-Form
+
+evaluate &irr.gvt_irr_ret_form
+  when = 'C'
+    do Print-SF2807-Page-Body
+  when = 'F'
+    do Print-SF3103-Page-Body
+  when-other
+    break
+end-evaluate
+
+
+End-Procedure
+
+
+!***********************************************************************
+!                                                                      *
+!  Function:     Update-IRR-Control                                    *
+!                                                                      *
+!  Description:   Update Seq#, PAGE_NUM, ROST Type                        *
+!                                                                      *
+!                                                                      *
+!***********************************************************************
+Begin-Procedure Update-IRR-Control
+
+Begin-SQL ON-ERROR = SQL-Error
+
+UPDATE PS_GVT_IRR_CONTROL
+SET GVT_ROST_TYPE = $reg_series,
+    GVT_ROST_SEQ_YR = #seq_yr,
+    GVT_ROST_PAGE_NO = #page_no
+
+WHERE EMPLID = &irr.emplid
+AND   EMPL_RCD = &irr.EMPL_RCD
+AND   GVT_IRR_TYPE = &irr.gvt_irr_type
+AND   EFFDT = &irr.effdt
+AND   EFFSEQ = &irr.effseq
+
+End-SQL
+
+End-Procedure
+
+!***********************************************************************
+!                                                                      *
+!  Function:     Insert-ROST-Control                                   *
+!                                                                      *
+!  Description:   Insert new ROST control                              *
+!                                                                      *
+!                                                                      *
+!***********************************************************************
+Begin-Procedure Insert-ROST-Control
+
+Begin-SQL ON-ERROR = SQL-Error
+
+INSERT INTO PS_GVT_ROST_CNTRL
+  (COMPANY,
+   GVT_ROST_TYPE,
+   GVT_ROST_SEQ_YR,
+   GVT_ROST_PAGE_NO,
+   EFFDT,
+   GVT_ROST_PG_CURYR,
+   GVT_ROST_PG_TOT,
+   GVT_ROST_YTD_CURYR,
+   GVT_ROST_YTD_TOT)
+VALUES
+  ($run_company,
+   $reg_series,
+   #seq_yr,
+   #page_no,
+   $AsOfToday,
+   #pg_tot_curyr,
+   #pg_tot_cum,
+   #td_tot_curyr,
+   #td_tot_cum)
+
+End-SQL
+
+
+End-Procedure
+
+#Include 'readxlat.sqc'  !Read Tranlate table procedure
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'stdapi.sqc'    !Routines to Update Run Status
+#Include 'tranctrl.sqc'  !Routines for Platform portable commit
+#include 'fgpy008f.sqc'  !SF-3103 and 2807 form layouts
+#include 'fgpy008p.sqc'  !print data on SF-3103 or 2807
+

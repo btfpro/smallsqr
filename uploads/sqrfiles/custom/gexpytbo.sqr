@@ -1,0 +1,3148 @@
+!***********************************************************************
+!  GEXPYTBO:  Team Bonus Progam Load/Register for Stores - Cloned from *   
+!							GEXPYTBR
+!             Load Bonus Amounts to Paysheets [prior-payroll confirm]  *
+!***********************************************************************
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module is the confidential and proprietary information of       *
+! Giant Eagle, Inc.; it is not to be copied, reproduced, or transmitted*
+! in any form, by any means, in whole or in part, nor is it to be used *
+! for any purpose other than that for which it is expressly provided   *
+! without the written permission of Giant Eagle.                       * 
+!***********************************************************************
+! GEXPYTBR:            This sqr is run prior to the payroll confirm.   *
+!                      It loads Bonus rate to pay_earnings (for        *
+!                      FLSA processing, and loads erncd 535 (Team      *
+!                      Bonus) and total Bonus amt to pay_oth_earns     *
+!                      The rate and amount are loaded for              *
+!                      each pay_earns_begin and end date that the ee   *
+!                      had hours PAID.  If the ee did not have a       *
+!                      current open paysheet for the current pay week, *
+!                      the sqr adds one.   *NOTE* if the ee is a       *
+!                      Pharmacist, they will have 1 pro-rated lumpsum  *
+!                      amount loaded with earn begin date/earn end date*
+!                      as the last week of the input period. This pro- *
+!                      rated amt is calc'd in the sqr using a matrix   *
+!                      provided by the Pharmacy group.  There is also  *
+!                      logic for ees that have a paysheet deptid= 'cg*'*
+!                      The home deptid (job.deptid) is used for deter- *
+!                      ming the bonus as opposed to the paysheet deptid*
+!                      The sqr will generate 3 reports.  One is a log  *
+!                      of each pay week updated.  There are 2 exception*
+!                      reports created- one for suspensions (these are *
+!                      all ee's suspended within the financial pd begin*
+!                      date and end date) and the other for terminations
+!                      (these are ALL empl_status = 'T' w/effdt within *
+!                      the financial period and from the end of the    *
+!                      period to the run date.)                        *          
+!                                                                      *
+! #Debugx Used:		#debug9 paragraph trace                        *
+!			#debug8 key variable values                    *
+!			#debug7 data returned from sql calls           *
+!                                                                      *
+! SQL Tables:           ps_pay_calendar                                *
+! 			ps_job                                         *               
+!                       ps_employment                                  *
+!                       ps_personal_data                               *
+!                       ps_gex_dept_tbl                                *     
+!                       ps_jobcode_tbl                                 *
+!                       ps_earnings_bal                                *
+!                       ps_pay_oth_earns                               *
+!                       ps_addl_pay                                    *
+!                                                                      *             
+! Written by:		Susan Mahady                                   *
+!                                                                      *
+! Normally Run:		Monthly                                        *
+!                                                                      *
+! Runcntl Parms:	Emplid, Deptid, Effdt                          *
+!***********************************************************************
+!                         MODIFICATION HISTORY                         *
+!***********************************************************************
+! CSR    INITIALS   DATE          DESCRIPTION OF THE CHANGE            *
+!***********************************************************************
+!HR-10348  SCM   02/25/2003   Initial Creation                         *
+!                                                                      *
+!          SCM   08/27/2003   Change code to put reportid on cover page*
+!                             Add code to exclude store managers from  *
+!                             getting bonuses. (jobcode_tbl.manager_lvl*
+!                             not = '99').     Add code to exclude     *
+!                             city police/security officers (jobcode=  *
+!                             '90000') from getting bonus.             * 
+!                             Change code to split out job lookup for  *
+!                             details because it was returning dup rows*
+!                             if ee had 2 effdtd rows w/the same date. *
+!                             NOTE: there were so many changes splitting
+!                             out job that I did not comment some code,*
+!                             but just deleted.  There is a backup copy*
+!                             of this sqr saved out on                 *
+!                             T:\data\pplsft\doclib\hr                 *
+!                                                                      *
+!          SCM  12/15/2003    Added totals for Hours Worked            *
+!                                                                      *
+!          AXL  03/16/2004    Change focus of home cmpy paygroup       *
+!                                                                      *
+!          AXL  03/16/2005    Allow Pharmacists to process like the    *
+!                             HOURLY employees.                        *
+!                                                                      *
+!          AXL  04/26/2005    Allow hourly rate to print on summary    *
+!                             line for each employee.                  *
+!          MXR  11/22/2006    
+!          CA   02/02/2007
+!
+!          GEX-AXG 01/29/2007 Added a new table Gex_teambonus 
+!			      data on which would be taken care by HRIS*
+!	   GEX-TLL 04/02/2008 Remove sysadm HCM 9.0 Upgrade            *
+!vendaxg 06/17/2008 Made Changes for ITG#50164		               *
+!ISDVDZK 10/09/2008 Made Changes according to the ITG#53594            *
+!ISDVSXP 21/09/2009 Changes doen to run '535' Bonus for 319507209 for second qtr of 2009   
+!GEXPY_848_ITG99203 ISDVAKG 2011-05-24  Added run control Parameters	 *
+!GEXPY_848_E920_01  Vahini Katta 2014-05-09 Took off jobcode 40072 exclusion *
+!***********************************************************************
+
+#Include 'setenv.sqc'    !Set environment
+#Include 'setup32.sqc'   !Printer and page-size initialization
+
+Begin-Setup
+  Declare-Report Bonus-Report
+!    Printer-Type=HPLASERJET          !comment for testing to get report to print correctly                 
+    Layout=Default
+  End-Declare
+  Declare-Report Suspension-Report
+!    Printer-Type=HPLASERJET         !comment for testing to get report to print correctly 
+    Layout=Default
+  End-Declare
+  Declare-Report Termination-Report
+!    Printer-Type=HPLASERJET         !comment for testing to get report to print correctly
+    Layout=Default
+  End-Declare
+
+End-Setup
+
+#define #column1      1
+#define #column2     15
+#define #column3     43
+#define #column3A    56
+#define #column3B    64                
+#define #column4     72
+#define #column5     100
+#define #column6     115
+#define #column5S    105
+#define #column6S    120
+#define #column7S    124
+#define #column8S    145
+ 
+#define #column7     125
+#define #column8     132
+#define #column9     139
+#define #column10    145
+#define #column11    153
+#define #column12    165    
+
+Begin-Heading 8  For-Reports=(Bonus-Report)
+!#debug9 Show 'Begin-Heading Bonus Report'
+ Show 'Begin-Heading Bonus Report'
+  Move 'GEXPYTBR'                To $ReportID
+  Move 'Team Bonus Program -Register- Prior Payroll Confirm' To $ReportTitle
+#Include 'stdhdg01.sqc'
+
+  if $Deptid <> $priorDeptid
+    move $Deptid to $priorDeptid
+    do Get-Department-Name  
+  end-if
+ 
+  Let $X000_temp_out = 'Pay End Dt: ' || $pay_end_dt
+  Print $X000_temp_out    (3,1)  
+  Let $X000_temp_out = 'Bonus Period  ' || $pfs.strt_dte
+  Print $X000_temp_out    (3,51)  
+  Let $X000_temp_out =  'thru  ' || $pfs.end_dte 
+  Print $X000_temp_out    (3,84)  
+ 
+  Print 'Store: '                     (6,1)
+  Print $Deptid                       (6,15,5)
+  Print $DeptName                     (6,25,30)
+!  Print 'Cents/Hour'                  (6,60,10)
+!  print #Cents_Per_Hour               (6,73,8)   edit 9.9999 
+
+  Print 'Acct'                     (+1,{#column1})
+  Print 'Employee Name'            (+0,{#column2})
+  Print 'Emplid'                   (+0,{#column3})
+  Print 'Job'                      (+0,{#column3A})
+  Print 'FT/'                      (+0,{#column3B})
+  Print 'Job Title'                (+0,{#column4})
+  Print ' Bonus'                   (+0,{#column5})
+  Print '# Hours'                  (+0,{#column6})
+  Print '**** Current Pay End **** Paysheet Log  ********' (+0,{#column7})
+  Print 'Code'                     (+1,{#column1})
+  Print 'Code'                     (+0,{#column3A})
+  Print 'PT'                       (+0,{#column3B})
+  Print ' Amount'                  (+0,{#column5})
+  Print 'Worked'                   (+0,{#column6})
+  Print 'page#'                    (+0,{#column7})
+  Print 'Line#'                    (+0,{#column8})
+  Print 'Addl#'                    (+0,{#column9})
+  Print 'Sepchk#'                  (+0,{#column10})
+  Print 'Earns Begin'              (+0,{#column11})
+  Print 'Earns End'                (+0,{#column12})
+  
+  Print '-'                    (+1,{#column1},174)   Fill
+  
+End-Heading
+
+Begin-Heading 8  For-Reports=(Suspension-Report)
+#debug9 Show 'Begin-Heading Suspension Report'
+  Show 'Begin-Heading Suspension Report'
+#Include 'stdhdg01.sqc'
+ 
+  Move 'GEXPYTBS'                To $ReportID
+  Move 'Team Bonus Program   -- Exceptions --   SUSPENSIONS' To $ReportTitle
+  
+  
+#Include 'stdhdg01.sqc'
+
+  if $Deptid <> $priorDeptid
+    move $Deptid to $priorDeptid
+    do Get-Department-Name  
+  end-if
+
+  Let $X000_temp_out = 'Team Bonus Period  ' || $pfs.strt_dte
+  Print $X000_temp_out    (3,51)  
+  Let $X000_temp_out =  'thru  ' || $pfs.end_dte 
+  Print $X000_temp_out    (3,84)  
+ 
+  Print 'Store: '                     (6,1)
+  Print $Deptid                       (6,15,5)
+  Print $DeptName                     (6,25,30)
+
+  Print 'Acct Code'                (+1,{#column1})
+  Print 'Employee Name'            (+0,{#column2})
+  Print 'Emplid'                   (+0,{#column3})
+  Print 'Job Title'                (+0,{#column4})
+  Print 'Effdt'                    (+0,{#column5S})
+  Print 'Action Reason'            (+0,{#column6S})
+  
+  Print '-'                    (+1,{#column1},174)   Fill
+  
+End-Heading
+
+Begin-Heading 8  For-Reports=(Termination-Report)
+#debug9 Show 'Begin-Heading Termination Report'
+  Show 'Begin-Heading Termination Report'
+  Move 'GEXPYTBT'                To $ReportID
+  Move 'Team Bonus Program   -- Exceptions --  TERMINATIONS' To $ReportTitle
+
+#Include 'stdhdg01.sqc'
+
+  if $Deptid <> $priorDeptid
+    move $Deptid to $priorDeptid
+    do Get-Department-Name  
+  end-if
+
+  Let $X000_temp_out = 'Team Bonus Period  ' || $pfs.strt_dte
+  Print $X000_temp_out    (3,51)  
+  Let $X000_temp_out =  'thru  ' || $pfs.end_dte 
+  Print $X000_temp_out    (3,84)  
+ 
+  Print 'Store: '                     (6,1)
+  Print $Deptid                       (6,15,5)
+  Print $DeptName                     (6,25,30)
+
+  Print 'Acct Code'                (+1,{#column1})
+  Print 'Employee Name'            (+0,{#column2})
+  Print 'Emplid'                   (+0,{#column3})
+  Print 'Job Title'                (+0,{#column4})
+  Print 'Effdt'                    (+0,{#column5S})
+  Print 'Action Reason'            (+0,{#column6S})
+  Print 'Term Date'                (+0,{#column8S})
+  
+  Print '-'                    (+1,{#column1},174)   Fill
+  
+End-Heading
+
+Begin-Report
+#debug9 Show 'Begin-Report'
+ Show 'Begin-Report'
+  Do Init-DateTime           !datetime.sqc
+  Do Init-Number             !number.sqc
+  Do Get-Current-DateTime    !curdttim.sqc
+  Do Stdapi-Init             !stdapi.sqc
+
+  Do P100-Start                    !Build index on pay_earnings in here
+  Do P185-Initialize-Flags
+  Do P190-Select-PFS-Store         !main payroll sum process is done w-in this select
+ ! Do P810-Drop-Index-PayEarnings !ISDVMXR
+ 
+  date-time () HH:MI:SS &timeEnded
+  date-time () MM/DD/YYYY &dateEnded
+  show 'Report Ended at ' &timeEnded ' on ' &dateEnded
+  show ' '                                                              
+  
+  !AXL 07-29-2008 Begin
+ ! do Rollback-Transaction  ! Uncomment this and comment the commit line above !isdvmxr *********************
+			   ! if you want to run thsi sqr without commiting any data
+  !AXL 07-29-2008 End
+
+  Do Reset                   !reset.sqc
+  Do Stdapi-Term             !stdapi.sqc
+   
+  Show 'Successful end of report'
+End-Report
+  
+!************************************************
+Begin-Procedure P100-Start
+!************************************************
+#debug9 Show 'P100-Start'
+  Show 'P100-Start'
+  date-time () HH:MI:SS &timeBegan
+  date-time () MM/DD/YYYY &dateBegan
+  show ' '
+  show 'Report Began at ' &timeBegan ' on ' &dateBegan
+  show ' '
+ 
+ ! Do P810-Drop-Index-PayEarnings      !if sqr abends, index will still be out there, so delete
+ ! do P110-Build-Index-On-PayEarnings
+  do P990-prepare-businessunit-lookup   
+
+  if $prcs_process_instance = ''
+    Do Ask-As-Of-Date
+    Let $X000_WHERE_SELECT_ASOFDATE = $AsOfDate
+!*********************************************************    
+!GEXPY_848_ITG99203 ISDVAKG 2011-05-24    - Begin 
+
+    Input $X000_WHERE_SELECT_EMPLID	'Enter the TM 9 digit number: '   						
+    Input $X000_WHERE_SELECT_DEPTID	'Enter the Store Number: ' 										
+    Input $X000_WHERE_SELECT_FROMDATE	'Enter the Bonus Start Date of the TM: '    
+    Input $X000_WHERE_SELECT_THRUDATE	'Enter the Bonus End Date of the TM: '    	
+    
+!GEXPY_848_ITG99203 ISDVAKG 2011-05-24 - End    
+!*********************************************************
+  else
+    Do GEXXX922-Select-Parameters
+    Let $X000_WHERE_SELECT_ASOFDATE = $GEX_RC_PAY.AsOfDate
+!*********************************************************    
+!GEXPY_848_ITG99203 ISDVAKG 2011-05-24    - Begin 
+    
+    Let $X000_WHERE_SELECT_FROMDATE = $GEX_RC_PAY.FromDate						
+    Let $X000_WHERE_SELECT_THRUDATE = $GEX_RC_PAY.ThruDate						
+    Let $X000_WHERE_SELECT_DEPTID	  = $GEX_RC_PAY.Deptid							
+    Let $X000_WHERE_SELECT_EMPLID		= $GEX_RC_PAY.Emplid							
+
+!GEXPY_848_ITG99203 ISDVAKG 2011-05-24 - End    
+!*********************************************************     
+
+    If Rtrim ($GEX_RC_PAY.AsOfDate, ' ') = ''
+      Let $X000_WHERE_SELECT_ASOFDATE = $AsOfToday
+    End-If
+  end-if
+
+ 
+  Let $AsOfToday_Dt = strtodate($X000_WHERE_SELECT_ASOFDATE, 'DD-MON-YYYY') !used for calculations
+  Do Format-DateTime($X000_WHERE_SELECT_ASOFDATE, $X000_REPORT_HEADING_ASOFDATE, {DEFDATE}, '', '')
+  Show ' '
+  Show '$X000_WHERE_SELECT_ASOFDATE                         = '  $X000_WHERE_SELECT_ASOFDATE
+  Show ' '
+
+  Let $X000_ORDER_BY = 'Store#, Account Code, Name, Earns_begin_dt, Earns_end_dt'
+
+  Do P130-Get-Max-UnConfirmed-Pay-End
+  !Let $pay_begin_dt   = '13-Sep-2009' !SXP 09/21/2009 535 Bonus FOR EMPLID 319507209   !TEMP FOR TESTING in HRTEST
+  !Let $pay_begin_dt   = '26-SEP-2010'  !Bonus FOR EMPLID 285403034 & 276744368   
+
+  Show '####### using this pay begin date  ===> ' $pay_begin_dt                             
+
+  !Let $pay_end_dt     = '19-Sep-2009'  !SXP 09/21/2009 535 Bonus FOR EMPLID 319507209  !Temp for testing
+  !Let $pay_end_dt     = '25-DEC-2010'   !Bonus FOR EMPLID 285403034 & 276744368
+  
+  Show '####### using this pay end date    ===> ' $pay_end_dt      
+  Show 'Using this date for runcntl as of date:  =======> ' $X000_WHERE_SELECT_ASOFDATE                         
+ 
+  Use-Report Bonus-Report
+  Move 'GEXPYTBR'                  To $ReportID                               !SCM  08/27/2003
+  Move 'Team Bonus Program -Register- Prior Payroll Confirm' To $ReportTitle  !SCM  08/27/2003
+  Do P150-Print-Cover-Page
+  Show '$ReportID=' $ReportID
+  Show '$ReportTitle=' $ReportTitle
+  Show 'Exception reports generated are: Suspensions (GEXPYTBS) and Terminations (GEXPYTBT)'
+ 
+End-Procedure
+
+!*****-----------------------------------------------------------------****
+!*****   Since STR_NO (store#) from Web App (PFS_PAYROLL_SEND) is the  
+!*****   driver in selecting open paysheets for employees in these stores,  
+!*****   (selecting from pay_earnings on deptid), 
+!*****   we need to build an index [Z] on pay_earnings to improve
+!*****   time performance in selecting the rows.   [it was dogging] 
+!*****-----------------------------------------------------------------****
+!***********************************************
+Begin-Procedure P110-Build-Index-On-PayEarnings
+!************************************************
+#debug9 Show 'P110-Build-Index-On-PayEarnings'
+   Show 'P110-Build-Index-On-PayEarnings'
+begin-SQL ON-ERROR=P995-SQL-Error-Found('P110-Build-Index-On-PayEarnings')
+alter table ps_pay_earnings nologging
+end-sql
+ 
+let #save-sql-status = 0 
+begin-sql
+CREATE INDEX PSZPAY_EARNINGS ON PS_PAY_EARNINGS (EARNS_BEGIN_DT,EARNS_END_DT,DEPTID)
+  tablespace PYLARGE_MD
+  unrecoverable
+end-sql 
+
+ If #save-sql-status = 0
+      show '** Earns_begin_dt, earns_end_dt, deptid Index built on ps_pay_earnings **'      
+  else
+      show 'PAY_EARNINGS BUILD INDEX Z ERROR FAILED'
+      STOP 		      	     
+  End-if 
+
+End-Procedure 
+ 
+ 
+!****-----------------------------------------------------------------****   
+!  Get the current pay_end_dt that you are processing the bonuses for.
+!*********************************************************************
+Begin-Procedure P130-Get-Max-UnConfirmed-Pay-End
+!*********************************************************************
+#debug9 Show 'P130-Get-Max-UnConfirmed-Pay-End'
+  Show 'P130-Get-Max-UnConfirmed-Pay-End'
+Begin-Select Loops=1
+PC.CHECK_DT
+PC.PAY_END_DT
+PC.PAY_BEGIN_DT  
+
+  Let $pay_end_dt     = &PC.PAY_END_DT
+  Let $pay_begin_dt   = &PC.PAY_BEGIN_DT
+  Let $check_issue_dt = &PC.CHECK_DT
+  Show 'Max unconfirmed pay end date:  ' $pay_end_dt
+
+FROM   PS_PAY_CALENDAR PC
+Where  pc.company = 'GEI'
+  and  pc.paygroup = 'RET'  
+  and  pc.pay_end_dt         =
+       (Select Max(pay_end_dt)
+       From   ps_pay_calendar pc2
+       Where  pc2.pay_end_dt <= $X000_WHERE_SELECT_ASOFDATE
+        and   pc2.company = 'GEI'
+        and   pc2.paygroup = 'RET'
+	!axl testing
+	And   pc2.PAY_CONFIRM_RUN = 'N') 
+        !And   pc2.PAY_CONFIRM_RUN = 'Y')
+  
+End-Select
+End-Procedure
+
+!************************************************
+begin-procedure P150-Print-Cover-Page
+!************************************************
+#debug9 Show 'P150-Print-Cover-Page'
+   Show 'P150-Print-Cover-Page'
+  Print 'RUN CONTROL INFORMATION FOR THIS REPORT RUN:'            (+5,1)
+  Print '$Prcs_OPRID          = '                                 (+1,5)
+  Print $Prcs_OPRID                                               (0,+2)
+  Print '$PRCS_RUN_CNTL_ID    = '                                 (+1,5)
+  Print $PRCS_RUN_CNTL_ID                                         (0,+2)
+
+  Print 'SELECTION CRITERIA FOR THIS REPORT RUN:'                 (+5,2)
+  Print 'As Of Date : '                                           (+1,5)
+  Print $X000_REPORT_HEADING_ASOFDATE                             (0,+2)
+ 
+  Print 'Current Pay end date: '                                  (+2,5)
+  Print $Pay_end_dt                                               (0,+2)
+
+  Print 'SORT ORDER FOR THIS REPORT RUN:'                         (+3,2)
+  Print $X000_ORDER_BY                                            (+1,5)
+
+  Let #PAGE-COUNT = 0
+  Use-Report Bonus-Report
+  New-Page
+End-Procedure
+
+!************************************************
+Begin-Procedure P185-Initialize-Flags
+!************************************************
+  Let $Active-Data-Found-Flag = 'N'
+  Let $first_trans = 'Y' 
+  Let $key_change  = 'N'
+  Let $Termination_Found = 'N'                !used to determine if theres data on Term rpt
+  Let $Suspension_Found  = 'N'                !used to determine if theres data on Susp rpt
+  move 0 to #lumpsum 
+  move 0 to #sum_deptid_Bonus_amt
+  move 0 to #recs-written-Bonus-Rpt
+  move 0 to #recs-written-Suspension-Rpt
+  move 0 to #recs-written-Terminated-Rpt
+  move 0 to #termrecs-per-Dept
+  move 0 to #susprecs-per-Dept 
+  move 0 to #pay_earns_recs_inserted
+  move 0 to #pay_oth_earns_recs_inserted
+  move 0 to #ees_receiving_Bonus 
+  let $Retrieved-Max-SepChk = 'N'             !only get max sepchk# once per ee, it is set='Y'
+                                              !in P320-Get-Max-Sepchk 
+                                              !and reset to 'N' when ee totals are printed.
+
+end-procedure
+ 
+!****   PFS = Passion for Service.  The name was changed to
+!****   TBP = Team Bonus Program but the Web Batch application kept the PFS name.
+!************************************************
+Begin-Procedure P190-Select-PFS-Store
+!************************************************
+#debug9 Show 'P190-Select-PFS-Store'
+  Show 'P190-Select-PFS-Store'
+  let $Input-Store-Found = 'N'
+Begin-Select
+pfs.str_no
+pfs.strt_dte
+pfs.end_dte
+pfs.hrly_payout
+pfs.slry_payout
+ 
+  let $Input-Store-Found = 'Y' 
+  show 'PFS store#:    ' &pfs.str_no
+  show 'PFS hrly rate: ' &pfs.hrly_payout
+  show 'PFS lump sum : ' &pfs.slry_payout
+  Move &pfs.str_no to $Pfs.Str_No 9999
+  !show 'pfs.strt_dte:  ' &pfs.strt_dte
+  !show 'pfs.end_dte:   ' &pfs.end_dte
+  Let #Cents_Per_Hour     = &pfs.hrly_payout
+  Let #lumpsum            = &pfs.slry_payout
+  
+!*****************************************************************  
+!  GEX-PY-ITG99203 - Begins 
+!*****************************************************************  
+  !Let $pfs.strt_dte       = &pfs.strt_dte 							
+  !Let $pfs.end_dte        = &pfs.end_dte								
+  If Rtrim ($X000_WHERE_SELECT_FROMDATE, ' ') = '' AND Rtrim($X000_WHERE_SELECT_THRUDATE,' ') = ''
+   	Let $pfs.strt_dte       = &pfs.strt_dte 
+  	Let $pfs.end_dte        = &pfs.end_dte
+  Else
+    Let $pfs.strt_dte       = $X000_WHERE_SELECT_FROMDATE 
+  	Let $pfs.end_dte        = $X000_WHERE_SELECT_THRUDATE
+  End-If  
+!*****************************************************************  
+!  GEX-PY-ITG99203 - Ends 
+!*****************************************************************     
+   show 'pfs.strt_dte:  ' $pfs.strt_dte
+   show 'pfs.end_dte:   '$pfs.end_dte
+ 
+  Do P195-Convert-PFS-Store-No             !input store is coming in with preceding spaces
+  Do P197-Find-PayBegin-for-PdEnd          !Find pay begin date for period end date
+ 
+  Do P200-Main-Process
+  
+  Do P290-Dept-Totals    
+ !Modified for upgrade 9.0 GEX-AXG - Begin 
+!from pfs_payroll_send  pfs
+!from PS_PFS_PAYROL_SEND pfs	!Changed by Vendkxy on 01/28/2008 for SCG 9753744 from pfs_payroll_send  pfs to from sysadm.ps_gex_teambonus pfs
+!from sysadm.ps_gex_teambonus pfs
+from ps_gex_teambonus pfs 
+where pfs.str_no= $X000_WHERE_SELECT_DEPTID   			! GEXPY_848_ITG99203 ISDVAKG 2011-05-24    
+!GEX-TLL  04/02/2008 HCM 9.0 Upgrade
+!Modified for upgrade 9.0 GEX-AXG - End
+order by pfs.str_no
+ 
+End-Select
+
+! ****  To ensure that the stores are only processed once, the Input WEB APP
+! ****  will delete the store records after our bonus process runs.
+ 
+ If $Input-Store-Found = 'N'
+   Use-Report Bonus-Report
+   Print 'NO STORE INPUT FOR THIS REPORT RUN'	(25,) Center
+   Use-Report Termination-Report
+   Print 'NO STORE INPUT FOR THIS REPORT RUN'	(25,) Center
+   Use-Report Suspension-Report
+   Print 'NO STORE INPUT FOR THIS REPORT RUN'	(25,) Center
+   goto NoStores-End-Sqr
+ end-if
+   
+ If $Active-Data-Found-Flag = 'N'
+    Use-Report Bonus-Report
+    Print 'NO DATA SELECTED FOR THIS REPORT RUN'	(25,) Center
+ Else
+    Do P800-Show-Totals-to-Log
+    Do P510-Print-Bonus-Rpt-Grand-Totals
+ End-If	
+ If $Termination_Found = 'N'
+    Use-Report Termination-Report
+    Print 'NO DATA SELECTED FOR THIS REPORT RUN'	(25,) Center
+ else
+    Do P512-Print-Termination-Rpt-Grand-totals
+ End-if
+ If $Suspension_Found = 'N'
+    Use-Report Suspension-Report
+    Print 'NO DATA SELECTED FOR THIS REPORT RUN'	(25,) Center
+ else
+    Do P514-Print-Suspension-Rpt-Grand-totals
+ end-if   
+
+NoStores-End-Sqr:
+ 
+End-Procedure
+ 
+!***************************************************
+Begin-Procedure P195-Convert-PFS-Store-No
+!***************************************************
+
+!  str_no coming in from the PFS Web App is 4 characters, but it is not
+!  preceded with zeros.  In order to find the deptid on the payroll tables, it
+!  must have zeros preceding the deptid.  This is a conversion to precede with zeros.
+
+  Extract $1stchar from $pfs.str_no 0 1       !extract 1st position of $pfs.str_no
+  Extract $2ndchar from $pfs.str_no 1 1       !extract 2nd position of $pfs.str_no
+  Extract $3rdchar from $pfs.str_no 2 1       !extract 3rd position of $pfs.str_no
+  Extract $4thchar from $pfs.str_no 3 1       !extract 4th position of $pfs.str_no
+  
+  if $3rdchar = ' '
+     let $convert_pfs_str_no = '0' || '0' || '0' || $4thchar
+  else
+     if $2ndchar = ' '
+        let $convert_pfs_str_no = '0' || '0' || $3rdchar || $4thchar
+     else
+        if $1stchar = ' '
+            let $convert_pfs_str_no = '0' || $2ndchar || $3rdchar || $4thchar
+        else
+            let $convert_pfs_str_no = $pfs.str_no  
+        end-if
+     end-if
+  end-if
+  
+End-Procedure
+ 
+!***************************************************************  
+!  Select pay end dt for the input period end date.  This will be
+!  used for earns_begin_dt for inserting pharmacists lump sum
+!**************************************************************** 
+Begin-Procedure P197-Find-PayBegin-for-PdEnd
+#debug9 Show 'P197-Find-PayBegin-for-PdEnd'
+  Show 'P197-Find-PayBegin-for-PdEnd'
+Begin-Select
+PCX.PAY_END_DT,
+PCX.PAY_BEGIN_DT 
+     move &PCX.PAY_BEGIN_DT to $PdEnd_pay_begin_dt
+     show '###Input period pay begin date for pharmacists insert:  ' $PdEnd_pay_begin_dt  
+FROM   PS_PAY_CALENDAR PCX
+Where  PCX.company = 'GEI'
+  and  PCX.paygroup = 'RET'  
+  and  PCX.pay_end_dt         =
+       (Select Max(pay_end_dt)
+       From   ps_pay_calendar PCX2
+       Where  PCX2.pay_end_dt = $pfs.end_dte
+        and   PCX2.company = 'GEI'
+        and   PCX2.paygroup = 'RET'
+        And   PCX2.PAY_CONFIRM_RUN = 'Y')
+
+End-Select
+End-Procedure
+
+  
+!***************************************************************  
+!  This sql select will return ONE row for each pay week between  
+!  the 2 input pfs (financial) period dates. 
+!  The returned row will have total hours paid for that week
+!  between (earns_begin_dt and earns_end_dt).
+!***************************************************************
+ 
+!************************************************
+Begin-Procedure P200-Main-Process
+!************************************************
+#debug9 Show 'P200-Main-Process'
+SHOW 'convert_pfs_str_no  ' $convert_pfs_str_no
+show 'P200-Main-Process'
+   let $first-pharmacist = 'Y'
+   Let #Sum_Pharmacist_Hours = 0
+Begin-Select
+
+j.emplid          ()     On-Break   Level=1
+                                    Print=Never
+                                    After=P295-Emplid-Totals
+pe.earns_begin_dt
+pe.earns_end_dt
+j.acct_cd		
+j.empl_rcd
+j.effdt
+pd.name	
+pe.deptid
+!AXL 3/16/2004 - Begin
+!pe.company 
+!pe.paygroup
+j.company 
+j.paygroup
+!AXL 3/16/2004 - End
+sum(pe.reg_hrs)      &pe.reg_hrs 	 
+sum(pe.reg_earn_hrs) &pe.reg_earn_hrs
+      show 'emplid' &j.emplid
+	!Vendaxg added for ITG#50164 on 07/22/2008 - Begin
+	Do Verify-PH-Jobcode	!Vendaxg added for ITG#50164 on 07/22/2008
+	If $Process_Row = 'N'
+		Goto bypass-paycheck-processing
+	End-if
+	!Vendaxg added for ITG#50164 on 07/22/2008 - End
+  Let $Employee-is-Active     = 'N'         !flag re-set for employee totaling
+  Let $Sus_Flag = 'N'
+ show 'verified JObcode'
+! ******  SCM  08/27/2003   BEGIN...ADD this code to exclude Hourly dept managers from bonuses
+! ******  and split out job select because the same effdtd row was duplicating results.
+  Do P700-Get-Job-Details                 !get current job detail   
+  !Do P750-Get-Job-Sus			  !get any suspensions during bonus period  uncomment***********************************
+
+!*******  SCM  08/27/2003   END
+ 
+!*-------------------------------*
+!*--   Suspended employees     --*
+!*-------------------------------*
+
+!***** SCM 08/27/2003  BEGIN
+ ! start commenting  from line below to allow processing of suspendded employeee
+ ! If (&js.empl_status = 'L' or &js.empl_status = 'P' or $Sus_Flag = 'Y')
+      
+ !     If (&js.action_reason = 'SUS' or &js.action_reason = 'SU1' or
+ !         &js.action_reason = 'SU2' or $Sus_Flag = 'Y')
+ !        Do P240-Check-if-Susp-During-Pd            !check if susp was during financ pd, if so,
+ !        if $Suspended_During_Period = 'Y'          !   the ee is ineligible for bonus.
+ !            if &j.emplid = $save_printed_susp_ee    !if this ee is the same as the one you just
+ !              Goto bypass-paycheck-processing       !printed on suspension rpt, bypass.
+ !            else
+ !              Do P520-Print-Suspension-Report
+ !              Goto bypass-paycheck-processing
+ !            end-if
+ !         end-if
+ !     end-if 
+ ! end-if
+!***** SCM 08/27/2003  END
+ !end commenting  from line below to allow processing of suspendded employeee
+    
+!*-------------------------------*
+!*--      Terminated           --*
+!*-------------------------------*   
+  If (&js.empl_status = 'T' or &js.empl_status = 'Q'     !Q,R=Retires    D,U=Deceased
+    or &js.empl_status = 'R' or &js.empl_status = 'D' 
+     or &js.empl_status = 'U')
+                      
+     Do P245-Check-if-Term-During-Pd-OrAfter         !check if term betw financ begin & cur run dt
+     if $Termed_During_Pd_OrAfter = 'Y'              !   the ee is ineligible for bonus.
+        if &j.emplid = $save_printed_termed_ee       !only print ee once on report
+          Goto bypass-paycheck-processing
+        else
+          Do P530-Print-Termination-Report           !print only if termed betw fin pd begin and cur run dt
+          Goto bypass-paycheck-processing
+        end-if
+     else
+        Goto bypass-paycheck-processing              !if not termed within betw fin pd begin  
+     end-if                                          !and current run dt, do not process-just bypass 
+  end-if
+
+! HRISCA ITG #  38400  Reorder Logic Flow  02/02/2007
+! **** Statements moved up program inorder to use in lookup routines (P725, P900)
+  let $earns_begin_dt    = &pe.earns_begin_dt	!ISDVMXR ITG#  38400 01/28/2007
+  let $earns_end_dt      = &pe.earns_end_dt	!ISDVMXR ITG#  38400 01/28/2007
+
+    
+! ******  SCM  08/27/2003   BEGIN...ADD this code to exclude Hourly dept managers from bonuses
+! ******  and split out job select because the same effdtd row was duplicating results.
+ 
+  Do P725-Get-Job-Details                 !get Pay week job detail   !HRISCXA ITG#  38400 02/02/2007
+  let $jobcode='80007'
+  Do P900-Get-Jobcode-Tbl                 !get $Jobtitle and $Manager_level 
+
+  !AXL 6/2009...override 
+  let $Manager_level = '99'   
+  if &j2s.empl_type = 'H' 
+    if $Manager_level = '99'              !Process only '99' (Non-Mgr)
+    else
+       show ' #######   Excluded this Manager from bonus:  ' &j.emplid
+       show ' #######   Manager level on Jobcode_tbl is :  ' $manager_level
+       show ' #######   Jobcode is                      :  ' $Jobcode
+       show ' #######   Pay Period is : ' $earns_begin_dt ' thru ' $earns_end_dt
+       Goto bypass-paycheck-processing
+    end-if
+  end-if 
+!    do get-job-title                         !getjobtl.sqc
+
+!*-----Active, Pharmacist Setup---------*
+!AXL 3/16/2005 ...Deactivate all Rx Code...let them come through like everyone else
+!   If $Jobcode = '30170'                             !EE IS A PHARMACIST (either FT or PT)     
+!       let $EE-is-Pharmacist = 'Y'
+!       if $first-pharmacist = 'Y'
+!          let $first-pharmacist = 'N'
+!          move &PFS.Slry_Payout to #Bonus_base            !to print on rpt on ee total line
+!          show ' ----------***  FIRST ee that is fulltime pharmacist:  ' &j.Emplid
+!       else      
+!          move &PFS.Slry_Payout to #Bonus_base            !to print on rpt on ee total line
+!          show ' ----------***  ee is fulltime pharmacist:  ' &j.Emplid
+!       end-if
+!   else
+!       let $EE-is-Pharmacist = 'N'
+!       move &PFS.Hrly_Payout to #Bonus_base                  
+!   end-if  
+
+  move &PFS.Slry_Payout to #Bonus_base   !AXL  04/26/2005 Print on rpt on ee total line 
+ 	 
+  let $Error-found = 'N'
+  Let #Total_Hours_FortheWeek = 0 
+  Let #Grand_Total_Hours_ByWeek = 0
+  let #reg_hrs           = 0
+  let #reg_earn_hrs      = 0 
+  !AXL 3/16/2004 - Begin
+  Let $company           = &j.company         
+  Let $paygroup          = &j.paygroup       
+  !Let $company           = &pe.company         
+  !Let $paygroup          = &pe.paygroup       
+  !AXL 3/16/2004 - End
+!  let $earns_begin_dt    = &pe.earns_begin_dt	!ISDVMXR ITG#  38400 01/28/2007
+!  let $earns_end_dt      = &pe.earns_end_dt	!ISDVMXR ITG#  38400 01/28/2007
+  Let $j.acct_cd         = &j.acct_cd
+  Let $j.effdt           = &j.effdt
+  
+  let $action_reason_descr = ' '            !reset for next ee since terms/susp were printed already
+  let #reg_hrs           = &pe.reg_hrs
+  let #reg_earn_hrs      = &pe.reg_earn_hrs
+ 
+  Let $Name        = &pd.name     
+  Let $Emplid      = &j.emplid
+  Let $Empl_rcd    = &j.empl_rcd
+  Let $Deptid      = $convert_pfs_str_no     !deptid will be set to the input pfs store #
+  
+  let $pe_deptid = &pe.deptid 
+  Extract $1sttwochar_deptid from $pe_deptid 0 2        
+  if $1sttwochar_deptid = 'CG' 
+    show 'CG* dept, ee, and store# processed ++++++++++: ' $pe_deptid $Emplid $convert_pfs_str_no
+  end-if
+                                            
+  Do Get-Department-Name                 !getdptnm.sqc
+
+!*------------------------------------------*
+!*--     Active employees processing      --*
+!*------------------------------------------*  
+  Let $Active-Data-Found-Flag = 'Y'
+  Let $Employee-is-Active     = 'Y'
+  
+  Do P205-Calc-Oth-Hours                          !Loop to get oth_hrs
+  Do P300-Get-Paysheet                            !get open paysheet for this pay end dt
+  if $Page_Sheet_Found = 'Y'    
+     Do P215-Process-the-Paysheet
+  else
+     Do P230-Format-for-New-Paysheet
+  end-if
+      
+bypass-paycheck-processing:
+ 
+  Let $Save_Deptid = $convert_pfs_str_no
+  Let $Save_Emplid = $Emplid
+  Let $Save_empl_Status = $empl_status
+  show '$convert_pfs_str_no =' $convert_pfs_str_no  !ISDVMXD
+ 
+From   ps_job                        j,
+       ps_personal_data              pd,
+       ps_pay_earnings              pe
+        
+where  (pe.earns_begin_dt           >= $pfs.strt_dte        !financial period begin/end
+       and pe.earns_end_dt       <= $pfs.end_dte)               
+
+and    (pe.deptid = $convert_pfs_str_no        
+       OR
+       (pe.deptid like 'CG%' and j.deptid = $convert_pfs_str_no)
+       or pe.deptid = $X000_WHERE_SELECT_DEPTID)  							! GEXPY_848_ITG99203 ISDVAKG 2011-05-24    
+and    j.empl_status in ('A', 'D', 'L', 'P', 'Q', 'R', 'S', 'T', 'U')   !Q,R=Retires;  D,U=Deceased
+!vendaxg modified for ITG#50164  - Begin
+!and    ((j.empl_type = 'H') OR                    !only select hourly ees and FT pharmacists  
+!     (j.comp_frequency = 'W' and j.jobcode = '30170'))
+!and ((j.empl_type = 'H') and ((j.jobcode <> '20138') and (j.jobcode <> '30000') and (j.jobcode <> '30005') and (j.jobcode <> '30170')
+!				and (j.jobcode <> '30299') and (j.jobcode <> '40072') and (j.jobcode <> '80022') and (j.jobcode <> '88016')))
+!vendaxg modified for ITG#50164  - End
+!ISDVDZK modified for ITG#53594  - start
+!GEXPY_848_E920_01  Vahini Katta 2014-05-09 Begins
+!and ((j.empl_type = 'H') and ((j.jobcode <> '30000')  and (j.jobcode <> '40072') and (j.jobcode <> '70019') and (j.jobcode <> '80074')  and ((j.jobcode = '30170' and j.std_hours<30 ) or (j.jobcode <> '30170')) and ((j.jobcode = '20138' and j.std_hours<30 ) or (j.jobcode <> '20138')) and ((j.jobcode = '30299' and j.std_hours<30 ) or (j.jobcode <> '30299'))))
+and ((j.empl_type = 'H') and ((j.jobcode <> '30000')  and (j.jobcode <> '70019') and (j.jobcode <> '80074')  and ((j.jobcode = '30170' and j.std_hours<30 ) or (j.jobcode <> '30170')) and ((j.jobcode = '20138' and j.std_hours<30 ) or (j.jobcode <> '20138')) and ((j.jobcode = '30299' and j.std_hours<30 ) or (j.jobcode <> '30299'))))
+!GEXPY_848_E920_01  Vahini Katta 2014-05-09 Ends
+!ISDVDZK modified for ITG#53594  - End
+and   j.jobcode <> '90000'                        !SCM 08/27/2003 exclude city police-security officers   
+and j.emplid = $X000_WHERE_SELECT_EMPLID 									! GEXPY_848_ITG99203 ISDVAKG 2011-05-24     
+And    pe.emplid                 = j.emplid
+And    pe.empl_rcd               = j.empl_rcd
+And    pd.emplid                 = pe.emplid
+And    j.effdt                   =
+      (Select Max(effdt)
+       From   ps_job
+       Where  emplid             = pe.emplid
+       And    empl_rcd           = pe.empl_rcd
+       And    effdt             <= $pfs.end_dte)														! GEXPY_848_ITG99203 ISDVAKG 2011-05-24    
+And    j.effseq                  =
+      (Select Max(effseq)
+       From   ps_job
+       Where  emplid             = j.emplid
+       And    empl_rcd           = j.empl_rcd
+       And    effdt              = j.effdt)
+
+Group by j.emplid, pe.earns_begin_dt, pe.earns_end_dt, j.acct_cd, j.empl_rcd,
+!j.effdt, pd.name, pe.deptid, j.company, j.paygroup !Vendaxg Commented for ITG#50164 
+j.effdt, pd.name, pe.deptid, j.company, j.paygroup,j.jobcode !Vendaxg Added for ITG#50164 
+Order by pe.deptid, j.acct_cd, pd.name, pe.earns_begin_dt, pe.earns_end_dt		       
+                                 
+End-Select
+End-Procedure
+ 
+
+!***  We need the detail information from pay_earnings for each
+!***  earn_begin_dt and earn_end_dt, but we need to also get the other hours
+!***  from pay_oth_hrs.  But..pay_oth_hrs is not based on earn_begin_dt,
+!***  but on pay_end_dt.  So we must backtrack and first select the detail hours
+!***  for each pay_end_dt (not earns_end_dt) then loop thru
+!***  pay_oth_earns to match up and sum the other hours  (oth_hrs).
+!***  The program logic does not need/or use the sums calced in this procedure.
+!***  It only needs pay end dt, page#, line# and addl# to look up the oth_hrs.
+!*******************************************
+Begin-Procedure P205-Calc-Oth-Hours
+!*******************************************
+#debug9 Show 'P205-Calc-Oth-Hours' 
+ Show 'P205-Calc-Oth-Hours' 
+let #oth_hrs = 0
+!**------ if paysheet deptid = 'CG*' lookup other hours under this CG* deptid,
+!**------ otherwise lookup the hours under $Deptid (which was set to the input store#)
+if $1sttwochar_deptid = 'CG'               
+  let $lookup_deptid = $pe_deptid
+else
+  let $lookup_deptid = $Deptid
+end-if
+  
+begin-Select
+pe1.emplid
+pe1.company 
+pe1.paygroup
+pe1.pay_end_dt
+pe1.off_cycle
+pe1.page_num
+pe1.line_num
+pe1.addl_nbr
+pe1.earns_begin_dt
+pe1.earns_end_dt
+pe1.deptid
+sum(pe1.reg_hrs)        &pe1.reg_hrs
+sum(pe1.reg_earn_hrs)   &pe1.reg_earns_hrs
+  
+  DO P210-Get-Pay-Oth-Hours
+  Add #accum_oth_hrs to #oth_hrs
+
+From   ps_pay_earnings               pe1
+where  (pe1.earns_begin_dt           = $earns_begin_dt
+       and pe1.earns_end_dt          = $earns_end_dt)
+And  pe1.emplid           = $emplid
+And  pe1.empl_rcd         = $empl_rcd
+and  pe1.deptid           = $lookup_deptid
+
+Group by pe1.emplid, pe1.company, pe1.paygroup, pe1.pay_end_dt, 
+pe1.off_cycle, pe1.page_num, pe1.line_num, pe1.addl_nbr, 
+pe1.earns_begin_dt, pe1.earns_end_dt, pe1.deptid
+
+Order by pe1.deptid, pe1.emplid, pe1.earns_begin_dt, pe1.earns_end_dt	
+end-select
+
+End-Procedure
+  
+!*******************************************
+Begin-Procedure P210-Get-Pay-Oth-Hours
+!*******************************************
+#debug9 Show 'P210-Get-Pay-Oth-Hours' 
+ Show 'P210-Get-Pay-Oth-Hours'
+  let #accum_oth_hrs = 0
+begin-select
+sum(poe.oth_hrs)  &poe.oth_hrs
+
+  let #accum_oth_hrs = &poe.oth_hrs
+
+from ps_pay_oth_earns poe
+where poe.company    = &pe1.company
+and   poe.paygroup   = &pe1.paygroup
+and   poe.pay_end_dt = &pe1.pay_end_dt
+and   poe.off_cycle  = &pe1.off_cycle
+and   poe.page_num   = &pe1.page_num
+and   poe.line_num   = &pe1.line_num
+and   poe.addl_nbr   = &pe1.addl_nbr
+end-select
+
+End-Procedure
+
+  
+!*This procedure is CLONED and modified TO:  P230-Format-for-New-Paysheet
+!*NOTE:  Any change to this procedure, will need done to P230-Format-for-New-Paysheet
+!**************************************************
+Begin-Procedure P215-Process-the-Paysheet
+!**************************************************
+#debug9 Show 'P215-Process-the-Paysheet'
+Show 'P215-Process-the-Paysheet'
+Show 'JobCode : '$JobCode
+   Let #Total_Hours_FortheWeek   = 0
+   Let #Bonus_Amt_FortheWeek = 0
+   Let #Total_Hours_FortheWeek   = #reg_hrs + #reg_earn_hrs + #oth_hrs
+   !AXL 3/16/2005 Deactivate Pharmacy code  
+   !if $EE-is-Pharmacist = 'Y'
+   !   Do P220-Process-A-Pharmacist                 !go calculate #Sum_Pharmacist_Hours
+   !   show '#reg_hrs:               ' #reg_hrs
+   !   show '#reg_earn_hrs:          ' #reg_earn_hrs
+   !   show '#oth_hrs:               ' #oth_hrs
+   !   let #Grand_Total_Hours_ByWeek = #Sum_Pharmacist_Hours               
+   !   Do P500-Print-Bonus-Report
+   !   goto Process-the-Paysheet-Bypass          !do not insert to pay/pay oth earnings until the
+!                                               !ee breaks cause the Bonus amt is pro-rated
+!                                               !on the total hours for the month. 
+                
+   !else                                 !ee is NOT a PHARMACIST AXL 3/16/2005
+      Do P305-Figure-Out-Addl-And-Sepchk
+      Move #Cents_per_hour to #hrlyrt              !for hourlies FLSA processing      
+      let #Grand_Total_Hours_ByWeek   = #Total_Hours_FortheWeek
+      Let #Bonus_Amt_FortheWeek       = #Cents_Per_Hour * #Total_Hours_FortheWeek
+      Let #Bonus_Amt_FortheWeek       = round (#Bonus_Amt_FortheWeek,2)      
+   !end-if AXL 3/16/2005
+ 
+   If #Bonus_Amt_FortheWeek = 0            !if amt is zero, just print on rpt
+      Do P500-Print-Bonus-Report           !and do not insert to pay_earnings records
+   else  
+      Do P400-Insert-Pay-Earnings                       
+      Do P450-Insert-Pay-Oth-Earnings                   
+      show 'Insert for pay earnings and pay_oth_earnings for regular ee: ' $EMPLID
+      show 'page# line# addl# ' #page #line #MaxAddl_Plus1
+      show '#total_Bonus_amt_fortheweek: ' #Bonus_Amt_FortheWeek
+      show '*****-----------------------------****'
+      Do P500-Print-Bonus-Report
+   end-if 
+     	
+Process-the-Paysheet-Bypass:    
+
+End-Procedure
+ 
+!***********************************************
+Begin-Procedure P220-Process-A-Pharmacist
+!************************************************
+!  #Total_Hours_ForTheWeek was already calc'd adding up 
+!  #reg_hrs+#reg_earn_hrs+#oth_hrs.  There could also be a flat  
+!  amount on the 167 erncd payline. If so, go calculate those and add      
+!  them to #Total_Hours_FortheWeek giving #Sum_Pharmacist_Hours.
+!*********************************************************************
+#debug9 
+ Show 'P220-Process-A-Pharmacist'
+ 
+   Let #Sum_Pharmacist_Hours = 0
+   Do P226-CalcHrs-From-FlatAmt-On167      !Process the hours on the 167 erncd line  
+   
+   If $earns_for167_found = 'Y'                  
+      Let #Sum_Pharmacist_Hours = (#Sum_Pharm_Oth_Earns_Hrs + #Total_Hours_FortheWeek)                           
+   else
+      Let #Sum_Pharmacist_Hours = #Total_Hours_FortheWeek  
+   end-if
+   show '#total_Hours_fortheweek:      ' #Total_Hours_FortheWeek
+   show '#sum_pharm_oth_earns_hrs:     ' #sum_pharm_oth_earns_hrs
+   show '#Sum_Pharmacist_Hours:        ' #Sum_Pharmacist_Hours    
+
+End-Procedure
+        
+
+!*** Pharmacy Premium (Hours or Flat Amount) =  167 erncd ***
+!************************************************************
+Begin-Procedure P226-CalcHrs-From-FlatAmt-On167
+!************************************************************
+#debug9 Show 'P226-Sum-Oth-Earns-for167' 
+ Show 'P226-Sum-Oth-Earns-for167'
+!**  Since each addl# on a page#, line# for this ee/deptid could have different hrs  
+!**  or flat amt, that is why this is done in a select loop and not a sum.
+!**  If oth_hrs on the 167 is > 0, we don't need to do anything, because we've
+!**  already previously retrieved and added these in the P205-Calc-Oth-Hours routine. 
+!**   --IF oth_hrs = 0, then there could be a flat amount.  IF so,
+!**  use the flat amount, convert to hours by dividing by rate, then add to sum.
+!
+  Let #Pharm_Oth_Earns_Hrs = 0     !this is the converted, for each unique addl# 
+  let #oth_earns_for167 = 0
+  let $earns_for167_found = 'N'
+  Let #Sum_Pharm_Oth_Earns_Hrs = 0   !this is a running total of all 167 hours for the incoming week  
+
+begin-select ON-ERROR=P995-SQL-Error-Found('P226-CalcHrs-From-FlatAmt-On167')
+pe4.hourly_rt
+poe4.oth_hrs
+poe4.oth_earns
+poe4.page_num
+poe4.line_num
+poe4.addl_nbr
+    
+  let $earns_for167_found = 'Y'
+  if &poe4.oth_hrs = 0                !if oth_hrs = 0, there could be a flat amount
+    if &poe4.oth_earns > 0              !then flat amount exists--calculate hours
+       show '******erncd 167****** found. Will CONVERT to hours. oth_earns = :  ' &poe4.oth_earns
+       show 'hourly_rt:                ' &pe4.hourly_rt
+       show 'pagenum/linenum           ' &poe4.page_num &poe4.line_num
+       show 'addl_nbr                  ' &poe4.addl_nbr
+       show 'earns begin/ earns end dt ' $earns_begin_dt $earns_end_dt
+       let #pharm_hourly_rt = &pe4.hourly_rt
+       if #pharm_hourly_rt = 0
+         show 'Cannot calc hours for pharmacist with flat amount because hourly rate = 0'
+         show 'writing to error log'
+       else
+          let #oth_earns_for167 = #oth_earns_for167 + &poe4.oth_earns
+          show 'other earnings from 167  #oth_earns_for167 = ' #oth_earns_for167 
+  
+          Let #Pharm_Oth_Earns_Hrs = #oth_earns_for167 / #pharm_hourly_rt
+          Let #Pharm_Oth_Earns_Hrs = round (#Pharm_Oth_Earns_Hrs,2)
+          show 'calculated hours #pharm_oth_earns_hrs =  ' #Pharm_Oth_Earns_Hrs
+          show '***********************************************************************' 
+          Let #Sum_Pharm_Oth_Earns_Hrs = #Sum_Pharm_Oth_Earns_Hrs + #Pharm_Oth_Earns_Hrs
+       end-if
+     end-if
+  end-if               !if &poe4.oth_hrs > 0, then we've already added these hours.  
+
+from ps_pay_earnings   pe4,
+     ps_pay_oth_earns  poe4
+
+where  (pe4.earns_begin_dt           = $earns_begin_dt
+       and pe4.earns_end_dt          = $earns_end_dt)
+And  pe4.emplid           = $emplid
+And  pe4.empl_rcd         = $empl_rcd
+and  pe4.deptid           = $deptid
+and  pe4.company          = poe4.company
+and  pe4.paygroup         = poe4.paygroup
+and  pe4.pay_end_dt       = poe4.pay_end_dt
+and  pe4.off_cycle        = poe4.off_cycle
+and  pe4.page_num         = poe4.page_num
+and  pe4.line_num         = poe4.line_num
+and  pe4.addl_nbr         = poe4.addl_nbr
+and  poe4.erncd           = '167'
+end-select
+
+End-Procedure
+ 
+
+!***  THIS PRocedure IS A MODIFIED CLONE OF P215-Process-the-Paysheet.
+!**** ANY CHANGE IN HERE MUST BE MADE TO PARA  P215-Process-the-Paysheet
+!**************************************************
+Begin-Procedure P230-Format-for-New-Paysheet
+!**************************************************
+#debug9 Show 'P230-Format-for-New-Paysheet'
+ show 'Procedure  P230-Format-for-New-Paysheet $Jobcode : '$JobCode
+   Let #Total_Hours_FortheWeek   = 0
+   Let #Bonus_Amt_FortheWeek = 0
+   Let #Total_Hours_FortheWeek   = #reg_hrs + #reg_earn_hrs + #oth_hrs
+   !AXL 3/16/2005 Deactivate Pharmacy code     
+   !if $EE-is-Pharmacist = 'Y'
+      !Do P220-Process-A-Pharmacist                 !we are inserting lumpsum for cur payweek
+      !let #Grand_Total_Hours_ByWeek = #Sum_Pharmacist_Hours            
+      !Do P500-Print-Bonus-Report
+      !goto Format-for-New-Paysheet-Bypass       !do not insert to pay/pay oth earnings until the
+!                                               !ee breaks cause the Bonus amt is calced
+!                                               !on the total hours for the month. 
+                
+   !else                                 !ee is NOT a PHARMACIST AXL 3/16/2005  
+      Do P305-Figure-Out-Addl-And-Sepchk
+      Move #Cents_per_hour to #hrlyrt              !for hourlies FLSA processing      
+      let #Grand_Total_Hours_ByWeek   = #Total_Hours_FortheWeek
+      Let #Bonus_Amt_FortheWeek    = #Cents_Per_Hour * #Total_Hours_FortheWeek
+      Let #Bonus_Amt_FortheWeek    = round (#Bonus_Amt_FortheWeek,2)      
+   !end-if AXL 3/16/2005
+ 
+   If #Bonus_Amt_FortheWeek > 0
+     Do P260-Process-EE-WithNo-Paysheet         !Build and Insert a new paysheet
+     if $Error-found = 'N'
+        Do P500-Print-Bonus-Report
+     else
+        show 'Error-found=Y when processing new paysheet for emplid:  ' $emplid
+        show 'Error occured in the P615-Get-Employee-Data para'
+     end-if
+   else
+      show 'Employee had no Bonus amount and no paysheet' $emplid      
+   end-if
+
+Format-for-New-Paysheet-Bypass:
+end-procedure
+ 
+!***************************************************************************! 
+!-------- NOTE:   ANYTIME this matrix changes, this sqr will need modified.
+!***************************************************************************!
+!      FT and PT Pharmacists Matrix for Bonus Pro-Ration
+! Bonus Earned  Hours Pd  Hours Pd  Hours Pd  Hours Pd  Hours Pd  Hours Pd             
+!  (Lumpsum)      1-23     24-48     49-72     73-96     97-119     >119     
+! <25            $0.00     $0.00     $0.00     $0.00      $0.00    Full Amt          
+! $25-$49        $0.00     $7.58    $12.73    $17.77     $22.71    Full Amt
+! $50-$99        $0.00    $15.17    $25.46    $35.54     $45.41    Full Amt
+! $100-$149      $0.00    $30.33    $50.92    $71.08     $90.83    Full Amt
+! $150-$199      $0.00    $45.50    $76.38   $106.63    $136.24    Full Amt
+! $200-$249      $0.00    $60.67   $101.83   $142.17    $181.65    Full Amt
+! > $250         $0.00    $75.83   $127.29   $177.71    $227.07    Full Amt
+!****************************************************************************!
+!***********************************************
+Begin-Procedure P235-Calc-Pharm-Prorated-Lumpsum
+!***********************************************
+#debug9 Show 'P235-Calc-Pharm-Prorated-Lumpsum'
+   show 'calculating prorated for lumpsum = ' #lumpsum
+   show 'total pharmacist hours           = ' #Sum_Pharmacist_Hours
+   Let #lumpsum_prorated = 0
+   if #lumpsum < 25              !incoming lumpsum from pfs_payroll_send table
+       let #lumpsum_prorated = 0
+   else
+       if #lumpsum < 50
+          Do P235A-Lumpsum-Lessthan50
+       else
+           if #lumpsum < 100
+             Do P235B-Lumpsum-Lessthan100
+           else
+                if #lumpsum < 150
+                   Do P235C-Lumpsum-Lessthan150
+                else
+                    if #lumpsum < 200
+                       Do P235D-Lumpsum-Lessthan200
+                    else
+                        if #lumpsum < 250
+                           Do P235E-Lumpsum-Lessthan250
+                        else
+                             Do P235F-Lumpsum-Greaterthan249
+                        end-if
+                    end-if
+                end-if
+           end-if     
+       end-if
+   end-if
+   
+End-Procedure
+
+
+!***********************************************
+Begin-Procedure P235A-Lumpsum-Lessthan50 
+!***********************************************
+#debug9 Show 'P235A-Lumpsum-Lessthan50'
+ Show 'P235A-Lumpsum-Lessthan50'
+  if #Total_Hours_FortheEE < 24 
+       let #lumpsum_prorated = 0
+  else
+       if #Total_Hours_FortheEE < 49
+          let #lumpsum_prorated = 7.58
+       else
+           if #Total_Hours_FortheEE < 73
+              let #lumpsum_prorated = 12.73
+           else
+               if #Total_Hours_FortheEE < 97
+                   let #lumpsum_prorated = 17.77
+               else
+                    if #Total_Hours_FortheEE < 120
+                       let #lumpsum_prorated = 22.71
+                    else
+                       let #lumpsum_prorated = #lumpsum     !hours >=120 get full amount
+                    end-if
+               end-if
+            end-if
+        end-if
+  end-if 
+End-Procedure
+
+!***********************************************
+Begin-Procedure P235B-Lumpsum-Lessthan100 
+!***********************************************
+#debug9 Show 'P235B-Lumpsum-Lessthan100' 
+ Show 'P235B-Lumpsum-Lessthan100' 
+  if #Total_Hours_FortheEE < 24 
+       let #lumpsum_prorated = 0
+  else
+       if #Total_Hours_FortheEE < 49
+          let #lumpsum_prorated = 15.17
+       else
+           if #Total_Hours_FortheEE < 73
+              let #lumpsum_prorated = 25.46
+           else
+               if #Total_Hours_FortheEE < 97
+                   let #lumpsum_prorated = 35.54
+               else
+                    if #Total_Hours_FortheEE < 120
+                       let #lumpsum_prorated = 45.41
+                    else
+                       let #lumpsum_prorated = #lumpsum     !hours >=120 get full amount
+                    end-if
+               end-if
+            end-if
+        end-if
+  end-if 
+End-Procedure
+
+!***********************************************
+Begin-Procedure P235C-Lumpsum-Lessthan150 
+!***********************************************
+#debug9 Show 'P235C-Lumpsum-Lessthan150' 
+  Show 'P235C-Lumpsum-Lessthan150' 
+  if #Total_Hours_FortheEE < 24 
+       let #lumpsum_prorated = 0
+  else
+       if #Total_Hours_FortheEE < 49
+          let #lumpsum_prorated = 30.33
+       else
+           if #Total_Hours_FortheEE < 73
+              let #lumpsum_prorated = 50.92
+           else
+               if #Total_Hours_FortheEE < 97
+                   let #lumpsum_prorated = 71.08
+               else
+                    if #Total_Hours_FortheEE < 120
+                       let #lumpsum_prorated = 90.83
+                    else
+                       let #lumpsum_prorated = #lumpsum     !hours >=120 get full amount
+                    end-if
+               end-if
+            end-if
+        end-if
+  end-if 
+End-Procedure
+
+!***********************************************
+Begin-Procedure P235D-Lumpsum-Lessthan200 
+!***********************************************
+#debug9 Show 'P235D-Lumpsum-Lessthan200' 
+  Show 'P235D-Lumpsum-Lessthan200' 
+  if #Total_Hours_FortheEE < 24 
+       let #lumpsum_prorated = 0
+  else
+       if #Total_Hours_FortheEE < 49
+          let #lumpsum_prorated = 45.5
+       else
+           if #Total_Hours_FortheEE < 73
+              let #lumpsum_prorated = 76.38
+           else
+               if #Total_Hours_FortheEE < 97
+                   let #lumpsum_prorated = 106.63
+               else
+                    if #Total_Hours_FortheEE < 120
+                       let #lumpsum_prorated = 136.24
+                    else
+                       let #lumpsum_prorated = #lumpsum     !hours >=120 get full amount
+                    end-if
+               end-if
+            end-if
+        end-if
+  end-if 
+End-Procedure
+
+!***********************************************
+Begin-Procedure P235E-Lumpsum-Lessthan250 
+!***********************************************
+#debug9 Show 'P235E-Lumpsum-Lessthan250' 
+  Show 'P235E-Lumpsum-Lessthan250'
+  if #Total_Hours_FortheEE < 24 
+       let #lumpsum_prorated = 0
+  else
+       if #Total_Hours_FortheEE < 49
+          let #lumpsum_prorated = 60.67
+       else
+           if #Total_Hours_FortheEE < 73
+              let #lumpsum_prorated = 101.83
+           else
+               if #Total_Hours_FortheEE < 97
+                   let #lumpsum_prorated = 142.17
+               else
+                    if #Total_Hours_FortheEE < 120
+                       let #lumpsum_prorated = 181.65
+                    else
+                       let #lumpsum_prorated = #lumpsum     !hours >=120 get full amount
+                    end-if
+               end-if
+            end-if
+        end-if
+  end-if 
+End-Procedure
+
+!***********************************************
+Begin-Procedure P235F-Lumpsum-Greaterthan249
+!***********************************************
+#debug9 Show 'P235F-Lumpsum-Greaterthan249' 
+ Show 'P235F-Lumpsum-Greaterthan249' 
+  if #Total_Hours_FortheEE < 24 
+       let #lumpsum_prorated = 0
+  else
+       if #Total_Hours_FortheEE < 49
+          let #lumpsum_prorated = 75.83
+       else
+           if #Total_Hours_FortheEE < 73
+              let #lumpsum_prorated = 127.29
+           else
+               if #Total_Hours_FortheEE < 97
+                   let #lumpsum_prorated = 177.71
+               else
+                    if #Total_Hours_FortheEE < 120
+                       let #lumpsum_prorated = 227.07
+                    else
+                       let #lumpsum_prorated = #lumpsum     !hours >=120 get full amount
+                    end-if
+               end-if
+            end-if
+        end-if
+  end-if 
+End-Procedure
+
+!*********************************************
+Begin-Procedure P240-Check-if-Susp-During-Pd
+!*********************************************
+#debug9 Show 'P240-Check-if-Susp-During-Pd'
+   Show 'P240-Check-if-Susp-During-Pd'
+ 
+     let $Suspended_During_Period = 'N'
+
+     if (&j.effdt >= $pfs.STRT_DTE and       !if suspended during period, ee is ineligible
+           &j.effdt <= $pfs.END_DTE)  
+
+        let $Suspended_During_Period = 'Y'
+        let $Suspension_Found = 'Y'
+        show 'suspended employee and job effdt:  ' &j.emplid &j.effdt
+     end-if
+ 
+End-Procedure
+
+!****************************************************
+Begin-Procedure P245-Check-if-Term-During-Pd-OrAfter
+!****************************************************
+#debug9 Show 'P245-Check-if-Term-During-Pd-OrAfter'
+  Show 'P245-Check-if-Term-During-Pd-OrAfter'
+     let $Termed_During_Pd_OrAfter = 'N'
+
+Begin-Select
+e.termination_dt
+
+      let $Termed_During_Pd_OrAfter = 'Y'
+      show 'termed employee and term date:  ' &j.emplid &e.termination_dt
+      show 'empl_status = ' &js.empl_status
+      let $Termination_Found = 'Y' 
+
+from  ps_employment   e
+ 
+Where  e.emplid                 = &j.emplid
+And    e.empl_rcd               = &j.empl_rcd
+and    (e.termination_dt         >= $pfs.STRT_DTE           
+        And e.termination_dt     <= $X000_WHERE_SELECT_ASOFDATE)
+
+End-Select
+End-Procedure
+
+!*********************************************** 
+begin-procedure P250-Get-Action-Reason-Descr
+!*********************************************** 
+
+BEGIN-SELECT
+AR.DESCRSHORT
+
+  let $action_reason_descr = &AR.DESCRSHORT
+
+FROM PS_ACTN_REASON_TBL AR
+WHERE AR.ACTION        = $action and
+      AR.ACTION_REASON = $action_reason and 
+      AR.EFFDT =
+        (SELECT MAX(A_ED.EFFDT) FROM PS_ACTN_REASON_TBL A_ED
+        WHERE AR.ACTION = A_ED.ACTION
+          AND AR.ACTION_REASON = A_ED.ACTION_REASON
+          AND A_ED.EFFDT <= $X000_WHERE_SELECT_ASOFDATE)
+
+END-SELECT
+
+END-PROCEDURE
+ 
+!***************************************************************************************
+! This procedure adds pages and lines appropriately for adding a new PAYSHEET for ee.
+! It gets max page and max line for current co/paygroup, then it gets
+! the employee data and benefit program data to populate pay_earnings and pay_oth_earns.
+! if the last line (max line) is = 7, it increments the page and inserts into PAY_PAGE.
+! then it sets line = 1 and inserts into PAY_LINE (using the incremented page number above). 
+! If last line < 7, it uses the current page and increments to the next line number, and
+! inserts into PAY_LINE.
+!***************************************************************************************
+!**************************************************
+Begin-Procedure P260-Process-EE-WithNo-Paysheet
+!**************************************************
+#debug9 Show 'P260-Process-EE-WithNo-Paysheet'
+   Show 'P260-Process-EE-WithNo-Paysheet'
+
+  show '---------------------------------'
+  show 'paysheet NOT found...building new one for emplid, empl_rcd:  ' $emplid $empl_rcd
+  show 'Company Paygroup  ' $company $paygroup
+
+  Do P600-Get-Last-Page
+  Do P605-Get-Last-Line                 
+   
+  move 0 to #MaxAddl_Plus1   
+  move 0 to #MaxSepChk_new 
+          
+  do P615-Get-Employee-Data          !required for data to insert to pay_earnings    
+	
+  if $Found = 'Y'
+      do P620-Get-Benefit-Program
+      do P630-Get-State-Locality
+      if #Lastline = 7               !max lines per page is 7. Start a new page
+        add 1  to #LastPage 
+        move 1 to #Lastline
+        move #LastPage to #page               !for pay_page insert
+        do P610-Insert-Pay-Page                                
+      else
+        add 1  to #Lastline  
+      end-if
+      
+      move #LastPage to #page
+      move #LastLine to #line                 !for pay_line insert
+      show 'Page Inserted ' #page
+      show 'Line Inserted ' #line
+      show '---------------------------------'
+      do P625-Insert-Pay-Line                                    
+      do P400-Insert-Pay-Earnings                              
+      do P450-Insert-Pay-Oth-Earnings                         
+ 
+      move $emplid to $save_emplid_new_paysheet           !save ee so we use the same sepchk#
+      move #MaxSepChk_new to #Save_MaxSepChk_fromInsert   !if we add anymore addl paylines for ee          
+  end-if                                            
+!                            
+                            
+End-Procedure
+
+!******************************************
+Begin-Procedure P290-Dept-Totals
+!******************************************
+#debug9 Show 'P290-Dept-Totals'
+   Show 'P290-Dept-Totals'
+   Use-Report Termination-Report                        !print total and page break
+   print 'Total Terminations for Store '               (+2,1)
+   print $Save_Deptid                                  (,+2)
+   print ': '                                          (,+2)
+   print #termrecs-per-Dept                            (,+2)  edit 99,999  
+   New-Page
+   let #termrecs-per-Dept      = 0
+
+   Use-Report Suspension-Report
+   print 'Total Suspensions for Store '               (+2,1)
+   print $Save_Deptid                                 (,+2)
+   print ': '                                         (,+2)
+   print #susprecs-per-Dept                           (,+2)  edit 99,999  
+   New-Page
+   let #susprecs-per-Dept      = 0
+   
+  Use-Report Bonus-Report
+  
+  print 'Totals  for  Store: '             (+2,1)
+  print $Save_Deptid                       (+0,+2) 
+  print #sum_deptid_Bonus_amt              (+0,97)  edit $999,999.99
+  print #sum_deptid_Hrs_worked             (+0,112) edit 99,999.99       !SCM 12/15/2003
+  let #sum_deptid_Bonus_amt     = 0
+  let #sum_deptid_Hrs_worked    = 0        !SCM  12/15/2003
+  Move 'GEXPYTBR'                To $ReportID
+  Move 'Team Bonus Program - Register - Prior Payroll Confirm' To $ReportTitle
+  New-Page
+
+End-Procedure
+
+!******************************************
+Begin-Procedure P295-Emplid-Totals
+!******************************************
+#debug9 Show 'P295-Emplid-Totals'
+  Show 'P295-Emplid-Totals'
+  if $Save_Emplid = $save_printed_termed_ee    !if the ee was printed on the terminations or
+    goto skip-ee-totals                        !suspended report, there are no totals to print.
+  end-if
+  if $Save_Emplid = $save_printed_susp_ee
+    goto skip-ee-totals
+  end-if
+ 
+!**  This was put in here to remove the duplicate total line that occurred if an
+!**  active ee was processed, then a terminated ee immediately followed them.  IT
+!**  was printing a total line for the active employee that had zero totals.
+ 
+  If $Employee-is-Active     = 'N'          !don't do totals for a non-active ee
+     goto skip-ee-totals
+  end-if     
+
+!********  Since the pharmacist is only getting ONE insert to pay/pay oth earnings
+!********  and that insert has the lump sum pro-ration, the insert is done here when
+!********  the employee changes.
+    !AXL 3/16/2005 Deactivate Pharmacy code - Begin
+    !if $EE-is-Pharmacist = 'Y'        
+    !     Do P235-Calc-Pharm-Prorated-Lumpsum        !calc prorated lumpsum based on total hours              
+    !     Do P305-Figure-Out-Addl-And-Sepchk                    
+    !     let #sum_emplid_Bonus_amt     = #lumpsum_prorated
+    !     let $earns_begin_dt = $PdEnd_pay_begin_dt       !insert the pay begin date of the end of
+    !     let $earns_end_dt   = $pfs.end_dte              !the period and pd end date for insert.                    
+    !     let #Sum_Pharmacist_Hours = 0                            !reset for next pharmacist
+    !     If #sum_emplid_Bonus_amt <> 0          !if amt is not zero, insert to pay_earnings
+    !        let #Bonus_Amt_FortheWeek = #sum_emplid_Bonus_amt     !for insert  
+    !        add #Bonus_Amt_FortheWeek to #sum_deptid_Bonus_amt    !for dept, grand totals
+    !        add #Bonus_Amt_FortheWeek to #Grand_Total_Bonus_Amt               
+    !        Do P400-Insert-Pay-Earnings                       
+    !        Do P450-Insert-Pay-Oth-Earnings                   
+    !        show 'Insert for pay earnings and pay_oth_earnings for PHARMACIST: ' $EMPLID
+    !        show 'page# line# addl# ' #page #line #MaxAddl_Plus1
+    !        show '#total_Bonus_amt_fortheweek: ' #Bonus_Amt_FortheWeek
+    !        show '*****-----------------------------****'       
+    !      end-if      
+    !end-if
+    !AXL 3/16/2005 Deactivate Pharmacy code - End
+
+  Use-Report Bonus-Report
+  print 'Totals  for  Employee: '            (+1,1)
+  print $Save_Emplid                         (+0,+2)
+  print 'Bonus based on: '                   (+0,45)
+  print #Bonus_base                          (+0,67)  edit $999.9999
+  print #sum_emplid_Bonus_amt                (+0,97)  edit $999,999.99    
+  print #Total_Hours_FortheEE                (+0,{#column6})   edit 999.99
+  print ' '                                  (+1,1)
+  
+  if #sum_emplid_Bonus_amt <> 0
+     add 1 to #ees_receiving_Bonus
+  end-if
+  
+  let #sum_deptid_Hrs_worked = #sum_deptid_Hrs_worked + #Total_Hours_FortheEE  !SCM  12/15/2003    
+  let #sum_emplid_Bonus_amt         = 0
+  let #Total_Hours_FortheEE         = 0
+  
+! since you only need to get max sepchk once, reset after each employee
+  move 'N' to $Retrieved-Max-SepChk
+      
+skip-ee-totals:  
+End-Procedure
+
+ 
+!******************************************
+begin-procedure P300-Get-Paysheet
+!******************************************
+#debug9 Show 'P300-Get-Paysheet'
+ Show 'P300-Get-Paysheet'
+!  ***********     Retrieves the current open paysheet (page, line information)
+!  ***********     use addl#=0 in order to clone the "home" data for the insert.
+  
+  move 'N' to $Page_Sheet_Found
+begin-SELECT ON-ERROR=P995-SQL-Error-Found('P300-Get-Paysheet')
+                   
+PS.COMPANY
+PS.PAYGROUP
+PS.PAY_END_DT
+PS.OFF_CYCLE
+PS.PAGE_NUM
+PS.LINE_NUM
+PS.ADDL_NBR
+PS.SEPCHK
+PS.EMPLID
+PS.EMPL_RCD
+PS.BENEFIT_RCD_NBR
+
+PS.ACCT_CD
+PS.GL_PAY_TYPE
+PS.DEPTID
+PS.JOBCODE
+PS.POSITION_NBR
+PS.SHIFT
+PS.HOURLY_RT			      
+PS.DED_TAKEN
+PS.DED_SUBSET_ID
+PS.STATE
+PS.LOCALITY
+PS.BUSINESS_UNIT
+PS.FICA_Status_EE
+PS.FLSA_STATUS 
+ 
+  show 'found paysheet for empl/rcd ===>  ' $EMPLID $EMPL_RCD 		 			                      
+
+  move 'Y' to $Page_Sheet_Found           !open paysheet found (home record of addl#=0)
+  let #page           = &PS.PAGE_NUM
+  let #line           = &PS.LINE_NUM 
+  let #benefit_rcd    = &PS.BENEFIT_RCD_NBR
+  let $Off_cycle      = &PS.Off_cycle
+  let $Acct_Cd        = &PS.Acct_Cd
+  let $GL_Pay_Type    = &PS.GL_Pay_Type
+  let $Jobcode        = &PS.Jobcode
+  let $Position_Nbr   = &PS.Position_Nbr
+  let $Shift          = &PS.Shift
+  let #hrlyrt         = &PS.HOURLY_RT              
+  let $Ded_Taken      = &PS.DED_TAKEN
+  let $Ded_Subset_ID  = &PS.DED_SUBSET_ID
+  let $State          = &PS.STATE
+  let $Locality       = &PS.LOCALITY
+  let $Business_Unit  = &PS.BUSINESS_UNIT
+  let $FICA_Status_EE = &PS.FICA_Status_EE
+  let $FLSA_STATUS    = &PS.FLSA_STATUS
+ 
+  EXIT-SELECT
+
+FROM     PS_PAY_EARNINGS PS
+
+Where PS.COMPANY    = $COMPANY
+  and PS.PAYGROUP   = $PAYGROUP
+  and PS.PAY_END_DT = $Pay_End_Dt         !current unconfirmed pay end dt being processed
+  and PS.OFF_CYCLE  = 'N'
+  and PS.ADDL_NBR   = 0        
+  and PS.EMPLID     = $EMPLID
+  and PS.EMPL_RCD   = $EMPL_RCD  
+
+end-select
+end-procedure
+
+!*************************************************
+begin-procedure P305-Figure-Out-Addl-And-Sepchk
+!*************************************************
+#debug9 Show 'P305-Figure-Out-Addl-And-Sepchk'
+  Show 'P305-Figure-Out-Addl-And-Sepchk'
+   let #MaxAddl = 0
+   Do P310-Get-Max-Addl
+!   show 'MaxAddl after P310-Get-Max_addl:  ' #MaxAddl
+!   show 'GMA.COMPANY, GMA.PAYGROUP:        ' &GMA.COMPANY &GMA.PAYGROUP
+!   show 'GMA.PAGE_NUM, GMA.LINE_NUM:       ' &GMA.PAGE_NUM &GMA.LINE_NUM
+   Let #MaxAddl_Plus1 = #MaxAddl + 1              !add 1 to Addl  for insert
+!   show 'Add +1 to Addl for Insert:        ' #MaxAddl_Plus1
+!*--------------------------------------------------------------------*
+!*-- Even tho ees can work in multiple stores, they should only get --*
+!*-- 1 bonus check.  First look to see if there was a 535 erncd     --*
+!*-- inserted.  If so, use that SEPCHK#.  If not,check if you already-*
+!*-- got max sepchk (since we could be processing multiple weeks for -*
+!*-- an ee); if 1st time, add 1 to it, otherwise use the same sepchk -*
+!*--------------------------------------------------------------------*
+
+   Do P308-Find-SepChk-Exists-for535
+   if $SEPCHK535_Exists = 'Y'
+       Let #MaxSepChk_new = #Sepchk535
+   else 
+!                                          !only get max sepchk once for each ee. Set='Y'  
+      if $Retrieved-Max-SepChk = 'N'       !in P320 para and reset to 'N' at ee totaling
+         Do P320-Get-Max-Sepchk
+         if $emplid = $save_emplid_new_paysheet  !if this ee is the same ee that you inserted a new paysheet
+              Let #MaxSepChk_new = 0             !for, use sepchk=0 because they only have 1 check
+         else
+            Let #MaxSepChk_new = #MaxSepChk + 1    !add 1 to sepchk for insert
+         end-if
+      end-if      !if $Retrieved-Max-Sepchk='Y', it will insert w/previous assigned SepChk value
+   end-if
+
+end-procedure
+
+!*************************************************
+begin-procedure P308-Find-SepChk-Exists-for535
+!*************************************************
+#debug9 Show 'P308-Find-SepChk-Exists-for535'
+ Show 'P308-Find-SepChk-Exists-for535'
+  Let $SEPCHK535_Exists = 'N'
+  Let #Sepchk535 = 0
+ 
+begin-select
+SEPC.COMPANY
+SEPC.PAYGROUP
+SEPC.PAY_END_DT
+SEPC.OFF_CYCLE
+SEPC.PAGE_NUM
+SEPC.LINE_NUM
+SEPC.ADDL_NBR
+SEPC.SEPCHK
+ 
+       Let $SEPCHK535_Exists = 'Y'
+       Let #Sepchk535 = &SEPC.SEPCHK
+ 
+FROM PS_PAY_EARNINGS SEPC,
+     ps_pay_oth_earns P535
+WHERE SEPC.COMPANY    =  $Company
+  AND SEPC.PAYGROUP   =  $Paygroup
+  AND SEPC.PAY_END_DT =  $Pay_End_Dt
+  AND SEPC.OFF_CYCLE  = &PS.OFF_CYCLE
+  AND SEPC.PAGE_NUM   = &PS.PAGE_NUM
+  AND SEPC.LINE_NUM   = &PS.LINE_NUM
+  AND SEPC.SEPCHK      = (select max(SEP2.SEPCHK)
+			from ps_pay_earnings SEP2
+                        where SEP2.COMPANY      = SEPC.COMPANY
+                         and  SEP2.PAYGROUP     = SEPC.PAYGROUP
+                         and  SEP2.PAY_END_DT   = SEPC.PAY_END_DT
+                         and  SEP2.OFF_CYCLE    = SEPC.OFF_CYCLE
+                         and  SEP2.PAGE_NUM     = SEPC.PAGE_NUM
+                         and  SEP2.LINE_NUM     = SEPC.LINE_NUM)
+ AND P535.COMPANY     =  SEPC.COMPANY
+ AND P535.PAYGROUP    =  SEPC.PAYGROUP
+ AND P535.PAY_END_DT  =  SEPC.PAY_END_DT
+ AND P535.OFF_CYCLE   =  SEPC.OFF_CYCLE 
+ AND P535.PAGE_NUM    =  SEPC.PAGE_NUM
+ AND P535.LINE_NUM    =  SEPC.LINE_NUM
+ AND P535.ADDL_NBR    =  SEPC.ADDL_NBR
+ AND P535.ERNCD      = '535' 
+  
+ORDER BY SEPC.COMPANY, SEPC.PAYGROUP, SEPC.PAY_END_DT,
+   SEPC.OFF_CYCLE, SEPC.PAGE_NUM, SEPC.LINE_NUM, SEPC.ADDL_NBR desc
+end-select
+  
+end-procedure
+ 
+ 
+!** Get Max Addl_Nbr for the current payweek for the paysheets page# and line#
+!******************************************
+begin-procedure P310-Get-Max-Addl
+!******************************************
+#debug9 Show 'P310-Get-Max-Addl'
+ Show 'P310-Get-Max-Addl'
+ 
+begin-SELECT ON-ERROR=P995-SQL-Error-Found('P310-Get-Max-Addl')
+GMA.COMPANY
+GMA.PAYGROUP
+GMA.PAY_END_DT
+GMA.OFF_CYCLE
+GMA.PAGE_NUM
+GMA.LINE_NUM
+GMA.ADDL_NBR
+
+      move &GMA.ADDL_NBR to #MaxAddl
+    
+      EXIT-SELECT
+
+FROM PS_PAY_EARNINGS GMA
+WHERE GMA.COMPANY    =  &PS.Company
+  AND GMA.PAYGROUP   =  &PS.Paygroup
+  AND GMA.PAY_END_DT =  $Pay_End_Dt
+  AND GMA.OFF_CYCLE  =  &PS.OFF_CYCLE
+  AND GMA.PAGE_NUM   =  &PS.page_num
+  AND GMA.LINE_NUM   =  &PS.LINE_NUM
+  AND GMA.ADDL_NBR   = (select max(gma1.ADDL_NBR)
+			from ps_pay_earnings GMA1
+                        where GMA1.COMPANY      = GMA.COMPANY
+                         and  GMA1.PAYGROUP     = GMA.PAYGROUP
+                         and  GMA1.PAY_END_DT   = GMA.PAY_END_DT
+                         and  GMA1.OFF_CYCLE    = GMA.OFF_CYCLE
+                         and  GMA1.PAGE_NUM     = GMA.PAGE_NUM
+                         and  GMA1.LINE_NUM     = GMA.LINE_NUM)
+ 
+ORDER BY GMA.COMPANY, GMA.PAYGROUP, GMA.PAY_END_DT,
+   GMA.OFF_CYCLE, GMA.PAGE_NUM, GMA.LINE_NUM, GMA.ADDL_NBR desc
+end-select
+end-procedure
+
+
+!  Get the maximum sepchk value because we need to add 1 to it for the insert
+!******************************************
+begin-procedure P320-Get-Max-Sepchk
+!******************************************
+#debug9 Show 'P320-Get-Max-Sepchk'
+  Show 'P320-Get-Max-Sepchk'
+ 
+begin-SELECT ON-ERROR=P995-SQL-Error-Found('P320-Get-Max-Sepchk')
+SEP.COMPANY
+SEP.PAYGROUP
+SEP.PAY_END_DT
+SEP.OFF_CYCLE
+SEP.PAGE_NUM
+SEP.LINE_NUM
+SEP.ADDL_NBR
+SEP.SEPCHK
+      
+      move 'Y' to $Retrieved-Max-SepChk   !only get max sepchk once, reset to 'N' at ee totaling
+      move &SEP.SEPCHK to #MaxSepChk
+    
+      EXIT-SELECT
+
+FROM PS_PAY_EARNINGS SEP
+WHERE SEP.COMPANY    =  $Company
+  AND SEP.PAYGROUP   =  $Paygroup
+  AND SEP.PAY_END_DT =  $Pay_End_Dt
+  AND SEP.OFF_CYCLE  = &PS.OFF_CYCLE
+  AND SEP.PAGE_NUM   = &PS.PAGE_NUM
+  AND SEP.LINE_NUM   = &PS.LINE_NUM
+  AND SEP.SEPCHK      = (select max(SEP1.SEPCHK)
+			from ps_pay_earnings SEP1
+                        where SEP1.COMPANY      = SEP.COMPANY
+                         and  SEP1.PAYGROUP     = SEP.PAYGROUP
+                         and  SEP1.PAY_END_DT   = SEP.PAY_END_DT
+                         and  SEP1.OFF_CYCLE    = SEP.OFF_CYCLE
+                         and  SEP1.PAGE_NUM     = SEP.PAGE_NUM
+                         and  SEP1.LINE_NUM     = SEP.LINE_NUM)
+ 
+ORDER BY SEP.COMPANY, SEP.PAYGROUP, SEP.PAY_END_DT,
+   SEP.OFF_CYCLE, SEP.PAGE_NUM, SEP.LINE_NUM, SEP.ADDL_NBR desc
+end-select
+end-procedure
+  
+ 
+! For those ee's with open paysheets, Use paysheet "home data (addl#=0)" for insert
+!*********************************************************************
+begin-procedure P400-Insert-Pay-Earnings
+!*********************************************************************
+#debug9 Show 'P400-Insert-Pay-Earnings'
+ Show 'P400-Insert-Pay-Earnings'
+show 'Insert pay earnings -----------' $emplid
+show 'page and line ' #page #line
+show 'Addl SepChk ' #MaxAddl_Plus1 #MaxSepChk_new
+show '#hrly_Rt    ' #hrlyrt
+show 'begin earns and end earns dt' $earns_begin_dt $earns_end_dt
+let #save-sql-status = 0
+			       
+begin-SQL ON-ERROR=P995-SQL-Error-Found('P400-Insert-Pay-Earnings')
+INSERT INTO PS_PAY_EARNINGS ( COMPANY,
+			      PAYGROUP,
+			      PAY_END_DT,
+			      OFF_CYCLE,
+			      PAGE_NUM,
+			      LINE_NUM,
+			      ADDL_NBR,
+			      SEPCHK,
+			      EMPLID,
+			      EMPL_RCD,
+			      BENEFIT_RCD_NBR,
+			      EARNS_BEGIN_DT,
+			      EARNS_END_DT,
+			      ADDLPAY_REASON,
+			      DISABLE_DIR_DEP,
+			      GROSSUP,
+			      PAY_LINE_STATUS,
+			      OK_TO_PAY,
+			      JOB_PAY,
+			      SINGLE_CHECK_USE,
+			      ACCT_CD,
+			      GL_PAY_TYPE,
+			      DEPTID,
+			      JOBCODE,
+			      POSITION_NBR,
+			      SHIFT,
+			      SHIFT_RT,
+			      HOURLY_RT,
+			      FLSA_RT,
+			      RATE_USED,
+			      FLSA_REQUIRED,
+			      ERNCD_REG_HRS,
+			      ERNCD_OT_HRS,
+			      REG_PAY_HRS,
+			      REG_HRS,
+			      OT_HRS,
+			      REG_HRLY_EARNS,
+			      OT_HRLY_EARNS,
+			      ERNCD_REG_EARNS,
+			      REG_PAY,
+			      REG_EARNS,
+			      REG_EARN_HRS,
+			      DED_TAKEN,
+			      DED_SUBSET_ID,
+			      DED_TAKEN_GENL,          !CWB 01/09/2003
+                              DED_SUBSET_GENL,         !CWB 01/09/2003   
+			      STATE,
+			      LOCALITY,
+			      PAY_FREQUENCY,
+			      TAX_PERIODS,
+			      TAX_METHOD,
+			      ADDL_TAXES,
+			      OVERRIDE_HOURLY_RT,
+			      TL_SOURCE,
+			      PAY_SHEET_SRC,
+			      BUSINESS_UNIT,  		 
+			      EI_PRIOR_PD_CORR,
+			      COMP_RATECD_REG,		 
+			      COMP_RATECD_OT,		 
+			      COMPRATE_USED_REG,	 
+			      COMPRATE_USED_OT,		 
+                              FICA_STATUS_EE,            
+                              PAID_PRDS_PER_YEAR,        
+                              FLSA_END_DT,               
+                              ORIG_PAYGROUP,             
+                              FLSA_STATUS,               
+                              XREF_NUM,                  
+                              UNION_CD,                  
+                              BEN_DED_STATUS,            
+                              GENL_DED_STATUS)             
+VALUES                  (     $company,
+			      $paygroup,
+			      $pay_end_dt,              !current pay end dt
+			      'N',               !off_cycle
+			      #page,
+			      #line,
+			      #MaxAddl_Plus1,
+			      #MaxSepChk_new,
+			      $emplid,
+			      $empl_rcd,
+			      #Benefit_Rcd,
+                              $earns_begin_dt,
+                              $earns_end_dt,
+			      '   ',                   !addlpay_reason
+			      'N',                     !disable_dir_dep
+			      'N',                     !grossup
+			      'I',                     !pay line status
+			      'Y',                     !ok_to_pay
+			      'N',                     !job_pay
+			      'N',
+                              $Acct_Cd,
+                              $GL_Pay_Type,
+			      $Deptid,
+			      $Jobcode,
+			      $Position_Nbr,
+			      $Shift,
+			      0,                        !SHIFT rate
+			      #hrlyrt,                  !HOURLY_RT  s/be cents per hr from PFS if ee is hrly
+			      0,                        !FLSA_RT
+			      'H',                      !RATE_USED
+			      'N',                      !FLSA_REQUIRED
+			      'REG',                    !ERNCD_REG_HRS
+			      'OTP',                    !ERNCD_OT_HRS
+			      0,                        !REG_PAY_HRS
+			      0,                        !REG_HRS
+			      0,                        !OT_HRS
+			      0,                        !REG_HRLY_EARNS
+			      0,                        !OT_HRLY_EARNS
+			      'REG',                    !ERNCD_REG_EARNS
+			      0,                        !REG_PAY
+			      0,                        !REG_EARNS
+			      0,                        !REG_EARNS_HRS
+			      'N',                      !DED_TAKEN (Benefit Deds taken)
+			      ' ',                      !(Ben Ded Subset)
+                              'N',                      !DED_TAKEN_GENL (General Deds taken)
+                              ' ',                      !DED_SUBSET_GENL
+			      $State,
+			      $Locality, 
+			      'W',                      !PAY_FREQUENCY
+			      1,                        !TAX_PERIODS
+			      'S',                      !TAX_METHOD (S=supplemental)
+			      'Y',                      !AddL_TAXES
+             		      'Y',                      !OVERRIDE_HOURLY_RT
+			      'G',                      !TL_SOURCE (G=gianteagle)                      
+			      'S',                      !PAY_SHEET_SRC
+			      $Business_Unit,        		 
+			      'N',	                !EI_PRIOR_PD_CORR
+			      ' ',		        !COMP_RATECD_REG
+			      ' ',		        !COMP_RATECD_OT
+			      0,		        !COMPRATE_USED_REG
+			      0,		        !COMPRATE_USED_OT
+                              $FICA_Status_EE,             
+                              0,                        !PAID_PRDS_PER_YEAR
+                              '',                       !FLSA_END_DT
+                              $paygroup,                !ORIG_PAYGROUP
+                              $FLSA_Status,               
+                              0,                        !XREF_NUM
+                              ' ',                      !UNION_CD
+                              'I',                      !BEN_DED_STATUS
+                              'I')                      !GENL_DED_STATUS        
+end-sql
+If #save-sql-status = 0 
+      add 1 to #pay_earns_recs_inserted       
+else
+     
+      show 'PAY_EARNS ERROR - INSERT FAILED for Emplid:  ' $Emplid
+      show 'Company, Paygroup, Pay_End_Dt =    ' $company $paygroup $pay_end_dt
+      show 'Off Cycle=N, page and line are:  ' #page #line
+      show 'Addl# and SepChk# =  :' #MaxAddl_Plus1 #MaxSepChk_new
+      show 'dropping index that was built on pay_earnings'
+    !  do P810-Drop-Index-PayEarnings
+      STOP 		      
+	     
+End-if
+
+end-procedure
+
+
+!Inserts Bonus $ to Pay Other Earnings Table
+!*********************************************************************
+begin-procedure P450-Insert-Pay-Oth-Earnings
+!*********************************************************************
+#debug9 Show 'P450-Insert-Pay-Oth-Earnings'
+  Show 'P450-Insert-Pay-Oth-Earnings'
+let #save-sql-status = 0
+let $erncd = '535'         !Team Bonus Program earnings code
+
+begin-sql On-Error=P995-SQL-Error-Found('P220-Add-Pay-Oth-Earnings')
+
+INSERT INTO PS_PAY_OTH_EARNS (COMPANY,
+			      PAYGROUP,
+			      PAY_END_DT,
+			      OFF_CYCLE,
+			      PAGE_NUM,
+			      LINE_NUM,
+			      ADDL_NBR,
+			      ERNCD,
+			      SEPCHK,
+			      JOB_PAY,
+			      OTH_HRS,
+			      OTH_PAY,
+			      OTH_EARNS,
+			      ADD_GROSS,
+			      TAX_METHOD,
+			      ADDL_SEQ,
+			      TL_SOURCE,
+			      RATE_USED,
+			      BAS_CREDIT_SW,
+                              COMP_RATECD,      
+                              COMPRATE,         
+                              COMPRATE_USED,     
+                              HRS_DIST_SW,
+                              XREF_NUM,
+                              EX_DOC_ID,
+                              EX_DOC_TYPE,
+                              EX_LINE_NBR,
+                              CURRENCY_CD,
+                              VC_PLAN_ID,
+                              VC_PAYOUT_PRD_ID,
+                              GB_GROUP_ID,
+                              APPLID,
+                              AWARD_DATE,
+                              !NOTIFY_STATUS)	!GEX-MXT commented for Upgrade
+                              NOTIFY_STATUS,	!GEX-MXT added for Upgrade
+                              EIM_KEY)		!GEX-MXT added for Upgrade
+
+VALUES                  (     $company,
+			      $paygroup,
+			      $pay_end_dt,
+			      'N',                                            
+			      #page,
+			      #line,
+			      #MaxAddl_Plus1,                
+			      $ErnCd,                          !535
+			      #MaxSepChk_new,               
+			      'N',                             !JOB_PAY
+			      0,                               !OTH_HRS
+			      #Bonus_Amt_FortheWeek,       !OTH_PAY
+			      0,                               !OTH_EARNS              
+			      'N',                             !ADD_GROSS
+			      'S',          ! Tax method   s=supplemental    
+			       01,          ! Addl seq      
+			      'G',          ! TL Source    g=giant eagle
+			      'H',          ! Rate used
+			      'N',
+                              ' ',   
+                               0,     
+                               0,       
+                              'N',          !hrs_dist_sw
+                              0,                        !xref_num
+                              ' ',                      !ex_doc_id
+                              ' ',                      !ex_doc_type
+                              0,                        !ex_line_nbr
+                              ' ',                      !currency_cd
+                              ' ',                      !vc_plan_id
+                              ' ',                      !vc_payout_prd_id
+                              ' ',                      !gb_group_id
+                              ' ',                      !applid
+                              '',                       !award_date
+                              !'N')                      !notify_status	!GEX-MXT commented for Upgrade
+                              'N',			!GEX-MXT added for Upgrade (sytem testing)
+                              ' ')			!GEX-MXT added for Upgrade
+end-SQL
+If #save-sql-status = 0
+      add 1 to #pay_oth_earns_recs_inserted       
+else
+     
+      show 'PAY_OTH_EARNS ERROR - INSERT FAILED for Emplid:  ' $Emplid
+      show 'Company, Paygroup, Pay_End_Dt =  ' $Company $paygroup $pay_end_dt  
+      show 'Off Cycle=N, page and line    =  ' #page #line
+      show 'Addl#     and    SepChk#      =  ' #MaxAddl_Plus1 #MaxSepChk_new
+      show 'dropping index that was built on pay_earnings'
+      do P810-Drop-Index-PayEarnings
+      STOP 		      
+	     
+End-if
+
+end-procedure
+
+!************************************************
+Begin-Procedure P500-Print-Bonus-Report
+!************************************************
+#debug9 Show 'P500-Print-Bonus-Report'
+ Show 'P500-Print-Bonus-Report'
+!Show 'Printing Bonus jobode : '$JobCOde
+!  let $Year4 = '1'
+  !Let $Jobcode = Ltrim(Rtrim(&j.jobcode, ' '),' ')	!Vendaxg Added for ITG#50164 
+ 
+  Do Format-DateTime($earns_begin_dt, $earns_begin_dt_ref, {DEFMDY}, '', '')
+  Do Format-DateTime($earns_end_dt, $earns_end_dt_ref, {DEFMDY}, '', '')
+  
+  Use-Report Bonus-Report
+
+  print $acct_cd                      (+1,{#column1})
+  print $name              	      (+0,{#column2},30)
+  print $Emplid                       (+0,{#column3})
+  !Vendaxg Modified  for ITG#50164 on 07/18/2008- Begin
+  !print $jobcode                     (+0,{#column3A})
+  print $Jobcode_Print                (+0,{#column3A})
+  !Vendaxg Modified  for ITG#50164 on 07/18/2008- End
+  print $full_part_time               (+0,{#column3B})          
+  print $JobTitle                     (+0,{#column4},30)         !job description 
+  print #Bonus_Amt_FortheWeek         (+0,{#column5})   edit 9,999.99
+  print #Grand_Total_Hours_ByWeek     (+0,{#column6})   edit 999.99
+  Print #page                         (+0,{#column7})   edit 9999
+  Print #line                         (+0,{#column8})   edit 9
+  Print #MaxAddl_Plus1                (+0,{#column9})   edit  99
+  Print #MaxSepChk_new                (+0,{#column10})  edit  99
+  Print $earns_begin_dt_ref           (+0,{#column11})
+  Print $earns_end_dt_ref             (+0,{#column12})              
+  
+  add #Bonus_Amt_FortheWeek to #sum_deptid_Bonus_amt
+  add #Bonus_Amt_FortheWeek to #Grand_Total_Bonus_Amt
+  add #Bonus_Amt_FortheWeek to #sum_emplid_Bonus_amt 
+  add #Grand_Total_Hours_ByWeek to #Total_Hours_FortheEE
+  add 1 to #recs-written-Bonus-Rpt
+   
+End-Procedure
+       
+!*******************************************************
+Begin-Procedure P510-Print-Bonus-Rpt-Grand-Totals
+!*******************************************************
+#debug9 Show 'P510-Print-Bonus-Rpt-Grand-Totals'
+  Show 'P510-Print-Bonus-Rpt-Grand-Totals'
+  Use-Report Bonus-Report
+  
+  Print '-'                              (+2,{#column1},174)  Fill
+  Print '******************  Team Bonus Register Totals **********************'    (+2,1)
+  Print 'Total Detail Lines Written to Report: '      (+1,1)
+  Print #recs-written-Bonus-Rpt                       (+0,48)      edit 9,999,999
+  Print 'Total #Employees Receiving Bonuses:   '      (+1,1)
+  Print #ees_receiving_Bonus                          (+0,48)      edit 999,999
+  Print '*NOTE* an employee could receive multiple bonuses if they worked in >1 deptid' (+1,1)   
+  Print 'Grand Total Bonus Amount: '                  (+2,1)
+  Print #Grand_Total_Bonus_Amt                        (+0,48)      edit $9,999,999.99
+ 
+End-Procedure
+
+!*******************************************************
+Begin-Procedure P512-Print-Termination-Rpt-Grand-Totals
+!*******************************************************
+#debug9 Show 'P512-Print-Termination-Rpt-Grand-Totals'
+  Show 'P512-Print-Termination-Rpt-Grand-Totals'
+  Use-Report Termination-Report
+  
+  Print '-'                                   (+2,{#column1},174)  Fill
+  Print '**Termination Report Totals**'       (+1,1)
+  Print 'Total Employees Terminated: '        (+1,1)
+  Print $recs-written-Termination-Rpt         (+0,48)      edit 999,999
+ 
+End-Procedure
+
+!*******************************************************
+Begin-Procedure P514-Print-Suspension-Rpt-Grand-Totals
+!*******************************************************
+#debug9 Show 'P514-Print-Suspension-Rpt-Grand-Totals'
+  Show 'P514-Print-Suspension-Rpt-Grand-Totals'
+  Use-Report Suspension-Report
+  
+  Print '-'                                   (+2,{#column1},174)  Fill
+  Print '**Suspension Report Totals**'        (+1,1)
+  Print 'Total Employees Suspended: '         (+1,1)
+  Print $recs-written-Suspension-Rpt          (+0,48)      edit 999,999
+ 
+End-Procedure
+
+!************************************************
+Begin-Procedure P520-Print-Suspension-Report
+!************************************************
+#debug9 Show 'P520-Print-Suspension-Report'
+
+  Show 'P520-Print-Suspension-Report'
+ 
+  Do P250-Get-Action-Reason-Descr  
+  Use-Report Suspension-Report
+
+  print &j.acct_cd                    (+1,{#column1})
+  print &pd.name              	      (+0,{#column2},30)
+  print &j.Emplid                     (+0,{#column3})
+  print $JobTitle                     (+0,{#column4},30)         !job description
+  print &j.effdt                      (+0,{#column5S})
+  print $action_reason                (+0,{#column6S})
+  print $action_reason_descr          (+0,{#column7S}) 
+  
+  add 1 to #recs-written-Suspension-Rpt
+  add 1 to #susprecs-per-Dept                   !zeroed out in the P290 para 
+  let $save_printed_susp_ee         = &j.emplid
+  let $Save_Deptid_for_suspensions  = $convert_pfs_str_no
+   
+End-Procedure
+ 
+!************************************************
+Begin-Procedure P530-Print-Termination-Report
+!************************************************
+#debug9 Show 'P530-Print-Termination-Report'
+ Show 'P530-Print-Termination-Report'
+ 
+  Do P250-Get-Action-Reason-Descr
+  Use-Report Termination-Report
+
+  print &j.acct_cd                    (+1,{#column1})
+  print &pd.name              	      (+0,{#column2},30)
+  print &j.Emplid                     (+0,{#column3})
+  print $JobTitle                     (+0,{#column4},30)         !job description
+  print &j.effdt                      (+0,{#column5S})
+  print $action_reason                (+0,{#column6S})
+  print $action_reason_descr          (+0,{#column7S})
+  print &e.termination_dt             (+0,{#column8S}) 
+  
+  add 1 to #recs-written-Termination-Rpt
+  add 1 to #termrecs-per-Dept                   !zeroed out in the P290 para 
+  let $save_printed_termed_ee = &j.Emplid
+  let $Save_Deptid_for_terms  = $convert_pfs_str_no
+   
+End-Procedure
+
+!*********************************************************************
+!Retrieves the last page in the pay_page table for company/paygroup of current period
+!*********************************************************************
+Begin-procedure P600-Get-Last-Page
+#debug9 Show 'P600-Get-Last-Page'
+ Show 'P600-Get-Last-Page'
+
+begin-select ON-ERROR=P995-SQL-Error-Found('Get-Last-Page')
+MAX(PG.PAGE_NUM) &Page
+
+  move &Page to #LastPage
+!  show '---------------------------'
+!  show 'Max Page : ' &Page
+!  show 'Company Paygroup:  ' $COMPANY $PAYGROUP
+
+FROM PS_PAY_PAGE PG
+WHERE PG.COMPANY = $COMPANY              
+  AND PG.PAYGROUP = $PAYGROUP
+  AND PG.PAY_END_DT = $Pay_End_Dt                     !pay calendar current pay end dt
+  AND PG.OFF_CYCLE = 'N'
+end-select
+end-procedure
+
+!***************************************************************************
+!Retrieves the last line in PS_pay_line for max pay page of company/paygroup 
+!***************************************************************************
+Begin-procedure P605-Get-Last-Line
+#debug9 Show 'P605-Get-Last-Line'
+ Show 'P605-Get-Last-Line'
+
+
+begin-select ON-ERROR=P995-SQL-Error-Found('P605-Get-Last-Line')
+MAX(L.LINE_NUM) &MaxLine
+
+  move &MaxLine to #LastLine
+!  show 'Max Line : ' &MaxLine
+!  show '---------------------------'
+
+FROM PS_PAY_LINE L
+WHERE L.COMPANY    = $COMPANY              
+  AND L.PAYGROUP   = $PAYGROUP
+  AND L.PAY_END_DT = $Pay_End_Dt                     !pay calendar current pay end dt
+  AND L.OFF_CYCLE  = 'N'
+  AND L.PAGE_NUM   = #LastPage
+end-select
+end-procedure
+
+!*********************************************************************
+!Inserts a new page in the paysheet
+!*********************************************************************
+begin-procedure P610-Insert-Pay-Page
+#debug9 Show 'P610-Insert-Pay-Page'
+ Show 'P610-Insert-Pay-Page'
+ 
+ let #save-sql-status = 0
+ show 'P610-Insert-Pay-Page'  
+ show 'company, paygroup, pay_end_dt, page  '  $company $paygroup $pay_end_dt #page
+  
+begin-SQL ON-ERROR=P995-SQL-Error-Found('P610-Insert-Pay-Page')
+INSERT INTO PS_PAY_PAGE ( COMPANY,
+			  PAYGROUP,
+			  PAY_END_DT,
+			  OFF_CYCLE,
+			  PAGE_NUM,
+			  CONFIRMED,
+			  BALNC_LINES,
+			  BALNC_LINES_OK,
+			  BALNC_REG_PAY_HRS,
+			  BALNC_OT_HRS,
+			  BALNC_OTH_HRS,
+			  BALNC_REG_PAY,
+			  BALNC_OTH_EARNS,
+			  BALNC_HOURLY_RT,
+			  SINGLE_CHECK_USE,
+			  PAY_SHEET_SRC)
+VALUES                  ( $Company,
+			  $paygroup,
+			  $pay_end_dt,
+			  'N',                  !off_cycle
+			  #page,
+			  'N',                  !confirmed
+			  0,
+			  0,
+			  0,
+			  0,
+			  0,
+			  0,
+			  0,
+			  0,
+			'N',
+			'S')
+end-SQL
+
+If #save-sql-status = 0
+      add 1 to #pay_page_recs_inserted       
+else     
+      show 'PAY_PAGE ERROR - INSERT FAILED for Adding New Page  ' #page  
+      show 'Company, Paygroup, Pay_End_Dt = ' $company $paygroup $pay_end_dt  
+      show 'Emplid processing: ' $Emplid
+      STOP 		      
+	     
+End-if
+
+end-procedure
+
+
+!*********************************************************************
+!Retrieves the employee information for pay_earnings insert
+!*********************************************************************
+
+
+begin-procedure P615-Get-Employee-Data
+
+  move 'N' to $Found
+
+  display 'axl in P615-Get-Employee-Data'
+  display 'emplid ' noline
+  display $emplid
+  display '$empl_rcd ' noline
+  display 'pay end ' noline
+  display $Pay_End_Dt
+
+
+begin-select ON-ERROR=P995-SQL-Error-Found('P615-Get-Employee-Data')
+A1.EMPLID
+A1.NAME
+!Modified for Upgrade 9.0 GEX-AXG -Begin
+!B1.DED_TAKEN
+!B1.DED_SUBSET_ID
+D1.DED_TAKEN
+D1.DED_SUBSET_ID
+!Modified for Upgrade 9.0 GEX-AXG - End
+B1.BENEFIT_RCD_NBR
+C1.JOBCODE
+C1.DEPTID
+C1.ACCT_CD
+C1.BUSINESS_UNIT
+C1.GL_PAY_TYPE
+C1.POSITION_NBR
+C1.SHIFT
+C1.EMPL_TYPE
+C1.LOCATION
+C1.HOURLY_RT
+C1.EFFDT
+C1.FICA_STATUS_EE
+C1.FLSA_STATUS
+
+  move 'Y' to $Found
+  let $Acct_Cd        = &C1.ACCT_CD
+  let $Jobcode        = &C1.Jobcode
+  let $Business_Unit  = &C1.Business_Unit 
+  let $FICA_Status_EE = &C1.FICA_STATUS_EE
+  let $FLSA_Status    = &C1.FLSA_STATUS
+	Show 'JobCode in P615-Get-Employee-Data Procedure : ' $Jobcode 'Pay_End_Dt : ' $Pay_End_Dt
+  FROM PS_PERSONAL_DATA A1,
+       PS_EMPLOYMENT B1,
+       !Modified for Upgrade 9.0 GEX-AXG -Begin
+       !PS_JOB C1
+       PS_JOB C1,
+       sysadm.PS_DED_NA D1
+       !Modified for Upgrade 9.0 GEX-AXG -End
+ WHERE A1.EMPLID    = $emplid
+   AND B1.EMPLID    = A1.EMPLID
+   !Added for Upgrade 9.0 GEX-AXG -Begin
+   AND B1.EMPLID = D1.EMPLID 
+   AND B1.EMPL_RCD = D1.EMPL_RCD
+   !Added for Upgrade 9.0 GEX-AXG -Begin
+   AND C1.EMPLID    = A1.EMPLID
+   AND B1.EMPL_RCD  = C1.EMPL_RCD
+   AND B1.EMPL_RCD  = $empl_rcd
+   AND C1.EFFDT =
+       (SELECT MAX(EFFDT)
+	FROM   PS_JOB
+	WHERE  EMPLID    = $emplid
+	  AND  EMPL_RCD  = $empl_rcd
+	  AND  EFFDT    <= $Pay_End_Dt)
+  AND  C1.EFFSEQ =
+       (SELECT MAX(EFFSEQ)
+	FROM   PS_JOB
+	WHERE  EMPLID    = $emplid
+	  AND  EMPL_RCD  = $empl_rcd
+	  AND  EFFDT     = C1.EFFDT)
+end-select
+ 
+  if $Found = 'N'
+    show '*******************************************************************************'
+    show 'EmplID, Empl_Rcd Not Found(Personal_Data,Employment,Job) when creating paysheet'  
+    show 'No paysheet created--Bypassing employee and empl_rcd:  ' $emplid $empl_rcd   
+    let $Error-Found = 'Y'
+    goto no-employee-data             !goto the end of this para   
+  end-if
+			     
+  if isnull(&C1.position_nbr) = 1
+     move '   ' to $position_nbr
+  else
+     move &C1.position_nbr to $position_nbr
+  end-if
+
+  if isnull(&C1.GL_PAY_TYPE) = 1
+     move ' ' to $Gl_Pay_type
+  else
+     move &C1.Gl_Pay_type to $Gl_Pay_Type
+  end-if
+  
+  if isnull(&B1.BENEFIT_RCD_NBR) = 1
+     move 0 to #Benefit_Rcd
+  else
+     move &B1.BENEFIT_RCD_NBR to #Benefit_Rcd
+  end-if
+!Modified for Upgrade 9.0 GEX-AXG -Begin
+  !if isnull(&B1.Ded_Taken) = 1
+  if isnull(&D1.Ded_Taken) = 1
+  !Modified for Upgrade 9.0 GEX-AXG -End
+     move 'D' to $Ded_Taken
+  else
+     !Modified for Upgrade 9.0 GEX-AXG -Begin
+     !move &B1.Ded_Taken to $Ded_Taken
+      move &D1.Ded_Taken to $Ded_Taken
+     !Modified for Upgrade 9.0 GEX-AXG -End
+  end-if
+ 
+ !Modified for Upgrade 9.0 GEX-AXG -Begin 
+  !if isnull(&B1.Ded_subset_id) = 1
+  if isnull(&D1.Ded_subset_id) = 1
+  !Modified for Upgrade 9.0 GEX-AXG -End
+     move '   ' to $Ded_Subset_Id
+  else
+  !Modified for Upgrade 9.0 GEX-AXG -Begin
+     !move &B1.Ded_subset_id to $Ded_Subset_Id
+     move &D1.Ded_subset_id to $Ded_Subset_Id
+  !Modified for Upgrade 9.0 GEX-AXG -End
+  end-if
+
+  move &C1.Shift to $Shift                          !shift code
+
+!  sometimes we do not use the hourly_rate for pay_earnings insert
+!  if hourly, use the Bonus cents per hour as the hourly_rate 
+!  for the pay_earnings insert.
+
+no-employee-data:
+end-procedure
+
+!*********************************************************************
+!Get Current Benefit Program of the Employee
+!*********************************************************************
+begin-procedure P620-Get-Benefit-Program
+#debug9 Show 'P620-Get-Benefit-Program'
+  Show 'P620-Get-Benefit-Program'
+
+move 'N' to $beninfo_found
+
+begin-select ON-ERROR=P995-SQL-Error-Found('P620-Get-Benefit-Program')
+BPP.BENEFIT_PROGRAM   &BPP.benefit_program
+
+     move 'Y' to $beninfo_found
+     let $benefit_program = &BPP.benefit_program
+
+FROM PS_BEN_PROG_PARTIC BPP
+
+WHERE BPP.EMPLID   = $emplid
+  AND BPP.EMPL_RCD = $empl_rcd
+  AND BPP.EFFDT = (SELECT MAX(EFFDT)
+                FROM PS_BEN_PROG_PARTIC BPPA
+                WHERE BPPA.EMPLID = $emplid
+                AND BPPA.EMPL_RCD = $empl_rcd
+                AND BPPA.EFFDT <= $Pay_End_Dt)
+ 
+end-select 
+
+if $beninfo_found = 'N'
+   show '*************  when creating paysheet  **************'
+   show 'No Benefit Program information found for emplid, empl_rcd: ' $emplid $empl_rcd
+   let $Error-found = 'Y'
+end-if
+
+end-procedure
+
+!*********************************************************************
+!inserts a new line in the pay sheet
+!*********************************************************************
+begin-procedure P625-Insert-Pay-Line
+#debug9 Show 'P625-Insert-Pay-Line'
+ Show 'P625-Insert-Pay-Line'
+
+  let #save-sql-status = 0 
+! show 'P625-Insert-Pay-Line'
+ let $bu_lkp = ' '
+
+ lookup bulookup 'COMMN' $bu_lkp  
+
+begin-SQL ON-ERROR=P995-SQL-Error-Found('P625-Insert-Pay-Line')
+INSERT INTO PS_PAY_LINE ( COMPANY,
+			  PAYGROUP,
+			  PAY_END_DT,
+			  OFF_CYCLE,
+			  PAGE_NUM,
+			  LINE_NUM,
+			  EMPLID,
+			  EMPL_RCD,
+			  BENEFIT_RCD_NBR,
+			  NAME,
+			  JOB_CHANGE,
+			  PARTIAL_PERIOD,
+			  CONFIRMED,
+			  EMPL_TYPE,
+			  LOCATION,
+			  DEPTID,
+			  BENEFIT_PROGRAM,
+			  MANUAL_CHECK,
+			  FORM_ID,
+			  PAYCHECK_NBR,
+			  CHECK_DT,
+			  TOTAL_GROSS,
+			  NET_PAY,
+			  PAYCHECK_ADJUST,
+			  SINGLE_CHECK_USE,
+			  TL_SOURCE,
+			  PAY_SHEET_SRC,
+			  BUSINESS_UNIT,         
+			  LOCKED_FOR_CONF)	 
+VALUES                  ( $company,
+			  $paygroup,
+			  $Pay_End_Dt,
+			  'N',
+			  #page,
+			  #line,
+			  $emplid,
+			  $empl_rcd,
+			  #Benefit_Rcd,
+			  &A1.name,
+			  'N',
+			  'N',
+			  'N',
+			  &C1.empl_type,
+			  &C1.location,
+			  &C1.deptid,
+			  &BPP.benefit_program,                      
+			  'N',         !manual_check
+			  '      ',
+			  0,
+			  NULL,
+			  0,
+			  0,
+			  'N',
+			 'N',
+			 'G',          !Tl_source 
+			 'S',          !pay_sheet_src  s=regular paysheet
+			 $bu_lkp,
+			 'N')
+end-SQL
+If #save-sql-status = 0
+      add 1 to #pay_line_recs_inserted       
+else     
+      show 'PAY_LINE ERROR - INSERT FAILED for Adding New Line#  ' #line 
+      show 'Company, Paygroup   = ' $company $paygroup 
+      show 'pay end dt          = ' $pay_end_dt
+      show 'page_num            = ' #page 
+      show 'Processing emplid : ' $Emplid
+      STOP 		      
+	     
+End-if
+
+end-procedure
+
+!***************************************************************
+begin-procedure P630-Get-State-Locality
+!**************************************************************
+#debug9 Show 'P630-Get-State-Locality'
+
+! display 'get-state-locality'
+
+  move '**' to $State
+  move ' '  to $Locality
+
+begin-select
+D.STATE
+D.LOCALITY
+D.DIST_PCT
+
+  let $State = rtrim(&D.State, ' ')
+
+  if isnull(&D.Locality) = 1
+    let $Locality = '  '
+  else
+    let $Locality = &D.Locality
+  end-if
+  exit-select
+
+ FROM PS_TAX_DISTRIB D
+where D.EMPLID    = $emplid
+  and D.EMPL_RCD  = $empl_rcd
+  and D.EFFDT =
+	    (SELECT MAX(X31.EFFDT)
+	     from PS_TAX_DISTRIB X31
+	     where X31.EMPLID   = $emplid
+	       and X31.EMPL_RCD = $empl_rcd
+	       and X31.EFFDT <= $Pay_End_Dt)
+end-select
+
+end-procedure
+
+!***  SCM 08/27/2003  begin 
+!***  Added to get required fields from the max effdtd/max effseq job row.
+!***  The reason this select is done separately, is that if these fields
+!***  are put in the main select, that means you have to put them in the group by.
+!***  And if the ee has two rows effdt'd for the same date, but with different
+!***  action/action reasons, or jobcodes, or empl_status's, etc. then there will
+!***  be two rows returned back from the select, therefore
+!***  doubling all the payroll earnings and hours.
+!********************************************************
+begin-procedure P700-Get-Job-Details
+!********************************************************
+#debug9 Show 'P700-Get-Job-Details'
+  Show 'P700-Get-Job-Details'
+begin-select
+
+js.jobcode
+js.empl_status                     
+js.comp_frequency
+js.full_part_time
+js.empl_type                         
+js.action
+js.action_reason
+    
+    let $Jobcode         = &js.JobCode 
+    Let $empl_status     = &js.empl_status
+    Let $comp_frequency  = &js.comp_frequency
+    Let $full_part_time  = &js.full_part_time
+    Let $empl_type       = &js.empl_type      
+    let $action          = &js.action 
+    let $action_reason   = &js.action_reason
+ 	Show 'JobCode  P700 Asof date : '$JobCode 
+ from ps_job js
+ 
+where  js.emplid             = &j.emplid
+And    js.empl_rcd           = &j.empl_rcd
+And    js.effdt                   =
+      (Select Max(js1.effdt)
+       From   ps_job js1
+       Where  js1.emplid             = &j.emplid
+       And    js1.empl_rcd           = &j.empl_rcd
+       And    js1.effdt             <= $X000_WHERE_SELECT_ASOFDATE)
+
+And    js.effseq                  =
+      (Select Max(js2.effseq)
+       From   ps_job js2
+       Where  js2.emplid             = &j.emplid
+       And    js2.empl_rcd           = &j.empl_rcd
+       And    js2.effdt              = js.effdt)
+
+end-select
+end-procedure
+!***  SCM 08/27/2003  end    added new procedure
+
+
+!***  CA 02/02/2007  begin 
+!***  Added to get Pay Period Job information
+!********************************************************
+begin-procedure P725-Get-Job-Details
+!********************************************************
+#debug9 Show 'P725-Get-Job-Details'
+ Show 'P725-Get-Job-Details'
+begin-select
+
+j2s.jobcode
+j2s.empl_status                     
+j2s.comp_frequency
+j2s.full_part_time
+j2s.empl_type                         
+j2s.action
+j2s.action_reason
+    
+    let $Jobcode         = &j2s.JobCode 
+!    Let $empl_status     = &j2s.empl_status
+    Let $comp_frequency  = &j2s.comp_frequency
+    Let $full_part_time  = &j2s.full_part_time
+    Let $empl_type       = &j2s.empl_type      
+!    let $action          = &j2s.action 
+!    let $action_reason   = &j2s.action_reason
+ 	Show 'JobCode in Procedure P725 for earn end dt : '$JobCode ' Earndate : '$earns_end_dt
+ from ps_job j2s
+ 
+where  j2s.emplid             = &j.emplid
+And    j2s.empl_rcd           = &j.empl_rcd
+And    j2s.effdt                   =
+      (Select Max(j2s1.effdt)
+       From   ps_job j2s1
+       Where  j2s1.emplid             = &j.emplid
+       And    j2s1.empl_rcd           = &j.empl_rcd
+!       And    j2s1.effdt             <= $X000_WHERE_SELECT_ASOFDATE)
+       And    j2s1.effdt             <= $earns_end_dt )	!ITG 38400 ISDVMXR 01/24/2007 added
+And    j2s.effseq                  =
+      (Select Max(j2s2.effseq)
+       From   ps_job j2s2
+       Where  j2s2.emplid             = &j.emplid
+       And    j2s2.empl_rcd           = &j.empl_rcd
+       And    j2s2.effdt              = j2s.effdt)
+
+end-select
+end-procedure
+!***  CA 02/02/2007  end    added new procedure
+
+!***  CA 02/02/2007  begin 
+!***  Added to get Bonus Period Suspensions
+!********************************************************
+begin-procedure P750-Get-Job-Sus
+!********************************************************
+!#debug9 Show 'P750-Get-Job-Sus'
+  Show 'P750-Get-Job-Sus'
+ Let $Sus_Flag = 'N'
+
+begin-select Loops=1
+'x'
+
+ Let $Sus_Flag = 'Y'
+
+ from ps_job jxs
+ 
+where  jxs.emplid             = &j.emplid
+And    jxs.empl_rcd           = &j.empl_rcd
+And   (jxs.effdt             >= $pfs.strt_dte
+And    jxs.effdt             <= $pfs.end_dte)
+And    jxs.action_reason     in ('SUS', 'SU1', 'SU2')
+
+end-select
+end-procedure
+!***  CA 02/02/2007  end    added new procedure
+
+!************************************************
+Begin-Procedure P800-Show-Totals-to-Log
+!************************************************
+!#debug9 Show 'P800-Show-Totals-to-Log'
+   
+    move #recs-written-Bonus-Rpt       to $recs-written-Bonus-Rpt         8,888,888 
+    move #recs-written-Suspension-Rpt  to $recs-written-Suspension-Rpt    8,888,888 
+    move #recs-written-Termination-Rpt to $recs-written-Termination-Rpt   8,888,888 
+    move #pay_earns_recs_inserted      to $pay_earns_recs_inserted        8,888,888
+    move #pay_oth_earns_recs_inserted  to $pay_oth_earns_recs_inserted    8,888,888
+    move #ees_receiving_Bonus          to $ees_receiving_Bonus            8,888,888
+    move #pay_page_recs_inserted       to $pay_page_recs_inserted         8,888,888 
+    move #pay_line_recs_inserted       to $pay_line_recs_inserted         8,888,888   
+    show '*********************************************************************'
+    show 'Number of Records Written to Bonus Rpt :          ' $recs-written-Bonus-Rpt 
+    show 'Number of Records Written to Suspension Rpt:      ' $recs-written-Suspension-Rpt
+    show 'Number of Records Written to Terminated Rpt:      ' $recs-written-Termination-Rpt
+ 
+    show 'Number of Records Inserted in pay_earnings :      ' $pay_earns_recs_inserted
+    show 'Number of Records Inserted in pay_oth_earn :      ' $pay_oth_earns_recs_inserted
+
+    show 'Number of Records Inserted in pay_page     :      ' $pay_page_recs_inserted
+    show 'Number of Records Inserted in pay_line     :      ' $pay_line_recs_inserted
+ 
+    show 'Number of Employees Receiving Bonuses      :      ' $ees_receiving_Bonus 
+ 
+    move #Grand_Total_Bonus_Amt to $Grand_Total_Bonus_Amt     8,888,888.88  
+    show 'Grand Total Retail Bonus Amount:                  ' $Grand_Total_Bonus_Amt
+    show '*********************************************************************' 
+ 
+End-Procedure
+
+
+!************************************************
+Begin-Procedure P810-Drop-Index-PayEarnings
+!************************************************
+!#debug9 Show 'P810-Drop-Index-PayEarnings'
+  let #save-sql-status = 0
+begin-sql ON-ERROR=P995-SQL-Error-Found('P810-Drop-Index-PayEarnings')
+drop index PSZPAY_EARNINGS
+end-sql
+  If  #save-sql-status = 0
+      show '** Successfully dropped PSZPAY_EARNINGS Z Index **'      
+  else
+      show 'PSZPAY_EARNINGS Index did not exist--- CONTINUING PROCESSING'	      	     
+  End-if 
+
+End-Procedure
+
+!SCM   08/27/2003    BEGIN   Added select of jobcode table for manager_level
+!************************************************ 
+begin-procedure P900-Get-Jobcode-Tbl
+!************************************************ 
+#debug9 show 'P900-Get-Jobcode-Tbl'
+  show 'P900-Get-Jobcode-Tbl'
+  Let $Manager_level = '  '
+  if rtrim($JobCode,' ') = ''
+    move '' to $JobTitle
+    move '' to $JobTitleAbbrv
+    goto P901_GetJobTlExit
+  end-if
+ 
+begin-SELECT
+JT2.DESCR
+JT2.DESCRSHORT
+JT2.MANAGER_LEVEL
+JT2.JOBCODE	!Vendaxg Added for ITG#50164 on 07/18/2008
+
+	let $Manager_level = &JT2.MANAGER_LEVEL
+	!Vendaxg Added for ITG#50164 on 07/18/2008 - Begin
+	let $JobTitle       = rtrim(&JT2.Descr,' ')
+	Let $Jobcode_Print =  rtrim(&JT2.JOBCODE,' ')
+  	let $JobTitleAbbrv  = rtrim(&JT2.DescrShort,' ')
+  	!Vendaxg Added for ITG#50164 on 07/18/2008 - End
+	Show 'Job COde to get Descr : '$JobCode ' DEscr ; '&JT2.DESCR
+FROM  PS_JOBCODE_TBL JT2
+WHERE JT2.JOBCODE = $JobCode
+  AND JT2.EFFDT =
+      (SELECT MAX(EFFDT)
+       FROM   PS_JOBCODE_TBL J3
+       WHERE  J3.JOBCODE = $JobCode
+        ! AND  J3.EFFDT  <= $X000_WHERE_SELECT_ASOFDATE) !ITG 38400 ISDVMXR 01/24/2007 commented out
+         And    J3.effdt             <= $earns_end_dt )    !     !ITG 38400 ISDVMXR 01/24/2007 added
+        
+end-SELECT
+!Vendaxg Added for ITG#50164 on 07/18/2008 - Begin
+  !let $JobTitle       = rtrim(&JT2.Descr,' ')
+  !let $JobTitleAbbrv  = rtrim(&JT2.DescrShort,' ')
+!Show 'Job COde to get Descr : '$JobCode
+!Vendaxg Added for ITG#50164 on 07/18/2008 - End
+P901_GetJobTlExit:
+end-procedure
+
+! SCM  08/27/2003    END                            **************
+
+!*******************************************************
+begin-procedure P990-Prepare-Businessunit-lookup
+!********************************************************
+
+Load-Lookup     
+     Name=BULookup
+     !Table='PS_GEX_DEPT_TBL BU'
+     !Key='BU.DEPTID'
+     !Return_Value='BU.BUSINESS_UNIT'
+     !Where='BU.EFFDT = (select max(effdt) from ps_gex_dept_tbl where deptid=bu.deptid and effdt <= $X000_WHERE_SELECT_ASOFDATE)'
+     Table='PS_BUS_UNIT_TBL_HR BU'
+     Key='BU.DEFAULT_SETID'
+     Return_Value='BU.BUSINESS_UNIT'
+     Where='BU.ACTIVE_INACTIVE  = ''A'''   
+end-procedure
+   
+begin-procedure P995-SQL-Error-Found($Proc_Name) 
+  display 'SQL Error in ' 
+  display $Proc_Name 
+  display $_sql-error
+  display 'sql-status:' 
+  display #_sql-status
+  move #_sql-status to #save-sql-status
+  show ' on error #save-sql-status is:   ' #save-sql-status 
+!  STOP
+end-procedure
+
+!vendaxg ADded for ITG#50164 on 07/22/2008 - Begin
+Begin-Procedure Verify-PH-Jobcode
+Let $JobCOde_Changed_Flag = 'N'
+
+Begin-Select 
+JOB.EFFDT
+JOB.JOBCODE
+JOB.STD_HOURS
+
+	Let $JobCOde_Changed_Flag= 'Y'
+	Let $Changed_JobCode = Ltrim(Rtrim(&JOB.JOBCODE,' '),' ')
+	Let #Std_Hours=&JOB.STD_HOURS
+	Do Check-Jobcode
+	
+FROM PS_JOB JOB 
+WHERE JOB.EMPLID = &J.EMPLID
+AND JOB.EFFDT BETWEEN  &pe.earns_begin_dt AND &pe.earns_end_dt
+
+End-Select 
+
+If $JobCOde_Changed_Flag= 'N'
+	Do Get-JobCode-ASofEarnDt
+	Do Check-Jobcode
+End-if
+
+End-Procedure Verify-PH-Jobcode 
+
+Begin-Procedure Check-Jobcode
+
+Let $Process_Row = 'N'
+
+!If ($Changed_JobCode <> '20138') and ($Changed_JobCode <> '30000') and ($Changed_JobCode <> '30005') and ($Changed_JobCode <> '30170')
+!	and ($Changed_JobCode <> '30299') and ($Changed_JobCode <> '40072') and ($Changed_JobCode <> '80022') and ($Changed_JobCode <> '88016')
+! modified for ITG#53594  - start
+!GEXPY_848_E920_01  Vahini Katta 2014-05-09 Begins
+!If ((($Changed_JobCode  ='20138' and #Std_Hours<30) or ($Changed_JobCode  <> '20138' ))  and ($Changed_JobCode <> '30000') and ($Changed_JobCode <> '70019') and ($Changed_JobCode <> '80074') and (($Changed_JobCode  = '30170' and #Std_Hours<30) or ($Changed_JobCode  <> '30170' ))  and (($Changed_JobCode  ='30299' and #Std_Hours<30) or ($Changed_JobCode  <> '30299' ))  and ($Changed_JobCode <> '40072')) 
+If ((($Changed_JobCode  ='20138' and #Std_Hours<30) or ($Changed_JobCode  <> '20138' ))  and ($Changed_JobCode <> '30000') and ($Changed_JobCode <> '70019') and ($Changed_JobCode <> '80074') and (($Changed_JobCode  = '30170' and #Std_Hours<30) or ($Changed_JobCode  <> '30170' ))  and (($Changed_JobCode  ='30299' and #Std_Hours<30) or ($Changed_JobCode  <> '30299' ))) 
+!GEXPY_848_E920_01  Vahini Katta 2014-05-09 Ends
+!ISDVDZK modified for ITG#53594  - end
+	Let $Process_Row = 'Y'
+Else
+	Let $Process_Row = 'N'
+End-if
+End-Procedure Check-Jobcode
+
+Begin-Procedure Get-JobCode-ASofEarnDt
+
+Begin-Select 
+JOBEARN.JOBCODE
+
+	Let $JobCode_ASofEarnDt = ltrim(Rtrim(&JOBEARN.JOBCODE, ' '),' ')
+	Show 'JobcOde as of Earn End DAte : '$JobCode_ASofEarnDt
+	!Do Check-Jobcode
+FROM PS_JOB JOBEARN 
+WHERE JOBEARN.EMPLID = &j.emplid
+AND JOBEARN.EFFDT = (SELECT MAX(JOBEARN1.EFFDT) FROM PS_JOB JOBEARN1 WHERE JOBEARN.EMPLID = JOBEARN1.EMPLID
+				AND JOBEARN.EMPL_RCD = JOBEARN1.EMPL_RCD
+				AND JOBEARN1.EFFDT <= &pe.earns_end_dt)
+AND JOBEARN.EFFSEQ = (SELECT MAX(JOBEARN2.EFFSEQ) FROM PS_JOB JOBEARN2 WHERE JOBEARN.EMPLID = JOBEARN2.EMPLID
+				AND JOBEARN.EMPL_RCD = JOBEARN2.EMPL_RCD
+				AND JOBEARN.EFFDT = JOBEARN2.EFFDT)
+
+
+End-Select 
+
+End-Procedure Get-JobCode-ASofEarnDt
+!vendaxg ADded for ITG#50164 on 07/22/2008 - Begin
+  
+#Include 'gexxx922.sqc'  !Get pay single row run control 
+#Include 'getdptnm.sqc'  !Get-Department-Name routine
+#Include 'askaod.sqc'    !Ask-As-Of-Date routine
+#Include 'rotname3.sqc'  !Routines to rotate name
+#Include 'stdapi.sqc'    !Routines to Update Run Status
+#Include 'curdttim.sqc'  !Get-Current-DateTime Procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'datemath.sqc'  !Routines for date math
+#Include 'number.sqc'    !Routines to format numbers
+#include 'gexaltse.sqc'  !Alter session SQC
+#include 'gexxx951.sqc'  !Get Oracle dbase instance
+#include 'getjobtl.sqc'  !get-job-title
+#Include 'reset.sqc'     !Reset printer Procedure
+!#Include 'readxlat.sqc' !Read-Translate-Table procedure
+! ****************************************************************** !
+! ORACLE CONFIDENTIAL.  For authorized use only.  Except for as      !
+! expressly authorized by Oracle, do not disclose, copy, reproduce,  !
+! distribute, or modify.                                             !
+! ****************************************************************** !
+!                                                                    !
+!**********************************************************************
+!  ReadXlat:  Read the Translate Table for the desired values.        *
+!                                                                     *
+!  Parameters passed:  $FieldName  (name of field to be translated)   *
+!                      $FieldValue (value of field to be translated)  *
+!                      $AsOfDate   (As-Of-Date -- optional)           *
+!**********************************************************************
+!***********************************************************************
+!                                                                      *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+!                                                                      *
+!                                                                      *
+!                                                                      *
+!                                                                      *
+!***********************************************************************
+begin-procedure Read-Translate-Table
+#ifdef debugx
+  display 'Entering READXLAT.SQC: Read-Translate-Table'
+  display ' Input $FieldName: ' noline
+  display $FieldName
+  display ' Input $FieldValue: ' noline
+  display $FieldValue
+  display ' Input $AsOfDate: ' noline
+  display $AsOfDate
+  #ifdef debugy
+    display '   $curr_language_cd: ' noline
+    display $curr_language_cd
+  #endif
+#endif
+
+  move '' to $XlatShortName
+  move '' to $XlatLongName
+
+  if $FieldName <> '' and $FieldValue <> ''
+    if $AsOfDate = ''  !if no As-Of-Date is specified, default to Today
+      move $AsOfToday to $AsOfDate
+    end-if
+
+      if $PSOptions_language_cd = ''
+        do Get-PSOptions-Language ($PSOptions_language_cd)
+      end-if
+
+    if $PSOptions_language_cd = $curr_language_cd
+      do Select_From_Xlat ($FieldName, $FieldValue,
+                           $XlatShortName, $XlatLongName)
+    else
+      do Select_From_XlatLang ($FieldName, $FieldValue, $curr_language_cd,
+                               $XlatShortName, $XlatLongName)
+
+      if $XlatShortName = '' and $XlatLongName = ''
+      do Select_From_Xlat ($FieldName, $FieldValue,
+                           $XlatShortName, $XlatLongName)
+      end-if
+    end-if
+  end-if
+
+#ifdef debugx
+  display 'Exiting READXLAT.SQC: Read-Translate-Table'
+  display ' Output $XlatShortName: ' noline
+  display $XlatShortName
+  display ' Input $XlatLongName: ' noline
+  display $XlatLongName
+#endif
+end-procedure
+
+
+!***********************************************************************
+! Select_From_Xlat                                                     *
+!                                                                      *
+!  Retrieves the XLATSHORTNAME and XLATLONGNAME from PSXLATITEM        *
+!  for the input language code.                                        *
+!***********************************************************************
+begin-procedure Select_From_Xlat ($FldName, $FldVal,
+                                  :$ShortName, :$LongName)
+#ifdef debugx
+  display 'Entering READXLAT.SQC: Select_From_Xlat'
+  display ' Input $FldName: ' noline
+  display $FldName
+  display ' Input $FldVal: ' noline
+  display $FldVal
+#endif
+
+  begin-SELECT
+XLATSHORTNAME
+XLATLONGNAME
+  move &XlatShortName to $ShortName
+  move &XlatLongName  to $LongName
+    FROM  sysadm.PSXLATITEM
+    WHERE FIELDNAME   = $FldName
+      AND FIELDVALUE  = $FldVal
+      AND EFFDT =
+          (SELECT MAX(EFFDT)
+             FROM   sysadm.PSXLATITEM
+             WHERE  FIELDNAME  = $_FieldName
+               AND  FIELDVALUE = $_FieldValue
+               AND  EFFDT     <= $_AsOfDate)
+  end-SELECT
+
+#ifdef debugx
+  display 'Exiting READXLAT.SQC: Select_From_Xlat'
+  display ' Output $ShortName: ' noline
+  display $ShortName
+  display ' Output $LongName: ' noline
+  display $LongName
+#endif
+end-procedure
+
+!***********************************************************************
+! Select_From_XlatLang                                                 *
+!                                                                      *
+!  Retrieves the XLATSHORTNAME and XLATLONGNAME from PSXLATITEMLANG    *
+!  for the input language code.                                        *
+!***********************************************************************
+begin-procedure Select_From_XlatLang ($FldName, $FldVal, $Language_cd,
+                                      :$ShortName, :$LongName)
+#ifdef debugx
+  display 'Entering READXLAT.SQC: Select_From_XlatLang'
+  display ' Input $Language_cd: ' noline
+  display $Language_cd
+  display ' Input $FldName: ' noline
+  display $FldName
+  display ' Input $FldVal: ' noline
+  display $FldVal
+#endif
+
+  let $Lcl_Language_Cd = rtrim($Language_cd, ' ')
+
+  begin-SELECT
+XLATSHORTNAME
+XLATLONGNAME
+  move &XlatShortName to $ShortName
+  move &XlatLongName  to $LongName
+    FROM  sysadm.PSXLATITEMLANG
+    WHERE FIELDNAME   = $FldName
+      AND FIELDVALUE  = $FldVal
+      AND LANGUAGE_CD = $Lcl_Language_Cd
+      AND EFFDT =
+          (SELECT MAX(EFFDT)
+             FROM  sysadm.PSXLATITEMLANG
+             WHERE  FIELDNAME  = $_FieldName
+               AND  FIELDVALUE = $_FieldValue
+               AND LANGUAGE_CD = $Lcl_Language_Cd
+               AND  EFFDT     <= $_AsOfDate)
+  end-SELECT
+
+#ifdef debugx
+  display 'Exiting READXLAT.SQC: Select_From_XlatLang'
+  display ' Output $ShortName: ' noline
+  display $ShortName
+  display ' Output $LongName: ' noline
+  display $LongName
+#endif
+end-procedure
+

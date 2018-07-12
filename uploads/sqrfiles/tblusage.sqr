@@ -1,0 +1,800 @@
+!***********************************************************************
+! TBLUSAGE: Analysis of Table Access by PeopleSoft Application Programs
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module contains confidential and proprietary information        *
+! of Oracle; it is not to be copied, reproduced, or transmitted        *
+! in any form, by any means, in whole or in part, nor is it to         *
+! be used for any purpose other than that for which it is              *
+! expressly provided under the applicable license agreement.           *
+!                                                                      *
+! Copyright (C) 2006 Oracle. All Rights Reserved.                      *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+!          $Date:  2006/07/19:15:36:54                                 !
+!       $Release:  HR9                                                 !
+!      $Revision:  101                                                 !
+!                                                                      *
+!***********************************************************************
+
+#include 'setenv.sqc'  !Set Database Environment
+
+begin-setup
+  #Include 'ptpsp125.sqc'  !Printer and Page-Size Initialization (Portrait)
+end-setup
+
+!----- Activate Utility Libraries -----
+#define USE_TOKEN_PARSING_LIB
+#define USE_OS_FILE_MGMT_LIB
+#define USE_STACK_LIB
+  #define STACK_SIZE     1000
+#define USE_LINKED_LIST_LIB
+  #define LIST_SIZE      7500
+#define USE_DATETIME_LIB
+
+#define REPORT_ID       'TBLUSAGE'
+#define MAX_BUFFER       2048
+#define TOOLS_TEST       'setenv.sqc'
+#define SQR_EXT          'sqr'
+#define EXE_EXT          'exe'
+#define MAX_PS_RECNAME   15
+
+!************
+begin-program
+!************
+
+   do Init-Report
+   do Display-Time($XRPT-PGM-BEGAN-AT)
+
+   evaluate $AppType
+   when='SQR'
+      do Analyze-SQR-Programs
+   when='CBL'
+      do Analyze-CBL-Programs
+   when='AEP'
+      do Analyze-AEP-Programs
+   when='QRY'
+      do Analyze-QRY-Programs
+   when-other
+      display ''
+      display $XRPT-UNKNOWN-APP-TYPE
+      display ''
+   end-evaluate
+
+   if (#FileAccessErrors)
+      print '>>>>> '             (+3,1)
+      print $XRPT-FILE-ERROR     ()
+      print ' <<<<<'             ()
+   end-if
+
+   do Close-All-Files
+   do Reset
+   do Delete-RunCntl-List
+
+   do Display-Time($XRPT-PGM-ENDED-AT)
+   do StdAPI-Term
+
+end-program
+
+!*******************************
+begin-procedure Init-Report
+!*******************************
+
+   !----- Establish global variables -----
+   let $ReportID    = ''
+   let $ReportTitle = ''
+   let $OwnerName = ''
+   let $OwnerIDClause = ''
+   let $TargetPgmClause = ''
+   let $TargetAELibClause = ''
+   let $PgmFile = ''
+   let $PgmTitle = ''
+
+   let $SourcePath = ''
+   let $ToolsSourcePath = ''
+   let $OwnerID = ''
+   let $TargetPgm = ''
+   let $AppType = ''
+   let $IncludeToolsTables = ''
+
+   let #ItemCnt = 0
+   let #PgmNotFound = 0
+   let #FileAccessErrors = 0
+   let #AnalysisError = 0
+   let #AEAnalysisError = 0
+   let #UsePgmList = 0
+   let #UsesRelLang = 0
+   let #SubstTablesUsed = 0
+   let #UsesMetaSQL = 0
+   let #UsesPCode = 0
+   let #LineNumber = 0
+
+   !----- Initialize PeopleTools Routines -----
+   do Init-Datetime
+   do Get-Current-DateTime
+   do StdAPI-Init
+
+   !----- Initialize Utility Libraries -----
+   do Init-Token-Parsing-Lib
+   do Init-OS-File-Mgmt-Lib
+   do Init-Stack-Lib(1)
+   do Init-Link-Lists-Lib(1)
+
+   !----- Process Run Control -----
+   if IsBlank($PRCS_Process_Instance)
+      do Prompt-For-Run-Parameters
+   else
+      do Read-Run-Control
+      do Use-Program-List(#UsePgmList)
+   end-if
+   do Process-Run-Information
+
+   !----- Start log file -----
+   do Get-Report-Language
+   do Start-Report-Log
+
+end-procedure
+
+!****************************************
+begin-procedure Prompt-For-Run-Parameters
+!****************************************
+
+   let $AppType = ''
+   let $OwnerID = ''
+   let $TargetPgm = ''
+   let $SourcePath = ''
+   let $ToolsSourcePath = ''
+   let $IncludeToolsTables = ''
+   let #UsePgmList = 0
+
+   while IsBlank($AppType)
+
+      input $AppType   'Application Type to analyze (SQR, CBL, AEP, QRY)'
+      let $AppType = Upper(LTrim(RTrim($AppType,' '),' '))
+
+      evaluate $AppType
+      when='SQR'
+      when='CBL'
+      when='AEP'
+      when='QRY'
+      break
+      when-other
+         let $AppType = ''
+      end-evaluate
+   end-while
+
+   evaluate $AppType
+   when='SQR'
+   when='CBL'
+   when='AEP'
+      input $OwnerID   'OwnerID to use to select programs for analysis (optional)'
+      let $OwnerID = Upper(LTrim(RTrim($OwnerID,' '),' '))
+      break
+   end-evaluate
+
+   input $TargetPgm 'Programs to analyze (wldcards are supported)(optional)'
+   let $TargetPgm = Upper(LTrim(RTrim($TargetPgm,' '),' '))
+
+   evaluate $AppType
+   when='SQR'
+      input $ToolsSourcePath 'Path to Tools SQRs (so these can be excluded from analysis)'
+      let $ToolsSourcePath = LTrim(RTrim($ToolsSourcePath,' '),' ')
+      break
+   when='CBL'
+      input $SourcePath 'Path to COBOL programs to be analyzed'
+      let $SourcePath = LTrim(RTrim($SourcePath,' '),' ')
+      break
+   end-evaluate
+
+   input $IncludeToolsTables 'Include PeopleTools Tables (Y/N)'
+   let $IncludeToolsTables = Upper(LTrim(RTrim($IncludeToolsTables,' '),' '))
+
+end-procedure
+
+!*******************************
+begin-procedure Read-Run-Control
+!*******************************
+
+   let $AppType = ''
+   let $OwnerID = ''
+   let $TargetSQR = ''
+   let $SourcePath = ''
+   let $ToolsSourcePath = ''
+
+Begin-SELECT
+RC.TAU_APPTYPE
+RC.OBJECTOWNERID
+RC.TAU_APPNAME
+RC.TAU_SOURCEPATH
+RC.TAU_TOOLSPATH
+RC.TAU_INCLUDE_TOOLS
+
+   let $AppType         = RTrim(&RC.TAU_APPTYPE,' ')
+   let $OwnerID         = RTrim(&RC.OBJECTOWNERID,' ')
+   let $TargetPgm       = RTrim(&RC.TAU_APPNAME,' ')
+   let $SourcePath      = RTrim(&RC.TAU_SOURCEPATH,' ')
+   let $ToolsSourcePath = RTrim(&RC.TAU_TOOLSPATH,' ')
+   let $IncludeToolsTables = RTrim(&RC.TAU_INCLUDE_TOOLS,' ')
+
+From  PS_RUN_CNTL_TAU RC
+Where RC.OPRID       = $PRCS_OprID
+And   RC.RUN_CNTL_ID = $PRCS_Run_Cntl_ID
+End-SELECT
+
+end-procedure
+
+!*********************************************
+begin-procedure Use-Program-List(:#UsePgmList)
+!*********************************************
+
+   let #UsePgmList = 0
+
+Begin-SELECT
+COUNT(*)       &LISTCOUNT
+
+   let #UsePgmList = &LISTCOUNT
+
+From  PS_TAU_PGM_LIST
+Where OPRID       = $_PRCS_OprID
+And   RUN_CNTL_ID = $_PRCS_Run_Cntl_ID
+End-SELECT
+
+end-procedure
+
+!**********************************
+begin-procedure Delete-RunCntl-List
+!**********************************
+
+Begin-SQL
+Delete From PS_TAU_PGM_LIST
+Where OPRID       = $PRCS_OprID
+And   RUN_CNTL_ID = $PRCS_Run_Cntl_ID
+End-SQL
+
+end-procedure
+
+!**************************************
+begin-procedure Process-Run-Information
+!**************************************
+
+   do Prepare-Source-Paths
+   do Prepare-SQL-Clauses
+
+   let $FieldName = 'OBJECTOWNERID'
+   let $FieldValue = $OwnerID
+   do Read-Translate-Table
+   let $OwnerName = $XlatLongName
+
+end-procedure
+
+!************************************
+begin-procedure Prepare-Source-Paths
+!************************************
+
+   evaluate $AppType
+   when='SQR'
+
+      !Retrieve the source path directly from the running program...
+      do Parse-FileSpec($SQR-Program, $SourcePath, $Dummy, $Dummy)
+
+      if ($IncludeToolsTables = 'N')
+         !Derive the tools path using PS_HOME...
+         if IsBlank($ToolsSourcePath)
+
+            let $Home = getenv('PS_HOME')
+            do Make-FileSpec($Home, {SQR_EXT}, '', $ToolsSourcePath)
+            let $ToolsSourcePath = $ToolsSourcePath || '\'
+            do Parse-FileSpec($ToolsSourcePath, $ToolsSourcePath, $Dummy, $Dummy)
+         end-if
+
+         !Check to see that the path to Tools is not the same as the application path...
+         !Check to see if we have a valid path to Tools by looking for a flag file...
+         do Make-FileSpec($ToolsSourcePath, {TOOLS_TEST}, '', $ToolsTest)
+         if ($ToolsSourcePath = $SourcePath) Or (Exists($ToolsTest) <> 0)
+            let $ToolsSourcePath = ''
+         end-if
+      else
+         let $ToolsSourcePath = ''
+      end-if
+      break
+
+   when='CBL'
+
+      !Need to figure out if we can derive the CBL source path...
+      break
+
+   end-evaluate
+
+end-procedure
+
+!**********************************
+begin-procedure Prepare-SQL-Clauses
+!**********************************
+
+   let $OwnerIDClause = ''
+   let $TargetPgmClause = ''
+   let $TargetAELibClause = ''
+
+   if Not IsBlank($OwnerID)
+      let $OwnerIDClause = ' And G.OBJECTOWNERID = ''' || $OwnerID || ''' '
+   end-if
+
+   if (#UsePgmList)
+
+      evaluate $AppType
+      when='SQR'
+      when='CBL'
+         let $TargetPgmClause = ' And P.PRCSNAME In (Select TAU_APPNAME From PS_TAU_PGM_LIST '
+         break
+      when='AEP'
+         let $TargetPgmClause = ' And P.PRCSNAME In (Select TAU_APPNAME From PS_TAU_PGM_LIST '
+         let $TargetAELibClause = ' And G.AE_APPLID In (Select TAU_APPNAME From PS_TAU_PGM_LIST '
+         break
+      when='QRY'
+         let $TargetPgmClause = ' Where Q.QRYNAME In (Select TAU_APPNAME From PS_TAU_PGM_LIST '
+         break
+      end-evaluate
+
+      let $TargetPgmClause = $TargetPgmClause || ' Where OPRID=''' || $PRCS_OprID || ''' '
+      let $TargetPgmClause = $TargetPgmClause || ' And RUN_CNTL_ID=''' || $PRCS_Run_Cntl_ID || ''') '
+      let $TargetAELibClause = $TargetAELibClause || ' Where OPRID=''' || $PRCS_OprID || ''' '
+      let $TargetAELibClause = $TargetAELibClause || ' And RUN_CNTL_ID=''' || $PRCS_Run_Cntl_ID || ''') '
+      let $TargetPgm = '(From List)'
+      let $OwnerID = ''
+      let $OwnerIDClause = ''
+   else
+
+      let $TargetPgm = Upper(LTrim(RTrim($TargetPgm,' '),' '))
+      if Not IsBlank($TargetPgm)
+
+         !Remove the extension, if supplied...
+         let #Pos = InStr($TargetPgm, '.', 1)
+         if (#Pos)
+            let #Len = Length($TargetPgm) - #Pos
+            let $TargetPgm = SubStr($TargetPgm, 1, #Len)
+         end-if
+         !Translate any wildcards, if supplied...
+         let $TargetPgm = Translate($TargetPgm, '?*', '%%')
+         if (InStr($TargetPgm, '%', 1) = 0)
+            let $TargetPgm = $TargetPgm || '%'
+         end-if
+
+         evaluate $AppType
+         when='SQR'
+         when='CBL'
+            let $TargetPgmClause = ' And P.PRCSNAME Like ''' || $TargetPgm || ''' '
+            break
+         when='AEP'
+            let $TargetPgmClause = ' And P.PRCSNAME Like ''' || $TargetPgm || ''' '
+            let $TargetAELibClause = ' And G.AE_APPLID Like ''' || $TargetPgm || ''' '
+            break
+         when='QRY'
+            let $TargetPgmClause = 'Where Q.QRYNAME Like ''' || $TargetPgm || ''' '
+            break
+         end-evaluate
+      end-if
+   end-if
+
+end-procedure
+
+!*********************************
+begin-procedure Report-Translation
+!*********************************
+
+   do Init_Report_Translation({REPORT_ID}, $Curr_Language_CD)
+
+   do Get_Field_Information ({REPORT_ID}, 'REPORT',           $XRPT-REPORT,           #Dummy)
+   do Get_Field_Information ({REPORT_ID}, 'SQR-RPT-TITLE',    $XRPT-SQR-REPORTTITLE,  #Dummy)
+   do Get_Field_Information ({REPORT_ID}, 'CBL-RPT-TITLE',    $XRPT-CBL-REPORTTITLE,  #Dummy)
+   do Get_Field_Information ({REPORT_ID}, 'AEP-RPT-TITLE',    $XRPT-AEP-REPORTTITLE,  #Dummy)
+   do Get_Field_Information ({REPORT_ID}, 'QRY-RPT-TITLE',    $XRPT-QRY-REPORTTITLE,  #Dummy)
+   do Get_Field_Information ({REPORT_ID}, 'TABLE-NAME',       $XRPT-TABLE-NAME,       #Dummy)
+   do Get_Field_Information ({REPORT_ID}, 'ACCESS-MODES',     $XRPT-ACCESS-MODES,     #Dummy)
+   do Get_Field_Information ({REPORT_ID}, 'MODULES-USING',    $XRPT-MODULES-USING,    #Dummy)
+   do Get_Field_Information ({REPORT_ID}, 'AE-MODULES-USING', $XRPT-AE-MODULES-USING, #Dummy)
+   do Get_Field_Information ({REPORT_ID}, 'OWNERID',          $XRPT-OWNERID,          #Dummy)
+   do Get_Field_Information ({REPORT_ID}, 'TARGET',           $XRPT-TARGET,           #Dummy)
+   do Get_Field_Information ({REPORT_ID}, 'RUN-PARAMS',       $XRPT-RUN-PARAMS,       #Dummy)
+   do Get_Field_Information ({REPORT_ID}, 'SRC-PATH',         $XRPT-SRCPATH,          #Dummy)
+   do Get_Field_Information ({REPORT_ID}, 'TOOLS-PATH',       $XRPT-TOOLS-PATH,       #Dummy)
+   do Get_Field_Information ({REPORT_ID}, 'INCLUDE-TOOLS',    $XRPT-INCLUDE-TOOLS,    #Dummy)
+   do Get_Field_Information ({REPORT_ID}, 'EXCLUDE-TOOLS',    $XRPT-EXCLUDE-TOOLS,    #Dummy)
+   do Get_Field_Information ({REPORT_ID}, 'UNKNOWN-APP-TYPE', $XRPT-UNKNOWN-APP-TYPE, #Dummy)
+   do Get_Field_Information ({REPORT_ID}, 'PGM-NOT-FOUND',    $XRPT-PGM-NOT-FOUND,    #Dummy)
+   do Get_Field_Information ({REPORT_ID}, 'FILE-ERROR',       $XRPT-FILE-ERROR,       #Dummy)
+   do Get_Field_Information ({REPORT_ID}, 'RELLANG-USED',     $XRPT-RELLANG-USED,     #Dummy)
+   do Get_Field_Information ({REPORT_ID}, 'SUBST-TBLS',       $XRPT-SUBST-TBLS,       #Dummy)
+   do Get_Field_Information ({REPORT_ID}, 'USES-EXECUTE',     $XRPT-USES-EXECUTE,     #Dummy)
+   do Get_Field_Information ({REPORT_ID}, 'USES-PCODE',       $XRPT-USES-PCODE,       #Dummy)
+   do Get_Field_Information ({REPORT_ID}, 'NO-ANALYZE-SQL',   $XRPT-NO-ANALYZE-SQL,   #Dummy)
+   do Get_Field_Information ({REPORT_ID}, 'AE-SQL-ERROR',     $XRPT-AE-SQL-ERROR,     #Dummy)
+   do Get_Field_Information ({REPORT_ID}, 'CALLTREE-ERROR',   $XRPT-CALLTREE-ERROR,   #Dummy)
+   do Get_Field_Information ({REPORT_ID}, 'NO-TABLES-USED',   $XRPT-NO-TABLES-USED,   #Dummy)
+   do Get_Field_Information ({REPORT_ID}, 'PGM-BEGAN-AT',     $XRPT-PGM-BEGAN-AT,     #Dummy)
+   do Get_Field_Information ({REPORT_ID}, 'PGM-ENDED-AT',     $XRPT-PGM-ENDED-AT,     #Dummy)
+   do Get_Field_Information ({REPORT_ID}, 'DESCR-NOT-AVAIL',  $XRPT-NO-DESCR-AVAIL,   #Dummy)
+
+!   let $XRPT-SQR-REPORTTITLE = 'Analysis of Table Access by SQR Programs'
+!   let $XRPT-CBL-REPORTTITLE = 'Analysis of Table Access by COBOL Programs'
+!   let $XRPT-AEP-REPORTTITLE = 'Analysis of Table Access by AppEngine Programs'
+!   let $XRPT-QRY-REPORTTITLE = 'Analysis of Table Access by Query Programs'
+!   let $XRPT-REPORT =       'Report'
+!   let $XRPT-RUN-PARAMS =   'Run Parameters'
+!   let $XRPT-SRCPATH =      'Path to Application source'
+!   let $XRPT-TOOLS-PATH =   'Path to Tools SQRs'
+!   let $XRPT-INCLUDE-TOOLS= 'Include PeopleTools Tables'
+!   let $XRPT-EXCLUDE-TOOLS= 'Exclude PeopleTools Tables'
+!   let $XRPT-TABLE-NAME =   'Table Name'
+!   let $XRPT-ACCESS-MODES = 'Access Modes'
+!   let $XRPT-OWNERID =      'Analyze Programs belonging to OwnerID'
+!   let $XRPT-TARGET =       'Analyze Programs matching pattern'
+!   let $XRPT-PGM-NOT-FOUND ='(Program not found - may not be installed)'
+!   let $XRPT-FILE-ERROR =   'File access errors occurred during analysis - Please review LOG file'
+!   let $XRPT-RELLANG-USED = 'Uses RELLANG.SQC - Table Access list incomplete for related language tables'
+!   let $XRPT-SUBST-TBLS =   '[Dynamic Table Substitution - Structurally similar tables may be missing from Table Access list]'
+!   let $XRPT-USES-EXECUTE = 'Use of meta-SQL %Execute/%Table not analyzed - Table Access list may be incomplete'
+!   let $XRPT-USES-PCODE =   'Use of SQL in PeopleCode not analyzed - Table Access list may be incomplete'
+!   let $XRPT-AE-SQL-ERROR = 'Errors occurred during SQL analysis - Table Access list may be incomplete'
+!   let $XRPT-CALLTREE-ERROR='Errors occurred analyzing call tree - Table Access list may be incomplete'
+!   let $XRPT-NO-TABLES-USED='(Program does not appear to perform any table access)'
+!   let $XRPT-PGM-BEGAN-AT = 'Table Access Analysis Began at: '
+!   let $XRPT-PGM-ENDED-AT = 'Table Access Analysis Ended at: '
+!   let $XRPT-NO-ANALYZE-SQL =   'Unable to analyze statement '
+!   let $XRPT-UNKNOWN-APP-TYPE = 'Unknown Application Type specified on Run Control'
+!   let $XRPT-MODULES-USING =    'Modules Using This Table'
+!   let $XRPT-AE-MODULES-USING = 'Modules Using This Table (AEProgram.AESection)'
+!   let $XRPT-NO-DESCR-AVAIL   = '(Description Not Available)'
+
+   let $XRPT-NO-DESCR-AVAIL  = '''' || $XRPT-NO-DESCR-AVAIL || ''''
+
+   evaluate $AppType
+   when='SQR'
+      let $XRPT-REPORTTITLE = $XRPT-SQR-REPORTTITLE
+      break
+   when='CBL'
+      let $XRPT-REPORTTITLE = $XRPT-CBL-REPORTTITLE
+      break
+   when='AEP'
+      let $XRPT-REPORTTITLE = $XRPT-AEP-REPORTTITLE
+      let $XRPT-MODULES-USING = $XRPT-AE-MODULES-USING
+      break
+   when='QRY'
+      let $XRPT-REPORTTITLE = $XRPT-QRY-REPORTTITLE
+      let $XRPT-MODULES-USING = ''
+      break
+   end-evaluate
+
+end-procedure
+
+!**********************************
+begin-procedure Start-Report-Log
+!**********************************
+
+   let $ReportID = {REPORT_ID}
+   let $ReportTitle = $XRPT-REPORTTITLE
+
+   display  ''
+   display  $XRPT-REPORT      noline
+   display  ': '              noline
+   display  $ReportID         noline
+   display  ': '              noline
+   display  $ReportTitle
+   display  ''
+
+   display $XRPT-RUN-PARAMS   noline
+   display  '...'
+
+   evaluate $AppType
+   when='SQR'
+   when='CBL'
+   when='AEP'
+      display $XRPT-OWNERID      noline
+      display  ': '              noline
+      display $OwnerID
+      break
+   end-evaluate
+
+   display $XRPT-TARGET       noline
+   display  ': '              noline
+   display $TargetPgm
+
+   evaluate $AppType
+   when='SQR'
+   when='CBL'
+      display $XRPT-SRCPATH      noline
+      display  ': '              noline
+      display $SourcePath
+      break
+   end-evaluate
+
+   evaluate $AppType
+   when='SQR'
+      if ($IncludeToolsTables = 'N')
+         display $XRPT-TOOLS-PATH   noline
+         display  ': '              noline
+         display $ToolsSourcePath
+      end-if
+      break
+   end-evaluate
+
+   display $XRPT-INCLUDE-TOOLS   noline
+   display  ': '                 noline
+   display $IncludeToolsTables
+
+end-procedure
+
+!*******************************************
+begin-procedure Progress-Display ($FileName)
+!*******************************************
+
+   display #_ItemCnt             0999 noline
+   display ': '                       noline
+   display 'Analyzing program: '      noline
+   display $FileName                  noline
+   display '...'
+
+end-procedure
+
+!*******************************************************
+begin-procedure Set-Access(#Link, $Access, :$AccessList)
+!*******************************************************
+
+   get $AccessList from List(#Link) StrData1
+   let #Pos = InStr($AccessList, $Access, 1)
+   if Not (#Pos)
+      let $AccessList = $AccessList || $Access
+   end-if
+
+end-procedure
+
+!*********************************************************
+begin-procedure Record-Module(#Link, $Module, :$ModuleList)
+!*********************************************************
+
+   get $ModuleList from List(#Link) StrData2
+   let #Pos = InStr($ModuleList, $Module, 1)
+   if Not (#Pos)
+      if Not IsBlank($ModuleList)
+         let $ModuleList = $ModuleList || ', '
+      end-if
+      let $ModuleList = $ModuleList ||$Module
+   end-if
+
+end-procedure
+
+!*********************************************
+begin-procedure Validate-Tables($IncludeTools)
+!*********************************************
+
+   !Step through the list and verify that every table logged is indeed valid
+   !(ie, that the parsing routines weren't fooled by some weird syntax)
+
+   do Top-Of-List(#Idx)
+   while (#Idx > 0)
+
+      get $TableName #NextLink from List(#Idx) ListKey ForwardLink
+      do IsValidPSTable($TableName, $IncludeTools, #IsValidTable)
+      if Not (#IsValidTable)
+         do Delete-Key-From-List($TableName)
+      end-if
+
+      let #Idx = #NextLink
+   end-while
+
+end-procedure
+
+!************************************************************************
+begin-procedure IsValidPSTable($TableName, $IncludeTools, :#IsValidTable)
+!************************************************************************
+
+   !Modify tablename if it was logged as a dynamic substitution table...
+   if (SubStr($TableName,1,1) = '[')
+      let $TableName = LTrim($TableName, '[')
+      let $TableName = RTrim($TableName, ']')
+   end-if
+
+   !Strip off the PS header since we're going against RECDEFN...
+   if (SubStr($TableName,1,3) = 'PS_')
+      let $TableName = SubStr($TableName, 4, Length($TableName))
+   end-if
+
+   let $ToolsClause = ''
+   if ($IncludeTools = 'N')
+      let $ToolsClause = ' And (OBJECTOWNERID<>''PPT'' '
+      !Subjective list of pseudo-Tools tables that might be of interest to the application...
+      let $ToolsClause = $ToolsClause || ' Or RECNAME Like ''APPR%'' '
+      let $ToolsClause = $ToolsClause || ' Or RECNAME Like ''CAN_TAX%'' '
+      let $ToolsClause = $ToolsClause || ' Or RECNAME Like ''CUR%'' '
+      let $ToolsClause = $ToolsClause || ' Or RECNAME Like ''DEPT%'' '
+      let $ToolsClause = $ToolsClause || ' Or RECNAME Like ''EC%'' '
+      let $ToolsClause = $ToolsClause || ' Or RECNAME Like ''EMPL_PHOTO%'' '
+      let $ToolsClause = $ToolsClause || ' Or RECNAME Like ''HIER%'' '
+      let $ToolsClause = $ToolsClause || ' Or RECNAME Like ''INTL_FLDSIZ%'' '
+      let $ToolsClause = $ToolsClause || ' Or RECNAME Like ''MC%'' '
+      let $ToolsClause = $ToolsClause || ' Or RECNAME Like ''SETID%'' '
+      let $ToolsClause = $ToolsClause || ' Or RECNAME Like ''SET_CNT%'' '
+      let $ToolsClause = $ToolsClause || ' Or RECNAME Like ''STRINGS%'' '
+      let $ToolsClause = $ToolsClause || ' Or RECNAME Like ''TREE%'' '
+      let $ToolsClause = $ToolsClause || ' Or RECNAME Like ''XLAT%'' '
+      let $ToolsClause = $ToolsClause || ' Or RECNAME Like ''PSXLAT%'' )'
+   end-if
+
+   let #IsValidTable = 0
+
+   !Defensive - some platforms choke if bindvar is too big
+   if Length($TableName) <= {MAX_PS_RECNAME}
+
+Begin-SELECT
+RECNAME
+
+   let #IsValidTable = 1
+
+From PSRECDEFN
+Where RECNAME = $TableName
+[$ToolsClause]
+End-SELECT
+
+   end-if
+
+end-procedure
+
+!****************************************
+begin-heading 9
+!****************************************
+
+#include 'stdhdgtr.sqc'
+
+   if Not IsBlank($OwnerID)
+      print $XRPT-OWNERID        (+1,1)
+      print ': '                 ()
+      print $OwnerID             ()
+      print ' - '                ()
+      print $OwnerName           ()
+   end-if
+
+   if Not IsBlank($TargetPgm)
+      print $XRPT-TARGET         (+1,1)
+      print ': '                 ()
+      print $TargetPgm           ()
+   end-if
+
+   if ($IncludeToolsTables = 'Y')
+      print $XRPT-INCLUDE-TOOLS  (+1,1)
+   else
+      print $XRPT-EXCLUDE-TOOLS  (+1,1)
+   end-if
+
+   print $XRPT-TABLE-NAME        (+2,1,28)
+   print $XRPT-ACCESS-MODES      (0,+2,18)
+   if Not IsBlank($XRPT-MODULES-USING)
+      print $XRPT-MODULES-USING  (0,+4,65)
+   end-if
+
+   print '='                     (+1,1,28)  Fill
+   print '='                     (0,+2,18)  Fill
+   if Not IsBlank($XRPT-MODULES-USING)
+      print '='                  (0,+4,65)  Fill
+   end-if
+
+end-heading
+
+!****************************************
+begin-procedure Print-Table-Access-Report
+!****************************************
+
+   evaluate $AppType
+   when='SQR'
+      do Parse-FileSpec($PgmFile, $Path, $Base, $Extension)
+      let $FileName = $Base || '.' || $Extension
+      break
+   when='CBL'
+      let $FileName = $PgmFile || '.' || {EXE_EXT}
+      break
+   when='AEP'
+   when='QRY'
+      let $FileName = $PgmFile
+      break
+   end-evaluate
+  let $FileName = Upper($FileName)
+
+   print $FileName                                       (+1,1)
+   print ' : '                                           ()
+   print $PgmTitle                                       ()
+   print '--------------------------------------------'  (+1,1)
+
+   do Top-Of-List(#Idx)
+   while (#Idx)
+
+      get $TableName $AccessList $ModuleList #NextLink from List(#Idx) ListKey StrData1 StrData2 ForwardLink
+      print $TableName     (+1,5,26)
+
+      if InStr($AccessList, 'S', 1)
+         print 'Sel  '   ()
+      else
+         print ' -   '   ()
+      end-if
+      if InStr($AccessList, 'U', 1)
+         print 'Upd  '   ()
+      else
+         print ' -   '   ()
+      end-if
+      if InStr($AccessList, 'I', 1)
+         print 'Ins  '   ()
+      else
+         print ' -   '   ()
+      end-if
+      if InStr($AccessList, 'D', 1)
+         print 'Del  '   ()
+      else
+         print ' -   '   ()
+      end-if
+
+      print $ModuleList  (0,+2) wrap 70 3
+
+      let #Idx = #NextLink
+   end-while
+
+   if (#PgmNotFound)
+      print $XRPT-PGM-NOT-FOUND  (+1,1)
+      let #AnalysisError = 0
+   end-if
+   if (#SubstTablesUsed)
+      print $XRPT-SUBST-TBLS     (+1,1)
+   end-if
+   if (#UsesRelLang)
+      print '>>>>> '             (+1,1)
+      print $XRPT-RELLANG-USED   ()
+      print ' <<<<<'             ()
+   end-if
+   if (#AnalysisError)
+      print '>>>>> '             (+1,1)
+      print $XRPT-CALLTREE-ERROR ()
+      print ' <<<<<'             ()
+   end-if
+   if (#AEAnalysisError)
+      print '>>>>> '             (+1,1)
+      print $XRPT-AE-SQL-ERROR   ()
+      print ' <<<<<'             ()
+   end-if
+   if (#UsesMetaSQL)
+      print '>>>>> '             (+1,1)
+      print $XRPT-USES-EXECUTE   ()
+      print ' <<<<<'             ()
+   end-if
+   if (#UsesPCode)
+      print '>>>>> '             (+1,1)
+      print $XRPT-USES-PCODE     ()
+      print ' <<<<<'             ()
+   end-if
+   if Not (#PgmNotFound Or #UsesRelLang Or #AEAnalysisError Or #UsesMetaSQL Or #UsesPCode)
+      do List-Count(#ListCnt)
+      if (#ListCnt = 0)
+         print $XRPT-NO-TABLES-USED  (+1,1)
+      end-if
+   end-if
+
+   next-listing need=4
+
+end-procedure
+
+!******************************************************************************
+
+#include 'tblutils.sqc'
+#include 'tblssqr.sqc'
+#include 'tblscbl.sqc'
+#include 'tblsaep.sqc'
+#include 'tblsqry.sqc'
+
+#include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#include 'datetime.sqc'  !Format-DateTime
+#include 'readxlat.sqc'  !Read Translate table
+#Include 'stdapi.sqc'    !Update Process API
+#Include 'sqrtrans.sqc'  !Translate SQR strings to given language
+#Include 'getrplng.sqc'  !Get the report language
+#Include 'useprntr.sqc'  !do Init_Printer
+#Include 'reset.sqc'     !Reset printer procedure
+
+!*************************** End of TBLUSAGE.SQR ******************************

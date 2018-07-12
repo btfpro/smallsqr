@@ -1,0 +1,482 @@
+!***********************************************************************
+!  gpusyt50:    W-3 Transmittal - Totals Report                        *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+!                                                                      *
+! This module contains confidential and proprietary information        *
+! of Oracle; it is not to be copied, reproduced, or transmitted        *
+! in any form, by any means, in whole or in part, nor is it to         *
+! be used for any purpose other than that for which it is              *
+! expressly provided under the applicable license agreement.           *
+!                                                                      *
+! Copyright (C) 2006 Oracle. All Rights Reserved.                      *
+!                                                                      *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!                $Date:  2006/05/09:17:32:24                           !
+!             $Release:  HR9                                           !
+!            $Revision:  101                                           !
+!                                                                      *
+!***********************************************************************
+
+#include 'setenv.sqc' !Set environment
+#include 'setup32.sqc' !Printer and page-size initialization
+
+begin-report
+  display ''
+  display 'Begin W-3 Transmittal - Totals Report'
+  do Init-Report
+  move 'W3  ' to $TaxFormSelect
+  do Process-Main
+  move 'W3SS' to $TaxFormSelect
+  do Process-Main
+  do CheckEmplFound
+  do Stdapi-Term
+  display ''
+  display 'End   W-3 Transmittal - Totals Report'
+end-report
+
+begin-procedure Init-Report
+  move 'GPUSYT50' to $ReportID
+  move 'W-3 Transmittal - Totals Report' to $ReportTitle
+  move 'N' to $EmployeeFound
+  do Init-DateTime
+  do Init-Number
+  do Stdapi-Init
+  do Get-Current-DateTime
+  do Initialization
+  do Emp-Stream
+end-procedure
+
+begin-heading 7
+  #Include 'stdhdg01.sqc'
+  print 'W2 Rpt Company:'              (3,1)
+  print $A.W2_Reporting_Co     (,+2)
+  let $TaxYear = 'Tax Year ' || $CalYear
+  print $TaxYear               (3,)    center
+  print $TaxFormSelect         (+3,3)
+  print 'Box'                  (+1,3)
+  print 'Description'          (,10)
+  print 'Contents / Amount'    (,65)
+end-heading
+
+begin-procedure Initialization
+  do Get-Current-DateTime
+  move '1' to $MMLZero
+  move '1' to $Year4
+  do Format-DateTime($AsOfToday, $910Date, {DEFYMD},'','')
+
+  move $910Date to $AsOfYear xxxx   !extract the current year
+  move $AsOfYear  to #AsOfYear
+  move #AsOfYear  to #saveAsOfYear
+  subtract 1    from #AsOfYear
+
+  do Get-Tax-Reporting-Run-Controls
+
+end-procedure
+
+begin-procedure Process-Main
+  move &TX.CALENDAR_YEAR to $CalYear 9999
+
+!To get last day of Calendar Year for comparison with EffDt Logic
+  let $CalYearDate =  $CalYear || '1231'
+  do Format-DateTime($CalYearDate, $CalYearDate, {DEFCMP}, '', 'native')
+
+begin-SELECT DISTINCT
+A.GPUS_YE_RPT_CO
+A.EFFDT
+A.DESCR
+A.GPUS_TAX_EIN
+A.ADDRESS1
+A.ADDRESS2
+A.CITY
+A.STATE
+A.POSTAL
+A.COUNTRY
+A.GPUS_OTHER_EIN
+
+  move &A.GPUS_OTHER_EIN to $A.GPUS_OTHER_EIN
+  move &A.GPUS_YE_RPT_CO to $A.W2_Reporting_Co
+  move &A.GPUS_TAX_EIN to $A.GPUS_TAX_EIN
+  do Zero-W3SS-Totals
+  do Get-W2-Count
+  if #W2SS-Count > 0
+    do Load-W3SS-Totals
+    move ' ' to $TaxForm_ID
+    do Print-W3
+    NEW-PAGE
+  end-if
+
+FROM  PS_GPUS_YE_CO_TBL A
+WHERE A.EFFDT = (SELECT MAX(CO.EFFDT)
+                FROM PS_GPUS_YE_CO_TBL CO
+                WHERE CO.GPUS_YE_RPT_CO = A.GPUS_YE_RPT_CO
+                AND CO.EFFDT <=  $CalYearDate)
+ORDER BY A.GPUS_YE_RPT_CO
+end-SELECT
+end-procedure
+
+begin-procedure Get-W2-Count
+  move 0 to #W2-Count
+begin-SELECT DISTINCT
+EE.GPUS_TAXFORM_ID             () on-break level=1 print=never after=After-TAXFORM
+EE.EMPLID
+  let $TAXFORM_ID = RTRIM(&EE.GPUS_TAXFORM_ID,' ')
+  if ($TaxFormSelect = 'W3  '
+        and $TAXFORM_ID = '10')
+  or ($TaxFormSelect = 'W3SS'
+          and ($TAXFORM_ID = '50'
+          or $TAXFORM_ID = '30'
+          or $TAXFORM_ID = '20'))
+    add 1 to #W2-Count
+  end-if
+FROM  PS_GPUS_YE_EE0_VW EE
+WHERE EE.GPUS_TAX_EIN     = $A.GPUS_TAX_EIN
+AND EE.GPUS_TAXFORM_ID  IN ('10','50','30','20')
+AND EE.GPUS_CAL_YEAR   = &TX.CALENDAR_YEAR
+AND EE.GPUS_YE_STATUS   <> '20'
+[$fromtoEE]
+
+ORDER BY EE.GPUS_TAXFORM_ID
+end-SELECT
+end-procedure
+
+begin-procedure After-TAXFORM
+
+  if #W2-Count > 0
+    do Load-Amounts
+      if $TaxFormSelect = 'W3SS'
+         do Accum-W3SS-Totals
+      end-if
+    do Print-W3
+    NEW-PAGE
+    move 0 to #W2-Count
+  end-if
+
+end-procedure
+
+begin-procedure Load-Amounts
+  do Zero-Amounts
+  do assign-year-end-variables
+begin-SELECT
+EE1.GPUS_TAXFORM_BOX
+SUM(EE1.GPUS_YE_AMOUNT) &EE1.GPUS_YE_AMOUNT
+
+  move &EE1.GPUS_YE_AMOUNT to #Amount
+  move 'Y' to $EmployeeFound
+
+   let $D.Box = RTRIM(&EE1.GPUS_TAXFORM_BOX,' ')
+   evaluate $D.Box
+     when = $YE_Fed_Wages                        !Federal wages
+       move #Amount to #01
+       break
+     when = $YE_Fed_Tax                          !Federal tax
+       move #Amount to #02
+       break
+     when = $YE_SS_Wages                         !SS wages
+       move #Amount to #03
+       break
+     when = $YE_SS_Tax                           !SS Tax
+       move #Amount to #04
+       break
+     when = $YE_Med_Wages                        !Medicare wages
+       move #Amount to #05
+       break
+     when = $YE_Med_Tax                          !Medicare tax
+       move #Amount to #06
+       break
+     when = $YE_SS_Tips                          !SS tips
+       move #Amount to #07
+       break
+     when = $YE_Alloc_Tips                       !Allocated tips
+       move #Amount to #08
+       break
+     when = $YE_Adv_EIC                          !EIC
+       move #Amount to #09
+       break
+     when = $YE_Dep_Care                         !Dependent care
+       move #Amount to #10
+       break
+     when = $YE_Non_Qual_457_Y                   !non-qualified 457
+       add  #Amount to #11AB
+       break
+     when = $YE_Non_Qual_457_N                   !non-qualified non-457
+       add  #Amount to #11AB
+       move 'Y' to $Non457
+       break
+     when = $YE_Group_Term_Life                  !GTL
+       move #Amount to #12C
+       break
+     when = $YE_401K                             !401(k)
+       add  #Amount to #12
+       break
+     when = $YE_403B                             !403(b)
+       add  #Amount to #12
+       break
+     when = $YE_408K6                            !408(k)(6)
+       add  #Amount to #12
+       break
+     when = $YE_457B                             !457(b)
+       add  #Amount to #12
+       break
+     when = $YE_501C18D                          !501(c)(18)(D)
+       add  #Amount to #12
+       break
+     when = $YE_408P_Simple_Retirement           !408(p)
+       add  #Amount to #12
+       break
+     when = $YE_NonQual_Def_Comp                 !NonQual Def Comp
+       add  #Amount to #12
+       break
+   end-evaluate
+
+FROM PS_GPUS_YE_EE5_VW EE5, PS_GPUS_YE_EE1_VW EE1
+WHERE EE5.GPUS_TAX_EIN = $A.GPUS_TAX_EIN
+  AND EE5.GPUS_CAL_YEAR    = &TX.CALENDAR_YEAR
+  AND EE5.GPUS_SEQ_NBR  = 1
+  AND EE1.GPUS_TAXFORM_BOX IN
+              ($YE_Fed_Wages,
+               $YE_Fed_Tax,
+               $YE_SS_Wages,
+               $YE_SS_Tax,
+               $YE_Med_Wages,
+               $YE_Med_Tax,
+               $YE_SS_Tips,
+               $YE_Alloc_Tips,
+               $YE_Adv_EIC,
+               $YE_Dep_Care,
+               $YE_Non_Qual_457_Y,
+               $YE_Non_Qual_457_N,
+               $YE_Group_Term_Life,
+               $YE_401K,
+               $YE_403B,
+               $YE_408K6,
+               $YE_457B,
+               $YE_501C18D,
+               $YE_408P_Simple_Retirement,
+               $YE_NonQual_Def_Comp)
+  AND EE5.GPUS_TAX_EIN     = EE1.GPUS_TAX_EIN
+AND EE5.EMPLID           = EE1.EMPLID
+AND EE5.GPUS_TAXFORM_ID  = EE1.GPUS_TAXFORM_ID
+AND EE5.GPUS_CAL_YEAR    = EE1.GPUS_CAL_YEAR
+AND EE5.GPUS_TAXFORM_ID  = $TaxForm_ID
+ AND EE5.GPUS_YE_STATUS   <> '20'
+  [$fromtoEE5]
+GROUP BY EE1.GPUS_TAXFORM_BOX
+end-SELECT
+end-procedure
+
+begin-procedure Zero-Amounts
+  move '' to $FedEIN
+  move '' to $OtherEIN
+  move 0 to #01
+  move 0 to #02
+  move 0 to #03
+  move 0 to #04
+  move 0 to #05
+  move 0 to #06
+  move 0 to #07
+  move 0 to #08
+  move 0 to #09
+  move 0 to #10
+  move 0 to #11AB
+  move 0 to #12C
+  move 0 to #12
+end-procedure
+
+begin-procedure Zero-W3SS-Totals
+  move 0 to #W2SS-Count
+  move 0 to #01-SS
+  move 0 to #02-SS
+  move 0 to #03-SS
+  move 0 to #04-SS
+  move 0 to #05-SS
+  move 0 to #06-SS
+  move 0 to #07-SS
+  move 0 to #08-SS
+  move 0 to #09-SS
+  move 0 to #10-SS
+  move 0 to #11AB-SS
+  move 0 to #12C-SS
+  move 0 to #12-SS
+end-procedure
+
+begin-procedure Accum-W3SS-Totals
+  add #W2-Count to #W2SS-Count
+  add #01 to #01-SS
+  add #02 to #02-SS
+  add #03 to #03-SS
+  add #04 to #04-SS
+  add #05 to #05-SS
+  add #06 to #06-SS
+  add #07 to #07-SS
+  add #08 to #08-SS
+  add #09 to #09-SS
+  add #10 to #10-SS
+  add #11AB to #11AB-SS
+  add #12C to #12C-SS
+  add #12 to #12-SS
+end-procedure
+
+begin-procedure Load-W3SS-Totals
+  move #W2SS-Count to #W2-Count
+  move #01-SS to #01
+  move #02-SS to #02
+  move #03-SS to #03
+  move #04-SS to #04
+  move #05-SS to #05
+  move #06-SS to #06
+  move #07-SS to #07
+  move #08-SS to #08
+  move #09-SS to #09
+  move #10-SS to #10
+  move #11AB-SS to #11AB
+  move #12C-SS to #12C
+  move #12-SS to #12
+end-procedure
+
+begin-procedure Print-W3
+
+  if $TaxForm_ID <> ' '
+    move 'GPUS_TAXFORM_ID'  to $FieldName
+    move $TaxForm_ID   to $FieldValue
+    do Read-Translate-Table
+    move $XlatShortName to $TaxForm_Name
+
+    if $TaxForm_ID <> '10'
+      let $TaxForm_Name = RTRIM($TaxForm_Name,' ') || ' (only)'
+    end-if
+  else
+    move 'W-2AS, W-2GU and W-2VI' to $TaxForm_Name
+  end-if
+
+  print 'c     Total number of statements     '  (+2,4)
+  print $TaxForm_Name                            (,40)
+  print #W2-Count                                (,76)   edit 999999
+
+  move &A.GPUS_TAX_EIN to $FedEIN 099999999
+  print 'e     Employer identification number '  (+2,4)
+  print $FedEIN                                  (,65)   edit xx-xxxxxxx
+
+  print 'f     Employer name                  '  (+2,4)
+  print &A.Descr                                 (,65)
+
+  let $City = RTRIM(&A.City,' ')
+  print 'g     Employer address               '  (+2,4)
+  print &A.Address1                              (,65)
+  print $City                                    (+1,65)
+  print &A.State                                 ()       edit ,bxx
+
+  Move &A.Postal to $Zip
+
+  if &A.Country <> 'USA'
+    print $Zip                                   (,+1)
+    print &A.Country                             (,+1)
+  else
+    move $Zip            to $ZipExtsn ~~~~~~xxxx
+    if instr($Zip,'-',6) = 0
+    and $ZipExtsn <> '    '
+      let $Zip = substr($Zip,1,5) || '-' || substr($Zip,6,4)
+    end-if
+    print $Zip                                      (,+1)
+  end-if
+
+  print 'h     Other EIN used this year'         (+2,4)
+  if isNull(rtrim(ltrim($A.GPUS_OTHER_EIN,' '),' '))
+  else
+    move &A.GPUS_OTHER_EIN to $OtherEIN 099999999
+    print $OtherEIN                              (,65)    edit xx-xxxxxxx
+  end-if
+
+  move '99999999999999.99' to $Fmt
+
+  print '1     Wages, tips, other compensation'  (+4,4)
+  do Format-Number(#01, $out, $Fmt)
+  print $out  (,65)
+
+  print '2     Federal income tax withheld    '  (+2,4)
+  do Format-Number(#02, $out, $Fmt)
+  print $out  (,65)
+
+  print '3     Social security wages          '  (+2,4)
+  do Format-Number(#03, $out, $Fmt)
+  print $out  (,65)
+
+  print '4     Social security tax withheld   '  (+2,4)
+  do Format-Number(#04, $out, $Fmt)
+  print $out  (,65)
+
+  print '5     Medicare wages and tips        '  (+2,4)
+  do Format-Number(#05, $out, $Fmt)
+  print $out  (,65)
+
+  print '6     Medicare tax withheld          '  (+2,4)
+  do Format-Number(#06, $out, $Fmt)
+  print $out  (,65)
+
+  print '7     Social security tips           '  (+2,4)
+  do Format-Number(#07, $out, $Fmt)
+  print $out  (,65)
+
+  print '8     Allocated tips                 '  (+2,4)
+  do Format-Number(#08, $out, $Fmt)
+  print $out  (,65)
+
+  print '9     Advance EIC payments           '  (+2,4)
+  do Format-Number(#09, $out, $Fmt)
+  print $out  (,65)
+
+  print '10    Dependent care benefits        '  (+2,4)
+  do Format-Number(#10, $out, $Fmt)
+  print $out  (,65)
+
+  print '11    Nonqualified plans             '  (+2,4)
+  do Format-Number(#11AB, $out, $Fmt)
+  print $out  (,65)
+
+  print '12    Deferred compensation (W-2 Box 12 codes D-H, S and Y)'   (+2,4)
+  do Format-Number(#12, $out, $Fmt)
+  print $out  (,65)
+end-procedure
+
+Begin-procedure Emp-Stream
+Begin-Select
+EMPLID_FROM  &EFROM
+EMPLID_TO   &ETO
+
+  let $EFRM = &EFROM
+  let $ET = &ETO
+  let $A = ''''
+
+  let $fromtoEE = 'AND EE.EMPLID BETWEEN '''||$EFRM||''' AND '''||$ET||$A
+  let $fromtoEE5  = 'AND EE5.EMPLID BETWEEN '''||$EFRM||''' AND '''||$ET||$A
+
+FROM PS_GP_STRM
+WHERE STRM_NUM = &TX.STRM_NUM
+End-Select
+End-Procedure
+
+Begin-procedure CheckEmplFound
+
+  if $EmployeeFound = 'N'
+    display ' '
+    display '****** No Employee Records Selected ******'
+    display ' '
+    print '********************************'  (+3,1)
+    print '  No Employee Records Selected  '  (+1,1)
+    print '********************************'  (+1,1)
+  end-if
+
+End-Procedure
+
+#Include 'gpusrntl.sqc'  !Get-Tax-Reporting-Run-Controls procedure
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'stdapi.sqc'    !Update Process API
+#Include 'gpusw2.sqc'    !Routine for W2 Year End Box variables
+#Include 'readxlat.sqc'  !Read-Translate-Table procedure

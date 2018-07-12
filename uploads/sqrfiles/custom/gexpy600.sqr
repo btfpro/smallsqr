@@ -1,0 +1,1094 @@
+!***********************************************************************
+! Interface ID:   GPYI005 - RMC Local 880 Union Dues                   *
+! Interface Name: GEXPY600                                             *
+! GEXPY600: This program creates a weekly report and file containing   *
+!           employee union deductions for Local 880 of Cleveland.      *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+! This module is the confidential and proprietary information of       *
+! Giant Eagle, Inc.; it is not to be copied, reproduced, or transmitted*
+! in any form, by any means, in whole or in part, nor is it to be used *
+! for any purpose other than that for which it is expressly provided   *
+! without the written permission of Giant Eagle.                       *
+!                                                                      *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+!  $Date:: 01/29/98 10:30a      $                                      *
+!  $Revision:: 01               $                                      *
+!  $Workfile:: GEXPY600.SQR     $                                      *
+!                                                                      *
+!***********************************************************************
+!                         MODIFICATION HISTORY                         *
+!***********************************************************************
+!  INITIALS    DATE           DESCRIPTION OF THE CHANGE                *        
+!***********************************************************************
+!  GXD         01/29/1998     INITIAL CREATION                         *
+!                                                                      *
+!  DAH         08/11/98       Added run control parms and code.        *
+!                             Tagged changed lines with GEX001.        *
+!                             Although only COMPANY and UNION_CD       *
+!                             are required as input parms, I added     *
+!                             the code for all the other standard      *
+!                             input parms and commented them out.      *
+!                                                                      *
+!  SXK         09/08/1998     Added OUTFILE variable                   *
+!                                                                      *
+!  JDH         10/29/98       Added bargaining unit parameter          *
+!                                                                      *
+!  JNB         12/15/1998     First name and last name did not appear  *
+!                             on the interface file. Corrected the     *
+!                             source code.                             *
+!                                                                      *
+!  JDH         01/04/99       Included stdhdg01.sqc                    *
+!                             Added SQRW run control logic             *
+!                                                                      *
+!  SXK         01/26/99       Changed action dt to effdt               *
+!	                      Used credit union dues to print          *
+!                             Removed duplicate entries                *
+!                                                                      *
+!  SXK         01/28/99       Improved performance by eliminating      *
+!                             redundant sum operation by dedcd         *
+!                                                                      *
+!  JDH         04/23/99       Added logic to pull EE's that are set up *
+!                             for deductions specified in the run      *
+!                             control. Removed company, union code,    *
+!                             bargaining unit parameters.              *
+!                             Added deduction code parameter.          *
+!                                                                      *
+!  JDH         05/11/99       Modified code to sum deductions when     *
+!                             multiple deductions exist for an EE.     *
+!                                                                      *
+!  SXK         10/28/1999     Modified to have union from job labor    *
+!                                                                      *
+!  PSR         08/06/2002     Modified to have union from JOB          * 
+!                                                                      *
+!  CWB         02/12/2003     Added COMPANY to GENL_DEDUCTION joins    *   
+!                                                                      *
+!  AXL         04/12/2004     Accommodate Reinstatement Dues - REI880  *
+!                             per user request.                        *
+!  SXR         06/03/2008     SSN to EMPLID conversion                 *
+!                                                                      * 
+!  SXR         07/18/2008     Excluded terms from the prior years      *
+!  AXG         01/11/2009     Changed logic of year begin and end date *
+!                             For S3#12197475.                         *
+!GEX_SEC_REENG 2015-04-29 Vahini Katta                                 *
+!Changes related to gex_emplid_mapp/7 digit emplid                     *
+!***********************************************************************
+
+!selection criteria
+#define #x000_col_selection_criteria_a  02
+#define #x000_col_selection_criteria_b  05
+
+#include 'setenv.sqc' !Set environment
+#include 'setup02.sqc'
+
+begin-report
+  !do Alter-Session   ! Set Session to RULE Optimizer !GEX-AXG Commented for Upgrade 9.0
+  do Init-DateTime
+  do Init-Number
+  do stdapi-init
+  do Get-Calendar-Year-Id
+  move 'GEXPY600' to $ReportID
+  move ' Local 880 Union Dues'   to $ReportTitle     !GEX001-add
+
+  display $ReportTitle noline
+  display '  ' noline
+
+  do Get-Current-DateTime
+
+  let $sev-error = 'N'
+  let $firstcomp = 'Y'
+  let $firstrec = 'Y'
+  let $firstunioncd = 'Y'
+  let $firstemplid = 'Y'
+  let #pass1a = 0
+  let #pass1 = 0
+  let $company-changed = 'N'
+  let $deptid-changed = 'N'
+  let $emp-already-printed = 'N'
+
+  let #tot_count = 0
+  let #write_recs = 0
+  let #union_dues = 0
+  let #init_dues = 0
+  let #cred_dues = 0
+  let #assess_dues = 0
+  let #rein_dues = 0		!AXL 04/12/2004 - Add
+
+  do Report
+  do Commit-Transaction
+  date-time () hh:mi:ss &timeEnded
+  display 'Report Ended: ' noline
+  display &timeEnded
+  do stdapi-term
+end-report
+
+
+begin-procedure Report
+  date-time () hh:mi:ss &timeBegan
+  display 'Report Began: ' noline
+  display &timeBegan
+
+  move 'N' to $Errorfound
+
+  do check_run_controls                 !GEX001-add
+  
+  do process-data
+
+  date-time () hh:mi:ss &timeProcess
+  display #InputTran 99999 noline
+  display ' Transactions Processed: ' noline
+  display &timeProcess
+end-procedure
+
+
+begin-procedure check_run_controls
+  Let $GEXXX919_Dedcd_Alias = 'DEDCD'
+
+  if $Prcs_Process_Instance = ''
+    Do Ask-As-Of-Date
+    Let $X000_WHERE_SELECT_ASOFDATE = $AsOfDate
+
+    Let $DedcdString = ''''
+    Display 'Enter Dedcd or leave blank to exit.'
+    While 1=1
+      Input $Dedcd Maxlen=6 'Dedcd'
+      Uppercase $Dedcd
+      If Rtrim($Dedcd, ' ') = ''
+        Concat '''' With $DedcdString
+        Break
+      End-If
+      If $DedcdString <> ''''
+        Concat ''',''' With $DedcdString
+      End-If
+      Concat $Dedcd With $DedcdString
+    End-While
+
+    If $DedcdString = ''''''
+      Let $GEXXX919_INCLUDE_DEDCD_CRITERIA = '1=1'
+      Let $GEXXX919_INCLUDE_DEDCD_DISPLAY_CRITERIA = 'ALL'
+    Else
+      Let $GEXXX919_INCLUDE_DEDCD_CRITERIA = $GEXXX919_Dedcd_Alias || ' In (' || $DedcdString || ')'
+      Let $GEXXX919_INCLUDE_DEDCD_DISPLAY_CRITERIA = $GEXXX919_INCLUDE_DEDCD_CRITERIA
+    End-If
+ 
+  else
+
+    Do GEXXX922-Select-Parameters
+
+    let $X000_WHERE_SELECT_ASOFDATE = $GEX_RC_PAY.ASOFDATE
+    if rtrim($GEX_RC_PAY.ASOFDATE,' ') = ''
+      let $X000_WHERE_SELECT_ASOFDATE = $AsOfToday
+    end-if
+
+    Do GEXXX919-Select-DEDCD-Parameters
+  end-if
+
+  Do Format-DateTime($X000_WHERE_SELECT_ASOFDATE, $X000_REPORT_HEADING_ASOFDATE ,{DEFDATE}, '', '')
+  let $X000_ORDER_BY = 'COMPANY, DEPTID, UNION_CD, NAME'
+
+  show '$GEXXX919_INCLUDE_DEDCD_CRITERIA = ' $GEXXX919_INCLUDE_DEDCD_CRITERIA
+  show '$X000_ORDER_BY                   = ' $X000_ORDER_BY
+  show '$X000_WHERE_SELECT_ASOFDATE      = ' $X000_WHERE_SELECT_ASOFDATE 
+
+  print 'RUN CONTROL INFORMATION FOR THIS REPORT RUN:'        (+5,{#x000_col_selection_criteria_a})
+  print '$Prcs_OPRID          ='                              (+1,{#x000_col_selection_criteria_b})
+  print $Prcs_OPRID                                           (0,+2)
+  print '$PRCS_RUN_CNTL_ID    ='                              (+1,{#x000_col_selection_criteria_b})
+  print $PRCS_RUN_CNTL_ID                                     (0,+2)
+
+  print 'SELECTION CRITERIA FOR THIS REPORT RUN:'             (+5,{#x000_col_selection_criteria_a})
+  print '$GEXXX919_INCLUDE_DEDCD_DISPLAY_CRITERIA        ='   (+1,{#x000_col_selection_criteria_b})
+  print $GEXXX919_INCLUDE_DEDCD_DISPLAY_CRITERIA              (0,+2)
+
+  print '$X000_WHERE_SELECT_ASOFDATE                     ='   (+1,{#x000_col_selection_criteria_b})
+  print $X000_WHERE_SELECT_ASOFDATE                           (0,+2)
+	 
+  print 'SORT ORDER FOR THIS REPORT RUN:'                     (+5,{#x000_col_selection_criteria_a})
+  print '$X000_ORDER_BY                                  ='   (+1,{#x000_col_selection_criteria_b})
+  print $X000_ORDER_BY    (0,+2)
+
+  LET #PAGE-COUNT = 0
+  NEW-PAGE
+end-procedure        
+
+!AXL 04/12/2004 - Add New Column - Begin
+begin-heading 7
+ #Include 'stdhdg01.sqc'
+
+  print 'UNION'         (+2,105)
+  print 'INIT'          (0,120)   
+  print 'CREDIT'        (0,132)
+  print 'ASSESSMENT'    (0,144)
+  print 'REINSTATE'	(0,159)
+  print 'STORE'         (+1,06)
+  print 'SS-NUM'        (0,16)
+  print 'LAST NAME'     (0,28)
+  print 'FIRST NAME'    (0,46)
+  print 'MI'            (0,60)
+  print 'UNION'         (0,65)
+  print 'PSC'           (0,75)
+  print 'ACTION'        (0,80)
+  print '  EFF DT '     (0,88)
+  print 'DUES'          (0,106)
+  print 'DUES'          (0,120)   
+  print 'DUES'         	(0,134)
+  print 'DUES'       	(0,150)
+  print 'DUES'          (0,164)
+end-heading
+!AXL 04/12/2004 - Add New Column - End
+
+
+begin-procedure process-data
+  do Select-Pay-End-Dt
+
+  let $filename = '{OUTFILE}'||'gexpy600.dat'
+  open $filename as 1
+     for-writing record=155
+
+  if #writestat != 0
+    display 'Error Opening output file.  Program terminating.'
+    stop
+  end-if
+  !ISDVSXR, creation of cross reference file, ITG 42071
+  !let $filename = '{OUTFILE}'||'gexpy600_emplidssn_map.dat'
+  !open $filename as 2 for-writing record=80:fixed
+  !     status=#filestat 
+  ! if #writestat != 0
+  !  display 'Error Opening output file.  Program terminating.'
+  !  stop
+  !end-if
+  !ISDVSXR, creation of cross reference file, ITG 42071
+  
+  
+  move 'N' to $rowfound
+
+  let #inputtran = 0
+  
+
+begin-select ON-ERROR=SQL-Error-Found('Process-data')
+A.COMPANY               () on-break
+			   procedure=Company-Change
+			   print=never
+
+A.DEPTID                () on-break
+			   procedure=Deptid-Change
+			   print=never
+!SXK 10/28/1999 Changed from C.union_cd
+!PSR 08/06/2002 Changed from C.union_cd TO a.union_cd 8 upgrade
+A.UNION_CD              () on-break
+			   procedure=Union-Change 
+			   print=never
+
+
+A.EMPLID             &emplid    
+A.EMPL_RCD           &empl_rcd
+B.NAME               &name
+!GEX-AXG Modified for Upgrade 9.0 - Begin
+!B.ORIG_HIRE_DT       &orig_hire_dt
+INST.ORIG_HIRE_DT       &orig_hire_dt
+!GEX-AXG Modified for Upgrade 9.0 - End
+B.BIRTHDATE          &birthdate
+A.PAYGROUP           &paygroup
+A.JOBCODE            &jobcode
+A.EMPL_STATUS        &empl_status
+A.HOURLY_RT          &hourly_rt
+A.ACTION             &action
+A.ACTION_DT          &action_dt
+A.ACCT_CD            &acct_cd
+A.EFFDT 
+A.TERMINATION_DT     &term_dt         !ISDVSXR 07/18/2008 ITG-51544
+
+   SHOW ' $termination_dt '  &term_dt !ISDVSXR 07/18/2008 ITG-51544
+   SHOW ' $employee_id '    &emplid   !ISDVSXR 07/18/2008 ITG-51544
+  if $firstcomp <> 'N'
+     move 'N' to $firstcomp
+     move &A.COMPANY to $hold-company
+     move &A.COMPANY to $company 
+  end-if
+
+  if $firstrec <> 'N'
+     move 'N' to $firstrec
+     move &A.DEPTID to $hold-deptid
+     move &A.DEPTID to $deptid
+  end-if
+
+  if $firstunioncd <> 'N'
+     move 'N' to $firstunioncd
+     !PSR 8 Upgrade JL.UNION_CD to A.UNION_CD
+     !move &JL.UNION_CD to $hold-unioncd !SXK 10/28/1999 Changed from c.union_cd
+     !move &JL.UNION_CD to $unioncd !SXK 10/28/1999 Changed from c.union_cd
+     move &A.UNION_CD to $hold-unioncd
+     move &A.UNION_CD to $unioncd
+  end-if
+
+  move &emplid       to $emplid
+  move &empl_rcd    to #empl_rcd
+
+  if $firstemplid <> 'N'
+     move &emplid    to $hold-emplid
+     move 'N'        to $firstemplid
+  end-if
+
+  if $emplid <> $hold-emplid
+     do Emplid-Change
+     let $hold-emplid = $emplid
+  end-if
+
+  move &name    to $name
+  let $name = RTRIM($name,' ')
+  Do Rotate-Name
+
+  move &orig_hire_dt to $orig_hire_dt
+  move &birthdate    to $birthdate
+  move &paygroup     to $paygroup
+  move &jobcode      to $jobcode
+  move &empl_status  to $empl_status
+  move &hourly_rt    to #hourly_rt
+  move &action       to $action
+  move &action_dt    to $actiondt
+
+  move &A.EFFDT      to $effdt
+
+  do Get-Union-Dues     
+
+!*********** Emplid Totals **************
+  add #ud_ded         to #emp_ud
+  add #id_ded         to #emp_id
+  add #cd_ded         to #emp_cd
+  add #ad_ded         to #emp_ad
+  add #rd_ded         to #emp_rd	!AXL 04/12/2004
+
+!********* Union Code Totals ************
+  add #ud_ded         to #union_ud
+  add #id_ded         to #union_id
+  add #cd_ded         to #union_cd
+  add #ad_ded         to #union_ad
+  add #rd_ded         to #union_rd	!AXL 04/12/2004
+
+  add 1 to #union-empl-count
+ 
+!********* Department Totals ************
+  add #ud_ded         to #dept_ud
+  add #id_ded         to #dept_id
+  add #cd_ded         to #dept_cd
+  add #ad_ded         to #dept_ad
+  add #rd_ded         to #dept_rd	!AXL 04/12/2004
+
+  add 1 to #dept-empl-count 
+
+!************ Company Totals ************
+  add #ud_ded          to #comp_ud
+  add #id_ded          to #comp_id
+  add #cd_ded          to #comp_cd
+  add #ad_ded          to #comp_ad
+  add #rd_ded          to #comp_rd	!AXL 04/12/2004
+
+  add 1 to #comp-empl-count
+
+!************ Report Totals ************
+  add #ud_ded          to #union_dues
+  add #id_ded          to #init_dues
+  add #ad_ded          to #assess_dues
+  add #cd_ded          to #cred_dues    
+  add #rd_ded          to #rein_dues	!AXL 04/12/2004    
+
+  if #current-line > 51
+     new-page
+  end-if
+
+  do Write-Record
+  
+  move 'Y' to $rowfound
+  add 1 to #inputtran
+
+FROM   PS_PERSONAL_DATA  B,
+!SXK 10/28/1999 Begin
+!       PS_EMPLOYMENT     C,
+!PSR 08/06/2002
+!       PS_JOB_LABOR      JL,
+!SXK 10/28/99 End
+      !GEX-AXG Modified for Upgrade 9.0 - Begin
+      ! PS_JOB            A
+       PS_JOB          A,
+       PS_PER_ORG_INST  INST
+      !GEX-AXG Modified for Upgrade 9.0 - End
+WHERE  
+!SXK 10/28/99 Begin
+!C.EMPLID          = A.EMPLID
+!AND    C.EMPL_RCD       = A.EMPL_RCD
+
+B.EMPLID          = A.EMPLID
+!GEX-AXG Added for Upgrade 9.0 - Begin
+AND INST.EMPLID = A.EMPLID 
+AND A.EMPL_RCD = INST.ORG_INSTANCE_ERN
+!GEX-AXG Added for Upgrade 9.0 - End
+AND    A.EFFDT           =
+      (SELECT MAX(EFFDT)
+       FROM   PS_JOB
+       WHERE  EMPLID     = A.EMPLID
+       AND    EMPL_RCD  = A.EMPL_RCD
+       AND    EFFDT     <= $pay_end_dt)
+
+AND    A.EFFSEQ          =
+      (SELECT MAX(EFFSEQ)
+       FROM   PS_JOB
+       WHERE  EMPLID     = A.EMPLID
+       AND    EMPL_RCD  = A.EMPL_RCD
+       AND    EFFDT      = A.EFFDT)
+
+AND    EXISTS
+      (SELECT 'x'
+       FROM   PS_GENL_DEDUCTION GD
+       WHERE  GD.EMPLID            = A.EMPLID
+         AND  GD.COMPANY           = A.COMPANY  ! CWB 02/12/2003
+       !AND    GD.EMPL_RCD         = A.EMPL_RCD 08/06/2002 8 Upgrade
+       AND   [$GEXXX919_INCLUDE_DEDCD_CRITERIA]
+       AND    GD.EFFDT             =
+             (SELECT MAX(EFFDT)
+              FROM   PS_GENL_DEDUCTION
+              WHERE  EMPLID        = GD.EMPLID
+              AND    COMPANY       = GD.COMPANY  ! CWB 02/12/2003
+              !AND    EMPL_RCD     = GD.EMPL_RCD 08/06/2002 8 Upgrade
+              AND    DEDCD         = GD.DEDCD
+              AND    EFFDT        <= $pay_end_dt)
+       AND   (GD.DEDUCTION_END_DT IS NULL
+       OR     GD.DEDUCTION_END_DT <= $pay_end_dt))
+!sxk 10/28/99 Changed from c.union_cd
+      AND (A.TERMINATION_DT IS NULL OR
+       (A.TERMINATION_DT between $year_begin_dt and $year_end_dt) ) !ISDVSXR 07/18/2008 ITG-51544
+Order by A.COMPANY, A.DEPTID, A.UNION_CD, B.NAME
+end-select
+
+  if $rowfound = 'N'
+    print '** NO DATA SELECTED FOR THIS REPORT RUN **'  (25,) center
+  else
+    move $emplid to $hold-emplid
+    do Emplid-Change
+    position (+1)
+    do Print-Union-Totals
+    position (+2)
+    do Print-Dept-Totals
+    position (+1)
+    do Print-Comp-Totals
+    do Print-All-Totals
+    close 1
+    !close 2                          !isdvsxr 06-03-2008  ITG-42071
+  end-if
+end-procedure
+
+
+!*********************************************************************
+! Get Dues from Pay_Deduction Table
+!*********************************************************************
+begin-procedure Get-Union-Dues
+  move 'N' to $union-found
+  move 'N' to $init-found
+  move 'N' to $assessment-found
+  move 'N' to $credit-union-found
+  move 'N' to $reinstate-found		!AXL 04/12/2004 - Add
+
+  let #ud_ded = 0
+  let #id_ded = 0
+  let #ad_ded = 0
+  let #cd_ded = 0
+  let #rd_ded = 0			!AXL 04/12/2004 - Add
+
+begin-select
+UD.DEDCD
+UD.DED_CUR        
+
+   move &ud.dedcd to $dedcd
+   let $dedcd = substr($dedcd,1,2)
+   evaluate $dedcd
+      when = 'UN'
+         move 'Y'         to $union-found
+         add &UD.DED_CUR  to #ud_ded
+      when = 'IN'
+         move 'Y'         to $init-found
+         add &UD.DED_CUR  to #id_ded
+      when = 'AS'
+         move 'Y'         to $assessment-found
+         add &UD.DED_CUR  to #ad_ded
+      !AXL 04/12/2004   NEW - Begin
+      when = 'RE'
+         move 'Y'         to $reinstate-found
+         add &UD.DED_CUR  to #rd_ded
+      !AXL 04/12/2004   NEW - End
+      when-other
+         move 'Y'         to $credit-union-found
+         add &UD.DED_CUR  to #cd_ded
+   end-evaluate
+
+   #debug8 Show #ud_ded
+   #debug8 Show #id_ded
+   #debug8 show #ad_ded
+   #debug8 show #cd_ded
+
+
+
+FROM   PS_PAY_CHECK     CUD,
+       PS_PAY_DEDUCTION UD
+
+WHERE  CUD.EMPLID     = $emplid
+AND    CUD.EMPL_RCD  = #empl_rcd
+AND    CUD.PAY_END_DT = $pay_end_dt
+
+AND    UD.COMPANY    = CUD.COMPANY
+AND    UD.PAYGROUP   = CUD.PAYGROUP
+AND    UD.PAY_END_DT = CUD.PAY_END_DT
+AND    UD.OFF_CYCLE  = CUD.OFF_CYCLE
+AND    UD.PAGE_NUM      = CUD.PAGE_NUM
+AND    UD.LINE_NUM      = CUD.LINE_NUM
+AND    UD.SEPCHK     = CUD.SEPCHK
+AND   [$GEXXX919_INCLUDE_DEDCD_CRITERIA]
+end-select
+
+  if $union-found = 'N'
+    move 0 to #ud_ded
+  end-if
+
+  if $init-found = 'N'
+    move 0 to #id_ded
+  end-if
+
+  if $credit-union-found = 'N'
+    move 0 to #cd_ded
+  end-if
+
+  if $assessment-found = 'N'
+    move 0 to #ad_ded
+  end-if
+
+  if $reinstate-found = 'N'	!AXL 04/12/2004 - Add
+    move 0 to #rd_ded		!AXL 04/12/2004 - Add
+  end-if			!AXL 04/12/2004 - Add			
+
+end-procedure
+
+
+!*********************************************************************
+! Company Change
+!*********************************************************************
+begin-procedure Company-Change
+
+  if #current-line > 51
+    new-page
+  end-if
+
+  move &A.COMPANY to $company
+
+  do Union-Change
+  do Deptid-Change
+
+  do Print-Comp-Totals
+  position (+2)
+
+  let $company-changed = 'Y'
+end-procedure
+
+
+!*********************************************************************
+! Department ID Change
+!*********************************************************************
+begin-procedure Deptid-Change
+
+  if #current-line > 51
+    new-page
+  end-if
+
+  if $company-changed = 'N'   
+   
+    move &A.DEPTID to $deptid
+      
+    if $hold-deptid <> $deptid
+      let $deptid-changed = 'Y' 
+      move 'Y' to $Emplid-Change
+      do Union-Change
+      move $unioncd to $hold-unioncd
+      position  (+2)
+      do Print-Dept-Totals
+      position  (+2)
+      let $hold-deptid = $deptid
+    end-if
+
+  else
+    move 'Y' to $deptid-changed
+    let $hold-deptid = $deptid
+    move 'N' to $company-changed
+  end-if
+end-procedure
+
+
+!*********************************************************************
+! Union Code Change
+!*********************************************************************
+begin-procedure Union-Change
+  if #current-line > 51
+    new-page
+  end-if
+
+  do Emplid-Change
+  move 'Y' to $emp-already-printed
+
+  if $deptid-changed = 'Y'
+    let $deptid-changed = 'N'
+    do Print-Union-Totals
+  else
+    !move &JL.UNION_CD to $unioncd !SXK 10/28/99
+    move &A.UNION_CD to $unioncd !PSR 08/06/2002
+    if $hold-unioncd <> $unioncd
+      do Print-Union-Totals
+    end-if
+  end-if
+end-procedure
+
+
+!*********************************************************************
+! Emplid Change
+!*********************************************************************
+begin-procedure Emplid-Change
+
+  if #current-line > 51
+     new-page
+  end-if
+
+  if $emp-already-printed = 'N'
+
+    do Format-Number(#emp_ud, $emp_ud, 'BBB,BB9.99')
+    do Format-Number(#emp_id, $emp_id, 'BBB,BB9.99')
+    do Format-Number(#emp_cd, $emp_cd, 'BBB,BB9.99')
+    do Format-Number(#emp_ad, $emp_ad, 'BBB,BB9.99')
+    do Format-Number(#emp_rd, $emp_rd, 'BBB,BB9.99')	!AXL 04/12/2004 - Add
+
+    if RTRIM($emp_ud, ' ') = ''
+      let $emp_ud = '      0.00'
+    end-if
+    if RTRIM($emp_id, ' ') = ''
+      let $emp_id = '      0.00'
+    end-if
+    if RTRIM($emp_cd, ' ') = ''
+      let $emp_cd = '      0.00'
+    end-if
+    if RTRIM($emp_ad, ' ') = ''
+      let $emp_ad = '      0.00'
+    end-if
+    if RTRIM($emp_rd, ' ') = ''		!AXL 04/12/2004 - Add
+      let $emp_rd = '      0.00'	!AXL 04/12/2004 - Add		
+    end-if				!AXL 04/12/2004 - Add
+    !do Get-Gex-Mapp-EmpIid ($hold-emplid,$emplid_out)       !isdvsxr 06-03-2008  ITG-42071
+    do Get-Emp-Ssn ($hold-emplid, $Hold_Ssn_Out)  !GEX_SEC_REENG 2015-04-29 Vahini Katta      
+
+    print $hold-deptid      (+1,06)
+    !print $hold-emplid       (0,16)      !isdvsxr 06-03-2008  ITG-42071 !GEX_SEC_REENG 2015-04-29 Vahini Katta 
+     print $Hold_Ssn_Out      (0,16) !GEX_SEC_REENG 2015-04-29 Vahini Katta 
+    !print $emplid_out        (0,16)       !isdvsxr 06-03-2008  ITG-42071
+    print $lastname          (0,28)       !JNB 12/15/98
+    print $firstname         (0,46)       !JNB 12/15/98 
+    print $midinitial        (0,60)       !JNB 12/15/98
+    print $unioncd           (0,65)
+    print $empl_status       (0,75)
+    print $action            (0,82)
+    print $effdt            (0,87)        !SXK 01/26/99 was actiondt
+    print $emp_ud           (0,100)
+    print $emp_id           (0,114)
+    print $emp_cd           (0,128)
+    print $emp_ad           (0,144)
+    print $emp_rd           (0,158)
+
+    move 0 to #emp_ud
+    move 0 to #emp_id
+    move 0 to #emp_cd
+    move 0 to #emp_ad
+    move 0 to #emp_rd		!AXL 04/12/2004 - Add
+
+    let $hold-emplid = $emplid  
+    add 1 to #tot_count 
+  else
+    move 'N' to $emp-already-printed
+  end-if
+end-procedure
+
+
+!*********************************************************************
+! Print Totals when break occurs
+!*********************************************************************
+begin-procedure Print-Union-Totals
+  if #current-line > 51
+     new-page
+  end-if
+
+  if (#union-empl-count = 0) and (#union_ud = 0) and
+     (#union_id = 0)         and (#union_cd = 0) and
+     (#union_ad = 0)         and (#union_rd = 0)	!AXL 04/12/2004 - Add RD
+     !Don't print
+  else
+  
+    do Format-Number(#union_ud, $union_ud, 'BBB,B99.99')
+    do Format-Number(#union_id, $union_id, 'BBB,B99.99')
+    do Format-Number(#union_cd, $union_cd, 'BBB,B99.99')
+    do Format-Number(#union_ad, $union_ad, 'BBB,B99.99')
+    do Format-Number(#union_rd, $union_rd, 'BBB,B99.99')	!AXL 04/12/2004 - Add
+
+    do Format-Number(#union-empl-count, $union-tot-count, 'BBB,B99')
+
+    if RTRIM($union_ud, ' ') = ''
+       let $union_ud = '      0.00'
+    end-if
+    if RTRIM($union_id, ' ') = ''
+       let $union_id = '      0.00'
+    end-if
+    if RTRIM($union_cd, ' ') = ''
+       let $union_cd = '      0.00'
+    end-if
+    if RTRIM($union_ad,' ') = ''
+       let $union_ad = '      0.00'
+    end-if
+    if RTRIM($union_rd,' ') = ''	!AXL 04/12/2004 - Add
+       let $union_rd = '      0.00'	!AXL 04/12/2004 - Add
+    end-if				!AXL 04/12/2004 - Add
+
+    print '* * TOTALS FOR UNION'        (+2,1)
+    print $hold-unioncd                 (0,+1)
+
+    print $union-tot-count              (0,38)
+    print $union_ud                    (0,100)
+    print $union_id                    (0,114)  
+    print $union_cd                    (0,128)
+    print $union_ad                    (0,144)
+    print $union_rd                    (0,158)
+    print ' '                          (+1,01)
+
+    move 0 to #union_ud
+    move 0 to #union_id
+    move 0 to #union_cd
+    move 0 to #union_ad
+    move 0 to #union_rd			!AXL 04/12/2004 - Add
+    move 0 to #union-empl-count
+  end-if
+!SXK 10/28/1999 Changed from c.union_Cd
+  !move &JL.UNION_CD to $unioncd
+  move &A.UNION_CD to $unioncd !PSR 8 Upgrade 
+  let $hold-unioncd = $unioncd
+end-procedure
+
+
+begin-procedure Print-Dept-Totals
+  if #current-line > 51
+     new-page
+  end-if
+
+  do Format-Number(#dept_ud, $dept_ud, 'BBB,B99.99')
+  do Format-Number(#dept_id, $dept_id, 'BBB,B99.99')
+  do Format-Number(#dept_cd, $dept_cd, 'BBB,B99.99')
+  do Format-Number(#dept_ad, $dept_ad, 'BBB,B99.99')
+  do Format-Number(#dept_rd, $dept_rd, 'BBB,B99.99')		!AXL 04/12/2004
+  do Format-Number(#dept-empl-count, $dept-tot-count, 'BBB,B99')
+
+  if RTRIM($dept_ud, ' ') = ''
+     let $dept_ud = '      0.00'
+  end-if
+  if RTRIM($dept_id, ' ') = ''
+     let $dept_id = '      0.00'
+  end-if
+  if RTRIM($dept_cd, ' ') = ''
+     let $dept_cd = '      0.00'
+  end-if
+  if RTRIM($dept_ad, ' ') = ''
+     let $dept_ad = '      0.00'
+  end-if
+  if RTRIM($dept_rd, ' ') = ''		!AXL 04/12/2004
+     let $dept_rd = '      0.00'	!AXL 04/12/2004
+  end-if				!AXL 04/12/2004
+
+  print '* * * TOTALS FOR DEPARTMENT' (+1,1)
+  print $hold-deptid                  (0,+1)
+   
+  print $dept-tot-count               (0,38)
+  print $dept_ud                     (0,100)
+  print $dept_id                     (0,114)  
+  print $dept_cd                     (0,128)
+  print $dept_ad                     (0,144)
+  print $dept_rd                     (0,158)	!AXL 04/12/2004 - Add
+ 
+  print ' '                           (+1,1)
+
+  move 0 to #dept_ud
+  move 0 to #dept_id
+  move 0 to #dept_cd
+  move 0 to #dept_ad
+  move 0 to #dept_rd			!AXL 04/12/2004 - Add
+  move 0 to #dept-empl-count
+
+  let $hold-deptid = $deptid
+
+  let $hold-unioncd = $unioncd
+end-procedure
+
+
+begin-procedure Print-Comp-Totals
+  if #current-line > 51
+     new-page
+  end-if
+
+  do Format-Number(#comp_ud, $comp_ud, 'BBB,B99.99')
+  do Format-Number(#comp_id, $comp_id, 'BBB,B99.99')
+  do Format-Number(#comp_cd, $comp_cd, 'BBB,B99.99')
+  do Format-Number(#comp_ad, $comp_ad, 'BBB,B99.99')
+  do Format-Number(#comp_rd, $comp_rd, 'BBB,B99.99')	!AXL 04/12/2004 - Add
+  do Format-Number(#comp-empl-count, $comp-tot-count, 'BBB,B99')
+
+  if RTRIM($comp_ud, ' ') = ''
+     let $comp_ud = '      0.00'
+  end-if
+  if RTRIM($comp_id, ' ') = ''
+     let $comp_id = '      0.00'
+  end-if
+  if RTRIM($comp_cd, ' ') = ''
+     let $comp_cd = '      0.00'
+  end-if
+  if RTRIM($comp_ad, ' ') = ''
+     let $comp_ad = '      0.00'
+  end-if
+  if RTRIM($comp_rd, ' ') = ''		!AXL 04/12/2004 - Add
+     let $comp_rd = '      0.00'	!AXL 04/12/2004 - Add
+  end-if				!AXL 04/12/2004 - Add
+
+  print '* * * * TOTALS FOR COMPANY'   (+2,1)
+  print $hold-company                  (0,+1)
+  print $comp-tot-count                (0,38)    
+
+  print $comp_ud                      (0,100)
+  print $comp_id                      (0,114)  
+  print $comp_cd                      (0,128)
+  print $comp_ad                      (0,144)
+  print $comp_rd                      (0,158)	!AXL 04/12/2004 - Add
+
+  print ' '                            (+1,1)
+
+  move 0 to #comp_ud
+  move 0 to #comp_id
+  move 0 to #comp_cd
+  move 0 to #comp_ad
+  move 0 to #comp_rd				!AXL 04/12/2004 - Add
+  move 0 to #comp-empl-count
+
+  let $hold-company = $company
+end-procedure
+
+
+begin-procedure Print-All-Totals
+new-page
+
+do Format-Number(#write_recs,$write_recs,'0999999999')
+do Format-Number(#union_dues,$union_dues,'BBB,BB9.99')
+do Format-Number(#init_dues,$init_dues,'BBB,BB9.99')
+do Format-Number(#cred_dues,$cred_dues,'BBB,BB9.99')
+do Format-Number(#assess_dues,$assess_dues,'BBB,BB9.99')
+do Format-Number(#rein_dues,$rein_dues,'BBB,BB9.99')	!AXL 04/12/2004 - Add
+do Format-Number(#tot_count,$tot_count,'0999999999')                                                
+
+if RTRIM($union_dues, ' ') = ''
+   let $union_dues = '      0.00'
+end-if
+if RTRIM($init_dues, ' ') = ''
+   let $init_dues = '      0.00'
+end-if
+if RTRIM($cred_dues,' ') = ''
+   let $cred_dues = '      0.00'
+end-if
+if RTRIM($assess_dues, ' ') = ''
+   let $assess_dues = '      0.00'
+end-if
+if RTRIM($rein_dues, ' ') = ''		!AXL 04/12/2004 - Add
+   let $rein_dues = '      0.00'	!AXL 04/12/2004 - Add
+end-if					!AXL 04/12/2004 - Add
+
+
+print '*'                               (+1,1,50) FILL
+print 'TOTAL RECS ON TAPE             ' (+1,1)
+print $write_recs                       (0,41)
+print 'TOTAL UNION DUES ON TAPE       ' (+1,1)
+print $union_dues                       (0,41)
+print 'TOTAL INIT DUES ON TAPE        ' (+1,1)
+print $init_dues                        (0,41)
+print 'TOTAL CREDIT UNION DUES ON TAPE' (+1,1)
+print $cred_dues                        (0,41)
+print 'TOTAL ASSESSMENT DUES ON TAPE  ' (+1,1)
+print $assess_dues                      (0,41)
+print 'TOTAL REINSTATEMENT DUES ON TAPE ' (+1,1)	!AXL 04/12/2004 - Add
+print $rein_dues                        (0,41)		!AXL 04/12/2004 - Add
+print '*'                               (+1,1,50) FILL
+print 'TOTAL REPORT RECORDS '           (+1,1)
+print $tot_count                        (0,41)
+print '******************* END OF PAGE ******************' (+2,1)
+end-procedure
+
+
+!*********************************************************************
+! Write Record Information to a file
+!*********************************************************************
+begin-procedure Write-Record
+
+  add 1 to #write_recs
+
+  let #emp_id_rd = #emp_id + #emp_rd			!AXL 04/12/2004 - Add
+  move #emp_id_rd to $emp_init_rein    09999999.99	!AXL 04/12/2004 - Add
+
+  move #emp_ud          to $emp_union     09999999.99
+  !move #emp_id          to $emp_init      09999999.99	 AXL 04/12/2004 - Add
+  move #emp_cd          to $emp_cred      09999999.99
+  move #emp_ad          to $emp_assess    09999999.99
+  move #hourly_rt       to $hrly_rt     099999.999999
+
+  do Format-DateTime($orig_hire_dt,$orig_dt,{DEFMDY},'','')
+  let $orig_mm = substr($orig_dt,1,2)
+  let $orig_dd = substr($orig_dt,4,2)
+  let $orig_yy = substr($orig_dt,7,2)
+
+  let $orig_all = $orig_yy||$orig_mm||$orig_dd
+
+  do Format-DateTime($birthdate,$birth_dt,{DEFMDY},'','')
+  let $birth_mm = substr($birth_dt,1,2)
+  let $birth_dd = substr($birth_dt,4,2)
+  let $birth_yy = substr($birth_dt,7,2)
+
+  let $birth_all = $birth_yy||$birth_mm||$birth_dd
+!SXK 01/26/99 Begin - Use EFFDT instead Action Date
+  do Format-DateTime($actiondt,$actiondate,{DEFMDY},'','')
+  let $action_mm = substr($actiondate,1,2)
+  let $action_dd = substr($actiondate,4,2)
+  let $action_yy = substr($actiondate,7,2)
+
+  let $action_all = $action_yy||$action_mm||$action_dd
+
+  do Format-DateTime($effdt,$effdate,{DEFMDY},'','')
+  let $eff_mm = substr($effdate,1,2)
+  let $eff_dd = substr($effdate,4,2)
+  let $eff_yy = substr($effdate,7,2)
+
+  let $effdt_all = $eff_yy||$eff_mm||$eff_dd
+!SXK 01/26/99 End
+
+  do Format-DateTime($AsOfToday,$currdate,{DEFMDY},'','')
+  let $curr_mm = substr($currdate,1,2)
+  let $curr_dd = substr($currdate,4,2)
+  let $curr_yy = substr($currdate,7,2)
+
+  let $curr_all = $curr_yy||$curr_mm||$curr_dd
+
+
+  if ($action = 'TER') or ($action = 'TWP') or ($action = 'TWB')
+     let $term_dt = $action_all
+  else
+     let $term_dt = '000000'
+  end-if
+  !do Get-Gex-Mapp-EmpIid ($emplid,$emplid_out)    !isdvsxr 06-03-2008  ITG-42071           
+  !do Get-Emp-Ssn ($emplid, $Ssn_Out)              !isdvsxr 06-03-2008  ITG-42071     
+  do Get-Emp-Ssn ($emplid, $Ssn_Out)  !GEX_SEC_REENG 2015-04-29 Vahini Katta      
+  write 1 from '0041'
+	       $deptid:10
+	       $curr_all:6
+	       '000000'
+	       !$emplid:9                         !isdvsxr 06-03-2008  ITG-42071 !GEX_SEC_REENG 2015-04-29 Vahini Katta 
+	      !$emplid_out:9                       !isdvsxr 06-03-2008  ITG-42071
+         $Ssn_Out:9   !GEX_SEC_REENG 2015-04-29 Vahini Katta 
+	       $lastname:15             !JNB 12/15/98
+	       $firstname:10            !JNB 12/15/98
+	       $midinitial:1 		!JNB 12/15/98
+	       $birth_all:6
+	       $orig_all:6
+	       $term_dt:6f
+	       $emp_union
+               $emp_init_rein		!AXL 04/12/2004
+	       !$emp_init		!AXL 04/12/2004
+	       $hrly_rt
+	       $emp_cred
+	       $emp_assess
+	       $unioncd:3
+	       $jobcode:6
+	       $empl_status:1
+	       $action:3
+	       $effdt_all:6                   !SXK 01/26/99 was action dt
+!ISDVSXR, creation of cross reference file, ITG 42071	       
+!let $empl_rcd = #empl_rcd
+!write 2 from $Ssn_Out:9
+!	     ' ':1
+!	     $emplid_out:7
+!	     ' ':1
+!	     $empl_rcd:3
+! ISDVSXR, creation of cross reference file, ITG 42071	     
+end-procedure
+
+
+begin-procedure Select-Pay-End-Dt
+begin-select
+MAX(PC.PAY_END_DT)      &pay_end_dt
+  move &pay_end_dt   to $pay_end_dt
+  SHOW ' $pay_end_dt ' $pay_end_dt!ISDVSXR 07/18/2008 ITG-51544
+  !Vendaxg modified for S3#12197475  - Begin 
+  !let $balance_year = substr($pay_end_dt,8,11) !ISDVSXR 07/18/2008 ITG-51544
+  !SHOW ' $balance_year ' $balance_year    !ISDVSXR 07/18/2008 ITG-51544
+
+  !Let $year_begin_dt  = '01-JAN-' || $balance_year !ISDVSXR 07/18/2008 ITG-51544
+  !Show ' $year_begin_dt ' $year_begin_dt           !ISDVSXR 07/18/2008 ITG-51544
+  !Let $year_end_dt    = '31-DEC-' || $balance_year !ISDVSXR 07/18/2008 ITG-51544
+  !show ' $year_end_dt ' $year_end_dt               !ISDVSXR 07/18/2008 ITG-51544
+  Do Get-Pay-Begin-Dt
+  !Vendaxg Modified for S3#12197475  - End 
+FROM   PS_PAY_CALENDAR PC
+WHERE  PC.PAY_END_DT <= $X000_WHERE_SELECT_ASOFDATE 
+AND    PC.PAY_CONFIRM_RUN = 'Y'
+end-select
+  display 'Last Confirmed Pay End Date: ' noline
+  display $pay_end_dt
+  
+  !Vendaxg Added for special run 
+  Let $year_begin_dt  = $Pay_Begin_Dt
+  Let $year_end_dt    = $pay_end_dt
+  Show 'Year End Date  : ' $pay_end_dt ' Year Begin Date which is Pay begin date - 365 days : ' $Pay_Begin_Dt
+  !Show 'Special run Year Begin date '$year_begin_dt ' End : '$year_end_dt
+end-procedure
+!Vendaxg Added for S3#12197475  - Begin 
+Begin-procedure Get-Pay-Begin-Dt
+
+Begin-Select
+DISTINCT(P.PAY_BEGIN_DT) - 365  &Pay_Begin_dt
+
+	LEt $Pay_Begin_Dt = &Pay_Begin_dt
+        
+FROM PS_PAY_CALENDAR P
+WHERE P.PAY_END_DT = $pay_end_dt
+
+End-Select
+
+End-Procedure Get-Pay-Begin-Dt
+!Vendaxg Added for S3#12197475  - End
+begin-procedure SQL-Error-Found($Proc_Name) 
+  display 'SQL Error in ' 
+  display $Proc_Name 
+  display $_sql-error
+  display 'sql-status:' 
+  display #_sql-status 
+  STOP
+end-procedure
+
+
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'stdapi.sqc'    !Update Process API
+#Include 'datemath.sqc'  !Does the date-math functions
+#Include 'getdatcd.sqc'  !Get-Date-Codes procedure
+#Include 'getbalid.sqc'  !Get-Calendar-Year-Id
+#Include 'rotname3.sqc'  !Rotate-Name
+#Include 'askaod.sqc'    !Ask-As-Of-Date Routine
+#include 'gexxx922.sqc'  !Get pay single row run control
+#Include 'gexxx919.sqc'  !Get Dedcd multiple row table
+#include 'gexaltse.sqc'  !Alter session SQC
+#Include 'getgeid.sqc'   !Get 7 digit Emplid      !isdvsxr 06-03-2008  ITG-42071 !GEX_SEC_REENG 2015-04-29 Vahini Katta 
+

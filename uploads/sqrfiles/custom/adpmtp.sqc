@@ -1,0 +1,600 @@
+!********************************************************************** 
+! SQR Name:           adpmtp.sqc  
+! SQR Descr:          ADP Tax Service Transporter 
+! Created by:         drmonroe 
+! Create date:        03/04/2010 
+! Last modified by:   drmonroe
+! Last modified date: 1/19/2015
+!*********************************************************************** 
+
+! Oct 21, 2011        Created, included by adp303.sqc if MASTER_TAX_HEADER is enabled in probiz.sqc periodic only
+! Nov 04, 2011        tested with 000 and 899 header rows
+! Feb 02, 2012        fixed company and file trailer record counts
+! May  8, 2012        this counts all the 100, 201, 210, and 899 records for the count that goes into the 899 record
+! Aug  3, 2012        MASTER_TAX_HEADER_NO_210_RECS
+! Oct  8, 2012        Client_Nbr
+! Jul  8, 2013
+!From:
+!  LET $LOCALITY = rtrim($MT_LOCALITY,' ')
+!To:
+!  LET $LOCALITY = substr(rtrim($MT_LOCALITY,' '),1,10)
+! Jan 19, 2015        Reworked postal code of the Company to accomodate the '-' in position 6
+! Oct 03, 2016        split out the payroll tax data so that the 210 records come out before the D records always
+!-------------------------------------------------------------------------------------------------------------------
+#define adpmtp_version adpmtp.sqc: Oct 3, 2016 
+#define DEBUG_MT_PERIODIC
+
+!***********************************************************************
+BEGIN-PROCEDURE INIT-PAYROLL-HEADER-MASTER-TAX
+!***********************************************************************
+
+  show 'MASTER_TAX_HEADER enabled. adpmtp_version: {adpmtp_version}'
+  
+  
+END-PROCEDURE
+
+!***********************************************************************
+BEGIN-PROCEDURE WRITE-PAYROLL-HEADER-MASTER-TAX
+!***********************************************************************
+! WRITE THE PAYROLL HEADER BEFORE EVERY CHANGE OF COMPANY IN PEOPLESOFT
+
+  if #WRITE-PAYROLL-HEADER-MASTER-TAX < 1
+    do INIT-PAYROLL-HEADER-MASTER-TAX
+  end-if
+  add 1 to #WRITE-PAYROLL-HEADER-MASTER-TAX
+
+  SHOW 'WRITE-PAYROLL-HEADER-MASTER-TAX ' $Extract_CompID ', Liab Date ' $liab_dt_DTU ', asofdate = ' $asofdate ', count = ' #WRITE-PAYROLL-HEADER-MASTER-TAX edit 999
+
+  let $PAYROLL_CODE = rtrim($Extract_CompID,' ')
+  let $COMPANY_START_DATE = substr($liab_dt_DTU,1,4) || '0101'  !default to first day of the year
+  let $Next_Check_Date  =  ' '   !PS does not supply
+  let $Name_Control     =  ' '   !this data.
+  LET $FILLER = ' '
+  LET $TAX_LIABILITY = 'Y'
+  LET $COMPANY_SETUP = 'Y'
+  LET $SERVICE_LEVEL = 'F'
+  LET $RECORD_TYPE = '1'
+  LET $SUB_TYPE = '00'
+  LET $TAX_CODE = '                    '
+
+  #ifdef Client_Nbr
+    let $company = rtrim($Save_Extract_CompID,' ')   ! in this case the Extract_CompID is 'xxx-ccc' where xxx is the Client_Nbr, and ccc is the company code
+  #else
+    let $company = rtrim($Extract_CompID,' ')        ! the normal case with the code is the company code
+  #endif
+  
+  let $Company_MT_Header_save = $Company
+  
+  DO GET-PHONE-FAX
+  DO GET-COMPANY-DATA-MT          !GET &MTCT.FEDERAL_EIN FROM GETCODTA1.SQC
+
+  LET  $PAYROLL_DESCR = SUBSTR($COMPANYNAME,1,40)  !FROM GETCODTA1.SQC
+  
+  #IFDEF DEBUG_MT_PERIODIC
+  show 'WRITE-PAYROLL-HEADER-MASTER-TAX  Company info. FEDERAL_EIN ='  &MTCT.FEDERAL_EIN edit 888888888 ' CompanyName = ' $COMPANYNAME
+  #END-IF
+
+  if &MTCT.FEDERAL_EIN          =  0
+    let $FEIN_Type            =  'Y'               !Default to Applied
+    let $FEIN                 =  ' '               !For.
+  else
+    MOVE &MTCT.FEDERAL_EIN      TO $FEIN 999999999
+    let $FEIN_Type            =  'N'
+    LET $FEIN                 =  LTRIM($FEIN,' ')
+    LET $FEIN                 =  LPAD($FEIN,9,'0')
+  end-if
+
+  WRITE 1 FROM    $RECORD_TYPE:1                 !0001  Y
+                  $SUB_TYPE:2                    !0002  Y
+                  $PAYROLL_CODE:10               !0004  Y
+                  $TAX_LIABILITY:1               !0014  Y
+                  $COMPANY_SETUP:1               !0015  Y
+                  $FILLER:20                     !0016  Y
+                  $PAYROLL_DESCR:40              !0036  Y
+                  $liab_dt_DTU:8                 !0076  Y
+                  $COMPANY_START_DATE:8          !0084  Y
+                  $COMPNYSTATUS:1                !0092  Y
+                  $COMPANYNAME:40                !0093  Y
+                  $SERVICE_LEVEL:1               !0133  Y
+                  $FEIN_Type:1                   !0134  Y
+                  $FEIN:9                        !0135  Y
+                  $FILLER:52                     !0144  Y
+                  $Next_Check_Date:8             !0196  Y
+                  $Name_Control:4                !0204  Y
+                  $FILLER:193                    !0208  Y
+
+    add 1 to #reccnt
+!    add 1 to #company_trailer_reccnt
+    add 1 to #company_trailer_MT_reccnt          !03/06/12 - Raja Katangur - Master Tax trailer count issue fix
+
+    do WRITE-COMPANY-ADDRESS
+    do WRITE-COMPANY-MAILING-ADDRESS
+    #ifndef USE_TEMP_TABLE_FOR_OUTPUT
+       do Write-Company-Tax-Records
+       do WRITE-PAYROLL-TRAILER                      !Raja Katangur 10/26/2011
+    #endif
+    
+END-PROCEDURE
+
+begin-procedure Write-Company-Tax-Records
+
+  #IFDEF DEBUG_MT_PERIODIC
+  show 'Write-Company-Tax-Records ' #mt_inx edit 999,999
+  #END-IF
+
+  let #mt_inx = 0
+  Let #COMPANY_TAXES = 0
+  
+  while #mt_inx < #Last_TaxBalance_Cnt
+    Add 1 to #mt_inx
+    get $MT_State          -
+        $MT_Tax_Class      -
+        $MT_Locality       -
+        $MT_Resident       -
+        #MT_TAX_CUR
+      from TaxBalance(#mt_inx)    -
+           TaxBalance_State      -
+           TaxBalance_Tax_Class  -
+           TaxBalance_Locality   -
+           TaxBalance_Resident   -
+           TaxBalance_TAX_Cur
+
+    do WRITE-COMPANY-TAX
+ 
+ end-while
+
+end-procedure
+
+
+!***********************************************************************
+BEGIN-PROCEDURE WRITE-COMPANY-TAX
+!***********************************************************************
+
+ #ifndef MASTER_TAX_HEADER_NO_210_RECS
+ 
+  #IFDEF DEBUG_MT_PERIODIC
+  show 'WRITE-COMPANY-TAX    = ' $MT_STATE $MT_TAX_CLASS $MT_LOCALITY ' taxes ' #MT_TAX_CUR edit 999,999,999.99
+  #END-IF
+
+  LET  $RECORD_TYPE    = '2'
+  LET  $SUB_TYPE       = '10'
+  LET  $FILLER         = ' '
+
+  LET $TAX_RATE =  '000000'
+  LET $TAX_RATE2 = '000000'
+
+  !END-IF
+
+  
+  LET $COMPANY_TAX_STATUS = 'A'
+  LET $EFFECTIVE_DATE = $BASEDATE_C
+
+  while 1 = 1                               !Only single pass.
+
+!   Try to determine the value of "EIN Type" based upon what information
+!   is available in PeopleSoft.
+!
+!   Values allowed by MasterTax as of version 06.
+!      Y - EIN is "Applied For"
+!      N - EIN is "Registered"
+!      I - EIN is "Reimbursable"
+!      F - EIN is the same as the FEIN
+!      E - EIN is "Exempt"
+!      P - EIN is "Common Pay"
+
+    if ltrim($MT_STATE,' ')    =  '$U'     !Federal.
+      if $FEIN_Type             =  'Y'      !Applied for from header.
+        let $EIN_Type           =  'Y'      !Applied for.
+      else
+        let $EIN_Type           =  'F'      !Same as federal ein.
+      end-if
+      let $EIN                  =  $FEIN    !Carried forward from header.
+      break                                 !Exit loop.
+    end-if
+
+    do GET-EIN                              !Gets $EIN.
+
+    MOVE &MTCST.SUT_EXPERIENCE_RT TO $TAX_RATE 099999
+    LET $TAX_RATE = LPAD($TAX_RATE,6,'0')
+
+    if isblank($EIN)
+      let $EIN                  =  'Applied For'
+    end-if
+
+    let $Found                  =  'N'
+    let $Test                   =  upper($EIN)
+    evaluate $Test
+      when = 'APPLIED FOR'                  !Add variations as needed.
+        let $Found              =  'Y'
+        let $EIN_Type           =  'Y'      !EIN Applied For.
+        let $EIN                =  ' '
+        break
+      when-other
+    end-evaluate
+
+    if $Found                   =  'Y'      !Exit loop.
+      break
+    end-if
+
+    if $EIN                     =  $FEIN
+      let $EIN_Type             =  'F'      !EIN same as FEIN.
+      break                                 !Exit loop.
+    end-if
+
+    let $EIN_Type               =  'N'      !EIN is Registered.
+
+    break                                   !Exit loop.
+
+  end-while
+
+  let $tax_code = $MT_STATE || $MT_TAX_CLASS || $MT_LOCALITY 
+
+  if rtrim($MT_Locality,' ') = ''
+    Let $tax_code = rpad($tax_code,15,' ')
+  else
+    Let $tax_code = rpad($tax_code,14,' ')  || $MT_Resident
+  end-if
+
+  WRITE 1 FROM $RECORD_TYPE:1
+              $SUB_TYPE:2
+              $PAYROLL_CODE:10
+              $FILLER:2
+              $TAX_CODE:20
+              $EFFECTIVE_DATE:8             ! YYYYMMDD FORMAT
+              $COMPANY_TAX_STATUS:1         ! A OR I ?
+              $EIN_Type:1
+              $EIN:25
+              $TAX_RATE:6                   ! STATE OR FEDERAL ?
+              $TAX_RATE2:6                  ! STATE OR FEDERAL  ?
+              $FILLER:40                    ! $PAYMENT_FREQUENCY
+              $FILLER:2                     ! $PAYMENT_METHOD
+              $FILLER:20                    ! $EFT_PASSWORD
+              $FILLER:256
+
+    Let #COMPANY_TAXES = #COMPANY_TAXES + #MT_TAX_CUR
+    add 1 to #reccnt
+!    add 1 to #company_trailer_reccnt
+    add 1 to #company_trailer_MT_reccnt
+
+ #endif
+
+END-PROCEDURE WRITE-COMPANY-TAX
+
+
+
+!***********************************************************************
+BEGIN-PROCEDURE WRITE-COMPANY-ADDRESS
+!***********************************************************************
+  LET $RECORD_TYPE    = '2'
+  LET $SUB_TYPE       = '01'
+  LET $FILLER         = ' '
+  LET $FIRST_NAME     = RPAD($FIRST_NAME,40,' ')
+  LET $MIDDLE_INITIAL = ' '
+  LET $LAST_NAME     = RPAD($LAST_NAME,40,' ')
+  LET $EXTENSION     = RPAD($EXTENSION,10,' ')
+  LET $COMPANY_DBA   = RPAD($COMPANY_DBA,40,' ')
+
+  WRITE 1 FROM $RECORD_TYPE:1
+              $SUB_TYPE:2
+              $PAYROLL_CODE:10
+              $FILLER:2
+              $COMPANYNAME:40
+              $COMPNYADD1:40
+              $COMPNYADD2:40
+              $COMPNYCITY:25
+              $COMPNYSTATE:2
+              $COMPNYPOSTAL:9
+              $COUNTRY_CODE:2
+              $FILLER:18
+              $FIRST_NAME:40
+              $MIDDLE_INITIAL:1
+              $LAST_NAME:40
+              $AREA_CODE:3
+              $TELEPHONE:8
+              $EXTENSION:10
+              $FAX_AREA_CODE:3
+              $FAX_NUMBER:8
+              $EMAIL_ADDRESS:40
+              $FILLER:56
+
+    add 1 to #reccnt
+!    add 1 to #company_trailer_reccnt
+    add 1 to #company_trailer_MT_reccnt
+
+
+END-PROCEDURE WRITE-COMPANY-ADDRESS
+
+
+!***********************************************************************
+BEGIN-PROCEDURE WRITE-COMPANY-MAILING-ADDRESS
+!***********************************************************************
+  LET $RECORD_TYPE     = '2'
+  LET  $SUB_TYPE       = '02'
+  LET  $FILLER         = ' '
+
+  WRITE 1 FROM $RECORD_TYPE:1
+              $SUB_TYPE:2
+              $PAYROLL_CODE:10
+              $FILLER:2
+              $COMPANYNAME:40
+              $COMPNYADD1:40
+              $COMPNYADD2:40
+              $COMPNYCITY:25
+              $COMPNYSTATE:2
+              $COMPNYPOSTAL:9
+              $COUNTRY_CODE:2
+              $FILLER:18
+              $FIRST_NAME:40
+              $MIDDLE_INITIAL:1
+              $LAST_NAME:40
+              $AREA_CODE:3
+              $TELEPHONE:8
+              $EXTENSION:10
+              $FAX_AREA_CODE:3
+              $FAX_NUMBER:8
+              $EMAIL_ADDRESS:40
+              $FILLER:56
+
+    add 1 to #reccnt
+!    add 1 to #company_trailer_reccnt
+    add 1 to #company_trailer_MT_reccnt
+
+END-PROCEDURE WRITE-COMPANY-MAILING-ADDRESS
+
+
+!**********************************************************************
+BEGIN-PROCEDURE GET-PHONE-FAX
+!**********************************************************************
+LET $AREA_CODE = '   '
+LET $TELEPHONE = '        '
+LET $FAX_AREA_CODE = '   '
+LET $FAX_NUMBER    = '        '
+
+BEGIN-SELECT
+MTCP.PHONE_TYPE
+MTCP.PHONE
+
+  IF &MTCP.PHONE_TYPE = 'BUSN'
+     LET $AREA_CODE = SUBSTR(&MTCP.PHONE,1,3)
+     LET $TELEPHONE = SUBSTR(&MTCP.PHONE,5,8)
+  END-IF
+
+  IF &MTCP.PHONE_TYPE = 'FAX'
+     LET $FAX_AREA_CODE = SUBSTR(&MTCP.PHONE,1,3)
+     LET $FAX_NUMBER    = SUBSTR(&MTCP.PHONE,5,8)
+  END-IF
+
+FROM PS_COMP_PHONE_TBL MTCP
+WHERE MTCP.COMPANY = $COMPANY
+AND MTCP.PHONE_TYPE IN ('BUSN','FAX')
+AND MTCP.EFFDT = (SELECT MAX(EFFDT)
+                FROM PS_COMP_PHONE_TBL
+                WHERE COMPANY = MTCP.COMPANY
+                  AND PHONE_TYPE = MTCP.PHONE_TYPE
+                  AND EFFDT <= $ASOFDATE)
+END-SELECT
+
+END-PROCEDURE GET-PHONE-FAX
+
+
+
+
+!**********************************************************************
+BEGIN-PROCEDURE GET-SUT-RATE
+!**********************************************************************
+BEGIN-SELECT
+MTCST.COMPANY
+MTCST.STATE
+MTCST.SUT_EXPERIENCE_RT*10000     &MTCST.SUT_EXPERIENCE_RT
+
+FROM PS_CO_STATETAX_TBL  MTCST
+WHERE MTCST.COMPANY = $COMPANY
+AND MTCST.STATE     = $MT_STATE
+AND MTCST.EFFDT = (SELECT MAX(EFFDT)
+                 FROM PS_CO_STATETAX_TBL
+                 WHERE COMPANY = MTCST.COMPANY
+                   AND STATE   = MTCST.STATE)
+END-SELECT
+
+  
+END-PROCEDURE GET-SUT-RATE
+
+
+!**********************************************************************
+BEGIN-PROCEDURE GET-EIN
+!**********************************************************************
+!GET EIN FOR STATE AND LOCAL.
+
+  LET $STATE    = rtrim($MT_STATE,' ')
+! LET $LOCALITY = rtrim($MT_LOCALITY,' ')
+  LET $LOCALITY = substr(rtrim($MT_LOCALITY,' '),1,10)
+
+  DO GET-SUT-RATE
+
+  EVALUATE $MT_TAX_CLASS
+    WHEN = 'U'
+    WHEN = 'D'
+    WHEN = 'L'
+    WHEN = 'M'
+    WHEN = 'N'
+    WHEN = 'S'
+    WHEN = 'V'
+      DO GET-STATE-TAX-DATA
+      LET $EIN = &EMPLOYER_ID_SUT
+
+    WHEN = 'B'
+    WHEN = 'P'
+    WHEN = 'R'
+      DO GET-LOCAL-TAX-DATA
+      LET $EIN = &EMPLOYER_ID_LWT
+
+    WHEN = 'H'
+      IF RTRIM($LOCALITY, ' ') <> ''
+        DO GET-LOCAL-TAX-DATA
+        LET $EIN = &EMPLOYER_ID_LWT
+      ELSE
+        DO GET-STATE-TAX-DATA
+        LET $EIN = &EMPLOYER_ID_SWT
+      END-IF
+
+  END-EVALUATE
+
+END-PROCEDURE
+
+!*******************************!
+begin-procedure Get-Company-Data-MT
+!*******************************!
+
+  if rtrim($Company,' ') = ''
+    move '' to $CompanyName
+    move '' to $CompanyNameAbbrv
+    goto GetCompanyExit
+  end-if
+  if $AsOfDate = ''  !if no As-Of-Date is specified, default to Today
+    move $AsOfToday to $AsOfDate
+  end-if
+
+
+BEGIN-SELECT
+MTCT.DESCR
+MTCT.DESCRSHORT
+MTCT.FEDERAL_EIN
+MTCT.TAX_REPORT_TYPE
+MTCT.ADDRESS1
+MTCT.ADDRESS2
+MTCT.CITY
+MTCT.STATE
+MTCT.POSTAL
+MTCT.COUNTRY
+MTCT.ERNCD_TIPS_ALLOC
+MTCT.TIPS_ESTBLSH_FLD
+MTCT.EFFDT
+MTCT.EFF_STATUS
+MTCT.HP_STATS_INSTN_CD
+
+  LET $CO_FOUND = 'Y'
+
+  FROM  PS_COMPANY_TBL MTCT
+  WHERE MTCT.COMPANY = $COMPANY
+    AND MTCT.EFFDT =
+        (SELECT MAX(EFFDT)
+         FROM   PS_COMPANY_TBL
+         WHERE  COMPANY = $COMPANY
+           AND  EFFDT  <= $ASOFDATE)
+
+END-SELECT
+
+     let $CompanyName      = rtrim(&MTCT.Descr,' ')
+     let $CompanyNameAbbrv = rtrim(&MTCT.DescrShort,' ')
+     let $Compnyadd1       = rtrim(&MTCT.Address1,' ')
+     let $Compnyadd2       = rtrim(&MTCT.Address2,' ')
+     let $Compnycity       = rtrim(&MTCT.City,' ')
+     let $Compnystate      = rtrim(&MTCT.State,' ')
+     let $Compnypostal     = rtrim(&MTCT.Postal,' ')
+     let $Compnystatus     = rtrim(&MTCT.eff_status,' ')
+     let $Basedate         = &MTCT.Effdt
+     DO FORMAT-DATETIME(&MTCT.Effdt, $Basedate_c, {DEFCMP},'','')
+
+     if substr($Compnypostal,6,1) = '-' or substr($Compnypostal,6,1) = ' '
+        let $Compnypostal     = substr($Compnypostal,1,5) || substr($Compnypostal,7,4)
+     else
+        let $Compnypostal     = substr($Compnypostal,1,9)
+     end-if
+
+!BEGIN-SELECT
+!MTGL.GL_FICA_EXP_MED,MTGL.GL_FICA_EXP_OASDI,
+!MTGL.GL_FICA_EE_MED,MTGL.GL_FICA_ER_MED,
+!MTGL.GL_FICA_EE_OASDI,MTGL.GL_FICA_ER_OASDI,
+!MTGL.GL_FWT,MTGL.GL_FUT,GL_EIC,MTGL.GL_NET_PAY,MTGL.GL_DIR_DEPOSITS
+!MTGL.GL_FUT_EXPENSE,MTGL.GL_SUT_EXPENSE,MTGL.GL_SDI_EXPENSE,MTGL.GL_VDI_EXPENSE,
+!MTGL.GL_LCL_EXP
+!
+!FROM  PS_COMPANY_TBL_GL  MTGL
+!WHERE COMPANY = $COMPANY
+!  AND EFFDT =
+!      (SELECT MAX(EFFDT)
+!       FROM   PS_COMPANY_TBL_GL
+!       WHERE  COMPANY = $COMPANY
+!         AND  EFFDT  <= $ASOFDATE)
+!END-SELECT
+
+GetCompanyExit:
+
+end-procedure
+!***********************************************************************   !Raja Katangur 10/26/2011 Begin
+BEGIN-PROCEDURE WRITE-FILE-HEADER-MASTER-TAX
+!***********************************************************************
+  #IFDEF DEBUG_MT_PERIODIC
+    SHOW 'BEGIN - WRITE-FILE-HEADER-MASTER-TAX'
+  #END-IF
+
+  LET $RECORD_TYPE = '0'
+  LET $SUB_TYPE    = '00'
+  LET $FILLER      = ' '
+  LET $FILE_TYPE   = 'MTAXPTS'
+  LET $VERSION     = '07'
+! LET $SOURCE      = 'PSFT'
+! LET $PS_VERSION  = '05'
+
+  LET $TIMEOUT     = SUBSTR($ASOFNOW, 1,2)
+                  || SUBSTR($ASOFNOW, 4,2)
+                  || SUBSTR($ASOFNOW, 7,2)
+  DO FORMAT-DATETIME($ASOFTODAY, $DATEOUT, {DEFCMP},'','')   !$DATEOUT = 'YYYYMMDD' FORMAT
+
+  WRITE 1 FROM   $RECORD_TYPE:1                      !0001
+                  $SUB_TYPE:2                         !0002
+                  $FILLER:32                          !0004
+                  $DATEOUT:8                          !0036
+                  $TIMEOUT:6                          !0044
+                  $FILE_TYPE:7                        !0050
+                  $VERSION:2                          !0057
+                  $FILLER:342                         !0059
+!                 $SOURCE:4                           !0059
+!                 $PS_VERSION:2                       !0063
+!                 $ACCESS_ID:40                       !0065
+!                 $FILLER:296                         !0105
+
+  add 1 to #reccnt
+!  add 1 to #company_trailer_reccnt
+  move 0 to #company_trailer_MT_reccnt              !5/4/2012, set to 0.  This resets the count
+
+END-PROCEDURE
+!***********************************************************************
+BEGIN-PROCEDURE WRITE-PAYROLL-TRAILER
+!***********************************************************************
+!WRITE PAYROLL TRAILER AFTER CHANGE IN COMPANY
+  #IFDEF DEBUG_MT_PERIODIC
+    SHOW 'BEGIN - WRITE-PAYROLL-TRAILER ' $Company_MT_Header_save ' ' #COMPANY_TAXES edit $$$9,999,999.99
+  #END-IF
+
+  LET $RECORD_TYPE  = '8'
+  LET $SUB_TYPE     = '99'
+  LET $FILLER       = ' '
+  add 1 to #company_trailer_MT_reccnt
+  DO FORMAT-NUMBER(#company_trailer_MT_reccnt , $RECORD_COUNT, '0999999999')    !03/06/12 - Raja Katangur - Master Tax trailer count issue fix
+  LET $TAX_SIGN     = '-'
+  
+  IF #COMPANY_TAXES > + 0.00
+    LET $TAX_SIGN = '+'
+  END-IF
+ 
+  LET #COMPANY_TAXES = ABS(#COMPANY_TAXES * 100)
+  DO FORMAT-NUMBER(#COMPANY_TAXES , $COMPANY_TAXES, '0999999999999')
+
+  WRITE 1 FROM   $RECORD_TYPE:1
+                  $SUB_TYPE:2
+                  $PAYROLL_CODE:10
+                  $FILLER:22
+                  $RECORD_COUNT:10
+                  $COMPANY_TAXES:13
+                  $TAX_SIGN:1
+                  $FILLER:341
+
+  MOVE 0 TO #COMPANY_TAXES
+  add 1 to #reccnt  
+!  move 0 to #company_trailer_reccnt               !05/09/12 - changed (DM) from add 1 to #company_trailer_reccnt
+  move 0 to #company_trailer_MT_reccnt            !03/06/12 - Raja Katangur - Master Tax trailer count issue fix
+
+
+END-PROCEDURE
+!***********************************************************************     !Raja Katangur 10/26/2011 End

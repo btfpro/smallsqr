@@ -1,0 +1,902 @@
+!***********************************************************************
+!  TAX911LD:  Distribute W-2 Territory Data Records                    *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!                                                                      *
+!                                                                      *
+! This software and related documentation are provided under a         *
+! license agreement containing restrictions on use and                 *
+! disclosure and are protected by intellectual property                *
+! laws. Except as expressly permitted in your license agreement        *
+! or allowed by law, you may not use, copy, reproduce,                 *
+! translate, broadcast, modify, license, transmit, distribute,         *
+! exhibit, perform, publish or display any part, in any form or        *
+! by any means. Reverse engineering, disassembly, or                   *
+! decompilation of this software, unless required by law for           *
+! interoperability, is prohibited.                                     *
+! The information contained herein is subject to change without        *
+! notice and is not warranted to be error-free. If you find any        *
+! errors, please report them to us in writing.                         *
+!                                                                      *
+! Copyright (C) 1988, 2012, Oracle and/or its affiliates.              *
+! All Rights Reserved.                                                 *
+!                                                                      *
+!***********************************************************************
+!                                                                      *
+!          $Date:  2012/07/19:17:54:55                                 !
+!       $Release:  HR9                                                 !
+!    $Resolution:  872684                                              !
+!                                                                      *
+!***********************************************************************
+
+#include 'setenv.sqc' !Set environment
+#Include 'setup31.sqc'   !Printer and page-size initialization
+#Include 'usarpt.sqc' !USA-specific variables
+
+begin-report
+  do Init-Report
+
+  do Test-For-Candidates
+
+  if &COUNT_EE > 0
+    do Process-Territories
+    do Cleanup-EE-DATA-rec
+  else
+    display 'Year end amounts do not need to be distributed.'
+    print 'Year end amounts do not need to be distributed.'    (+2,12)
+    move 'C' to $diff_flag
+  end-if
+
+  if $diff_flag = 'N'
+    print 'No differences encountered.'                        (+2,12)
+  end-if
+
+  if $diff_flag = 'Y'
+    print 'An employee who is paid in multiple jurisdictions will appear on this report'  (+2,2)
+    print 'if the loaded year end amounts for any earnings or deductions do not match'    (+1,2)
+    print 'the total of the same earnings and deductions amounts from the employee''s'    (+1,2)
+    print 'paycheck detail data.  The reports shows the adjusted YE_AMOUNTS that will be' (+1,2)
+    print 'used for year-end processing.  Because TAX911LD reads paycheck detail data'    (+1,2)
+    print 'and not balance records, be aware that any online adjustments made to either'  (+1,2)
+    print 'earnings or deductions that are entered in the Tax Form Definition table will' (+1,2)
+    print 'not be reflected in the adjusted YE_AMOUNTS.  It is strongly suggested that'   (+1,2)
+    print 'you reverse the effects of any online balance adjustments which may have been' (+1,2)
+    print 'used to adjust balances for these types of earnings and deductions, and'       (+1,2)
+    print 'instead use the manual check process to adjust these types of earnings and'    (+1,2)
+    print 'deductions, and then rerun the year end load programs TAX910LD and TAX911LD.'  (+1,2)
+  end-if
+
+  do Get-Current-DateTime
+  display 'End: '        noline
+  display $SysDateTime
+
+  do Stdapi-Term
+end-report
+
+begin-procedure Init-Report
+  move 'TAX911LD' to $ReportID
+  move 'Distributing Year-End Other Earnings and Deductions' to $ReportTitle
+  display ''
+  display $ReportTitle
+  do Init-DateTime
+  do Init-Number
+  do Stdapi-Init
+  do Initialization
+
+end-procedure
+
+begin-procedure Initialization
+  do Get-Current-DateTime
+
+  display 'Start: '        noline
+  display $SysDateTime
+
+  move '1' to $MMLZero
+  move '1' to $Year4
+  move 1   to #Sequence_Number
+  do Format-DateTime($AsOfToday, $910Date, {DEFYMD},'','')
+
+  move $910Date to $AsOfYear xxxx   !extract the current year
+  move $AsOfYear  to #AsOfYear
+  move #AsOfYear  to #saveAsOfYear
+  subtract 1    from #AsOfYear
+  do Get-Tax-Reporting-Run-Controls
+  if &TX.Balance_Year <> #AsOfYear and $Prcs_Process_Instance = ''
+    display ''
+    display 'Current Year is not one greater than Tax Reporting Year.'
+    display 'Current Year is    ' noline
+    display  #saveAsOfYear  9999
+    display 'Tax Reporting Year ' noline
+    display &TX.Balance_Year
+    input $Answer maxlen=1 'Do you want to continue? (Y/N)'
+    uppercase $Answer
+    if $Answer <> 'Y'
+      stop
+    end-if
+  end-if
+
+  move 'N' to $diff_flag
+
+  move &TX.Company       to $Company  !TX.Company is the Transmitter
+  move &TX.Balance_Year to $CalYear 9999
+  let $AsOfDate = $CalYear || '1231'
+  do Format-DateTime($AsOfDate, $AsOfDate, {DEFCMP}, '', 'native')
+  let $BeginDate = $CalYear || '0101'
+  do Format-DateTime($BeginDate, $BeginDate, {DEFCMP}, '', 'native')
+
+Begin-SELECT
+MAX(EFFDT)  &Max_effdt
+   Move &Max_effdt to $Max_Effdt
+FROM   PS_TAXFORM_TBL
+WHERE  TAXFORM_ID = 'W'
+  AND  EFFDT  <= $AsOfDate
+End-SELECT
+
+end-procedure
+
+begin-heading 7
+#Include 'stdhdg01.sqc'  !standard heading 1
+
+  print 'Type'                                 (+2,6)
+  print 'EMPLID'                               (0,18)
+  print 'YE Load Amount'                       (0,30)
+  print 'Check Detail'                         (0,48)
+
+  print '----'                                 (+1,6)
+  print '------'                               (0,18)
+  print '--------------'                       (0,30)
+  print '------------'                         (0,48)
+end-heading
+
+begin-procedure Test-For-Candidates
+
+Begin-SELECT
+COUNT(*)               &COUNT_EE
+FROM PS_YE_EE A
+WHERE A.CALENDAR_YEAR = &TX.Balance_Year
+  AND A.TAXFORM_ID IN('W','I','M','P','S')
+  AND 1 < (SELECT COUNT(*)
+            FROM PS_YE_EE B
+             WHERE A.COMPANY       = B.COMPANY
+               AND A.EMPLID        = B.EMPLID
+               AND A.CALENDAR_YEAR = B.CALENDAR_YEAR
+               AND B.TAXFORM_ID    IN('W','I','M','P','S'))
+end-SELECT
+
+  display &COUNT_EE     noline
+  display ' multiple territory employees'
+  display ' '
+
+end-procedure
+
+
+begin-procedure Process-Territories
+
+Begin-SELECT DISTINCT
+QA.COMPANY
+QA.EMPLID                () on-break print=never level=1 before=New-Employee after=Emp-Total
+QA.TAXFORM_ID
+
+  let $Acompany    = &QA.COMPANY
+  let $Aemplid     = &QA.EMPLID
+  let $Ataxform_id = &QA.TAXFORM_ID
+
+  evaluate &QA.TAXFORM_ID
+    when = 'W'
+      let $state = '$U'
+    when = 'S'
+      let $state = '$UAS'
+    when = 'M'
+      let $state = '$UGU'
+    when = 'P'
+      let $state = '$UPR'
+    when = 'I'
+      let $state = '$UVI'
+  end-evaluate
+
+  do Process-ERN
+
+  do Process-DED
+
+FROM PS_YE_EE QA
+WHERE QA.CALENDAR_YEAR = &TX.Balance_Year
+  AND QA.TAXFORM_ID IN('W','I','M','P','S')
+  AND 1 < (SELECT COUNT(*)
+            FROM PS_YE_EE QA1
+             WHERE QA.COMPANY       = QA1.COMPANY
+               AND QA.EMPLID        = QA1.EMPLID
+               AND QA.CALENDAR_YEAR = QA1.CALENDAR_YEAR
+               AND QA1.TAXFORM_ID   IN('W','I','M','P','S'))
+ORDER BY QA.COMPANY, QA.EMPLID, QA.TAXFORM_ID
+end-SELECT
+
+end-procedure
+
+begin-procedure Cleanup-EE-DATA-rec
+
+Begin-SELECT DISTINCT
+CL.COMPANY
+CL.EMPLID
+
+  do Select-YE-EE-DATA
+
+FROM PS_YE_EE CL
+WHERE CL.CALENDAR_YEAR = &TX.Balance_Year
+  AND CL.TAXFORM_ID IN('W','I','M','P','S')
+  AND 1 < (SELECT COUNT(*)
+            FROM PS_YE_EE CL1
+             WHERE CL.COMPANY       = CL1.COMPANY
+               AND CL.EMPLID        = CL1.EMPLID
+               AND CL.CALENDAR_YEAR = CL1.CALENDAR_YEAR
+               AND CL1.TAXFORM_ID   IN('W','I','M','P','S'))
+ORDER BY CL.COMPANY, CL.EMPLID
+end-SELECT
+
+end-procedure
+
+begin-procedure Select-YE-EE-DATA
+
+Begin-SELECT
+YE.TAXFORM_ID
+
+  do Delete-YE-EE-DATA
+
+FROM PS_YE_EE YE
+WHERE YE.COMPANY = &CL.COMPANY
+   AND YE.EMPLID = &CL.EMPLID
+   AND YE.CALENDAR_YEAR = &TX.Balance_Year
+   AND YE.TAXFORM_ID NOT IN (SELECT YE1.TAXFORM_ID FROM
+                            PS_YE_AMOUNTS YE1
+                            WHERE YE1.COMPANY = YE.COMPANY
+                            AND   YE1.EMPLID = YE.EMPLID
+                            AND   YE1.CALENDAR_YEAR = YE.CALENDAR_YEAR)
+end-SELECT
+
+end-procedure
+
+begin-procedure New-Employee
+
+  let #EAMT_OLD = 0
+  let #EAMT_NEW = 0
+  let #DAMT_OLD = 0
+  let #DAMT_NEW = 0
+
+  do Zero-Pen
+
+end-procedure
+
+begin-procedure Emp-Total
+
+  if (#EAMT_NEW - #EAMT_OLD > .001
+      or #EAMT_OLD - #EAMT_NEW > .001)
+
+    move 'Y' to $diff_flag
+
+    print 'Earnings'            (+1,6)
+    print $Aemplid              (0,18)
+    do Format-Number(#EAMT_OLD, $out, '999,999,999.99mi')
+    print $out                  (0,30)
+    do Format-Number(#EAMT_NEW, $out, '999,999,999.99mi')
+    print $out                  (0,46)
+
+  end-if
+
+  if (#DAMT_NEW - #DAMT_OLD > .001
+      or #DAMT_OLD - #DAMT_NEW > .001)
+
+    move 'Y' to $diff_flag
+
+    print 'Deductions'          (+1,6)
+    print $Aemplid              (0,18)
+    do Format-Number(#DAMT_OLD, $out, '999,999,999.99mi')
+    print $out                  (0,30)
+    do Format-Number(#DAMT_NEW, $out, '999,999,999.99mi')
+    print $out                  (0,46)
+
+  end-if
+
+  if #PAMT_U + #PAMT_UAS + #PAMT_UGU + #PAMT_UPR + #PAMT_UVI = 0
+    do Clear-Pension-Plan
+  else
+    do Get-Pension-Plan
+    if &QM.PENSION_PLAN = 'Y'
+      do Clear-Pension-Plan
+      do Update-Pension-Plan
+    end-if
+  end-if
+
+
+end-procedure
+
+begin-procedure Process-ERN
+  move 0 to #Amount
+
+Begin-SELECT DISTINCT
+QB.BOX                 () on-break print=never level=1 after=ERN-Total
+QB.ERNCD
+
+  let $box        = &QB.BOX
+
+  do process-oth-earns
+
+  if $state = '$U'
+    if $Processed-with-Taxbal = 'Y'
+      do reduce-oth-earns
+    end-if
+    if $Processed-with-No-Taxbal = 'Y'
+      do reduce-oth-earns-alt
+    end-if
+  end-if
+
+FROM PS_TAXFORM_ERN QB
+WHERE QB.EFFDT      = $Max_Effdt
+  AND QB.TAXFORM_ID = $Ataxform_id
+ORDER BY QB.BOX, QB.ERNCD
+end-SELECT
+
+end-procedure
+
+begin-procedure ERN-Total
+
+  do Get-Old-Row
+  add #AMT_OLD to #EAMT_OLD
+  do Delete-Old-Row
+  if #Amount <> 0
+    do Insert-W2-Amount
+  end-if
+  move 0 to #Amount
+
+end-procedure
+
+begin-procedure process-oth-earns
+
+  let $Processed-with-Taxbal = 'N'
+  let $Processed-with-No-Taxbal = 'N'
+
+Begin-SELECT
+QE.OTH_PAY
+
+  add &QE.OTH_PAY to #Amount
+  add &QE.OTH_PAY to #EAMT_NEW
+  let $Processed-with-Taxbal = 'Y'
+
+FROM PS_PAY_OTH_EARNS QE, PS_PAY_TAX QF, PS_PAY_CHECK QG
+WHERE QE.COMPANY    = $Acompany
+  AND QE.ERNCD      = &QB.ERNCD
+  AND QG.CHECK_DT   between $BeginDate and $AsOfDate
+  AND QG.EMPLID     = $Aemplid
+  AND QG.PAYCHECK_STATUS IN ('A','F','R')
+  AND QE.COMPANY    = QG.COMPANY
+  AND QE.PAYGROUP   = QG.PAYGROUP
+  AND QE.PAY_END_DT = QG.PAY_END_DT
+  AND QE.OFF_CYCLE  = QG.OFF_CYCLE
+  AND QE.PAGE_NUM   = QG.PAGE_NUM
+  AND QE.LINE_NUM   = QG.LINE_NUM
+  AND QE.SEPCHK     = QG.SEPCHK
+  AND QE.COMPANY    = QF.COMPANY
+  AND QE.PAYGROUP   = QF.PAYGROUP
+  AND QE.PAY_END_DT = QF.PAY_END_DT
+  AND QE.OFF_CYCLE  = QF.OFF_CYCLE
+  AND QE.PAGE_NUM   = QF.PAGE_NUM
+  AND QE.LINE_NUM   = QF.LINE_NUM
+  AND QE.SEPCHK     = QF.SEPCHK
+  AND QF.STATE      = $state
+  AND QF.TAX_CLASS  = (SELECT MIN(TAX_CLASS)
+                     FROM PS_PAY_TAX QF2
+                     WHERE QF2.COMPANY  = QF.COMPANY
+                     AND QF2.PAYGROUP   = QF.PAYGROUP
+                     AND QF2.PAY_END_DT = QF.PAY_END_DT
+                     AND QF2.OFF_CYCLE  = QF.OFF_CYCLE
+                     AND QF2.PAGE_NUM   = QF.PAGE_NUM
+                     AND QF2.LINE_NUM   = QF.LINE_NUM
+                     AND QF2.SEPCHK     = QF.SEPCHK
+                     AND QF2.STATE      = QF.STATE)
+end-SELECT
+
+  do Determine-Tax-Status
+
+
+end-procedure
+
+begin-procedure Determine-Tax-Status
+
+Begin-SELECT
+QX.ERNCD
+
+  do Process-Oth-Earns-Alt
+
+FROM PS_EARNINGS_TBL QX
+
+WHERE &QB.ERNCD = QX.ERNCD
+
+  AND QX.EFFDT = (SELECT MAX(EFFDT) FROM PS_EARNINGS_TBL QXA
+                WHERE QX.ERNCD = QXA.ERNCD)
+  AND QX.EFF_STATUS = 'A'
+  AND QX.SUBJECT_FWT = 'N'
+  AND QX.SUBJECT_FICA = 'N'
+  AND QX.SUBJECT_FUT = 'N'
+
+end-SELECT
+
+end-procedure
+
+begin-procedure Process-Oth-Earns-Alt
+
+Begin-SELECT
+QX1.OTH_PAY
+
+  add &QX1.OTH_PAY to #Amount
+  add &QX1.OTH_PAY to #EAMT_NEW
+  let $Processed-with-No-Taxbal = 'Y'
+
+FROM PS_PAY_OTH_EARNS QX1, PS_PAY_CHECK QX2
+WHERE QX1.COMPANY    = $Acompany
+  AND QX1.ERNCD      = &QB.ERNCD
+  AND QX2.CHECK_DT   between $BeginDate and $AsOfDate
+  AND QX2.EMPLID     = $Aemplid
+  AND QX2.PAYCHECK_STATUS IN ('A','F','R')
+  AND QX1.COMPANY    = QX2.COMPANY
+  AND QX1.PAYGROUP   = QX2.PAYGROUP
+  AND QX1.PAY_END_DT = QX2.PAY_END_DT
+  AND QX1.OFF_CYCLE  = QX2.OFF_CYCLE
+  AND QX1.PAGE_NUM   = QX2.PAGE_NUM
+  AND QX1.LINE_NUM   = QX2.LINE_NUM
+  AND QX1.SEPCHK     = QX2.SEPCHK
+  AND NOT EXISTS (SELECT 'X' FROM PS_PAY_TAX QX3
+                     WHERE QX2.COMPANY  = QX3.COMPANY
+                     AND QX2.PAYGROUP   = QX3.PAYGROUP
+                     AND QX2.PAY_END_DT = QX3.PAY_END_DT
+                     AND QX2.OFF_CYCLE  = QX3.OFF_CYCLE
+                     AND QX2.PAGE_NUM   = QX3.PAGE_NUM
+                     AND QX2.LINE_NUM   = QX3.LINE_NUM
+                     AND QX2.SEPCHK     = QX3.SEPCHK
+                     AND QX2.STATE      = QX3.STATE)
+end-SELECT
+
+end-procedure
+
+begin-procedure reduce-oth-earns
+
+Begin-SELECT
+QE1.OTH_PAY
+
+  subtract &QE1.OTH_PAY from #Amount
+  subtract &QE1.OTH_PAY from #EAMT_NEW
+
+FROM PS_PAY_OTH_EARNS QE1, PS_PAY_TAX QF1, PS_PAY_CHECK QG1
+WHERE QE1.COMPANY    = $Acompany
+  AND QE1.ERNCD      = &QB.ERNCD
+  AND QG1.CHECK_DT   between $BeginDate and $AsOfDate
+  AND QG1.EMPLID     = $Aemplid
+  AND QG1.PAYCHECK_STATUS IN ('A','F','R')
+  AND QE1.COMPANY    = QG1.COMPANY
+  AND QE1.PAYGROUP   = QG1.PAYGROUP
+  AND QE1.PAY_END_DT = QG1.PAY_END_DT
+  AND QE1.OFF_CYCLE  = QG1.OFF_CYCLE
+  AND QE1.PAGE_NUM   = QG1.PAGE_NUM
+  AND QE1.LINE_NUM   = QG1.LINE_NUM
+  AND QE1.SEPCHK     = QG1.SEPCHK
+  AND QE1.COMPANY    = QF1.COMPANY
+  AND QE1.PAYGROUP   = QF1.PAYGROUP
+  AND QE1.PAY_END_DT = QF1.PAY_END_DT
+  AND QE1.OFF_CYCLE  = QF1.OFF_CYCLE
+  AND QE1.PAGE_NUM   = QF1.PAGE_NUM
+  AND QE1.LINE_NUM   = QF1.LINE_NUM
+  AND QE1.SEPCHK     = QF1.SEPCHK
+  AND QF1.STATE      in ('$UAS','$UGU','$UPR','$UVI')
+  AND QF1.TAX_CLASS  = (SELECT MIN(TAX_CLASS)
+                     FROM PS_PAY_TAX QF3
+                     WHERE QF3.COMPANY  = QF1.COMPANY
+                     AND QF3.PAYGROUP   = QF1.PAYGROUP
+                     AND QF3.PAY_END_DT = QF1.PAY_END_DT
+                     AND QF3.OFF_CYCLE  = QF1.OFF_CYCLE
+                     AND QF3.PAGE_NUM   = QF1.PAGE_NUM
+                     AND QF3.LINE_NUM   = QF1.LINE_NUM
+                     AND QF3.SEPCHK     = QF1.SEPCHK
+                     AND QF3.STATE      = QF1.STATE)
+end-SELECT
+
+end-procedure
+
+begin-procedure reduce-oth-earns-alt
+
+Begin-SELECT
+QY1.OTH_PAY
+
+  subtract &QY1.OTH_PAY from #Amount
+  subtract &QY1.OTH_PAY from #EAMT_NEW
+
+FROM PS_PAY_OTH_EARNS QY1, PS_PAY_CHECK QY2
+WHERE QY1.COMPANY    = $Acompany
+  AND QY1.ERNCD      = &QB.ERNCD
+  AND QY2.CHECK_DT   between $BeginDate and $AsOfDate
+  AND QY2.EMPLID     = $Aemplid
+  AND QY2.PAYCHECK_STATUS IN ('A','F','R')
+  AND QY1.COMPANY    = QY2.COMPANY
+  AND QY1.PAYGROUP   = QY2.PAYGROUP
+  AND QY1.PAY_END_DT = QY2.PAY_END_DT
+  AND QY1.OFF_CYCLE  = QY2.OFF_CYCLE
+  AND QY1.PAGE_NUM   = QY2.PAGE_NUM
+  AND QY1.LINE_NUM   = QY2.LINE_NUM
+  AND QY1.SEPCHK     = QY2.SEPCHK
+  AND NOT EXISTS (SELECT 'X' FROM PS_PAY_TAX QY3
+                     WHERE QY2.COMPANY  = QY3.COMPANY
+                     AND QY2.PAYGROUP   = QY3.PAYGROUP
+                     AND QY2.PAY_END_DT = QY3.PAY_END_DT
+                     AND QY2.OFF_CYCLE  = QY3.OFF_CYCLE
+                     AND QY2.PAGE_NUM   = QY3.PAGE_NUM
+                     AND QY2.LINE_NUM   = QY3.LINE_NUM
+                     AND QY2.SEPCHK     = QY3.SEPCHK
+                     AND QY2.STATE      = QY3.STATE)
+end-SELECT
+
+end-procedure
+
+begin-procedure Process-DED
+  move 0 to #Amount
+
+Begin-SELECT DISTINCT
+QH.BOX              () on-break print=never level=1 before=New-DED after=DED-Total
+QH.PLAN_TYPE
+QH.DEDCD
+QH.DED_CLASS
+
+  let $box = &QH.BOX
+
+  do process-deductions
+
+  if $state = '$U'
+    do reduce-deductions
+  end-if
+
+FROM PS_TAXFORM_DED QH
+WHERE QH.EFFDT      = $Max_Effdt
+  AND QH.TAXFORM_ID = $Ataxform_id
+ORDER BY QH.BOX, QH.PLAN_TYPE, QH.DEDCD, QH.DED_CLASS
+end-SELECT
+
+end-procedure
+
+begin-procedure New-DED
+
+  move 'N' to $pen
+
+  if $Ataxform_id = 'P' and &QH.BOX = '16 '
+    and &TX.Balance_Year < 2005
+    move 'Y' to $pen
+  end-if
+
+  if $Ataxform_id = 'P' and &QH.BOX = '15 '
+    and &TX.Balance_Year > 2004
+    move 'Y' to $pen
+  end-if
+
+  if $Ataxform_id <> 'P'
+    evaluate &QH.BOX
+      when = '12D'
+      when = '12E'
+      when = '12F'
+      when = '12G'
+      when = '12H'
+      when = '12S'
+        move 'Y' to $pen
+    end-evaluate
+  end-if
+
+end-procedure
+
+begin-procedure DED-Total
+
+    do Get-Old-Row
+    add #AMT_OLD to #DAMT_OLD
+    do Delete-Old-Row
+    if #Amount <> 0
+      do Insert-W2-Amount
+      if $pen = 'Y'
+        evaluate $state
+          when = '$U'
+               add #Amount to #PAMT_U
+               break
+          when = '$UAS'
+               add #Amount to #PAMT_UAS
+               break
+          when = '$UGU'
+               add #Amount to #PAMT_UGU
+               break
+          when = '$UPR'
+               add #Amount to #PAMT_UPR
+               break
+          when = '$UVI'
+               add #Amount to #PAMT_UVI
+               break
+        end-evaluate
+      end-if
+    end-if
+    move 0 to #Amount
+
+end-procedure
+
+
+begin-procedure process-deductions
+
+Begin-SELECT
+QI.DED_CUR
+
+  add &QI.DED_CUR to #Amount
+  add &QI.DED_CUR to #DAMT_NEW
+
+FROM PS_PAY_DEDUCTION QI, PS_PAY_TAX QJ, PS_PAY_CHECK QK
+WHERE QI.COMPANY    = $Acompany
+  AND QI.PLAN_TYPE  = &QH.PLAN_TYPE
+  AND QI.DEDCD      = &QH.DEDCD
+  AND QI.DED_CLASS  = &QH.DED_CLASS
+  AND QK.CHECK_DT   between $BeginDate and $AsOfDate
+  AND QK.EMPLID     = $Aemplid
+  AND QK.PAYCHECK_STATUS IN ('A','F','R')
+  AND QI.COMPANY    = QK.COMPANY
+  AND QI.PAYGROUP   = QK.PAYGROUP
+  AND QI.PAY_END_DT = QK.PAY_END_DT
+  AND QI.OFF_CYCLE  = QK.OFF_CYCLE
+  AND QI.PAGE_NUM   = QK.PAGE_NUM
+  AND QI.LINE_NUM   = QK.LINE_NUM
+  AND QI.SEPCHK     = QK.SEPCHK
+  AND QI.COMPANY    = QJ.COMPANY
+  AND QI.PAYGROUP   = QJ.PAYGROUP
+  AND QI.PAY_END_DT = QJ.PAY_END_DT
+  AND QI.OFF_CYCLE  = QJ.OFF_CYCLE
+  AND QI.PAGE_NUM   = QJ.PAGE_NUM
+  AND QI.LINE_NUM   = QJ.LINE_NUM
+  AND QI.SEPCHK     = QJ.SEPCHK
+  AND QJ.STATE      = $state
+  AND QJ.TAX_CLASS  = (SELECT MIN(TAX_CLASS)
+                     FROM PS_PAY_TAX QJ2
+                     WHERE QJ2.COMPANY  = QJ.COMPANY
+                     AND QJ2.PAYGROUP   = QJ.PAYGROUP
+                     AND QJ2.PAY_END_DT = QJ.PAY_END_DT
+                     AND QJ2.OFF_CYCLE  = QJ.OFF_CYCLE
+                     AND QJ2.PAGE_NUM   = QJ.PAGE_NUM
+                     AND QJ2.LINE_NUM   = QJ.LINE_NUM
+                     AND QJ2.SEPCHK     = QJ.SEPCHK
+                     AND QJ2.STATE      = QJ.STATE)
+end-SELECT
+
+end-procedure
+
+begin-procedure reduce-deductions
+
+Begin-SELECT
+QI1.DED_CUR
+
+  subtract &QI1.DED_CUR from #Amount
+  subtract &QI1.DED_CUR from #DAMT_NEW
+
+FROM PS_PAY_DEDUCTION QI1, PS_PAY_TAX QJ1, PS_PAY_CHECK QK1
+WHERE QI1.COMPANY    = $Acompany
+  AND QI1.PLAN_TYPE  = &QH.PLAN_TYPE
+  AND QI1.DEDCD      = &QH.DEDCD
+  AND QI1.DED_CLASS  = &QH.DED_CLASS
+  AND QK1.CHECK_DT   between $BeginDate and $AsOfDate
+  AND QK1.EMPLID     = $Aemplid
+  AND QK1.PAYCHECK_STATUS IN ('A','F','R')
+  AND QI1.COMPANY    = QK1.COMPANY
+  AND QI1.PAYGROUP   = QK1.PAYGROUP
+  AND QI1.PAY_END_DT = QK1.PAY_END_DT
+  AND QI1.OFF_CYCLE  = QK1.OFF_CYCLE
+  AND QI1.PAGE_NUM   = QK1.PAGE_NUM
+  AND QI1.LINE_NUM   = QK1.LINE_NUM
+  AND QI1.SEPCHK     = QK1.SEPCHK
+  AND QI1.COMPANY    = QJ1.COMPANY
+  AND QI1.PAYGROUP   = QJ1.PAYGROUP
+  AND QI1.PAY_END_DT = QJ1.PAY_END_DT
+  AND QI1.OFF_CYCLE  = QJ1.OFF_CYCLE
+  AND QI1.PAGE_NUM   = QJ1.PAGE_NUM
+  AND QI1.LINE_NUM   = QJ1.LINE_NUM
+  AND QI1.SEPCHK     = QJ1.SEPCHK
+  AND QJ1.STATE      in ('$UAS','$UGU','$UPR','$UVI')
+  AND QJ1.TAX_CLASS  = (SELECT MIN(TAX_CLASS)
+                     FROM PS_PAY_TAX QJ3
+                     WHERE QJ3.COMPANY  = QJ1.COMPANY
+                     AND QJ3.PAYGROUP   = QJ1.PAYGROUP
+                     AND QJ3.PAY_END_DT = QJ1.PAY_END_DT
+                     AND QJ3.OFF_CYCLE  = QJ1.OFF_CYCLE
+                     AND QJ3.PAGE_NUM   = QJ1.PAGE_NUM
+                     AND QJ3.LINE_NUM   = QJ1.LINE_NUM
+                     AND QJ3.SEPCHK     = QJ1.SEPCHK
+                     AND QJ3.STATE      = QJ1.STATE)
+end-SELECT
+
+end-procedure
+
+
+begin-procedure Get-Old-Row
+
+  move 0 to #AMT_OLD
+
+Begin-SELECT
+QL.COMPANY
+QL.EMPLID
+QL.CALENDAR_YEAR
+QL.TAXFORM_ID
+QL.SEQUENCE_NUMBER
+QL.BOX
+QL.STATE
+QL.LOCALITY
+QL.WORK_PSD_CD
+QL.RES_PSD_CD
+QL.W2_AMOUNT
+
+  add &QL.W2_AMOUNT to #AMT_OLD
+
+FROM PS_YE_AMOUNTS QL
+WHERE QL.COMPANY       = $Acompany
+  AND QL.EMPLID        = $Aemplid
+  AND QL.CALENDAR_YEAR = &TX.Balance_Year
+  AND QL.TAXFORM_ID    = $Ataxform_id
+  AND QL.BOX           = $box
+end-SELECT
+
+end-procedure
+
+begin-procedure Delete-Old-Row
+begin-SQL  on-error=Ignore
+DELETE FROM PS_YE_AMOUNTS
+WHERE COMPANY       = $Acompany
+  AND EMPLID        = $Aemplid
+  AND CALENDAR_YEAR = &TX.Balance_Year
+  AND TAXFORM_ID    = $Ataxform_id
+  AND BOX           = $box
+end-SQL
+end-procedure
+
+begin-procedure Delete-YE-EE-DATA
+
+begin-SQL  on-error=Ignore
+DELETE FROM PS_YE_EE
+WHERE COMPANY       = &CL.Company
+  AND EMPLID        = &CL.Emplid
+  AND CALENDAR_YEAR = &TX.Balance_Year
+  AND TAXFORM_ID    = &YE.TAXFORM_ID
+end-SQL
+
+begin-SQL  on-error=Ignore
+DELETE FROM PS_YE_DATA
+WHERE COMPANY       = &CL.Company
+  AND EMPLID        = &CL.Emplid
+  AND CALENDAR_YEAR = &TX.Balance_Year
+  AND TAXFORM_ID    = &YE.TAXFORM_ID
+  AND SEQUENCE_NUMBER = #Sequence_Number
+end-SQL
+
+end-procedure
+
+begin-procedure Insert-W2-Amount
+
+begin-SQL on-error=Error-W2-Amounts
+
+  INSERT INTO PS_YE_AMOUNTS (COMPANY,
+                             EMPLID,
+                             CALENDAR_YEAR,
+                             TAXFORM_ID,
+                             SEQUENCE_NUMBER,
+                             BOX,
+                             STATE,
+                             LOCALITY,
+                             WORK_PSD_CD,
+                             RES_PSD_CD,
+                             W2_AMOUNT)
+                     VALUES ($Acompany,
+                             $Aemplid,
+                             &TX.Balance_Year,
+                             $Ataxform_id,
+                             #Sequence_Number,
+                             $box,
+                             '$U',
+                             ' ',
+                             ' ',
+                             ' ',
+                             #Amount);
+end-SQL
+end-procedure
+
+
+begin-procedure Error-W2-Amounts
+  display 'W2 Amount Error '  noline
+  display $Acompany           noline
+  display ' '                 noline
+  display $Aemplid            noline
+  display ' '                 noline
+  display &TX.Balance_Year    noline
+  display ' '                 noline
+  display $Ataxform_id        noline
+  display ' '                 noline
+  display $box                noline
+  display ' '                 noline
+  display $State              noline
+  display ' '                 noline
+  display #Amount
+end-procedure
+
+begin-procedure Zero-Pen
+  move 0 to #PAMT_U
+  move 0 to #PAMT_UAS
+  move 0 to #PAMT_UGU
+  move 0 to #PAMT_UPR
+  move 0 to #PAMT_UVI
+end-procedure
+
+begin-procedure Get-Pension-Plan
+
+begin-SELECT DISTINCT
+QM.PENSION_PLAN
+
+FROM PS_YE_DATA QM
+WHERE COMPANY       = $Acompany
+  AND EMPLID        = $Aemplid
+  AND CALENDAR_YEAR = &TX.Balance_Year
+end-SELECT
+end-procedure
+
+begin-procedure Clear-Pension-Plan
+
+begin-SQL  on-error=Ignore
+UPDATE PS_YE_DATA
+  SET PENSION_PLAN  = 'N'
+WHERE COMPANY       = $Acompany
+  AND EMPLID        = $Aemplid
+  AND CALENDAR_YEAR = &TX.Balance_Year
+end-SQL
+end-procedure
+
+begin-procedure Update-Pension-Plan
+
+  if #PAMT_U > 0
+    move 'W'           to $TAXFORM_ID
+    do Update-W2-Data
+  end-if
+
+  if #PAMT_UAS > 0
+    move 'S'           to $TAXFORM_ID
+    do Update-W2-Data
+  end-if
+
+  if #PAMT_UGU > 0
+    move 'M'           to $TAXFORM_ID
+    do Update-W2-Data
+  end-if
+
+  if #PAMT_UPR > 0
+    move 'P'           to $TAXFORM_ID
+    do Update-W2-Data
+  end-if
+
+  if #PAMT_UVI > 0
+    move 'I'           to $TAXFORM_ID
+    do Update-W2-Data
+  end-if
+
+end-procedure
+
+begin-procedure Update-W2-Data
+
+begin-SQL  on-error=Ignore
+UPDATE PS_YE_DATA
+  SET PENSION_PLAN  = 'Y'
+WHERE COMPANY       = $Acompany
+  AND EMPLID        = $Aemplid
+  AND CALENDAR_YEAR = &TX.Balance_Year
+  AND TAXFORM_ID    = $TAXFORM_ID
+end-SQL
+end-procedure
+
+begin-procedure Ignore
+  !Dummy procedure to avoid error if no records to delete
+end-procedure
+
+
+#include 'tranctrl.sqc'  !Transaction Control
+#Include 'taxrnctl.sqc'  !Get-Tax-Reporting-Run-Controls procedure
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'stdapi.sqc'    !Update Process API

@@ -1,0 +1,570 @@
+!********************************
+!  PAY005:  Cost Center Report  *
+!********************************
+!******************************************************************************
+!                                                                      	      *
+!               Confidentiality Information:                           	      *
+!                                                                      	      *
+! This module is the confidential and proprietary information of       	      *
+! PeopleSoft, Inc.; it is not to be copied, reproduced, or transmitted 	      *
+! in any form, by any means, in whole or in part, nor is it to be used 	      *
+! for any purpose other than that for which it is expressly provided   	      *
+! without the written permission of PeopleSoft.                        	      *
+!                                                                      	      *
+! Copyright (c) 1988-1997 PeopleSoft, Inc. All Rights Reserved         	      *
+!                                                                      	      *
+!******************************************************************************
+!                                                                      	      *
+!      $Date:: 7/02/98 6:01p    $                                      	      *
+!  $Revision:: 3                $                                      	      *
+!  $Workfile:: PAY005.SQR       $                                      	      *
+!                                                                      	      *
+!******************************************************************************
+!******************************************************************************
+!                         MODIFICATION HISTORY                         	      *
+!******************************************************************************
+! INITIALS  DATE        DESCRIPTION OF THE CHANGE                      	      *
+!******************************************************************************
+! SXK       03/25/99    Initial Creation.                              	      *
+! SXK       03/29/99    Added Shift and Shift Rate for each pay line.  	      *
+! SXK       04/04/99    Removed redundant report procedure.            	      *
+! JDH       04/19/99    Modified SQL to exclude confirmed pay lines.   	      *
+!                       Added SQRW run control logic.                  	      *
+! CJH       01/02/01    Added criteria to ignore the off-cycle pay     	      *
+!                       calendar entries                               	      *
+! CWB       03/21/2001  Added DEPTID to run control.                   	      *
+! GBD       09/06/2002  v8.3 Upgrade                                   	      *
+!                                                                      	      *
+!HR-10702 CWB 05/10/2004 Added EMPL_TYPE to the report.                	      *
+!                                                                      	      *
+!HR-10728 CWB 05/25/2004 Fix the code in main select to report EEs who 	      *
+!                        have hours in stores other than their home one	      *
+!                                                                      	      * 
+!CSR 10860               Holiday hours(ex: -4 hrs) are not shown on the Rpt,  *
+!			 when Payroll is run during the holiday.              *  	
+!                                                                             * 
+!			 Hoilday hours (-4) comes under Regular Hours         *                             			 			 
+!                        and it is REG_HRS, But the program was selecting     *
+!	 		 REG_PAY_HRS(instead of REG_HRS)so,changed to REG_HRS.*
+!								 	      *
+!                        Added Overtime Earnings (OT_HRLY_EARNS) in selection *
+!		 	 Criteria                    			      *	
+!									      *
+!                        Also, On the Report $amount for Other Earnings was   *
+!			 showing as 0.00 this is because the value is selected*
+!			 from a wrong column, it's selecting OTH_PAY whereas  *
+!			 it is supposed to be OTH_EARNS.                      *
+!                                                                             *
+!CSR 10860/ITG 32894     Remove the changes done according to the CSR 10860   *
+!                        Reason: It is not working correctly for the non      *
+!			 exempt population.                                   *                           
+!******************************************************************************
+                         
+                         
+#include 'setenv.sqc' !Set environment
+#Include 'setup02.sqc'  !Printer and page-size initialization
+                         
+!********************************************************
+begin-report
+  do Init-Report
+  do Stdapi-Term
+end-report
+!********************************************************
+
+
+!********************************************************
+begin-procedure Init-Report
+!********************************************************
+#debug9 Show 'Init-Report'
+  move 'GEXPY005' to $ReportID
+  move 'Time Balance Report' to $ReportTitle
+
+  do Init-DateTime
+  do Init-Number
+  do Stdapi-Init
+  do Array-Initialization
+  do get-current-datetime
+  do check-run-control
+end-procedure
+
+
+!********************************************************
+begin-procedure Array-Initialization
+!********************************************************
+#debug9 Show 'Array-Initialization'
+  create-array name=Totals size=5 -
+    field=TotalName:char field=total:number:7 field=startCol:number:7
+  put 'Grand Total'       into Totals(1) TotalName
+  put 'Company Total'     into Totals(2) TotalName
+  put 'Pay Period Total'  into Totals(3) TotalName
+  put 'Cost Center Total' into Totals(4) TotalName
+  put  40 into Totals(0) startCol(0)
+  put  54 into Totals(0) startCol(1)
+  put  63 into Totals(0) startCol(2)
+  put  74 into Totals(0) startCol(3)
+  put  87 into Totals(0) startCol(4)
+  put 101 into Totals(0) startCol(5)
+  put 118 into Totals(0) startCol(6)
+end-procedure
+
+!********************************************************
+begin-heading 8
+!********************************************************
+  if $DeptID <> $priorDeptID
+    do Get-Department-Name
+    move $DeptID to $priorDeptID
+  end-if
+
+  #Include 'stdhdg07.sqc'
+  if $PayGroup <> $priorPayGroup
+    do Get-PayGroup-Data
+    move $PayGroup to $priorPayGroup
+  end-if
+  print '/ Pay Group '        (3,35)
+  print $PayGroup          ()
+  print $PayGroupName      (0,+1)
+
+  print                                           '<----- REGULAR ---' (+4,48)
+  print '-->  <-- OVERTIME ---> <--------- OTHER --------->          ' ()
+  print ' Total'                                                       ()
+  print 'Employee Name                 Type Employee ID  Hours      Earni' (+1,1)
+  print 'ngs    Hours   Earnings  Type  Hours      Earnings         E' ()
+  print 'arnings     Shift     Shift Rate'                             ()
+end-heading
+
+!********************************************************
+Begin-Procedure Check-Run-Control
+!********************************************************
+#debug9 Show 'Check-Run-Control'
+  Let $GEXXX900_Company_Alias  = 'b.company'
+  Let $GEXXX901_Company_Alias  = 'b.company'
+  Let $GEXXX901_Paygroup_Alias = 'b.paygroup'
+
+! CWB 03/21/2001 BEGIN
+  Let $GEXXX902_Deptid_Alias   = 'b.deptid'
+! CWB 03/21/2001 END
+ 
+  If $prcs_process_instance = ''
+    Do P110-SQRW-Run-Controls
+  Else
+    Do P120-Process-Scheduler-Run-Controls
+  End-If
+
+  Do Format-DateTime($X000_Where_Select_AsOfDate, $X000_Report_Heading_AsOfDate, {DEFDATE}, '', '')
+  Let $X000_Order_By = 'Company, Paygroup, Department, Name'
+
+  Show '$GEXXX900_Include_Company_Display_Criteria          = ' $GEXXX900_Include_Company_Display_Criteria
+  Show '$GEXXX901_Include_Company_Paygroup_Display_Criteria = ' $GEXXX901_Include_Company_Paygroup_Display_Criteria
+! CWB 03/21/2001 BEGIN
+  Show '$GEXXX902_Include_Deptid_Display_Criteria          = ' $GEXXX902_Include_Deptid_Display_Criteria
+! CWB 03/21/2001 END
+  Show '$X000_Where_Select_AsOfDate = ' $X000_Where_Select_AsOfDate
+
+  Do P130-Print-Cover-Page
+  do get-pay-end-dt
+
+  do Report
+End-Procedure
+
+!********************************************************
+Begin-Procedure P110-SQRW-Run-Controls
+!********************************************************
+#debug9 Show 'P110-SQRW-Run-Controls'
+  Do Ask-As-Of-Date
+  Let $X000_WHERE_SELECT_ASOFDATE = $AsOfDate
+
+  Let $GEXXX900_INCLUDE_COMPANY_CRITERIA = '1=1'
+  Let $GEXXX900_INCLUDE_COMPANY_DISPLAY_CRITERIA = 'ALL'
+
+
+  Display 'Enter Company/Paygroup or leave blank to exit.'
+  While 1=1
+    Input $In-Company Maxlen=3 'Company'
+    Uppercase $In-Company
+    If Rtrim($In-Company, ' ') = ''
+      Break
+    Else
+      Input $In-Paygroup Maxlen=3 'Paygroup'
+      Uppercase $In-Paygroup
+      If Rtrim($In-Paygroup, ' ') = ''
+        Let $Include_Condition = '(' || $GEXXX901_Company_Alias || ' = '''  || $In-Company || ''')'
+      Else
+        Let $Include_Condition = '(' || $GEXXX901_Company_Alias || ' = '''  || $In-Company || ''' And ' || $GEXXX901_Paygroup_Alias || ' = '''  || $In-Paygroup || ''')'
+      End-If
+      Add 1 To #GEX_RC_PAYGROUP_ROWS
+      If #GEX_RC_PAYGROUP_ROWS = 1
+        Let $GEXXX901_INCLUDE_COMPANY_PAYGROUP_CRITERIA = '(' || $Include_Condition
+      Else
+        Let $GEXXX901_INCLUDE_COMPANY_PAYGROUP_CRITERIA = $GEXXX901_INCLUDE_COMPANY_PAYGROUP_CRITERIA || ' Or '  || $Include_Condition
+      End-If
+    End-If
+  End-While
+
+  If #GEX_RC_PAYGROUP_ROWS = 0
+    Let $GEXXX901_INCLUDE_COMPANY_PAYGROUP_CRITERIA = '1=1'
+    Let $GEXXX901_INCLUDE_COMPANY_PAYGROUP_DISPLAY_CRITERIA = 'ALL'
+  Else
+    Let $GEXXX901_INCLUDE_COMPANY_PAYGROUP_CRITERIA = $GEXXX901_INCLUDE_COMPANY_PAYGROUP_CRITERIA || ')'
+    Let $GEXXX901_INCLUDE_COMPANY_PAYGROUP_DISPLAY_CRITERIA = $GEXXX901_INCLUDE_COMPANY_PAYGROUP_CRITERIA
+  End-If
+
+! CWB 03/21/2001 BEGIN
+    Display 'Enter DeptID or leave blank to exit.'
+    Let #deptcount = 1                                    !GBD 09/06/2002
+    While 1=1
+      Input $In-DeptID Maxlen=10 'DeptID'
+      Uppercase $In-DeptID
+
+      If Rtrim($In-DeptID, ' ') = ''
+        Concat '''' With $DeptIDString
+        Break
+      End-If
+!GBD 09/06/2002 Begin - Modified Statements
+      If $DeptIDString <> ''''
+        if #deptcount = 1
+           Concat '''' With $DeptIDString
+        else
+           Concat ''',''' With $DeptIDString
+        end-if
+        add 1 to #deptcount
+      End-If
+      Concat $In-DeptID With $DeptIDString
+
+    End-While
+
+    If $DeptIDString = '''''' or $DeptIDString = ''''
+      Let $GEXXX902_INCLUDE_DEPTID_CRITERIA = '1=1'
+      Let $GEXXX902_INCLUDE_DEPTID_DISPLAY_CRITERIA = 'ALL'
+    Else
+      Let $GEXXX902_INCLUDE_DEPTID_CRITERIA = $GEXXX902_Deptid_Alias || ' In (' || $DeptIDString || ')'
+      Let $GEXXX902_INCLUDE_DEPTID_DISPLAY_CRITERIA = $GEXXX902_INCLUDE_DEPTID_CRITERIA
+    End-If
+!GBD 09/06/2002 End
+! CWB 03/21/2001 END
+
+End-Procedure
+
+!********************************************************
+Begin-Procedure P120-Process-Scheduler-Run-Controls
+!********************************************************
+#debug9 Show 'P120-Process-Scheduler-Run-Controls'
+  Do GEXXX922-Select-Parameters
+
+  Let $X000_Where_Select_AsOfDate = $GEX_RC_PAY.AsOfDate
+  If Rtrim ($GEX_RC_PAY.AsOfDate, ' ') = ''
+    Let $X000_Where_Select_AsOfDate = $AsOfToday
+  End-If
+
+  Do GEXXX900-Select-Company-Parameters
+  Do GEXXX901-Select-Company-Paygroup-Parameters
+
+! CWB 03/21/2001 BEGIN
+  Do GEXXX902-Select-Deptid-Parameters
+! CWB 03/21/2001 END
+
+End-Procedure
+
+!********************************************************
+begin-procedure P130-Print-Cover-Page
+!********************************************************
+#debug9 Show 'P130-Print-Cover-Page'
+  Print 'RUN CONTROL INFORMATION FOR THIS REPORT RUN:'            (+5,1)
+  Print '$Prcs_OprID          ='                                  (+2,5)
+  Print $Prcs_OprID                                               (0,+2)
+  Print '$Prcs_Run_Cntl_ID    ='                                  (+1,5)
+  Print $Prcs_Run_Cntl_ID                                         (0,+2)
+
+  Print 'SELECTION CRITERIA FOR THIS REPORT RUN:'                 (+5,2)
+  Print '$GEXXX900_Include_Company_Display_Criteria          ='   (+1,5)
+  Print $GEXXX900_Include_Company_Display_Criteria                (0,+2)
+  Print '$GEXXX901_Include_Company_paygroup_Display_Criteria ='   (+1,5)
+  Print $GEXXX901_Include_Company_paygroup_Display_Criteria       (0,+2)
+
+! CWB 03/21/2001 BEGIN
+  Print '$GEXXX902_Include_Deptid_Display_Criteria          ='   (+1,5)
+  Print $GEXXX902_Include_Deptid_Display_Criteria                (0,+2)
+! CWB 03/21/2001 END
+
+  Print 'As Of Date :'                      (+2,5)
+  Print $X000_Report_Heading_AsOfDate       (0,+2)
+
+  Print 'SORT ORDER FOR THIS REPORT RUN:'   (+5,2)
+  Print $X000_Order_By                      (+2,5)
+
+  Let #PAGE-COUNT = 0
+  NEW-PAGE
+End-Procedure
+
+!********************************************************
+Begin-Procedure get-pay-end-dt
+!********************************************************
+#debug9 Show 'get-pay-end-dt'
+  move 'N' to $found
+
+begin-select
+PAY.PAY_BEGIN_DT
+PAY.PAY_END_DT
+
+  move &PAY.PAY_END_DT to $pay_end_Dt
+  move &PAY.PAY_BEGIN_DT to $pay_begin_dt
+  display 'Pay End Date: ' noline
+  display $pay_end_Dt
+  move 'Y' to $found
+  exit-select
+
+FROM PS_PAY_CALENDAR PAY
+
+WHERE PAY.PAY_SHEETS_RUN = 'Y'
+  AND PAY.PAY_END_DT = (SELECT MAX(PAY_END_DT)
+		      FROM PS_PAY_CALENDAR
+		     WHERE PAY_END_DT <= $X000_Where_Select_AsOfDate
+		       AND PAY_SHEETS_RUN = 'Y'
+! 01/02/2001 - add criteria to ignore the off-cycle pay calendar entries
+                       AND PAY_OFF_CYCLE_CAL = 'N')
+  AND PAY.PAY_OFF_CYCLE_CAL = 'N'
+! 01/02/2001
+
+end-select
+
+  if $found = 'N'
+    DISPLAY 'No Previously Sheeted Pay Cycle as of:'  noline
+    DISPLAY $X000_Where_Select_AsOfDate 
+    stop
+  end-if
+end-procedure
+!********************************************************
+
+
+!********************************************************
+begin-procedure Report
+!********************************************************
+#debug9 Show 'Report'
+ 
+begin-SELECT
+B.COMPANY    () on-break print=never level=1 procedure=Company-Change
+B.PAY_END_DT () on-break print=never level=2 procedure=PayEndDate-Change
+B.DEPTID     () on-break print=never level=3 procedure=Department-Change
+B.EMPLID     (+1,36) on-break        level=4 procedure=Employee-Change
+B.PAYGROUP
+P.NAME       () on-break print=never level=4
+   let $out = Rtrim(&P.Name, ' ')
+   print $out (0,1,30) on-break level=4
+   
+!B.REG_PAY_HRS     &Hours    (0,47)  EDIT       B999.99MI         !Commented       ISDVSRC 04/27/05  CSR10860
+B.REG_PAY_HRS     &Hours    (0,47)  EDIT       B999.99MI          !removed comment ISDVSRC 06/06/05  CSR10920
+
+!B.REG_HRS       &Hours    	(0,47)  EDIT       B999.99MI      !new       ISDVSRC 04/27/05 CSR10860 
+                                                                  !Commented ISDVSRC 06/06/05 CSR10920  
+B.REG_PAY       &Earnings 	(0,55)  EDIT       B9,999,999.99MI
+B.OT_HRS                	(0,70)  EDIT       B999.99MI
+
+!B.OT_HRLY_EARNS &OT_HRLY_EARNS  (0,79)  EDIT       B999.99MI      !ISDVSRC 04/27/05 CSR10860
+                                                                   !Commented ISDVSRC 06/06/05  CSR10920
+!B.OFF_CYCLE,B.PAGE#,B.LINE#,B.SEPCHK,B.ADDL#          
+B.OFF_CYCLE,B.PAGE_NUM,B.LINE_NUM,B.SEPCHK,B.ADDL_NBR     !GBD 09/06/2002
+B.SHIFT 
+B.SHIFT_RT 
+J.EMPL_TYPE  (0,32)    ! CWB 05/10/2004
+
+  move &B.Company    to $Company
+  move &B.Paygroup   to $Paygroup
+  
+  let $DeptID = Rtrim(&B.DeptID, ' ')
+  
+  move &B.Pay_End_Dt to $PayEndDate
+  move &B.Pay_End_Dt to $AsOfDate     !for included procedures
+  
+  add &Earnings        to #TotalEarnings
+  !add &OT_HRLY_EARNS   to #TotalEarnings  !ISDVSRC 04/27/05 
+                                            !commented - ISDVSRC 06/06/05  CSR10920	
+  
+						       !remove comment - ISDVSRC 06/06/05  CSR10920	
+  ARRAY-ADD &Hours &Earnings &B.OT_Hrs -               !previous code commented -ISDVSRC 04/27/05
+  to Totals(4) total(0) total(1) total(2)              !previous code commented -ISDVSRC 04/27/05
+                                                       !removed comment - ISDVSRC 06/06/05  CSR10920	
+!Commented ISDVSRC 06/06/05  CSR10920
+!  ARRAY-ADD &Hours &Earnings &OT_Hrs &OT_HRLY_EARNS - 	!ISDVSRC 04/27/05
+!  to Totals(4) total(0) total(1) total(2) total(3)   	!ISDVSRC 04/27/05
+!Commented ISDVSRC 06/06/05  CSR10920  
+
+
+  move 'N' to $OtherRecs
+  POSITION (-1)  !to ensure "Others" start on first line
+  do Get-Other-Hours-Earnings
+
+  if $OtherRecs = 'N'  !no "Others" for this employee's earnings record
+    POSITION (+1)
+  end-if
+
+FROM  PS_PAY_EARNINGS B, PS_PERSONAL_DATA P,PS_JOB J
+WHERE B.OK_TO_PAY  = 'Y'
+  AND B.SINGLE_CHECK_USE IN ('C', 'N')
+  AND B.PAY_LINE_STATUS <> 'F'
+  And [$GEXXX900_Include_Company_Criteria]
+  And [$GEXXX901_Include_Company_Paygroup_Criteria]
+! CWB 03/21/2001 BEGIN
+  And [$GEXXX902_Include_Deptid_Criteria]
+! CWB 03/21/2001 BEGIN
+  And B.PAY_END_DT = $pay_end_dt
+  AND B.EMPLID = P.EMPLID
+
+! CWB 05/25/2004 BEGIN
+!  AND J.COMPANY = B.COMPANY
+!  AND J.PAYGROUP = B.PAYGROUP
+!  AND J.DEPTID = B.DEPTID
+! CWB 05/25/2004 END
+
+  AND J.EMPLID = B.EMPLID
+  AND J.EMPL_RCD = B.EMPL_RCD
+  AND J.EFFDT  = 
+      (SELECT MAX(EFFDT)
+       FROM PS_JOB 
+       WHERE EMPLID = J.EMPLID
+       AND EMPL_RCD = J.EMPL_RCD
+       AND EFFDT <= $Pay_end_dt)
+  AND J.EFFSEQ  = 
+      (SELECT MAX(EFFSEQ)
+       FROM PS_JOB
+       WHERE EMPLID = J.EMPLID
+       AND EMPL_RCD = J.EMPL_RCD
+       AND EFFDT    = J.EFFDT)
+ORDER BY B.COMPANY, B.PAYGROUP, B.PAY_END_DT, B.DEPTID, P.NAME
+end-SELECT
+  move 1 to #changeLevel
+  move 'Y' to $End
+  do Print-Totals
+end-procedure
+!********************************************************
+
+
+
+!********************************************************
+begin-procedure Get-Other-Hours-Earnings
+!********************************************************
+!#debug9 Show 'Get-Other-Hours-Earnings'
+begin-SELECT
+ERNCD     (+1,90)
+OTH_HRS   (0,94)  EDIT       B999.99MI
+!OTH_PAY (0,102)  EDIT 99,999,999.99MI   !previous code commented ISDVSRC 04/27/05
+OTH_EARNS (0,102)  EDIT 99,999,999.99MI  !ISDVSRC 04/27/05
+
+  print &B.SHIFT  (0,138)
+  print &B.SHIFT_RT (0,148) edit 9,999.99
+  
+  !add &Oth_Pay to #TotalEarnings  				!previous code commented ISDVSRC 04/27/05
+  !ARRAY-ADD &Oth_Hrs &Oth_Pay to TOTALS(4) TOTAL(4) TOTAL(5)   !previous code commented ISDVSRC 04/27/05
+  
+  add &OTH_EARNS to #TotalEarnings 				 !ISDVSRC 04/27/05
+  ARRAY-ADD &Oth_Hrs &OTH_EARNS to TOTALS(4) total(4) total(5)   !ISDVSRC 04/27/05
+  
+  
+  move 'Y' to $OtherRecs
+FROM  PS_PAY_OTH_EARNS
+WHERE COMPANY    = $Company
+  AND PAYGROUP   = &B.PayGroup
+  AND PAY_END_DT = $PayEndDate
+  AND OFF_CYCLE  = &B.Off_Cycle
+  AND PAGE_NUM   = &B.Page_Num
+  AND LINE_NUM   = &B.Line_Num
+  AND SEPCHK     = &B.SepChk
+  AND ADDL_NBR   = &B.Addl_NBR
+ORDER BY ERNCD
+end-SELECT
+end-procedure
+!********************************************************
+
+
+
+!********************************************************
+begin-procedure Employee-Change
+!********************************************************
+!#debug9 Show 'Employee-Change'
+
+  !Show 'Employee-Change'
+  do Format-Number(#TotalEarnings, $out, '99,999,999.99mi')
+  print $out (0,119)
+  array-add #TotalEarnings to Totals(4) total(6)
+  move 0 to #TotalEarnings
+  position (+1)
+end-procedure
+
+!********************************************************
+begin-procedure Company-Change
+!********************************************************
+!#debug9 Show 'Company-Change'
+  move 2 to #changeLevel
+  do Print-Totals
+end-procedure
+
+!********************************************************
+begin-procedure PayEndDate-Change
+!********************************************************
+!#debug9 Show 'PayEndDate-Change'
+  move 3 to #changeLevel
+  do Print-Totals
+end-procedure
+
+!********************************************************
+begin-procedure Department-Change
+!********************************************************
+!#debug9 Show 'Department-Change'
+  move 4 to #changeLevel
+  do Print-Totals
+end-procedure
+
+!********************************************************
+begin-procedure Print-Totals
+!********************************************************
+!#debug9 Show 'Print-Totals'
+  do Employee-Change
+  move 4 to #totalRow
+  while #totalRow >= #changeLevel
+    if #current-line > 55  !don't split a total series across pages
+      new-page
+    end-if
+    move #totalRow to #rollRow
+    subtract 1 from #rollRow
+    get $TotalName from Totals(#totalRow) TotalName
+    print $TotalName (+3,23)				!cost center total 
+    position (+1)
+    move 1 to #posn
+    move 0 to #i
+    while #i <= 6
+      get #total from Totals(#totalRow) total(#i)
+      get #startCol from Totals(0) startCol(#i)
+      multiply -1 times #posn
+      if #i = 6  !print total earnings on the earnings line
+        move 0 to #posn
+      end-if
+      do Format-Number(#total, $out, '999,999,999.99mi')
+      print $out (+#posn,#startCol)
+      array-add #total to Totals(#rollRow) total(#i)
+      put 0 into Totals(#totalRow) total(#i)
+      add 1 to #i
+    end-while
+    subtract 1 from #totalRow
+  end-while
+  if $End = 'Y'
+    do Reset
+  end-if
+  new-page
+end-procedure
+!********************************************************
+
+
+#Include 'askaod.sqc'    !Ask-As-Of-Date procedure
+#Include 'getcodta.sqc'  !Get-Company-Data procedure
+#Include 'getpgdta.sqc'  !Get-Paygroup-Data Procedure
+#Include 'getdptnm.sqc'  !Get-Department-Name procedure
+#Include 'reset.sqc'     !Reset printer procedure
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'stdapi.sqc'    !Update Process API
+#include 'gexxx900.sqc'  !Get company multiple row table
+#include 'gexxx901.sqc'  !Get company/paygroup multiple row table
+#include 'gexxx922.sqc'  !Get pay single row run control
+
+! CWB 03/21/2001 BEGIN
+#include 'gexxx902.sqc'  !Get deptid multiple row table
+! CWB 03/21/2001 END

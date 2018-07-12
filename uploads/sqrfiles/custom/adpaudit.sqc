@@ -1,0 +1,783 @@
+!********************************************************************** 
+! SQR Name:           adpaudit.sqc  
+! SQR Descr:          ADP Tax Service Transporter 
+! Created by:         drmonroe 
+! Create date:        03/04/2010 
+! Last modified by:   drmonroe
+! Last modified date: 08/09/2012 
+!*********************************************************************** 
+!
+!  Dec 09, 2010 for 2011+ do NOT warn of mis-matching Fica EE/ER
+!                     08/09/2012 - Init-Audits added, called from pbzqtr.sqr
+!                                  NMU warning added for missing UI location 
+!----------------------------------------------------------------------------
+
+#define        adpaudit_release     adpaudit.Aug 9,2012
+
+#define SKIP_ZERO_LOCALS_WARNING_ORWC_WALOC  !skip warnings for Oregon W/C, Washington Locals always
+
+begin-procedure init-audits
+     show ''
+     show 'init-audits, version {adpaudit_release}'
+     #ifndef MULTISTATE_LIMIT            !this can be set in probiz.sqc to associate count of AK, VT, WY, MN/MI, WA, OR associates
+       #define MULTISTATE_LIMIT 3000
+     #endif
+     show 'Multi-state reporting enabled. array limit = {MULTISTATE_LIMIT}'
+     create-array name=multistate size={MULTISTATE_LIMIT}     -
+           field=Company:char              -
+           field=Emplid:char               -
+           field=Taxcode:char              -
+           field=Worksite:char             -
+           field=QTD_Taxable:number        -
+           field=QTD_Taxes:number          -
+           field=YTD_Taxable:number        -
+           field=YTD_Taxes:number          -
+           field=message:char              
+
+    
+     #ifndef AUDIT_LIMIT            !this can be set in probiz.sqc 
+       #define AUDIT_LIMIT 5000
+     #endif
+     show 'Tax and Wage audit enabled. array limit = {AUDIT_LIMIT}'
+     create-array name=audits size={AUDIT_LIMIT}     -
+           field=Company:char              -
+           field=Emplid:char               -
+           field=Message:char              -
+           field=Taxcode:char              -
+           field=QTD_Taxable:number        -
+           field=QTD_Taxes:number          -
+           field=YTD_Taxable:number        -
+           field=YTD_Taxes:number          -
+           field=pMessage:char             -
+           field=pTaxcode:char             -
+           field=pCompare:number       
+    
+     #ifndef VOID_LIMIT            !this can be set in probiz.sqc 
+       #define VOID_LIMIT 1000
+     #endif
+     show 'W-2 void audit enabled. array limit = {VOID_LIMIT}'
+     create-array name=voids size={VOID_LIMIT}     -
+           field=Company:char              -
+           field=Emplid:char               -
+           field=Message:char              -
+           field=Taxcode:char              -
+           field=QTD_Taxes:number          -
+           field=QTD_Taxable:number        -
+           field=YTD_Taxes:number          -
+           field=YTD_Taxable:number        
+end-procedure
+
+
+begin-procedure log-multistate      !hooked in from adp303.sqc right before WAGE records are written out  (everything else is here in pbzqtr.sqr)
+
+!       ALASKA         Occupational_Code            Geo_Code
+!       MI/MN/IA/MA/NM Location_code
+!       VERMONT        Empl_type (Hourly/Salary)    Hourly_rate       HLTH_COV  QTD-hours
+!       WYOMING        Wyoming_Comp_Cd              Wyoming_comp_rate
+!       WA/OR          Warning if zero hours in the quarter with positive QTD taxable wages
+!       ------------------------------------------------------------------------------------
+
+ if $SelectEmplid <> ''
+  show 'log-multistate: Emplid ' $Current_Emplid ', taxcode ' $Output_Taxcode
+ end-if
+
+ let $message = ''
+ let $output_taxcode_trimmed = rtrim($output_taxcode,' ')
+ evaluate $output_taxcode_trimmed
+     when = 'AKU'
+       if $occup_code = $Occup_Code_default
+         let $message = 'Warning: Occup_code=' || $occup_code || ' '
+       end-if
+       if $Area_Code_AK_fix = $Area_Code_AK_default
+        if $message = ''
+         let $message = 'Warning: Geo_code=' || $Area_Code_AK_fix
+        else
+         let $message = $message || ', Geo_code=' || $Area_Code_AK_fix
+        end-if
+       end-if
+       break
+   #ifdef INCLUDE_SUI_LOCATION_AUDIT ! TMG added 3/24/11
+     when = 'MIU'
+     when = 'MNU'
+     when = 'MAU'
+     when = 'IAU'
+     when = 'NMU'
+       if $out_deptid = '00000'
+        let $message = 'Warning: Loc_code=' || $out_deptid
+       end-if
+       break
+   #endif
+      when = 'VTU'
+       #ifdef VT_HEALTH_INSURANCE_INDICATOR
+        if $Empl_type = 'H' and #hourly_rt <= 0
+         let $message = 'Warning: ZERO Hourly_rt '
+        end-if
+        if $Health_insurance_indicator <> '1' and $Health_insurance_indicator <> '3'
+         if $message = ''
+          let $message = 'Warning: Hlth_ind=' || $Health_insurance_indicator
+         else
+          let $message = ', Hlth_ind=' || $Health_insurance_indicator
+         end-if
+        end-if
+       #endif
+       break
+     when = 'WAU'
+     when = 'ORU'
+       if (rtrim($QTD_hours_worked,' ') = '' or $QTD_hours_worked = '   0')  and (#TaxBalance_Txgrs_Qtd > 0)
+         let $message = 'Warning: QTD_Hours=' || $QTD_hours_worked
+       end-if
+       break
+     when = 'WYU'
+       if #wc_rate = 0
+         let $message = 'Warning: WC_Rate=' || $wc_rate || ' '
+       end-if
+       if $wc_code_fix = '000000' or rtrim($wc_code_fix,' ') = ''
+        if $message = ''
+         let $message = 'Warning: WC_code=' || $wc_code_fix
+        else
+         let $message = $message || ', WC_code=' || $wc_code_fix
+        end-if
+       end-if
+       break
+     when-other
+     break
+ end-evaluate
+   
+ if rtrim($message,' ') <> ''
+   if $SelectEmplid <> ''
+    show 'log-multistate: Emplid ' $Current_Emplid ', taxcode ' $Output_Taxcode ', Worksite ' $worksite_into_extract ', Message: ' $message
+   end-if
+
+    if (#multistate_count < {MULTISTATE_LIMIT})
+          Put $Current_Company                              -
+              $Current_Emplid                               -
+              $Output_Taxcode                               -
+              $worksite_into_extract                        -
+              #TaxBalance_Tax_Qtd                           -
+              #TaxBalance_Txgrs_Qtd                         -
+              #TaxBalance_Tax_Ytd                           -
+              #TaxBalance_Txgrs_Ytd                         -
+              $Message                                      -
+           Into multistate(#multistate_count)               -
+              Company                                       -
+              Emplid                                        -
+              Taxcode                                       -
+              Worksite                                      -
+              QTD_Taxes                                     -
+              QTD_Taxable                                   -
+              YTD_Taxes                                     -
+              YTD_Taxable                                   -
+              Message   
+              
+          add 1 to #multistate_count
+    else
+     if #multistate_Count_warning = 0
+      show ' '
+      show 'Maximum multistate ( {MULTISTATE_LIMIT} ) created... increase MULTISTATE_LIMIT definition.'
+      add 1 to #multistate_Count_warning
+     end-if
+    end-if
+
+ end-if
+
+end-procedure
+
+begin-procedure print-multistate
+
+    show 'multistate_count = ' #multistate_count
+
+    if #multistate_count > 0
+
+      let $E_prior = ''
+      let #header_type = 15
+      let $ReportTitle  = 'ADP Employment Tax Quarterly. Multistate Report'
+
+      let #ii = 0
+      let $company_zz    = 'ZZZ'
+      let $taxcode_zz    = 'ZZZZZZZZZZZZZZZ'
+
+      while (#ii < #multistate_count)
+
+        if #current-line > 56
+          New-Page
+        end-if
+
+        let #jj = 0
+        let $sorttest =  $company_zz || $taxcode_zz
+        let #nextinx = 0
+
+        while (#jj < #multistate_count)
+         get $c from multistate(#jj) Company
+         get $t from multistate(#jj) Taxcode
+         let $sortfield = $c || $t
+
+         if ($sortfield < $sorttest)
+           let #nextinx = #jj
+           move $sortfield to $sorttest
+         end-if
+         add 1 to #jj
+        end-while
+
+        Get $C -
+            $E -
+            $T -
+            $W -
+            #QT -
+            #QW -
+            #YT -
+            #YW -
+            $M  -
+            from multistate(#nextinx) -
+               Company  -
+               Emplid   -
+               Taxcode  -
+               Worksite -
+               QTD_Taxes -
+               QTD_Taxable -
+               YTD_Taxes   -
+               YTD_Taxable -
+               Message  
+
+           print $C        (+1,1)
+           print $E        (0,8)
+           print $T        (0,26)
+           print $W        (0,42)
+           print #QT       (0,52)   edit $$$,$$$,$$$,$$9.99mi
+           print #QW       (0,72)   edit $$$,$$$,$$$,$$9.99mi
+           print #YT       (0,92)   edit $$$,$$$,$$$,$$9.99mi
+           print #YW       (0,112)  edit $$$,$$$,$$$,$$9.99mi
+           print $M        (0,132)
+
+           put $company_zz    into multistate(#nextinx) Company
+           put $taxcode_zz    into multistate(#nextinx) Taxcode
+
+        add 1 to #ii
+
+      end-while
+
+      print 'Multistate Message count  = '        (+2,10)
+      print #multistate_count                     () edit 99999
+
+     if #multistate_Count_warning > 0
+      print ' Maximum multistate messages ( {MULTISTATE_LIMIT} ) reached... set MULTISTATE_LIMIT definition in probiz.sqc' ()
+     end-if
+
+     New-Page
+
+   end-if
+
+end-procedure
+
+begin-procedure create-audit
+  
+  let $pOutputTaxcode = ''
+  let #pCompare       = 0
+  let $pMessage       = ''
+
+  if rtrim($output_taxcode,' ') = '$U8' or rtrim($output_taxcode,' ') = '$U9'  !new hire act data is negative normally
+    goto no_audit_required
+  end-if
+  
+  !-------------------------------------------------------------
+  !if $0.00 taxable wages with > $0.00 taxes.. (added 10/18/07)
+  !-------------------------------------------------------------
+  #ifndef SKIP_ZERO_LOCALS
+   #ifdef SKIP_ZERO_LOCALS_WARNING_ORWC_WALOC     
+
+     if (substr($output_taxcode,1,5) <> 'WABWA' and substr($output_taxcode,1,5) <> 'ORBOR')
+
+       if (#TaxBalance_Txgrs_Qtd = 0) and (#TaxBalance_Tax_Qtd > 0)
+        let $message = 'QTD Taxes & Zero Wages'
+        do log-audit
+       end-if
+  
+       if (#TaxBalance_Txgrs_Ytd = 0) and (#TaxBalance_Tax_Ytd > 0)
+        let $message = 'YTD Taxes & Zero Wages'
+        do log-audit
+       end-if
+     end-if
+   #else
+     if (#TaxBalance_Txgrs_Qtd = 0) and (#TaxBalance_Tax_Qtd > 0)
+      let $message = 'QTD Taxes & Zero Wages'
+      do log-audit
+     end-if
+  
+     if (#TaxBalance_Txgrs_Ytd = 0) and (#TaxBalance_Tax_Ytd > 0)
+      let $message = 'YTD Taxes & Zero Wages'
+      do log-audit
+     end-if
+   #endif
+#endif
+  
+  
+  !--------------------------------------------------------------------------------
+  !if negative QTD or YTD taxable wages..
+  !---------------------------------------
+  
+  if (#TaxBalance_Txgrs_Qtd < 0) or (#TaxBalance_Txgrs_Ytd < 0)
+    let $message = 'Negative Wages'
+    do log-audit
+  end-if
+  
+  !--------------------------------------------------------------------------------
+  !if  QTD > YTD taxable wages..
+  !---------------------------------------
+  if (#TaxBalance_Txgrs_Qtd > #TaxBalance_Txgrs_Ytd)
+    let $message = 'QTD > YTD Wages'
+    do log-audit
+  end-if
+  
+  
+  !--------------------------------------------------------------------------------
+  !NY - If an employee has Taxable Wages  for any of the NY Taxes  (SIT and Local) 
+  !     different to Federal Taxable Wages, print on the report. 
+  !--------------------------------------------------------------------------------
+
+  if rtrim($output_taxcode,' ') = 'NYH'        !NY-SIT
+    let #NYH_Q = #TaxBalance_Txgrs_Qtd
+    let #NYH_Y = #TaxBalance_Txgrs_Ytd
+    let $NYH_extracted = 't'
+  end-if
+  
+  if substr($output_taxcode,1,8) = 'NYHP0001'  !NY City
+    let #NYHP0001_Q = #TaxBalance_Txgrs_Qtd
+    let #NYHP0001_Y = #TaxBalance_Txgrs_Ytd
+    let $NYHP0001_extracted = 't'
+  end-if
+  
+  
+  if substr($output_taxcode,1,8) = 'NYH84000'  !Yonkers
+    let #NYH84000_Q = #TaxBalance_Txgrs_Qtd
+    let #NYH84000_Y = #TaxBalance_Txgrs_Ytd
+    let $NYH84000_extracted = 't'
+  end-if
+  
+  if rtrim($output_taxcode,' ') = '$UH'
+   
+   if #NYH_Q <> #TaxBalance_Txgrs_Qtd AND ($NYH_extracted = 't')
+    let $message = 'NY SIT QTD Wage Mismatch'
+    let $pOutput_taxcode = 'NYH'
+    let #pCompare        = #NYH_Q 
+    let $pMessage       = 'QW'
+    do log-audit
+   end-if
+   if #NYH_Y <> #TaxBalance_Txgrs_Ytd AND ($NYH_extracted = 't')
+    let $message = 'NY SIT YTD Wage Mismatch'
+    let $pOutput_taxcode = 'NYH'
+    let #pCompare        = #NYH_Y 
+    let $pMessage       = 'YW'
+    do log-audit
+   end-if
+   
+   if #NYHP0001_Q <> #TaxBalance_Txgrs_Qtd AND ($NYHP0001_extracted = 't')
+    let $message = 'NY City QTD Wage Mismatch'
+    let $pOutput_taxcode = 'NYHP0001'
+    let #pCompare        = #NYHP0001_Q 
+    let $pMessage       = 'QW'
+    do log-audit
+   end-if
+   if #NYHP0001_Y <> #TaxBalance_Txgrs_Ytd AND ($NYHP0001_extracted = 't')
+    let $message = 'NY City YTD Wage Mismatch'
+    let $pOutput_taxcode = 'NYHP0001'
+    let #pCompare        = #NYHP0001_Y 
+    let $pMessage       = 'YW'
+    do log-audit
+   end-if
+
+   if #NYH84000_Q <> #TaxBalance_Txgrs_Qtd AND ($NYH84000_extracted = 't')
+    let $message = 'Yonkers QTD Wage Mismatch'
+    let $pOutput_taxcode = 'NYH84000'
+    let #pCompare        = #NYH84000_Q 
+    let $pMessage       = 'QW'
+    do log-audit
+   end-if
+   if #NYH84000_Y <> #TaxBalance_Txgrs_Ytd AND ($NYH84000_extracted = 't')
+    let $message = 'Yonkers YTD Wage Mismatch'
+    let $pOutput_taxcode = 'NYH84000'
+    let #pCompare        = #NYH84000_Y 
+    let $pMessage       = 'YW'
+    do log-audit
+   end-if
+
+   let $NYH_extracted = 'f'
+   let $NYHP0001_extracted = 'f'
+   let $NYH84000_extracted = 'f'
+   let #NYH_Q      = 0
+   let #NYH_Y      = 0
+   let #NYHP0001_Q = 0
+   let #NYHP0001_Y = 0
+   let #NYH84000_Q = 0
+   let #NYH84000_Y = 0
+   
+  end-if
+  
+  !--------------------------------------------------------------------------------
+  !FICA EE/ER - <> taxes or wages 
+  !--------------------------------------------------------------------------------
+
+ if #RptYear < 2011                              !due to the Dec 2010 tax law change to the temporary 4.2% EE rate
+  if rtrim($output_taxcode,' ') = '$UD'
+    let #UDT_Q = #TaxBalance_Tax_Qtd
+    let #UDT_Y = #TaxBalance_Tax_Ytd
+    let #UDW_Q = #TaxBalance_Txgrs_Qtd
+    let #UDW_Y = #TaxBalance_Txgrs_Ytd
+    let $UD_extracted = 't'
+  end-if
+  
+  if rtrim($output_taxcode,' ') = '$UE' AND ($UD_extracted = 't')
+   
+   if #UDT_Q <> #TaxBalance_Tax_Qtd
+    let $message = 'Fica EE/ER QTD Tax Mismatch'
+    let $pOutput_taxcode = '$UD'
+    let #pCompare        = #UDT_Q 
+    let $pMessage       = 'QT'
+    do log-audit
+   end-if
+   if #UDW_Q <> #TaxBalance_Txgrs_Qtd
+    let $message = 'Fica EE/ER QTD Wage Mismatch'
+    let $pOutput_taxcode = '$UD'
+    let #pCompare        = #UDW_Q 
+    let $pMessage       = 'QW'
+    do log-audit
+   end-if
+   if #UDT_Y <> #TaxBalance_Tax_Ytd
+    let $message = 'Fica EE/ER YTD Tax Mismatch'
+    let $pOutput_taxcode = '$UD'
+    let #pCompare        = #UDT_Y 
+    let $pMessage       = 'YT'
+    do log-audit
+   end-if
+   if #UDW_Y <> #TaxBalance_Txgrs_Ytd
+    let $message = 'Fica EE/ER YTD Wage Mismatch'
+    let $pOutput_taxcode = '$UD'
+    let #pCompare        = #UDW_Y 
+    let $pMessage       = 'YW'
+    do log-audit
+   end-if
+
+   let #UDT_Q = 0
+   let #UDT_Y = 0
+   let #UDW_Q = 0
+   let #UDW_Y = 0
+   let $UD_extracted = 'f'
+
+  end-if
+ end-if
+ 
+  !--------------------------------------------------------------------------------
+  !Med EE/ER - <> taxes or wages 
+  !--------------------------------------------------------------------------------
+
+  if rtrim($output_taxcode,' ') = '$UF'
+    let #UFT_Q = #TaxBalance_Tax_Qtd
+    let #UFT_Y = #TaxBalance_Tax_Ytd
+    let #UFW_Q = #TaxBalance_Txgrs_Qtd
+    let #UFW_Y = #TaxBalance_Txgrs_Ytd
+    let $UF_extracted = 't'
+  end-if
+  
+  if rtrim($output_taxcode,' ') = '$UQ' AND ($UF_extracted = 't')
+   
+   if #UFT_Q <> #TaxBalance_Tax_Qtd
+    let $message = 'Med EE/ER QTD Tax Mismatch'
+    let $pOutput_taxcode = '$UF'
+    let #pCompare        = #UFT_Q 
+    let $pMessage       = 'QT'
+    do log-audit
+   end-if
+   if #UFW_Q <> #TaxBalance_Txgrs_Qtd
+    let $message = 'Med EE/ER QTD Wage Mismatch'
+    let $pOutput_taxcode = '$UF'
+    let #pCompare        = #UFW_Q 
+    let $pMessage       = 'QW'
+    do log-audit
+   end-if
+   if #UFT_Y <> #TaxBalance_Tax_Ytd
+    let $message = 'Med EE/ER YTD Tax Mismatch'
+    let $pOutput_taxcode = '$UF'
+    let #pCompare        = #UFT_Y
+    let $pMessage       = 'YT'
+    do log-audit
+   end-if
+   if #UFW_Y <> #TaxBalance_Txgrs_Ytd
+    let $message = 'Med EE/ER YTD Wage Mismatch'
+    let $pOutput_taxcode = '$UF'
+    let #pCompare        = #UFW_Y
+    let $pMessage       = 'YW'
+    do log-audit
+   end-if
+
+   let #UFT_Q = 0
+   let #UFT_Y = 0
+   let #UFW_Q = 0
+   let #UFW_Y = 0
+   let $UF_extracted = 'f'
+   
+  end-if
+
+no_audit_required:
+
+end-procedure
+
+
+
+begin-procedure log-audit
+
+   if $SelectEmplid <> ''
+    show 'log-audit: Emplid ' $Current_Emplid ', Message: ' $message 
+   end-if
+
+    if (#Audit_count < {AUDIT_LIMIT})
+          Put $Current_Company                              -
+              $Current_Emplid                               -
+              $message                                      -
+              $Output_Taxcode                               -
+              #TaxBalance_Tax_Qtd                           -
+              #TaxBalance_Txgrs_Qtd                         -
+              #TaxBalance_Tax_Ytd                           -
+              #TaxBalance_Txgrs_Ytd                         -
+              $pMessage                                     -
+              $pOutput_Taxcode                              -
+              #pCompare                                     -
+           Into audits(#Audit_count)                        -
+              Company                                       -
+              Emplid                                        -
+              Message                                       -
+              Taxcode                                       -
+              QTD_Taxes                                     -
+              QTD_Taxable                                   -
+              YTD_Taxes                                     -
+              YTD_Taxable                                   -
+              pMessage                                      -
+              pTaxcode                                      -
+              pCompare
+          add 1 to #Audit_count
+    else
+     if #Audit_Count_warning = 0
+      show ' '
+      show 'Maximum audits ( {AUDIT_LIMIT} ) created... increase AUDIT_LIMIT definition.'
+      add 1 to #Audit_Count_warning
+     end-if
+    end-if
+
+
+end-procedure
+
+begin-procedure print-audits
+
+    show 'Audit_count = ' #Audit_count
+
+    if #Audit_count > 0
+
+      let $E_prior = ''
+      let #header_type = 13
+      let $ReportTitle  = 'ADP Employment Tax Quarterly. Tax and Wage Audits'
+
+      let #i = 0
+      while (#i < #Audit_count)
+
+        if #current-line > 56
+          New-Page
+        end-if
+
+        Get $C -
+            $E -
+            $M -
+            $T -
+            #QT -
+            #QW -
+            #YT -
+            #YW -
+            $pM -
+            $pT -
+            #pC -
+            from audits(#i) -
+               Company  -
+               Emplid   -
+               Message  -
+               Taxcode  -
+               QTD_Taxes -
+               QTD_Taxable -
+               YTD_Taxes   -
+               YTD_Taxable -
+               pMessage  -
+               pTaxcode  -
+               pCompare
+
+           !header: Company Emplid           Message                       Taxcode             QTD-Withheld       QTD-Taxable             YTD-Withheld       YTD-Taxable               
+
+           !if $E <> $E_prior
+           ! print ' '      (+1,1)
+           !end-if
+           !move $E to $E_prior
+
+           print $C        (+1,1)
+           print $E        (0,8)
+           print $M        (0,26)
+           print $T        (0,56)
+           print #QT       (0,69)   edit $$$,$$$,$$$,$$9.99mi
+           print #QW       (0,87)   edit $$$,$$$,$$$,$$9.99mi
+           print #YT       (0,112)  edit $$$,$$$,$$$,$$9.99mi
+           print #YW       (0,131)  edit $$$,$$$,$$$,$$9.99mi
+
+           if $pM <> ''
+             print $pT           (+1,56)
+             evaluate $pM
+              when = 'QT'
+                print #pC       (0,69)   edit $$$,$$$,$$$,$$9.99mi
+                break
+              when = 'QW'
+                print #pC       (0,87)   edit $$$,$$$,$$$,$$9.99mi
+                break
+              when = 'YT'
+                print #pC       (0,112)   edit $$$,$$$,$$$,$$9.99mi
+                break
+              when = 'YW'
+                print #pC       (0,131)   edit $$$,$$$,$$$,$$9.99mi
+                break
+              when-other
+                break
+             end-evaluate
+           end-if
+
+        add 1 to #i
+
+      end-while
+
+      print 'Audit Message count (# of warnings) = '        (+2,10)
+      print #audit_count                                    () edit 99999
+
+      New-Page
+
+   end-if
+
+end-procedure
+
+
+
+begin-procedure log-void
+
+    if (#void_count < {VOID_LIMIT})
+          Put $Current_Company                              -
+              $Current_Emplid                               -
+              $message                                      -
+              $Output_Taxcode                               -
+              #TaxBalance_Tax_Qtd                           -
+              #TaxBalance_Txgrs_Qtd                         -
+              #TaxBalance_Tax_Ytd                           -
+              #TaxBalance_Txgrs_Ytd                         -
+           Into voids(#void_count)                          -
+              Company                                       -
+              Emplid                                        -
+              Message                                       -
+              Taxcode                                       -
+              QTD_Taxes                                     -
+              QTD_Taxable                                   -
+              YTD_Taxes                                     -
+              YTD_Taxable                                   
+
+          add 1 to #void_count
+
+    else
+     
+     if #void_limit_count = 0
+       show ' '
+       show 'WARNING: Maximum voids ( {VOID_LIMIT} ) created... increase VOID_LIMIT definition.'
+       add 1 to #void_limit_count
+     end-if
+     
+    end-if
+
+
+end-procedure
+
+
+
+begin-procedure print-voids
+
+    show 'W-2 void_log count       = ' #void_count
+    show 'W-2 Void Associate count = ' #void-w2-hash_count
+    
+    if #void_count > 0
+
+      let $E_prior = ''
+      let #header_type = 14
+      let $ReportTitle  = 'ADP Employment Tax Quarterly. W-2 Voids'
+
+      let #i = 0
+      while (#i < #void_count)
+
+        if #current-line > 56
+          New-Page
+        end-if
+
+        Get $C -
+            $E -
+            $M -
+            $T -
+            #QT -
+            #QW -
+            #YT -
+            #YW -
+            from voids(#i) -
+               Company  -
+               Emplid   -
+               Message  -
+               Taxcode  -
+               QTD_Taxes -
+               QTD_Taxable -
+               YTD_Taxes   -
+               YTD_Taxable 
+
+           if $E <> $E_prior
+            print ' '      (+1,1)
+           end-if
+           move $E to $E_prior
+
+           !header: Company Emplid           Taxcode             QTD-Withheld       QTD-Taxable             YTD-Withheld       YTD-Taxable               
+
+           print $C        (+1,1)
+           print $E        (0,8)
+           print $M        (0,26)
+           print $T        (0,56)
+           print #QT       (0,69)   edit $$$,$$$,$$$,$$9.99mi
+           print #QW       (0,87)   edit $$$,$$$,$$$,$$9.99mi
+           print #YT       (0,112)  edit $$$,$$$,$$$,$$9.99mi
+           print #YW       (0,131)  edit $$$,$$$,$$$,$$9.99mi
+
+           !$message... starts with 'New' or 'Original' AND the  Totals = New - Original
+           !-------------------------------------------=========------------------------
+           
+           if substr($m,1,3) = 'New'
+             let #QT_T = #QT_T + (#QT - #QT_orig)
+             let #QW_T = #QW_T + (#QW - #QW_orig)
+             let #YT_T = #YT_T + (#YT - #YT_orig)
+             let #YW_T = #YW_T + (#YW - #YW_orig)
+           else
+             Let #QT_orig = #QT
+             Let #QW_orig = #QW
+             Let #YT_orig = #YT
+             Let #YW_orig = #YW
+           end-if
+           
+        add 1 to #i
+
+      end-while
+
+      print ' Total adjusted (New - Original) -->'             (+2,10)
+      print #QT_T                                              (0,69)   edit $$$,$$$,$$$,$$9.99mi
+      print #QW_T                                              (0,87)   edit $$$,$$$,$$$,$$9.99mi
+      print #YT_T                                              (0,112)  edit $$$,$$$,$$$,$$9.99mi
+      print #YW_T                                              (0,131)  edit $$$,$$$,$$$,$$9.99mi
+      
+      print 'W-2 Log Void count       = '                      (+2,10)
+      print #void_count                                        () edit 99999
+      print 'W-2 Void Associate count = '                      (+2,10)
+      print #void-w2-hash_count                                () edit 99999
+
+      New-Page
+
+   end-if
+
+end-procedure
+

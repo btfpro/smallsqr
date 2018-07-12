@@ -1,0 +1,1899 @@
+!****************************************
+! PAYGL03  Encumbrance Posting          *
+!****************************************
+!***********************************************************************
+!                                                                      *
+!               Confidentiality Information:                           *
+!                                                                      *
+!                                                                      *
+! This module contains confidential and proprietary information        *
+! of Oracle; it is not to be copied, reproduced, or transmitted        *
+! in any form, by any means, in whole or in part, nor is it to         *
+! be used for any purpose other than that for which it is              *
+! expressly provided under the applicable license agreement.           *
+!                                                                      *
+! Copyright (C) 2006 Oracle. All Rights Reserved.                      *
+!                                                                      *
+!***********************************************************************
+!***********************************************************************
+!                                                                      *
+!          $Date:  2006/07/20:05:10:15                                 !
+!       $Release:  HR9                                                 !
+!      $Revision:  101                                                 !
+!                                                                      *
+!  Last Modified June 14 Platform Testing Issue                        *
+!                APR 12 2002 Pass 4 Additional Chartfields to FDM      *
+!***********************************************************************
+! This program is specific to HRMS for Public Sector.                  *
+!***********************************************************************
+
+#include 'setenv.sqc'     !Set environment
+#include 'setup07.sqc'
+#Include 'usarpt.sqc'    !USA report variables
+
+!****************************************************************************
+begin-report
+
+  do HOUSEKEEPING
+  do MAINLINE
+  do WRAPUP
+
+end-report
+!****************************************************************************
+! HOUSEKEEPING                                                              *
+!****************************************************************************
+begin-procedure HOUSEKEEPING
+
+  do INIT-DATETIME
+  do INIT-NUMBER
+  do GET-CURRENT-DATETIME
+  do STDAPI-INIT
+
+  display ' Start at : ' noline
+  display $ReportDate noline
+  display ' ' noline
+  display $ReportTime
+
+  if $Prcs_Process_Instance = ''
+     !START-Security logic, does not allow SQR to run with SQRW
+     !DISPLAY 'ERROR - SQR CAN ONLY BE RUN FROM PROCESS SCHEDULER'
+     !DISPLAY ' THIS IS BECAUSE OF SECURITY LOGIC'
+     !STOP QUIET               !exit program
+     !END of Security Logic
+     !Uncomment Prompts for SQRW development/testing ONLY!!
+     do PROMPTS              !Change this to call whatever
+                             !procedures are needed if the user
+                             !is not using the process scheduler.
+                             !(eg. do ASK-FROM-THRU-DATE)
+  else
+
+     do SELECT-PARAMETERS
+  end-if
+
+  let $Pre_Encumbrance  = 'PRE-ENCUMB'
+  let $Requisition       = 'REQ'
+
+  let $Company           = ' '
+  let $Business_Unit_HR  = ' '
+  let #Total_Acctg_Lines = 0
+  let #Total_Credits     = 0
+  let #Total_Debits      = 0
+
+  move $AsOfToday            to $Journal_Line_Date
+  move $AsOfToday            to $gl_run_date
+
+  if $Accounting_Dt = ''
+     let $Accounting_Dt = $AsOfToday
+  end-if
+
+  move 0 to #processed_rows
+  move 'ENCUMBRANCE POSTING' to $ReportTitle
+  display $ReportTitle
+  display ' '
+
+  if $Prcs_Process_Instance = ''
+      let #Msg_PrcsInstance = 0
+  else
+      let #Msg_PrcsInstance = to_number($Prcs_Process_Instance)
+  end-if
+
+  do DELETE-ENCUMB-MSG
+
+  let $prgm_name           = 'PAYGL03'
+  let $runid               = ' '
+  let $paygroup            = 'ENC'
+  let #max_line            = 99999
+  let #gl_entry_line       = 0
+  let #gl_run_num          = 0
+  let #proc_seq_no         = 1
+  let #last_posted_seq_num = 0
+  do  Clear-Acctg-Ln-Stg ($prgm_name, $gl_run_date, $Prcs_Process_Instance)
+
+end-procedure
+!****************************************************************************
+! PROMPTS                                                                   *
+! Prompts for all input parameters.                                         *
+!****************************************************************************
+begin-procedure PROMPTS
+
+  input $Accounting_Dt 'Enter Accounting Posting Date' type=date
+  uppercase $Accounting_Dt
+
+end-procedure
+!****************************************************************************
+! GET-VALUES                                                                *
+! Retrieves run control varibles for process scheduler                      *
+!****************************************************************************
+begin-procedure GET-VALUES
+
+  let $Accounting_Dt = rtrim(&RUN_CNTL_BDGT.THRUDATE, ' ')
+
+end-procedure
+!****************************************************************************
+! MAINLINE                                                                  *
+! This procedure contains the three driver procedures: Earnings, Tax, and   *
+! Deductions.                                                               *
+!****************************************************************************
+begin-procedure MAINLINE
+
+  do PROCESS-EARN-ENCUMB
+  if $ProcessFlag = 'Y'
+    do UPDATE-EARN-ENCUMB-RCDS
+    do Update-GL-History
+  end-if
+  do COMMIT-TRANSACTION
+
+  do PROCESS-TAX-ENCUMB
+  if $ProcessFlag = 'Y'
+     do UPDATE-TAX-ENCUMB-RCDS
+     do Update-GL-History
+  end-if
+  do COMMIT-TRANSACTION
+
+  do PROCESS-DED-ENCUMB
+  if $ProcessFlag = 'Y'
+     do UPDATE-DED-ENCUMB-RCDS
+     do Update-GL-History
+  end-if
+  do COMMIT-TRANSACTION
+
+  do UPDATE-WORK-ACTUALS
+
+  move #Total_Credits_Count to $Total_Credits_Count 999999999999
+  move #Total_Debits_Count  to $Total_Debits_Count 999999999999
+  move #Total_Debits   to $Total_Debits 999999999.99
+  move #Total_Credits  to $Total_Credits 999999999.99
+
+  display ' '
+  display '*** Encumbrance and Pre-Encumbrance Posting Summary ***'
+  display ' '
+  display 'Total Debits       :  ' noline
+  display $Total_Debits_Count
+  display 'Total Debit Amount : $' noline
+  display $Total_Debits
+  display ' '
+  display 'Total Credits      :  ' noline
+  display $Total_Credits_Count
+  display 'Total Credit Amount: $' noline
+  display $Total_Credits
+
+  do PUBLISH_HR_ACCTG_LINE
+
+end-procedure
+
+!****************************************************************************
+! PUBLISH_HR_ACCTG_LINE                                                     *
+! Insert values into Parameter Table for Batch Publish when there were      *
+! successful HR_ACCTG_LINE row(s) written.                                  *
+!****************************************************************************
+begin-procedure PUBLISH_HR_ACCTG_LINE
+
+  do Get-Process-Name (#prcs_process_instance, $prcsname)
+  do Get-Active-In-BatchPub ($prcsname, #cntmsg)
+  if #cntmsg > 0
+      do Get-Job-Instance
+      let $Out_Clean_Up_Flag  = 'U'
+      do Insert-Param-In-BatchPub (#prcs_process_instance, #prcs_job_instance, $prcsname,
+                                                                       $SysDateTime, $out_clean_up_flag)
+  end-if
+
+end-procedure
+
+!****************************************************************************
+! PROCESS-EARN-ENCUMB                                                       *
+! This procedure will process the earnings distributions.  It controls the  *
+! obtaining of the chart key and account information and the writting of    *
+! both the encumbrance and offset transaction to G/L.  In addition, the     *
+! internal HRMS budgeting tables are updated for each transaction.          *
+!****************************************************************************
+begin-procedure PROCESS-EARN-ENCUMB
+
+  display 'Processing Earnings Encumbrances'
+
+  move 'N' to $ProcessFlag
+
+  let $err-statement1  = 'PROCESS-EARN-ENCUMB, Select Error, '
+  let $err-statement2  = 'Bind Variables: Encumb_Posted = N and Department '||
+                        'effective date <= '||$Accounting_Dt
+
+  let $Msg_MsgData1 = 'PROCESS-EARN-ENCUMB check log'
+  let $Msg_MsgData2 = 'Encumb_Posted = N'
+  do Format-DateTime($Accounting_Dt, $Acctg_Dt_DMY, {DEFDATE}, '', '')
+  let $Msg_MsgData3 = 'Dept Effdt: '||$Acctg_Dt_DMY
+  let $Msg_MsgID    = '000020'
+
+begin-SELECT On-Error=SQL-Statement-Error
+DIST_ERN.BUSINESS_UNIT
+DIST_ERN.SETID
+DIST_ERN.DEPTID
+DIST_ERN.POSITION_POOL_ID
+DIST_ERN.SETID_JOBCODE
+DIST_ERN.JOBCODE
+DIST_ERN.POSITION_NBR
+DIST_ERN.EMPLID
+DIST_ERN.EMPL_RCD
+DIST_ERN.FISCAL_YEAR
+DIST_ERN.ACCT_CD
+DIST_ERN.ACCOUNT
+DIST_ERN.ENCUMB_TYPE
+DIST_ERN.ENCUMB_ERN_AMT
+DEPT.COMPANY
+
+  let #processed_rows = #processed_rows + 1
+
+  move 'Y' to $ProcessFlag
+  move &DIST_ERN.SETID  to $SetID_Dept
+  move &DIST_ERN.DEPTID to $DeptID
+
+  move &DIST_ERN.SETID             to $Msg_SetID
+  move &DIST_ERN.DEPTID            to $Msg_DeptID
+  move &DIST_ERN.EMPLID            to $Msg_EmplID
+  move &DIST_ERN.EMPL_RCD          to #Msg_Empl_Rcd
+  move &DIST_ERN.SETID_JOBCODE     to $Msg_SetID_JobCode
+  move &DIST_ERN.JOBCODE           to $Msg_JobCode
+  move &DIST_ERN.POSITION_NBR      to $Msg_Position_Nbr
+  move &DIST_ERN.POSITION_POOL_ID  to $Msg_Position_Pool_ID
+
+  if &DEPT.COMPANY <> $Company
+
+     move &DEPT.COMPANY    to $Company
+     do GET-FINANCIAL-DATA
+  end-if
+
+  if &DIST_ERN.BUSINESS_UNIT <> $Business_Unit_HR
+
+     let $Business_Unit_HR = &DIST_ERN.BUSINESS_UNIT
+     do GET-GL-BUS-UNIT
+     do GET-GL-BU-DETAILS
+  end-if
+
+  move &DIST_ERN.ACCT_CD           to $Acct_Cd
+  move &DIST_ERN.ACCOUNT           to $Dist_Account
+  move &DIST_ERN.EMPLID            to $Emplid
+  move &DIST_ERN.EMPL_RCD          to #Empl_Rcd
+  move &DIST_ERN.SETID_JOBCODE     to $SetID_Jobcode
+  move &DIST_ERN.JOBCODE           to $JobCode
+  move &DIST_ERN.POSITION_NBR      to $Position_Nbr
+  move &DIST_ERN.POSITION_POOL_ID  to $Position_Pool_ID
+  move &DIST_ERN.FISCAL_YEAR       to #Fiscal_Year
+  move &DIST_ERN.ENCUMB_TYPE       to $Encumb_Type
+  move &DIST_ERN.ENCUMB_ERN_AMT    to #Monetary_Amount
+  move 'D'                         to $DrCr
+  move 'X'                         to $Acct_Type
+
+  let $SetID_Dept = rtrim($SetID_Dept,' ')
+  let $Deptid     = rtrim($Deptid,' ')
+  let $Req_Emplid = substr($Emplid,1,3)
+  let $Pre_Emplid = substr($Emplid,1,10)
+
+  do GET-CHARTKEYS
+
+  if (($Pre_Emplid = $Pre_Encumbrance)
+   or ($Req_Emplid = $Requisition))
+
+     let $Amount_Type = '3'
+     move $Pre_Account to $Account
+  else
+
+     let $Amount_Type = '2'
+     move $Enc_Account to $Account
+  end-if
+
+  if (rtrim($Acct_Cd, ' ')) <> ''
+
+     do WRITE-GL-TRANSACTION
+
+     let $Encumb_Proc_Type = 'E'
+
+     do INTERNAL-BUDGET-UPDATE
+
+     move 'C' to $DrCr
+     move 'L' to $Acct_Type
+
+     if (($Pre_Emplid = $Pre_Encumbrance)
+      or ($Req_Emplid = $Requisition))
+
+        let $Amount_Type = '3'
+        move $Pre_Account to $Account
+        move 'PRE' to $Activity
+     else
+
+        let $Amount_Type = '2'
+        move $Enc_Account to $Account
+        move 'ERE' to $Activity
+     end-if
+
+     do GET-OFF-SET-ACCOUNT
+     do WRITE-GL-TRANSACTION
+  end-if
+
+FROM PS_ENCUMB_DIST_ERN DIST_ERN,
+     PS_DEPT_TBL DEPT
+WHERE DIST_ERN.ENCUMB_POSTED = 'N'
+  AND DIST_ERN.SETID         = DEPT.SETID
+  AND DIST_ERN.DEPTID        = DEPT.DEPTID
+  AND DEPT.EFFDT             = (SELECT MAX(DEPT1.EFFDT)
+                                FROM PS_DEPT_TBL DEPT1
+                                WHERE DEPT1.SETID  = DEPT.SETID
+                                  AND DEPT1.DEPTID = DEPT.DEPTID
+                                  AND DEPT1.EFFDT <= $Accounting_Dt)
+ORDER BY DEPT.COMPANY, DIST_ERN.BUSINESS_UNIT, DIST_ERN.SETID, DIST_ERN.DEPTID,
+         DIST_ERN.EMPLID, DIST_ERN.EMPL_RCD, DIST_ERN.ENCUMB_TYPE DESC
+end-SELECT
+
+end-procedure
+!****************************************************************************
+! PROCESS-TAX-ENCUMB                                                        *
+! This procedure will process the Tax distributions.  It controls the       *
+! obtaining the chart key and account information and the writting of both  *
+! the encumbrance and offset transaction to G/L.  In addition, the internal *
+! HRMS budgeting tables are updated for each transaction.                   *
+!****************************************************************************
+begin-procedure PROCESS-TAX-ENCUMB
+
+  display ' '
+  display 'Processing Tax Encumbrances'
+
+  move 'N' to $ProcessFlag
+
+  let $Company         = ' '
+  let $err-statement1  = 'PAYGL03, Select Error, PROCESS-TAX-ENCUMB '
+  let $err-statement2  = 'Bind Variables: Encumb_Posted = N and Department '||
+                        'effective date <= '||$Accounting_Dt
+  let $Msg_MsgData1 = 'PROCESS-TAX-ENCUMB check log'
+  let $Msg_MsgData2 = 'Encumb_Posted = N'
+  do Format-DateTime($Accounting_Dt, $Acctg_Dt_DMY, {DEFDATE}, '', '')
+  let $Msg_MsgData3 = 'Dept Effdt: '||$Acctg_Dt_DMY
+  let $Msg_MsgID    = '000020'
+
+begin-SELECT On-Error=SQL-Statement-Error
+DIST_TAX.BUSINESS_UNIT
+DIST_TAX.SETID
+DIST_TAX.DEPTID
+DIST_TAX.POSITION_POOL_ID
+DIST_TAX.SETID_JOBCODE
+DIST_TAX.JOBCODE
+DIST_TAX.POSITION_NBR
+DIST_TAX.EMPLID
+DIST_TAX.EMPL_RCD
+DIST_TAX.FISCAL_YEAR
+DIST_TAX.ACCT_CD
+DIST_TAX.ACCOUNT
+DIST_TAX.ENCUMB_TYPE
+DIST_TAX.ENCUMB_TAX_AMT
+DEPT_TAX.COMPANY
+
+  move 'Y' to $ProcessFlag
+  move &DIST_TAX.SETID   to $SetID_Dept
+  move &DIST_TAX.DEPTID  to $DeptID
+
+  move &DIST_TAX.SETID             to $Msg_SetID
+  move &DIST_TAX.DEPTID            to $Msg_DeptID
+  move &DIST_TAX.EMPLID            to $Msg_EmplID
+  move &DIST_TAX.EMPL_RCD          to #Msg_Empl_Rcd
+  move &DIST_TAX.SETID_JOBCODE     to $Msg_SetID_JobCode
+  move &DIST_TAX.JOBCODE           to $Msg_JobCode
+  move &DIST_TAX.POSITION_NBR      to $Msg_Position_Nbr
+  move &DIST_TAX.POSITION_POOL_ID  to $Msg_Position_Pool_ID
+
+  if &DEPT_TAX.COMPANY <> $Company
+
+     move &DEPT_TAX.COMPANY to $Company
+
+     do GET-FINANCIAL-DATA
+  end-if
+
+  if &DIST_TAX.BUSINESS_UNIT <> $Business_Unit_HR
+
+     let $Business_Unit_HR = &DIST_TAX.BUSINESS_UNIT
+     do GET-GL-BUS-UNIT
+     do GET-GL-BU-DETAILS
+  end-if
+
+  move &DIST_TAX.ACCT_CD           to $Acct_Cd
+  move &DIST_TAX.ACCOUNT           to $Dist_Account
+  move &DIST_TAX.EMPLID            to $Emplid
+  move &DIST_TAX.EMPL_RCD          to #Empl_Rcd
+  move &DIST_TAX.SETID_JOBCODE     to $SetID_Jobcode
+  move &DIST_TAX.JOBCODE           to $JobCode
+  move &DIST_TAX.POSITION_NBR      to $Position_Nbr
+  move &DIST_TAX.POSITION_POOL_ID  to $Position_Pool_ID
+  move &DIST_TAX.FISCAL_YEAR       to #Fiscal_Year
+  move &DIST_TAX.ENCUMB_TYPE       to $Encumb_Type
+  move &DIST_TAX.ENCUMB_TAX_AMT    to #Monetary_Amount
+  move 'D'                         to $DrCr
+  move 'X'                         to $Acct_Type
+
+  let $SetID_Dept = rtrim($SetID_Dept,' ')
+  let $Deptid     = rtrim($Deptid,' ')
+  let $Req_Emplid = substr($Emplid,1,3)
+  let $Pre_Emplid = substr($Emplid,1,10)
+
+  do GET-CHARTKEYS
+
+  if (($Pre_Emplid = $Pre_Encumbrance)
+   or ($Req_Emplid = $Requisition))
+
+     let $Amount_Type = '3'
+     move $Pre_Account to $Account
+  else
+
+     let $Amount_Type = '2'
+     move $Enc_Account to $Account
+  end-if
+
+  if (rtrim($Acct_Cd, ' ')) <> ''
+
+     do WRITE-GL-TRANSACTION
+
+     let $Encumb_Proc_Type = 'T'
+
+     do INTERNAL-BUDGET-UPDATE
+
+     move 'C' to $DrCr
+     move 'L' to $Acct_Type
+
+     if (($Pre_Emplid = $Pre_Encumbrance)
+      or ($Req_Emplid = $Requisition))
+
+        let $Amount_Type = '3'
+        move $Pre_Account to $Account
+        move 'PRT' to $Activity
+     else
+
+        let $Amount_Type = '2'
+        move $Enc_Account to $Account
+        move 'ERT' to $Activity
+     end-if
+
+     do GET-OFF-SET-ACCOUNT
+     do WRITE-GL-TRANSACTION
+  end-if
+
+FROM PS_ENCUMB_DIST_TAX DIST_TAX,
+     PS_DEPT_TBL DEPT_TAX
+WHERE DIST_TAX.ENCUMB_POSTED = 'N'
+  AND DIST_TAX.SETID         = DEPT_TAX.SETID
+  AND DIST_TAX.DEPTID        = DEPT_TAX.DEPTID
+  AND DEPT_TAX.EFFDT         = (SELECT MAX(DEPT2.EFFDT)
+                                FROM PS_DEPT_TBL DEPT2
+                                WHERE DEPT2.SETID  = DEPT_TAX.SETID
+                                  AND DEPT2.DEPTID = DEPT_TAX.DEPTID
+                                  AND DEPT2.EFFDT <= $Accounting_Dt)
+ORDER BY DEPT_TAX.COMPANY, DIST_TAX.BUSINESS_UNIT, DIST_TAX.SETID, DIST_TAX.DEPTID,
+         DIST_TAX.EMPLID, DIST_TAX.EMPL_RCD, DIST_TAX.ENCUMB_TYPE DESC
+end-SELECT
+
+end-procedure
+!****************************************************************************
+! PROCESS-DED-ENCUMB                                                        *
+! This procedure will process the Deduction distributions.  It controls the *
+! obtaining the chart key and account information and the writting of both  *
+! the encumbrance and offset transaction to G/L.  In addition, the internal *
+! HRMS budgeting tables are updated for each transaction.                   *
+!****************************************************************************
+begin-procedure PROCESS-DED-ENCUMB
+
+  display ' '
+  display 'Processing Deduction Encumbrances'
+
+  move 'N' to $ProcessFlag
+
+  let $Company         = ' '
+  let $err-statement1  = 'PAYGL03, Select Error, PROCESS-DED-ENCUMB '
+  let $err-statement2  = 'Bind Variables: Encumb_Posted = N and Department '||
+                        'effective date <= '||$Accounting_Dt
+
+  let $Msg_MsgData1 = 'PROCESS-DED-ENCUMB check log'
+  let $Msg_MsgData2 = 'Encumb_Posted = N'
+  do Format-DateTime($Accounting_Dt, $Acctg_Dt_DMY, {DEFDATE}, '', '')
+  let $Msg_MsgData3 = 'Dept Effdt: '||$Acctg_Dt_DMY
+  let $Msg_MsgID    = '000020'
+
+begin-SELECT On-Error=SQL-Statement-Error
+DIST_DED.BUSINESS_UNIT
+DIST_DED.SETID
+DIST_DED.DEPTID
+DIST_DED.POSITION_POOL_ID
+DIST_DED.SETID_JOBCODE
+DIST_DED.JOBCODE
+DIST_DED.POSITION_NBR
+DIST_DED.EMPLID
+DIST_DED.EMPL_RCD
+DIST_DED.FISCAL_YEAR
+DIST_DED.ACCT_CD
+DIST_DED.ACCOUNT
+DIST_DED.ENCUMB_TYPE
+DIST_DED.ENCUMB_DED_AMT
+DEPT_DED.COMPANY
+
+  move 'Y' to $ProcessFlag
+  move &DIST_DED.SETID   to $SetID_Dept
+  move &DIST_DED.DEPTID  to $Deptid
+
+  move &DIST_DED.SETID             to $Msg_SetID
+  move &DIST_DED.DEPTID            to $Msg_DeptID
+  move &DIST_DED.EMPLID            to $Msg_EmplID
+  move &DIST_DED.EMPL_RCD          to #Msg_Empl_Rcd
+  move &DIST_DED.SETID_JOBCODE     to $Msg_SetID_JobCode
+  move &DIST_DED.JOBCODE           to $Msg_JobCode
+  move &DIST_DED.POSITION_NBR      to $Msg_Position_Nbr
+  move &DIST_DED.POSITION_POOL_ID  to $Msg_Position_Pool_ID
+
+  if &DEPT_DED.COMPANY <> $Company
+
+     move &DEPT_DED.COMPANY to $Company
+
+     do GET-FINANCIAL-DATA
+  end-if
+
+  if &DIST_DED.BUSINESS_UNIT <> $Business_Unit_HR
+
+     let $Business_Unit_HR = &DIST_DED.BUSINESS_UNIT
+     do GET-GL-BUS-UNIT
+     do GET-GL-BU-DETAILS
+  end-if
+
+  move &DIST_DED.ACCT_CD           to $Acct_Cd
+  move &DIST_DED.ACCOUNT           to $Dist_Account
+  move &DIST_DED.EMPLID            to $Emplid
+  move &DIST_DED.EMPL_RCD          to #Empl_Rcd
+  move &DIST_DED.SETID_JOBCODE     to $SetID_Jobcode
+  move &DIST_DED.JOBCODE           to $JobCode
+  move &DIST_DED.POSITION_NBR      to $Position_Nbr
+  move &DIST_DED.POSITION_POOL_ID  to $Position_Pool_ID
+  move &DIST_DED.FISCAL_YEAR       to #Fiscal_Year
+  move &DIST_DED.ENCUMB_TYPE       to $Encumb_Type
+  move &DIST_DED.ENCUMB_DED_AMT    to #Monetary_Amount
+  move 'D'                         to $DrCr
+  move 'X'                         to $Acct_Type
+
+  let $SetID_Dept = rtrim($SetID_Dept,' ')
+  let $Deptid     = rtrim($Deptid,' ')
+  let $Req_Emplid = substr($Emplid,1,3)
+  let $Pre_Emplid = substr($Emplid,1,10)
+
+  do GET-CHARTKEYS
+
+  if (($Pre_Emplid = $Pre_Encumbrance)
+   or ($Req_Emplid = $Requisition))
+
+     let $Amount_Type = '3'
+     move $Pre_Account to $Account
+  else
+
+     let $Amount_Type = '2'
+     move $Enc_Account to $Account
+  end-if
+
+  if (rtrim($Acct_Cd, ' ')) <> ''
+
+     do WRITE-GL-TRANSACTION
+
+     let $Encumb_Proc_Type = 'D'
+
+     do INTERNAL-BUDGET-UPDATE
+
+     move 'C' to $DrCr
+     move 'L' to $Acct_Type
+
+     if (($Pre_Emplid = $Pre_Encumbrance)
+      or ($Req_Emplid = $Requisition))
+
+        let $Amount_Type = '3'
+        move $Pre_Account to $Account
+        move 'PRD' to $Activity
+     else
+
+        let $Amount_Type = '2'
+        move $Enc_Account to $Account
+        move 'ERD' to $Activity
+     end-if
+
+     do GET-OFF-SET-ACCOUNT
+     do WRITE-GL-TRANSACTION
+  end-if
+
+FROM PS_ENCUMB_DIST_DED DIST_DED,
+     PS_DEPT_TBL DEPT_DED
+WHERE DIST_DED.ENCUMB_POSTED = 'N'
+  AND DIST_DED.SETID         = DEPT_DED.SETID
+  AND DIST_DED.DEPTID        = DEPT_DED.DEPTID
+  AND DEPT_DED.EFFDT         = (SELECT MAX(DEPT3.EFFDT)
+                                FROM PS_DEPT_TBL DEPT3
+                                WHERE DEPT3.SETID  = DEPT_DED.SETID
+                                  AND DEPT3.DEPTID = DEPT_DED.DEPTID
+                                  AND DEPT3.EFFDT <= $Accounting_Dt)
+ORDER BY DEPT_DED.COMPANY, DIST_DED.BUSINESS_UNIT, DIST_DED.SETID, DIST_DED.DEPTID,
+         DIST_DED.EMPLID, DIST_DED.EMPL_RCD, DIST_DED.ENCUMB_TYPE DESC
+end-SELECT
+
+end-procedure
+!****************************************************************************
+! UPDATE-GL-HISTORY                                                         *
+!****************************************************************************
+begin-procedure Update-GL-History
+
+  if #gl_run_num = 0
+      do Get-Max-Cntrl-Num ($gl_run_date, #gl_run_num, #gl_seq_num)
+  else
+      do Get-Max-Seq-Num ($gl_run_date, #gl_seq_num)
+  end-if
+
+  let #max_seq_num = #gl_seq_num + #proc_seq_no
+  let $Company     = ' '
+
+  let #idx = #gl_seq_num + 1
+  while #idx <= #max_seq_num
+
+      do Add-to-GL-Run-History ($prgm_name, $gl_run_date, #gl_run_num, #idx, $runid,
+                                $company, $paygroup, $Accounting_Dt)
+      let #idx = #idx + 1
+  end-while
+  do Commit-Transaction
+
+  if #gl_seq_num = #last_posted_seq_num
+      do Update-Acctg-Ln-Seq-Num ($prgm_name, $gl_run_date, $Prcs_Process_Instance, 'N', #gl_seq_num)
+  else
+      do Update-Acctg-Ln-Seq-Num ($prgm_name, $gl_run_date, $Prcs_Process_Instance, 'Y', #last_posted_seq_num)
+      do Update-Acctg-Ln-Seq-Num ($prgm_name, $gl_run_date, $Prcs_Process_Instance, 'N', #gl_seq_num)
+  end-if
+
+  do Copy-from-Acctg-Ln-Stg ($prgm_name, $gl_run_date, $Prcs_Process_Instance)
+  do Clear-Acctg-Ln-Stg ($prgm_name, $gl_run_date, $Prcs_Process_Instance)
+
+  let #last_posted_seq_num = #max_seq_num
+  let #proc_seq_no = 0
+
+end-procedure
+!****************************************************************************
+! GET-FINANCIAL-DATA                                                        *
+!****************************************************************************
+begin-procedure GET-FINANCIAL-DATA
+
+  display '   Processing Company: ' noline
+  display $Company
+
+  do GET-COMPANY-DATA
+  do GET-FROM-CURRENCY-CD
+
+end-procedure
+!****************************************************************************
+! GET-FROM-CURRENCY-CD                                                      *
+!****************************************************************************
+begin-procedure GET-FROM-CURRENCY-CD
+
+  let $From_Found = 'N'
+
+  let $err-statement1 = 'PAYGL03, Select Error - GET-FROM-CURRENCY-CD'
+  let $err-statement2 = 'Bind Variables: Company:'||$Company ||
+                        ', PayGroup:'||$Paygroup
+
+  let $Msg_MsgData1 = 'GET-FROM-CURRENCY-CD see log'
+  let $Msg_MsgData2 = 'Company :'||$Company'
+  let $Msg_MsgData3 = 'PayGroup:'||$Paygroup
+  let $Msg_MsgID    = '000020'
+
+begin-SELECT On-Error=SQL-Statement-Error
+PYG.CURRENCY_CD
+PYG.RT_TYPE
+PYG.RT_CONV_DT
+
+  move 'Y'              to $From_Found
+
+  move &PYG.CURRENCY_CD to $currency_cd_hr
+  move &PYG.RT_TYPE     to $hr_rate_type
+  move &PYG.RT_CONV_DT  to $Rate_Conv_Date_Code
+
+  let $Rate_Conversion_Date = $Accounting_Dt
+
+FROM  PS_PAYGROUP_TBL PYG,
+      PS_COMPANY_TBL COMP
+WHERE COMP.COMPANY = $Company
+AND   PYG.COMPANY  = COMP.COMPANY
+AND   PYG.PAYGROUP = COMP.PAYGROUP
+AND   PYG.EFFDT    = (SELECT MAX(EFFDT) FROM PS_PAYGROUP_TBL PYG1
+                       WHERE PYG1.COMPANY  = PYG.COMPANY
+                         AND PYG1.PAYGROUP = PYG.PAYGROUP
+                         AND PYG1.EFFDT <= $Accounting_Dt)
+
+end-SELECT
+
+  if $From_Found = 'N'
+
+
+
+     let $Msg = 'ERROR-HR Currency not found for Company:'||$Company||
+                ', Paygroup:'||$Paygroup
+
+     display $Msg
+
+     let $Msg_MsgID    = '000013'
+     let $Msg_MsgData1 = 'Company :'||$Company
+     let $Msg_MsgData2 = 'Paygroup:'||$Paygroup
+     let $Msg_MsgData3 = ' '
+
+     do WRITE-ENCUMB-MESSAGE
+     do STOP-PROCESSING
+  end-if
+
+end-procedure
+
+!****************************************************************************
+! GET-GL-BUS-UNIT                                                           *
+!****************************************************************************
+
+begin-procedure GET-GL-BUS-UNIT
+
+let $Business_Unit_GL = ' '
+
+! Get GL Business Unit
+
+begin-SELECT
+
+A.BUSINESS_UNIT_GL
+  let $Business_Unit_GL = &A.BUSINESS_UNIT_GL
+
+FROM PS_BUS_UNIT_TBL_HR A
+WHERE A.BUSINESS_UNIT =  $Business_Unit_HR
+
+end-SELECT
+
+end-procedure
+
+!****************************************************************************
+! GET-GL-CURRENCY                                                           *
+!****************************************************************************
+
+begin-procedure GET-GL-CURRENCY
+
+begin-SELECT
+
+BASE_CURRENCY
+
+FROM  PS_BUS_UNIT_TBL_GL
+WHERE BUSINESS_UNIT = $Business_Unit_GL
+end-SELECT
+
+let $Currency_Cd_GL = &BASE_CURRENCY
+
+end-procedure
+!****************************************************************************
+! GET-GL-BU-DETAILS                                                         *
+!****************************************************************************
+begin-procedure GET-GL-BU-DETAILS
+
+
+  do GET-GL-CURRENCY
+  if isnull($currency_cd_hr)
+     let $currency_cd_hr = $Currency_Cd_GL
+  end-if
+
+  do GET-JOURNAL-TEMPLATE
+
+end-procedure
+
+!****************************************************************************
+! GET-JOURNAL-TEMPLATE                                                      *
+!****************************************************************************
+begin-procedure GET-JOURNAL-TEMPLATE
+
+  let $Jrnl_Template_Found = 'N'
+
+  let $err-statement1 = 'PAYGL03, Select Error - GET-JOURNAL-TEMPLATE'
+  let $err-statement2 = 'Bind Variables: BUSINESS UNIT '||$Business_Unit_GL||
+                        'Effective Status A, and Effective date <= '||
+                        $Accounting_Dt
+
+  let $Msg_MsgData1 = 'GET-JOURNAL-TEMPLATE see log'
+  let $Msg_MsgData2 = 'BUSINESS UNIT:'||$Business_Unit_GL
+  do Format-DateTime($Accounting_Dt, $Acctg_Dt_DMY, {DEFDATE}, '', '')
+  let $Msg_MsgData3 = 'Eff Status:A Effdt<='||$Acctg_Dt_DMY
+  let $Msg_MsgID    = '000020'
+
+begin-SELECT On-Error=SQL-Statement-Error
+
+GL_TMPLT.APPL_JRNL_ID
+
+  move 'Y'                    to $Jrnl_Template_Found
+  move &GL_TMPLT.APPL_JRNL_ID to $Appl_Jrnl_ID
+
+FROM PS_GL_JRNL_TMPLT GL_TMPLT,
+     PS_SET_CNTRL_REC SETREC,
+     PS_JRNLGEN_APPL_ID JRNLGEN
+WHERE GL_TMPLT.BUSINESS_UNIT_GL = $Business_Unit_GL
+  AND SETREC.SETCNTRLVALUE      = GL_TMPLT.BUSINESS_UNIT_GL
+  AND SETREC.REC_GROUP_ID       = 'FS_15'
+  AND SETREC.RECNAME            = 'JRNLGEN_APPL_ID'
+  AND JRNLGEN.SETID             = SETREC.SETID
+  AND JRNLGEN.APPL_JRNL_ID      = GL_TMPLT.APPL_JRNL_ID
+  AND JRNLGEN.EFFDT             = (SELECT MAX(JRNLGEN1.EFFDT)
+                                     FROM PS_JRNLGEN_APPL_ID JRNLGEN1
+                                    WHERE JRNLGEN1.SETID        = JRNLGEN.SETID
+                                      AND JRNLGEN1.APPL_JRNL_ID = JRNLGEN.APPL_JRNL_ID
+                                      AND JRNLGEN1.EFFDT        <= $Accounting_Dt
+                                      AND JRNLGEN1.EFF_STATUS   = 'A')
+end-SELECT
+
+  if $Jrnl_Template_Found = 'N'
+
+     let $Msg = '   ERROR-Appl Journal ID was '||
+                'not found for Business Unit '||$Business_Unit_GL||'.'
+
+     display $Msg
+
+     let $Msg_MsgData1 = 'GET-JOURNAL-TEMPLATE'
+     let $Msg_MsgData2 = 'BUSINESS UNIT: '||$Business_Unit_GL
+     do Format-DateTime($Accounting_Dt, $Acctg_Dt_DMY, {DEFDATE}, '', '')
+     let $Msg_MsgData3 = 'Effdt<='||$Acctg_Dt_DMY||', Status:A'
+     let $Msg_MsgID    = '000019'
+
+     do WRITE-ENCUMB-MESSAGE
+     do STOP-PROCESSING
+  end-if
+
+end-procedure
+
+!****************************************************************************
+! GET-OFF-SET-ACCOUNT                                                       *
+!****************************************************************************
+begin-procedure GET-OFF-SET-ACCOUNT
+
+  let $Off_Found = 'N'
+
+  let $err-statement1 = 'PAYGL03, Select Error - GET-OFF-SET-ACCOUNT'
+  let $err-statement2 = 'Bind Variables: SetID '||$SetID_Dept||
+                        ', Department ID '||$Deptid||
+                        ', Effective Date <= '||$Accounting_Dt||
+                        ', and Activity '||$Activity
+
+  let $Msg_MsgData1 = 'GET-OFF-SET-ACCOUNT see log'
+  let $Msg_MsgData2 = 'SetID:'||$SetID_Dept||' Dept:'||$Deptid
+  do Format-DateTime($Accounting_Dt, $Acctg_Dt_DMY, {DEFDATE}, '', '')
+  let $Msg_MsgData3 = 'Effdt<='||$Acctg_Dt_DMY||' Acty:'||$Activity
+  let $Msg_MsgID    = '000020'
+
+begin-SELECT On-Error=SQL-Statement-Error
+DEPT_ACT.ACCOUNT
+DEPT_ACT.DESCR
+
+  move 'Y'               to $Off_Found
+  move &DEPT_ACT.ACCOUNT to $Account
+  move &DEPT_ACT.DESCR   to $Descr
+
+FROM PS_DEPT_BUDGET_DT DEPT_BUD,
+     PS_DEPT_OFFSET_GRP DEPT_OFF_GRP,
+     PS_DEPT_ACTIVITY DEPT_ACT
+WHERE DEPT_BUD.SETID  = $SetID_Dept
+  AND DEPT_BUD.DEPTID = $Deptid
+  AND DEPT_BUD.FISCAL_YEAR = #Bud_Fiscal_Year
+  AND DEPT_BUD.DEPT_OFFSET_GRP = DEPT_OFF_GRP.DEPT_OFFSET_GRP
+  AND DEPT_OFF_GRP.EFFDT       = (SELECT MAX(DEPT_OFF_GRP1.EFFDT)
+                                  FROM PS_DEPT_OFFSET_GRP DEPT_OFF_GRP1
+                                  WHERE DEPT_OFF_GRP1.DEPT_OFFSET_GRP =
+                                        DEPT_OFF_GRP.DEPT_OFFSET_GRP
+                                    AND DEPT_OFF_GRP1.EFFDT <= $Accounting_Dt)
+  AND DEPT_OFF_GRP.DEPT_OFFSET_GRP = DEPT_ACT.DEPT_OFFSET_GRP
+  AND DEPT_OFF_GRP.EFFDT           = DEPT_ACT.EFFDT
+  AND DEPT_ACT.ACTIVITY            = $Activity
+
+end-SELECT
+
+  if $Off_Found = 'N'
+
+     let $Msg = 'ERROR-Offset Account not found for Department '||$Deptid||
+                ' and Activity '||$Activity||'.'
+
+     display $Msg
+
+     let $Msg_MsgID    = '000014'
+     let $Msg_MsgData1 = 'Activity '||$Activity
+     let $Msg_MsgData2 = ' '
+     let $Msg_MsgData3 = ' '
+
+     do WRITE-ENCUMB-MESSAGE
+     do STOP-PROCESSING
+  end-if
+
+end-procedure
+!****************************************************************************
+! GET-CHARTKEYS                                                             *
+!****************************************************************************
+begin-procedure GET-CHARTKEYS
+
+  let $ChartKey_Found = 'N'
+
+  let $err-statement1 = 'PAYGL03, Select Error - GET-CHARTKEYS'
+  let $err-statement2 = 'Bind Variables: Account Code '||$Acct_Cd||
+                        ' Effective Status A and effective date <= '||
+                        $Accounting_Dt
+
+  let $Msg_MsgData1 = 'GET-CHARTKEYS see log'
+  let $Msg_MsgData2 = 'Acct:'||$Acct_Cd
+  do Format-DateTime($Accounting_Dt, $Acctg_Dt_DMY, {DEFDATE}, '', '')
+  let $Msg_MsgData3 = 'Effdt<='||$Acctg_Dt_DMY||', Status:A'
+  let $Msg_MsgID    = '000020'
+
+begin-SELECT On-Error=SQL-Statement-Error
+ACCT_CD.FUND_CODE
+ACCT_CD.DEPTID_CF
+ACCT_CD.PROGRAM_CODE
+ACCT_CD.CLASS_FLD
+ACCT_CD.PROJECT_ID
+ACCT_CD.AFFILIATE
+ACCT_CD.DESCR
+ACCT_CD.ENCUMB_ACCOUNT
+ACCT_CD.PRE_ENCUMB_ACCOUNT
+ACCT_CD.PRODUCT
+ACCT_CD.OPERATING_UNIT
+ACCT_CD.ALTACCT
+ACCT_CD.BUDGET_REF
+ACCT_CD.CHARTFIELD1
+ACCT_CD.CHARTFIELD2
+ACCT_CD.CHARTFIELD3
+ACCT_CD.AFFILIATE_INTRA1
+ACCT_CD.AFFILIATE_INTRA2
+
+
+  move 'Y'                          to $ChartKey_Found
+  move &ACCT_CD.FUND_CODE           to $Fund_Code
+  move &ACCT_CD.DEPTID_CF           to $GL_DeptID
+  move &ACCT_CD.PROGRAM_CODE        to $Program_Code
+  move &ACCT_CD.CLASS_FLD           to $Class_Fld
+  move &ACCT_CD.PROJECT_ID          to $Project_ID
+  move &ACCT_CD.AFFILIATE           to $Affiliate
+  move &ACCT_CD.DESCR               to $Descr
+  move &ACCT_CD.PRE_ENCUMB_ACCOUNT  to $Pre_Account
+  move &ACCT_CD.ENCUMB_ACCOUNT      to $Enc_Account
+  move &ACCT_CD.PRODUCT             to $Product
+  move &ACCT_CD.OPERATING_UNIT      to $Operating_Unit
+  move &ACCT_CD.ALTACCT             to $AltAcct
+  move &ACCT_CD.BUDGET_REF          to $Budget_Ref
+  move &ACCT_CD.CHARTFIELD1         to $Chartfield1
+  move &ACCT_CD.CHARTFIELD2         to $Chartfield2
+  move &ACCT_CD.CHARTFIELD3         to $Chartfield3
+  move &ACCT_CD.AFFILIATE_INTRA1    to $Affiliate_Intra1
+  move &ACCT_CD.AFFILIATE_INTRA2    to $Affiliate_Intra2
+
+FROM PS_ACCT_CD_TBL ACCT_CD
+WHERE ACCT_CD.ACCT_CD    = $Acct_Cd
+end-SELECT
+
+  if $ChartKey_Found = 'N'
+
+     let $Msg     = 'ERROR-Account Code: '||$Acct_Cd||' Is Invalid or Inactive'
+
+     display $Msg
+
+     let $Msg_MsgID    = '000015'
+     let $Msg_MsgData1 = 'Acc:'||$Acct_Cd
+     let $Msg_MsgData2 = 'Is Invalid or Inactive'
+     let $Msg_MsgData3 = ' '
+
+     do WRITE-ENCUMB-MESSAGE
+     do STOP-PROCESSING
+  end-if
+
+end-procedure
+!****************************************************************************
+! WRITE-GL-TRANSACTION                                                      *
+!****************************************************************************
+begin-procedure WRITE-GL-TRANSACTION
+
+  do CONVERT-AMOUNT ($currency_cd_hr, $currency_cd_gl, $hr_rate_type, #Monetary_Amount, #GL_Amount, #rate_mult, #rate_div)
+
+  let #Bud_Monetary_Amount = #Monetary_Amount
+  let #Bud_Fiscal_Year     = #Fiscal_Year
+
+  if #Monetary_Amount <> 0
+
+     do WRITE-ACCOUNTING-LINE
+  end-if
+
+  move ' ' to $Line_Descr
+
+end-procedure
+!****************************************************************************
+! WRITE-ACCOUNTING-LINE                                                     *
+!****************************************************************************
+begin-procedure WRITE-ACCOUNTING-LINE
+
+  do GET-CURRENCY-DECIMALS ($Currency_Cd_GL, #Dec_Positions )
+
+  if #Dec_Positions = 3
+    let #GL_Amount       = round(#GL_Amount, 3 )
+    let #Monetary_Amount = round(#Monetary_Amount, 3 )
+
+  else
+    let #Original_amount    =  #Monetary_Amount
+    let #Monetary_Amount    =  round(#Monetary_Amount, 2)
+    let #Round_Diff         =  #Original_amount - #Monetary_Amount
+    let #Total_Round_Diff   = #Total_Round_Diff + #Round_Diff
+
+    if #Total_Round_Diff >= 0.01
+       let #Monetary_Amount = #Monetary_Amount + 0.01
+       let #Total_Round_Diff = #Total_Round_Diff - 0.01
+    end-if
+
+    if #Total_Round_Diff <= -0.01
+       let #Monetary_Amount = #Monetary_Amount - 0.01
+       let #Total_Round_Diff = #Total_Round_Diff + 0.01
+    end-if
+
+    let #Original_famount    =  #GL_Amount
+    let #GL_Amount           =  round(#GL_Amount, 2)
+    let #Round_fDiff  =  #Original_famount - #GL_Amount
+    let #Total_Round_fDiff = #Total_Round_fDiff + #Round_fDiff
+
+    if #Total_Round_fDiff >= 0.01
+       let #GL_Amount = #GL_Amount + 0.01
+       let #Total_Round_fDiff = #Total_Round_fDiff - 0.01
+    end-if
+
+    if #Total_Round_fDiff <= -0.01
+       let #GL_Amount = #GL_Amount - 0.01
+       let #Total_Round_fDiff = #Total_Round_fDiff + 0.01
+    end-if
+
+  end-if
+
+  if $DrCr = 'C'
+
+     let #Monetary_Amount = #Monetary_Amount * (-1)
+     let #GL_Amount       = #GL_Amount * (-1)
+
+     add #Monetary_Amount to #Total_Credits
+     add 1                to #Total_Credits_Count
+  else
+
+     if $DrCr = 'D'
+
+        if $Encumb_Type = 'R'             !Need to do only once because the same amt field is used.
+
+           let #Monetary_Amount = #Monetary_Amount * (-1)
+           let #GL_Amount       = #GL_Amount  * (-1)
+        end-if
+
+        add #Monetary_Amount to #Total_Debits
+        add 1                to #Total_Debits_Count
+     end-if
+  end-if
+
+  move ' '                    to $Journal_ID
+  move ''                     to $Journal_Date
+  move  0                     to #Journal_Line
+  move ' '                    to $Statistics_Code
+  move 0                      to #Statistics_Amount
+  move 0                      to #Accounting_Period
+  move 0                      to #Fiscal_Year
+  move $Acct_Type             to $Jrnl_Ln_Ref
+  move 'N'                    to $Open_Item_Status
+  move '0'                    to $Jrnl_Line_Status
+  move 'N'                    to $GL_Distrib_Status
+  move ' '                    to $Ledger
+  move ' '                    to $Ledger_Group
+  move $Prcs_Process_Instance to #Process_Instance
+  move $Amount_Type           to $KK_Amount_Type
+  move 'A'                    to $Audit_Actn
+  move ' '                    to $In_Process_Flg
+  move 'N'                    to $Budget_Line_Status
+  move $Accounting_Dt         to $Budget_Dt
+  move 'Y'                    to $Use_Distribution
+
+  let $Monetary_Amount   = #Monetary_Amount
+  let $GL_Amount         = #GL_Amount
+  let $Statistics_Amount = #Statistics_Amount
+  let $Process_Instance  = #Process_Instance
+  let $Accounting_Period = #Accounting_Period
+  let $Fiscal_Year       = #Fiscal_Year
+  let $journal_line      = #journal_line
+  let $rate_mult         = #rate_mult
+  let $rate_div          = #rate_div
+
+  do Get-Seqnum (#max_line, #proc_seq_no, #gl_entry_line)
+  let $proc_seq_no       = #proc_seq_no
+  let $gl_entry_line     = #gl_entry_line
+
+  let $err-statement1 = 'PAYGL03, Insert-Error - WRITE-ACCOUNTING-LINE'
+  let $err-statement2 = 'Key Values: TABLE '||'PS_HR_ACCTG_LN_STG'||
+                        ', GL_RUN_DATE '||$gl_run_date||
+                        ', PROCESS_INSTANCE '||$Process_Instance||
+                        ', GL_RUN_SEQ '||$proc_seq_no||
+                        ', GL_ENTRY_LINE '||$gl_entry_line||
+                        ', KK_AMOUNT_TYPE '||$KK_Amount_Type||
+                        ', AUDIT_ACTN '||$Audit_Actn||
+                        ', IN_PROCESS_FLG '||$In_Process_Flg||
+                        ', BUDGET_LINE_STATUS '||$Budget_Line_Status||
+                        ', BUDGET_DT '||$Budget_Dt||
+                        ', BUSINESS_UNIT_GL '||$Business_Unit_GL||
+                        ', JOURNAL_ID '||$Journal_Id||
+                        ', JOURNAL_DATE '||$Journal_Date||
+                        ', JOURNAL_LINE '||$Journal_Line||
+                        ', ACCOUNT '||$Account||
+                        ', DEPTID '||$GL_DeptID||
+                        ', PROJECT_ID '||$Project_Id||
+                        ', PRODUCT '||$Product||
+                        ', FUND_CODE '||$Fund_Code||
+                        ', PROGRAM_CODE  '||$Program_Code||
+                        ', CLASS_FLD '||$Class_Fld||
+                        ', AFFILIATE '||$Affiliate||
+                        ', OPERATING_UNIT '||$Operating_Unit||
+                        ', ALTACCT'||$AltAcct||
+                        ', BUDGET_REF'||$Budget_Ref||
+                        ', CHARTFIELD1'||$Chartfield1||
+                        ', CHARTFIELD2'||$Chartfield2||
+                        ', CHARTFIELD3'||$Chartfield3||
+                        ', AFFILIATE_INTRA1' ||$Affiliate_Intra1||
+                        ', AFFILIATE_INTRA2' ||$Affiliate_Intra2||
+                        ', STATISTICS_CODE '||$Statistics_Code||
+                        ', MONETARY_AMOUNT '||$GL_Amount||
+                        ', FOREIGN_AMOUNT '||$Monetary_Amount||
+                        ', FOREIGN_CURRENCY '||$currency_cd_hr||
+                        ', RT_TYPE '||$hr_rate_type||
+                        ', RATE_MULT '||$rate_mult||
+                        ', RATE_DIV '||$rate_div||
+                        ', STATISTIC_AMOUNT '||$Statistics_Amount||
+                        ', JRNL_LN_REF '||$Jrnl_Ln_Ref||
+                        ', OPEN_ITEM_STATUS '||$Open_Item_Status||
+                        ', LINE_DESCR '||$Descr||
+                        ', JRNL_LINE_STATUS '||$Jrnl_Line_Status||
+                        ', JOURNAL_LINE_DATE '||$Journal_Line_Date||
+                        ', BUSINESS_UNIT '||$Business_Unit_HR||
+                        ', APPL_JRNL_ID '||$Appl_Jrnl_ID||
+                        ', ACCOUNTING_DT '||$Accounting_Dt||
+                        ', GL_DISTRIB_STATUS '||$GL_Distrib_Status||
+                        ', CURRENCY_CD '||$Currency_Cd_GL||
+                        ', ACCOUNTING_PERIOD '||$Accounting_Period||
+                        ', FISCAL_YEAR '||$Fiscal_Year||
+                        ', LEDGER '||$Ledger||
+                        ', LEDGER_GROUP '||$Ledger_Group||
+                        ', USE_DISTRIBUTION '||$Use_Distribution
+
+  let $Msg_MsgData1 = 'WRITE-ACCOUNTING-LINE'
+  let $Msg_MsgData2 = 'See log for bind variables'
+  let $Msg_MsgData3 = ' '
+  let $Msg_MsgID    = '000021'
+
+begin-SQL On-Error=SQL-Statement-Error
+INSERT INTO PS_HR_ACCTG_LN_STG
+(RUN_DT,
+  PROCESS_INSTANCE,
+  SEQNUM,
+  LINE_NBR,
+  KK_AMOUNT_TYPE,
+  AUDIT_ACTN,
+  IN_PROCESS_FLG,
+  BUDGET_LINE_STATUS,
+  BUDGET_DT,
+  BUSINESS_UNIT_GL,
+  JOURNAL_ID,
+  JOURNAL_DATE,
+  JOURNAL_LINE,
+  ACCOUNT,
+  DEPTID,
+  PROJECT_ID,
+  PRODUCT,
+  FUND_CODE,
+  PROGRAM_CODE,
+  CLASS_FLD,
+  AFFILIATE,
+  OPERATING_UNIT,
+  ALTACCT,
+  BUDGET_REF,
+  CHARTFIELD1,
+  CHARTFIELD2,
+  CHARTFIELD3,
+  AFFILIATE_INTRA1,
+  AFFILIATE_INTRA2,
+  STATISTICS_CODE,
+  MONETARY_AMOUNT,
+  FOREIGN_AMOUNT,
+  FOREIGN_CURRENCY,
+  RT_TYPE,
+  RATE_MULT,
+  RATE_DIV,
+  STATISTIC_AMOUNT,
+  JRNL_LN_REF,
+  OPEN_ITEM_STATUS,
+  LINE_DESCR,
+  JRNL_LINE_STATUS,
+  JOURNAL_LINE_DATE,
+  BUSINESS_UNIT,
+  APPL_JRNL_ID,
+  ACCOUNTING_DT,
+  GL_DISTRIB_STATUS,
+  CURRENCY_CD,
+  ACCOUNTING_PERIOD,
+  FISCAL_YEAR,
+  LEDGER,
+  LEDGER_GROUP,
+  USE_DISTRIBUTION)
+VALUES($gl_run_date,
+       #Process_Instance,
+       #proc_seq_no,
+       #gl_entry_line,
+       $KK_Amount_Type,
+       $Audit_Actn,
+       $In_Process_Flg,
+       $Budget_Line_Status,
+       $Budget_Dt,
+       $Business_Unit_GL,
+       $Journal_ID,
+       $Journal_Date,
+       #Journal_Line,
+       $Account,
+       $GL_DeptID,
+       $Project_ID,
+       $Product,
+       $Fund_Code,
+       $Program_Code,
+       $Class_Fld,
+       $Affiliate,
+       $Operating_Unit,
+       $AltAcct,
+       $Budget_Ref,
+       $Chartfield1,
+       $Chartfield2,
+       $Chartfield3,
+       $Affiliate_Intra1,
+       $Affiliate_Intra2,
+       $Statistics_Code,
+       #GL_Amount,
+       #Monetary_Amount,
+       $currency_cd_hr,
+       $hr_rate_type,
+       #rate_mult,
+       #rate_div,
+       #Statistics_Amount,
+       $Jrnl_Ln_Ref,
+       $Open_Item_Status,
+       $Descr,
+       $Jrnl_Line_Status,
+       $Journal_Line_Date,
+       $Business_Unit_HR,
+       $Appl_Jrnl_ID,
+       $Accounting_Dt,
+       $GL_Distrib_Status,
+       $Currency_Cd_GL,
+       #Accounting_Period,
+       #Fiscal_Year,
+       $Ledger,
+       $Ledger_Group,
+       $Use_Distribution)
+end-SQL
+
+end-procedure
+!****************************************************************************
+! INTERNAL-BUDGET-UPDATE                                                    *
+! This is the driving procedure for updating the internal budget table.     *
+! It determine if an update or insert is needed to the budget actuals table.*
+!****************************************************************************
+begin-procedure INTERNAL-BUDGET-UPDATE
+
+  move 'N'              to $Found_Budget
+  move #Empl_Rcd        to $Empl_Rcd
+  move #Bud_Fiscal_Year to $Bud_Fiscal_Year
+
+
+  let $err-statement1 = 'PAYGL03, Select-Error - INTERNAL-BUDGET-UPDATE'
+  let $err-statement2 = 'Bind Variables: SETID '||$SetID_Dept||
+                        ', DEPTID '||$Deptid||
+                        ', POSITION_POOL_ID  '||$Position_Pool_ID||
+                        ', SETID_JOBCODE '||$SetID_Jobcode||
+                        ', JOBCODE '||$Jobcode||
+                        ', POSITION_NBR '||$Position_Nbr||
+                        ', EMPLID '||$Emplid||
+                        ', EMPL_RCD '||$Empl_Rcd||
+                        ', ACCT_CD '||$Acct_CD||', Account '||$Dist_Account||
+                        ', ENCUMB_PROC_TYPE ' || $Encumb_Proc_Type||
+                        ', and FISCAL_YEAR '||$Bud_Fiscal_Year
+
+  let $Msg_MsgData1 = 'INTERNAL-BUDGET-UPDATE see log'
+  let $Msg_MsgData2 = 'Acct:'||$Acct_CD
+  let $Msg_MsgData3 = 'FISCAL_YEAR:'||$Bud_Fiscal_Year
+  let $Msg_MsgID    = '000020'
+
+
+begin-SELECT On-Error=SQL-Statement-Error
+BUD_ACT.ANNUAL_ENCUMB_AMT
+BUD_ACT.POSTED_ENCUMB_AMT
+
+  move &BUD_ACT.POSTED_ENCUMB_AMT to #Posted_Encumb_Amt
+  move 'Y' to $Found_Budget
+
+
+  if $Encumb_Type = 'R'
+
+     let #Posted_Encumb_Amt = #Posted_Encumb_Amt - #Bud_Monetary_Amount
+     let #Annual_Encumb_Amt = &BUD_ACT.ANNUAL_ENCUMB_AMT - #Bud_Monetary_Amount
+
+
+  else
+
+     let #Posted_Encumb_Amt = #Posted_Encumb_Amt + #Bud_Monetary_Amount
+     let #Annual_Encumb_Amt = &BUD_ACT.ANNUAL_ENCUMB_AMT + #Bud_Monetary_Amount
+
+
+  end-if
+
+
+FROM PS_BUDGET_ACTUALS BUD_ACT
+WHERE BUD_ACT.SETID             = $SetID_Dept
+  AND BUD_ACT.DEPTID            = $Deptid
+  AND BUD_ACT.POSITION_POOL_ID  = $Position_Pool_ID
+  AND BUD_ACT.SETID_JOBCODE     = $SetID_Jobcode
+  AND BUD_ACT.JOBCODE           = $Jobcode
+  AND BUD_ACT.POSITION_NBR      = $Position_Nbr
+  AND BUD_ACT.EMPLID            = $Emplid
+  AND BUD_ACT.EMPL_RCD          = #Empl_Rcd
+  AND BUD_ACT.ACCT_CD           = $Acct_CD
+  AND BUD_ACT.ACCOUNT           = $Dist_Account
+  AND BUD_ACT.ENCUMB_PROC_TYPE  = $Encumb_Proc_Type
+  AND BUD_ACT.FISCAL_YEAR       = #Bud_Fiscal_Year
+
+end-SELECT
+
+  if $Found_Budget = 'Y'
+
+
+     do CHECK-ENCUMBRANCE-TOTALS
+     do UPDATE-BUDGET-TOTALS
+  else
+
+     do INSERT-BUDGET-TOTALS
+
+  end-if
+
+end-procedure
+!****************************************************************************
+! CHECK-ENCUMBRANCE-TOTALS                                                 *
+!****************************************************************************
+begin-procedure CHECK-ENCUMBRANCE-TOTALS
+
+  if #Posted_Encumb_Amt < 0
+
+     move 0 to #Posted_Encumb_Amt
+  end-if
+
+end-procedure
+!****************************************************************************
+! UPDATE-BUDGET-TOTALS                                                      *
+!****************************************************************************
+begin-procedure UPDATE-BUDGET-TOTALS
+
+  let $Empl_Rcd          = #Empl_Rcd
+  let $Bud_Fiscal_Year   = #Bud_Fiscal_Year
+  let $Posted_Encumb_Amt = #Posted_Encumb_Amt
+  let $Annual_Encumb_Amt = #Annual_Encumb_Amt
+
+  let $err-statement1 = 'PAYGL03, Update-Error - UPDATE-BUDGET-TOTALS'
+  let $err-statement2 = 'Bind Varables: SETID '||$SetID_Dept||
+                        ', DEPTID '||$Deptid||
+                        ', POSITION_POOL_ID '||$Position_Pool_ID||
+                        ', SETID_JOBCODE '||$SetID_Jobcode||
+                        ', JOBCODE '||$Jobcode||
+                        ', POSITION_NBR '||$Position_Nbr||
+                        ', EMPLID '||$Emplid||
+                        ', EMPL_RCD '||$Empl_Rcd||
+                        ', ACCT_CD '||$Acct_Cd||', Account '||$Dist_Account||
+                        ', ENCUMB_PROC_TYPE ' || $Encumb_Proc_Type||
+                        ', FISCAL_YEAR '||$Bud_Fiscal_Year||
+                        '  Key Values: POSTED_ENCUMB_AMT '||$Posted_Encumb_Amt||
+                        ', ANNUAL_ENCUMB_AMT '||$Annual_Encumb_Amt
+
+  let $Msg_MsgData1 = 'UPDATE-BUDGET-TOTALS see log'
+  let $Msg_MsgData2 = 'Acct:'||$Acct_Cd
+  let $Msg_MsgData3 = 'Fiscal Year:'||$Bud_Fiscal_Year
+  let $Msg_MsgID    = '000022'
+
+
+begin-SQL On-Error=SQL-Statement-Error
+
+UPDATE PS_BUDGET_ACTUALS
+SET POSTED_ENCUMB_AMT  = #Posted_Encumb_Amt,
+    ANNUAL_ENCUMB_AMT  = #Annual_Encumb_Amt
+WHERE SETID            = $SetID_Dept
+  AND DEPTID           = $Deptid
+  AND POSITION_POOL_ID = $Position_Pool_Id
+  AND SETID_JOBCODE    = $SetID_Jobcode
+  AND JOBCODE          = $Jobcode
+  AND POSITION_NBR     = $Position_Nbr
+  AND EMPLID           = $Emplid
+  AND EMPL_RCD         = #Empl_Rcd
+  AND ACCT_CD          = $Acct_Cd
+  AND ACCOUNT          = $Dist_Account
+  AND ENCUMB_PROC_TYPE = $Encumb_Proc_Type
+  AND FISCAL_YEAR      = #Bud_Fiscal_Year
+end-SQL
+
+end-procedure
+!****************************************************************************
+! INSERT-BUDGET-TOTALS                                                      *
+!****************************************************************************
+begin-procedure INSERT-BUDGET-TOTALS
+
+  let $Empl_Rcd          = #Empl_Rcd
+  let $Bud_Fiscal_Year   = #Bud_Fiscal_Year
+  let $Posted_Encumb_Amt = #Bud_Monetary_Amount
+
+  let $err-statement1 = 'PAYGL03, Insert-Error - INSERT-BUDGET-TOTALS'
+  let $err-statement2 = 'Key Values: SETID '||$SetID_Dept||
+                        ', DEPTID '||$Deptid||
+                        ', POSITION_POOL_ID '||$Position_Pool_ID||
+                        ', SETID_JOBCODE '||$SetID_Jobcode||
+                        ', JOBCODE '||$Jobcode||
+                        ', POSITION_NBR '||$Position_Nbr||
+                        ', EMPLID '||$Emplid||
+                        ', EMPL_RCD '||$Empl_Rcd||
+                        ', ACCT_CD '||$Acct_Cd||', Account '||$Dist_Account||
+                        ', ENCUMB_PROC_TYPE ' || $Encumb_Proc_Type||
+                        ', FISCAL_YEAR '||$Bud_Fiscal_Year||
+                        ', POSTED_ACTUAL_AMT 0'||
+                        ', POSTED_ENCUMB_AMT '||$Posted_Encumb_Amt||
+                        ', ANNUAL_ENCUMB_AMT '||$Posted_Encumb_Amt||
+                        ', WORK_ACTUAL_AMT 0'||
+                        ', WORK_ENCUMB_AMT 0'
+
+  let $Msg_MsgData1 = 'INSERT-BUDGET-TOTALS see log'
+  let $Msg_MsgData2 = 'Acct:'||$Acct_Cd
+  let $Msg_MsgData3 = 'Fiscal Year:'||$Bud_Fiscal_Year
+  let $Msg_MsgID    = '000021'
+
+begin-SQL On-Error=SQL-Statement-Error
+
+INSERT INTO PS_BUDGET_ACTUALS
+(SETID,
+DEPTID,
+POSITION_POOL_ID,
+SETID_JOBCODE,
+JOBCODE,
+POSITION_NBR,
+EMPLID,
+EMPL_RCD,
+ACCT_CD,
+ACCOUNT,
+ENCUMB_PROC_TYPE,
+FISCAL_YEAR,
+POSTED_ACTUAL_AMT,
+POSTED_ENCUMB_AMT,
+ANNUAL_ENCUMB_AMT,
+WORK_ACTUAL_AMT,
+WORK_ENCUMB_AMT)
+VALUES($SetID_Dept,
+$Deptid,
+$Position_Pool_ID,
+$SetID_Jobcode,
+$Jobcode,
+$Position_Nbr,
+$Emplid,
+#Empl_Rcd,
+$Acct_CD,
+$Dist_Account,
+$Encumb_Proc_Type,
+#Bud_Fiscal_Year,
+0,
+#Bud_Monetary_Amount,
+#Bud_Monetary_Amount,
+0,
+0)
+
+end-SQL
+
+end-procedure
+!****************************************************************************
+! UPDATE-EARN-ENCUMB-RCDS                                                   *
+! Updates all records in the earnings distribution table that were posted.  *
+!****************************************************************************
+begin-procedure UPDATE-EARN-ENCUMB-RCDS
+
+  let $err-statement1 = 'PAYGL03, Update Error - UPDATE-EARN-ENCUMB-RCDS'
+  let $err-statement2 = 'Bind Variable: ENCUMB_POSTED N'||
+                        ', Department Effective Date '||$Accounting_Dt||
+                        '   Key Values: ENCUMB_POSTED Y'
+
+  let $Msg_MsgData1 = 'UPDATE-EARN-ENCUMB-RCDS'
+  let $Msg_MsgData2 = 'See log, ENCUMB_POSTED:N'
+  do Format-DateTime($Accounting_Dt, $Acctg_Dt_DMY, {DEFDATE}, '', '')
+  let $Msg_MsgData3 = 'Dept Effdt: '||$Acctg_Dt_DMY
+  let $Msg_MsgID    = '000022'
+
+begin-SQL On-Error=SQL-Statement-Error
+
+UPDATE PS_ENCUMB_DIST_ERN
+SET ENCUMB_POSTED   = 'Y'
+WHERE ENCUMB_POSTED = 'N'
+  AND DEPTID = (SELECT DEPT_A.DEPTID
+                  FROM PS_DEPT_TBL DEPT_A
+                 WHERE DEPT_A.SETID  = PS_ENCUMB_DIST_ERN.SETID
+                   AND DEPT_A.DEPTID = PS_ENCUMB_DIST_ERN.DEPTID
+                   AND DEPT_A.EFFDT  = (SELECT MAX(DEPT_B.EFFDT)
+                                          FROM PS_DEPT_TBL DEPT_B
+                                         WHERE DEPT_B.SETID  =
+                                               DEPT_A.SETID
+                                           AND DEPT_B.DEPTID =
+                                               DEPT_A.DEPTID
+                                           AND DEPT_B.EFFDT <=
+                                               $Accounting_Dt))
+end-SQL
+
+end-procedure
+!****************************************************************************
+! UPDATE-TAX-ENCUMB-RCDS                                                    *
+! Updates all records in the tax distribution table that were posted.       *
+!****************************************************************************
+begin-procedure UPDATE-TAX-ENCUMB-RCDS
+
+  let $err-statement1 = 'PAYGL03, Update-Error - UPDATE-TAX-ENCUMB-RCDS'
+  let $err-statement2 = 'Bind Variable: ENCUMB_POSTED N'||
+                        ', Department Effective Date '||$Accounting_Dt||
+                        '   Key Values: ENCUMB_POSTED Y'
+
+  let $Msg_MsgData1 = 'UPDATE-TAX-ENCUMB-RCDS see log'
+  let $Msg_MsgData2 = 'ENCUMB_POSTED:N'
+  do Format-DateTime($Accounting_Dt, $Acctg_Dt_DMY, {DEFDATE}, '', '')
+  let $Msg_MsgData3 = 'Dept Effdt: '||$Acctg_Dt_DMY
+  let $Msg_MsgID    = '000022'
+
+begin-SQL On-Error=SQL-Statement-Error
+
+UPDATE PS_ENCUMB_DIST_TAX
+SET ENCUMB_POSTED   = 'Y'
+WHERE ENCUMB_POSTED = 'N'
+  AND DEPTID = (SELECT DEPT_C.DEPTID
+                  FROM PS_DEPT_TBL DEPT_C
+                 WHERE DEPT_C.SETID  = PS_ENCUMB_DIST_TAX.SETID
+                   AND DEPT_C.DEPTID = PS_ENCUMB_DIST_TAX.DEPTID
+                   AND DEPT_C.EFFDT  = (SELECT MAX(DEPT_D.EFFDT)
+                                          FROM PS_DEPT_TBL DEPT_D
+                                         WHERE DEPT_D.SETID  =
+                                               DEPT_C.SETID
+                                           AND DEPT_D.DEPTID =
+                                               DEPT_C.DEPTID
+                                           AND DEPT_D.EFFDT <=
+                                               $Accounting_Dt))
+end-SQL
+
+end-procedure
+!****************************************************************************
+! UPDATE-DED-ENCUMB-RCDS                                                    *
+! Updates all records in the deduction distribution table that were posted. *
+!****************************************************************************
+begin-procedure UPDATE-DED-ENCUMB-RCDS
+
+  let $err-statement1 = 'PAYGL03, Update-Error - UPDATE-DED-ENCUMB-RCDS'
+  let $err-statement2 = 'Bind Variable: ENCUMB_POSTED N'||
+                        ', Department Effective Date '||$Accounting_Dt||
+                        '   Key Values: ENCUMB_POSTED Y'
+
+  let $Msg_MsgData1 = 'UPDATE-DED-ENCUMB-RCDS see log'
+  let $Msg_MsgData2 = 'ENCUMB_POSTED:N'
+  do Format-DateTime($Accounting_Dt, $Acctg_Dt_DMY, {DEFDATE}, '', '')
+  let $Msg_MsgData3 = 'Dept Effdt: '||$Acctg_Dt_DMY
+  let $Msg_MsgID    = '000022'
+
+begin-SQL On-Error=SQL-Statement-Error
+
+UPDATE PS_ENCUMB_DIST_DED
+SET ENCUMB_POSTED   = 'Y'
+WHERE ENCUMB_POSTED = 'N'
+  AND DEPTID = (SELECT DEPT_E.DEPTID
+                  FROM PS_DEPT_TBL DEPT_E
+                 WHERE DEPT_E.SETID  = PS_ENCUMB_DIST_DED.SETID
+                   AND DEPT_E.DEPTID = PS_ENCUMB_DIST_DED.DEPTID
+                   AND DEPT_E.EFFDT  = (SELECT MAX(DEPT_F.EFFDT)
+                                          FROM PS_DEPT_TBL DEPT_F
+                                         WHERE DEPT_F.SETID  =
+                                               DEPT_E.SETID
+                                           AND DEPT_F.DEPTID =
+                                               DEPT_E.DEPTID
+                                           AND DEPT_F.EFFDT <=
+                                               $Accounting_Dt))
+end-SQL
+
+end-procedure
+!****************************************************************************
+! UPDATE-WORK-ACTUALS                                                       *
+!****************************************************************************
+begin-procedure UPDATE-WORK-ACTUALS
+
+  let $err-statement1 = 'PAYGL03, Update Error - UPDATE-WORK-ACTUALS'
+  let $err-statement2 = ' '
+
+begin-SQL On-Error=Error-Display
+
+UPDATE PS_BUDGET_ACTUALS
+SET WORK_ENCUMB_AMT  = 0
+
+end-SQL
+
+end-procedure
+!****************************************************************************
+! GET-EXCH-RATE                                                             *
+!****************************************************************************
+begin-procedure GET-EXCH-RATE ($from, $to, $rtype, :#rate_mult, :#rate_div)
+
+let #rate_mult = 1
+let #rate_div  = 1
+
+if $rtype = ' '
+    let $rtype = 'OFFIC'
+end-if
+
+begin-SELECT
+
+RATE_MULT
+RATE_DIV
+
+  let #rate_mult = &RATE_MULT
+  let #rate_div  = &RATE_DIV
+
+FROM PS_RT_DFLT_VW A
+WHERE FROM_CUR = $from AND TO_CUR = $to
+  AND RT_TYPE = $rtype  AND EFFDT
+  = ( SELECT MAX(EFFDT) FROM PS_RT_DFLT_VW WHERE FROM_CUR = A.FROM_CUR
+  AND TO_CUR = A.TO_CUR AND RT_TYPE = A.RT_TYPE
+  AND EFFDT <= $_Rate_Conversion_Date )
+
+end-SELECT
+
+
+end-procedure
+!****************************************************************************
+! CONVERT-AMOUNT                                                            *
+!****************************************************************************
+begin-procedure CONVERT-AMOUNT ($from, $to, $rtype, #hr_amount, :#gl_amount, :#rate_mult,
+                                 :#rate_div)
+
+let $currency_error =
+   cond($from=$to and rtrim($from,' ')='','Blank PY&GL Currency-Chk BUs',
+   cond(rtrim($from,' ')='','Blank PY currency:'||$_business_unit_hr,
+   cond(rtrim($to,' ')='' and rtrim($_business_unit_gl,' ')='',
+        'No GL Curr, no GL BU for ' || $_business_unit_hr
+   cond(rtrim($to,' ')='','No GL Curr',
+    'None'))))
+
+if $currency_error <> 'None'
+   display ' '
+   display $currency_error
+   display 'Please correct and re-run'
+   let $_Msg_MsgID    = '000016'
+   let $_Msg_MsgData1 = $currency_error
+   let $_Msg_MsgData2 = ' '
+   let $_Msg_MsgData3 = ' '
+   do WRITE-ENCUMB-MESSAGE
+   stop quiet
+else
+  if $from = $to
+          let #gl_amount = #hr_amount
+          let #rate_mult = 1
+          let #rate_div  = 1
+  else
+        do Get-Exch-Rate ($from, $to, $rtype, #rate_mult, #rate_div)
+        if #rate_div = 0
+           display ' '
+           display 'Divisor rate is zero for currency codes :' noline
+           display $from noline
+           display ' and '  noline
+           display $to
+           display 'please correct and re-run'
+           let $_Msg_MsgID    = '000017'
+           let $_Msg_MsgData1 = 'From: ' || $from
+           let $_Msg_MsgData2 = '  To: ' || $To
+           let $_Msg_MsgData3 = ' '
+           do WRITE-ENCUMB-MESSAGE
+           stop
+        end-if
+        let #gl_amount = #hr_amount * #rate_mult/#rate_div
+  end-if
+        if #rate_div = 0 or #rate_mult = 0
+           display ' '
+           display 'Rates are invalid for currency codes :' noline
+           display $from noline
+           display ' and ' noline
+           display $to
+           display 'please correct and re-run'
+           let $_Msg_MsgID    = '000018'
+           let $_Msg_MsgData1 = 'From: ' || $from
+           let $_Msg_MsgData2 = '  To: ' || $To
+           let $_Msg_MsgData3 = ' '
+           do WRITE-ENCUMB-MESSAGE
+           stop
+        end-if
+end-if
+
+end-procedure
+
+!****************************************************************************
+! GET-CURRENCY-DECIMALS                                                     *
+!****************************************************************************
+begin-procedure GET-CURRENCY-DECIMALS ($Currency, :#Decimals)
+
+begin-SELECT
+
+DECIMAL_POSITIONS
+
+  move &DECIMAL_POSITIONS to #decimals
+
+FROM PS_CURRENCY_CD_TBL A
+WHERE CURRENCY_CD = $Currency
+  AND EFF_STATUS = 'A' AND EFFDT
+  = ( SELECT MAX(EFFDT) FROM PS_CURRENCY_CD_TBL WHERE CURRENCY_CD = A.CURRENCY_CD
+  AND EFF_STATUS = A.EFF_STATUS AND EFFDT <= $_Rate_Conversion_Date )
+
+end-SELECT
+
+end-procedure
+!****************************************************************************
+! Procedure: WRITE-ENCUMB-MESSAGE                                           *
+! Descr:     Inserts a ENCUMB_MSG record                                    *
+!****************************************************************************
+begin-procedure WRITE-ENCUMB-MESSAGE
+
+  let $err-statement1 = 'PAYGL03, Insert Error - ENCUMB_MSG'
+  let $err-statement2 = 'Bind Variables: SetID: '||$Msg_SetID ||
+                         ', Department ID: ' || $Msg_DeptID ||
+                         ', Position Pool ID: ' || $Msg_Position_Pool_ID ||
+                         ', Position_Nbr: ' || $Msg_Position_Nbr ||
+                         ', SetID JobCode: ' || $Msg_SetID_JobCode ||
+                         ', JobCode: ' || $Msg_JobCode ||
+                         ', Employee ID: ' || $Msg_EmplID ||
+                         ', Employee Rcd#: ' || $Msg_Empl_Rcd ||
+                         ', MsgID: ' || $Msg_MsgID||
+                         ', MsgData1: ' || $Msg_MsgData1 ||
+                         ', MsgData2: ' || $Msg_MsgData2 ||
+                         ', MsgData3: ' || $Msg_MsgData3
+
+  do ROLLBACK-TRANSACTION
+
+begin-SQL  On-Error=Error-Display
+INSERT INTO PS_ENCUMB_MSG ( SETID,
+                             DEPTID,
+                             POSITION_POOL_ID,
+                             POSITION_NBR,
+                             SETID_JOBCODE,
+                             JOBCODE,
+                             EMPLID,
+                             EMPL_RCD,
+                             MSGID,
+                             MSGDATA1,
+                             MSGDATA2,
+                             MSGDATA3
+                            )
+                       VALUES ( $Msg_SetID,
+                                $Msg_DeptID,
+                                $Msg_Position_Pool_ID,
+                                $Msg_Position_Nbr,
+                                $Msg_SetID_JobCode,
+                                $Msg_JobCode,
+                                $Msg_EmplID,
+                                #Msg_Empl_Rcd,
+                                $Msg_MsgID,
+                                $Msg_MsgData1,
+                                $Msg_MsgData2,
+                                $Msg_MsgData3 );
+
+end-SQL
+
+  do COMMIT-TRANSACTION
+
+end-procedure
+
+!****************************************************************************
+! DELETE-RUN-CONTROL                                                        *
+! Deletes run control information from run control table.                   *
+!****************************************************************************
+begin-procedure DELETE-RUN-CONTROL
+
+  let $err-statement1 = 'PAYGL03, Delete-Error - DELETE-RUN-CONTROL'
+  let $err-statement2 = 'Key Values: TABLE PS_RUN_CNTL_BDGT' ||
+                        ', OPRID ' || $PRCS_OPRID ||
+                        ', RUN_CNTL_ID ' || $PRCS_RUN_CNTL_ID
+
+begin-SQL On-Error=Error-Display
+
+DELETE FROM PS_RUN_CNTL_BDGT
+WHERE OPRID       = $Prcs_OprID
+  AND RUN_CNTL_ID = $Prcs_Run_Cntl_ID
+
+end-SQL
+
+end-procedure
+
+!****************************************************************************
+! DELETE-ENCUMB-MSG                                                         *
+! Deletes ENCUMB_MSG table                              .                   *
+!****************************************************************************
+begin-procedure DELETE-ENCUMB-MSG
+
+  let $err-statement1 = 'PAYGL03, Delete-Error - DELETE-ENCUMB-MSG'
+  let $err-statement2 = 'Key Values: TABLE PS_ENCUMB_MSG'
+
+begin-SQL On-Error=Error-Display
+
+DELETE FROM PS_ENCUMB_MSG
+
+end-SQL
+
+  do COMMIT-TRANSACTION
+
+end-procedure
+
+!****************************************************************************
+! SQL-STATEMENT-ERROR                                                       *
+! Write SQL error message to ENCUMB_MSG table & SQR log                     *
+!****************************************************************************
+begin-procedure SQL-STATEMENT-ERROR
+
+  do WRITE-ENCUMB-MESSAGE
+  do Error-Display
+
+end-procedure
+
+!****************************************************************************
+! STOP-PROCESSING                                                           *
+! Termminates processing and rolls back to prior commit.                    *
+!****************************************************************************
+begin-procedure STOP-PROCESSING
+
+ display ' '
+ display '                        PROGRAM TERMINATED'
+ display '**************UNRECOVERABLE ERRORS HAVE BEEN ENCOUNTERED*************'
+ display '               Correct Above Errors and Restart Program'
+
+ stop
+
+end-procedure
+!****************************************************************************
+! WRAPUP                                                                    *
+! This paragraph ends the report process and updates the status of the      *
+! job in the process scheduler.                                             *
+!****************************************************************************
+begin-procedure WRAPUP
+
+  do DELETE-RUN-CONTROL
+  do RESET
+  do STDAPI-TERM
+
+end-procedure
+
+!***********************************************************************
+! SQCs                                                                 *
+!***********************************************************************
+#Include 'reset.sqc'     !Reset printer procedure
+#Include 'curdttim.sqc'  !Get-Current-DateTime procedure
+#Include 'datetime.sqc'  !Routines for date and time formatting
+#Include 'number.sqc'    !Routines to format numbers
+#Include 'stderror.sqc'  !Routine for error display
+#Include 'getcodta.sqc'  !Get-Company-Data
+#Include 'stdapi.sqc'    !Update Process API
+#Include 'btrnctl1.sqc'  !Get run control parameters.  This will change
+                         !depending on the type of report you are running
+                         !and which type of parameters are being used to
+                         !run the report.
+#Include 'btgetval.sqc'  !Get values from run control table
+#Include 'tranctrl.sqc'  !Transaction control (commits, etc.)
+#Include 'eoprcsnm.sqc'  !Determine Process Name
+#Include 'eoactive.sqc'  !Determine Active Publish Definition
+#Include 'eoparam.sqc'   !Insert values into Parameter Table for Batch Publish
+#Include 'payglstg.sqc'  !Common procedures for GL interface
+
