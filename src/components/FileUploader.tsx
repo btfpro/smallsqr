@@ -20,7 +20,8 @@ class FileUploader extends React.Component < IFileUploaderProps , any> {
         // For a full list of possible configurations,
         // please consult http://www.dropzonejs.com/#configuration
         this.djsConfig = {
-            addRemoveLinks: true
+            addRemoveLinks: true,
+            timeout: 660000
         };
 
         this.componentConfig = {
