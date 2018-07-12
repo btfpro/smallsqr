@@ -2,6 +2,7 @@
 // /> import axios from 'axios';
 import * as React from 'react';
 import {DropzoneComponent} from 'react-dropzone-component';
+import {RingLoader} from 'react-spinners';
 // import FileDownload from 'react-file-download';
 
 class FileUploader extends React.Component < IFileUploaderProps,
@@ -17,7 +18,10 @@ any > {
     public options : any;
     constructor(props : IFileUploaderProps) {
         super(props);
-
+        this.state = {
+            loading: false,
+            value: ''
+        }
         // For a full list of possible configurations, please consult
         // http://www.dropzonejs.com/#configuration
         this.djsConfig = {
@@ -33,6 +37,7 @@ any > {
             showFiletypeIcon: true
         };
 
+
         // If you want to attach multiple callbacks, simply create an array filled with
         // all your callbacks. tslint:disable-next-line:no-console
         this.callbackArray = [
@@ -40,11 +45,13 @@ any > {
 
         // Simple callbacks work too, of course tslint:disable-next-line:no-console
         this.callback = () => {
+            this.setState({loading : true});
             this.componentConfig.postUrl = '/upload?base=' + this.props.sqrInputValue;
             this.setState({value: new Date()});
         }
 
         this.success = (file : any, data : any) => {
+            this.setState({ loading: false });
             this.solution1Path = data;
             this
                 .props
@@ -72,11 +79,18 @@ any > {
             success: this.success
         }
 
-        return <DropzoneComponent
+        return (<div>
+            <div className="spinner"><RingLoader
+                color={'#123abc'}
+                loading={this.state.loading}
+            /> </div>
+            <DropzoneComponent
             className="dropzone"
             config={config}
             eventHandlers={eventHandlers}
             djsConfig={djsConfig}/>
+            
+            </div>)
     }
 }
 export default FileUploader;
