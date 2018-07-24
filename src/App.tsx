@@ -8,7 +8,8 @@ import FileUploader from './components/FileUploader';
 
 class App extends React.Component < {}, {
   sol1Path: string,
-  sqrInputValue: string
+  sqrInputValue: string,
+  uploadedData: any
 } > {
   constructor(props : any) {
     super(props);
@@ -17,7 +18,8 @@ class App extends React.Component < {}, {
       .bind(this);
     this.state = {
       sol1Path: '',
-      sqrInputValue: ''
+      sqrInputValue: '',
+      uploadedData: null
     }
   }
 
@@ -25,9 +27,19 @@ class App extends React.Component < {}, {
     this.setState({sol1Path: val});
   }
 
+  public onUploadedData = (val: any) => {
+    this.setState({ uploadedData: val });
+  }
+
   public downloadHandler = () => {
+    // axios
+    //   .get(this.state.sol1Path)
+    //   .then((response) => {
+    //     FileDownload(response.data, 'output.txt');
+    //   });
+
     axios
-      .get(this.state.sol1Path)
+      .get('/v1/slone?base=' + this.state.uploadedData.fileToParse + '&path=' + this.state.uploadedData.path)
       .then((response) => {
         FileDownload(response.data, 'output.txt');
       });
@@ -49,16 +61,9 @@ class App extends React.Component < {}, {
                 <h2>File Uploader</h2>
                 <h4>SQR Files</h4>
                 <span>Step 1 :</span>
-                <input
-                  type="text"
-                  className="form-control"
-                  placeholder="Enter sqr name to parse eg: bas003.sqr"
-                  value={this.state.sqrInputValue}
-                  onChange={this.handleChange}/>
-                <br/>
-                <span>Step 2 :</span>
                 <FileUploader
                   onSol1Path={this.onSol1Path}
+                  onUploadedData={this.onUploadedData}
                   sqrInputValue={this.state.sqrInputValue}/>
                 <br/>
                 <br/>
@@ -67,7 +72,7 @@ class App extends React.Component < {}, {
                     className="btn btn-success btn-lg"
                     id="downloadBtn"
                     onClick={this.downloadHandler}
-                    disabled={!this.state.sol1Path}>Sol1 Download</button>
+                    disabled={!this.state.uploadedData}>Sol1 Download</button>
                 </div>
               </div>
             </div>

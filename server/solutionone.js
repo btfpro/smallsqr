@@ -34,15 +34,16 @@ let tableConfig = {
 
     columns: {
         0: {
-            width: 10,
+            width: 30,
             alignment: 'right'
         },
         1: {
-            alignment: 'center',
-            width: 10
+            width : 30,
+            alignment: 'center'
         },
         2: {
-            alignment: 'left'
+            alignment: 'left',
+            width : 30
         }
     }
 };
@@ -245,7 +246,7 @@ const slone = (fileName, dirPath, outputFilePath) => {
                 resolve('success');
             });
 
-        }, 5000);
+        }, 6000);
 
     });
 }

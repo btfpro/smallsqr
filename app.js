@@ -7,9 +7,27 @@ var rimraf = require('rimraf');
 const sqrparser = require('./server/sqrparser');
 const uuidv1 = require('uuid/v1');
 const slone = require('./server/solutionone');
-const extract = require('extract-zip')
+const extract = require('extract-zip');
 
 var PORT = process.env.PORT || 5000;
+
+let isDirectory = (entry) => {
+    // convert external file attr int into a fs stat mode int
+    let mode = (entry.externalFileAttributes >> 16) & 0xFFFF;
+    // check if it's a symlink or dir (using stat mode constants)
+    var IFMT = 61440
+    var IFDIR = 16384
+    var IFLNK = 40960
+    var symlink = (mode & IFMT) === IFLNK;
+    var isDir = (mode & IFMT) === IFDIR;
+
+    // Failsafe, borrowed from jsZip
+    if (!isDir && entry.fileName.slice(-1) === '/') {
+        isDir = true
+    }
+
+    return isDir;
+}
 
 app.use(express.static(path.join(__dirname, 'build')));
 // app.use(express.static(path.join(__dirname, 'bower_components')));
@@ -45,12 +63,18 @@ app.get('/v1/allfiles', function (req, res) {
     });
 });
 
-app.get('/slone', function (req, res) {
-    slone();
+app.get('/v1/slone', function (req, res) {
+    const baseSQRFile = req.query.base || 'bas003.sqr';
+    const uploadDir = req.query.path;
+    slone(baseSQRFile, uploadDir, uploadDir + '/output.txt').then((success) => {
+        res.sendFile(uploadDir + '/output.txt');
+    });
 })
 
 app.post('/upload', function (req, res) {
     let uploadedFileName = "";
+    let uploadedFoldersList = [];
+    let uploadedFilesList = [];
     const baseSQRFile = req.query.base || 'bas003.sqr';
     // create an incoming form object
     var form = new formidable.IncomingForm();
@@ -80,15 +104,30 @@ app.post('/upload', function (req, res) {
     // once all the files have been uploaded, send a response to the client
     form.on('end', function () {
         if (uploadedFileName.indexOf('.zip') > -1) {
-
             extract(form.uploadDir + '/' + uploadedFileName, {
-                dir: form.uploadDir
+                dir: form.uploadDir,
+                onEntry: function (entry, zipfile) {
+                    if (entry) {
+                        if (isDirectory(entry)) {
+                            uploadedFoldersList.push(entry.fileName);
+                        } else {
+                            let entryFileName = entry.fileName.replace(/^.*[\\\/]/, '');
+                            if (entryFileName.split('.').pop() === 'sqr') {
+                                uploadedFilesList.push(entryFileName);
+                            }
+                            
+                        }
+                    }
+                }
             }, function (err) {
-                slone(baseSQRFile, form.uploadDir, form.uploadDir + '/output.txt').then((success) => {
-                    res
-                        .status(200)
-                        .send('/v1/ab7820028322' + form.uploadDir.replace(__dirname, "") + '/output.txt');
-                });
+                res
+                    .status(200)
+                    .send({ 'path': form.uploadDir, files: uploadedFilesList, folders: uploadedFoldersList});
+                // slone(baseSQRFile, form.uploadDir, form.uploadDir + '/output.txt').then((success) => {
+                //     res
+                //         .status(200)
+                //         .send('/v1/ab7820028322' + form.uploadDir.replace(__dirname, "") + '/output.txt');
+                // });
             });
         } else {
             let promise = sqrparser(form.uploadDir + '/' + uploadedFileName, form.uploadDir + '/output.txt');
